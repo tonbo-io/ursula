@@ -5437,6 +5437,452 @@ async fn cli_a_wal_root_started_under_another_node_id_is_refused() {
     assert_eq!(std::fs::read(&topology).unwrap(), before);
 }
 
+/// IT-2 (#768 addendum, section 7): restarts on the same boot owe no
+/// predecessor wait. A SIGKILL of every node is a crash of each process on
+/// its own mount: each next run reads `process_crash`, finds its
+/// predecessor gone and serves with every write kept. A follower stopped
+/// with SIGTERM and started again under write load, whose leaders' pooled
+/// AppendStream sessions name its old process (D25), catches up within a
+/// bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_restarts_on_the_same_boot_owe_no_predecessor_wait() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the same-boot restart test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let stream = format!("{}/same-boot/restarts", nodes[0].url());
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "before-the-kill;").await;
+
+    // 1. Every process is killed, and each next run owes no wait.
+    for node in &nodes {
+        procs.kill(node.id);
+    }
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+    // Where the kernel reports no boot id, a killed process reads as a host
+    // crash, whose successor waits.
+    let (run, predecessor) = if cfg!(target_os = "linux") {
+        ("process_crash", "gone")
+    } else {
+        ("host_crash", "may_live")
+    };
+    for node in &nodes {
+        wait_readiness_reason(&client, &mut procs, node, None).await;
+        let recovery = wal_recovery(&client, &node.url()).await;
+        assert_eq!(recovery["previous_run"]["kind"], run, "{recovery}");
+        assert_eq!(recovery["predecessor"], predecessor, "{recovery}");
+    }
+    let read =
+        |node: &MetaNode| format!("{}/same-boot/restarts?offset=0&max_bytes=65536", node.url());
+    read_until_matches(&client, &read(&nodes[1]), b"before-the-kill;").await;
+
+    // 2. Under write load, node 3 stops by SIGTERM and starts again.
+    let load = WriteLoad::start(&client, &stream, "load");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    procs.stop(3).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    procs.start(binary, &nodes[2]);
+    let restarted = std::time::Instant::now();
+    let bound = Duration::from_secs(20);
+    wait_readiness_reason(&client, &mut procs, &nodes[2], None).await;
+    let recovery = wal_recovery(&client, &nodes[2].url()).await;
+    assert_eq!(recovery["previous_run"]["kind"], "clean", "{recovery}");
+    assert_eq!(recovery["predecessor"], "gone", "{recovery}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut expected = vec!["before-the-kill;".to_owned()];
+    let loaded = load.stop().await;
+    assert!(!loaded.is_empty(), "the write load was acknowledged");
+    expected.extend(loaded);
+    // What node 3 applies reaches each group's committed index within the
+    // bound, through the leaders that streamed to its old process.
+    let committed = leaders_committed(&client, &nodes[..2]).await;
+    eventually(
+        &mut procs,
+        "node 3 caught up after its restart",
+        async || {
+            let metrics = try_node_metrics(&client, &nodes[2].url()).await?;
+            let behind = committed
+                .iter()
+                .filter(|(group, index)| {
+                    metrics
+                        .groups
+                        .iter()
+                        .find(|metrics| metrics.raft_group_id == **group)
+                        .and_then(|metrics| metrics.last_applied_index)
+                        < Some(**index)
+                })
+                .collect::<Vec<_>>();
+            if behind.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("groups behind their committed index: {behind:?}"))
+            }
+        },
+    )
+    .await;
+    assert!(
+        restarted.elapsed() < bound,
+        "node 3 caught up {:?} after it started",
+        restarted.elapsed()
+    );
+    let on_node_1 = read_until_holding(&client, &read(&nodes[0]), &expected).await;
+    read_until_matches(&client, &read(&nodes[2]), &on_node_1).await;
+}
+
+/// Reads `url` until it holds each of `writes` in order, among writes whose
+/// outcome is unknown, and answers what it read.
+async fn read_until_holding(client: &reqwest::Client, url: &str, writes: &[String]) -> Vec<u8> {
+    let holds = |bytes: &[u8]| {
+        let mut rest = String::from_utf8_lossy(bytes).into_owned();
+        writes.iter().all(|write| match rest.find(write.as_str()) {
+            Some(at) => {
+                rest = rest.split_off(at.saturating_add(write.len()));
+                true
+            }
+            None => false,
+        })
+    };
+    let mut last = Vec::new();
+    for _ in 0..100 {
+        if let Ok(response) = client.get(url).send().await
+            && response.status().is_success()
+        {
+            last = response.bytes().await.expect("read the stream").to_vec();
+            if holds(&last) {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{url} does not hold the {} acknowledged writes: {:?}",
+        writes.len(),
+        String::from_utf8_lossy(&last)
+    );
+}
+
+/// IT-1 (#768 addendum, section 7): a replaced process behind a relay, over
+/// real gRPC with pooled channels and AppendStream sessions. Nodes 1 and 2
+/// reach node 3 through a relay. Pointed at node 2, an address that serves
+/// another node, the relay fences nobody and writes go on. Then node 3's
+/// process is stopped with SIGSTOP, its root released by `ursulactl node
+/// replace-disk` and a replacement started on an empty WAL, which the
+/// relay's new connections reach while its open ones stay on the old
+/// process, under write load, and the old process is continued. That breaks
+/// the release rule while every peer reaches meta. The continued old
+/// process reports `superseded`, the replacement becomes ready after its
+/// wait, and with node 1 killed no acknowledged write is lost.
+///
+/// It does not show that no leader counts the old process's answers. Node 2
+/// acknowledges throughout, so every write commits on a leader and node 2
+/// whether or not the old process's answers count, and node 1 is killed
+/// whether or not it leads the stream's group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_replaced_process_behind_a_relay_is_superseded_and_loses_no_write() {
+    use ursula_proto::admin::ServingReadinessReason;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the relayed replacement test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let mut nodes = MetaNode::cluster(root.path(), 3);
+    let relay = Relay::start(nodes[2].port).await;
+    // Each node reaches node 3 through the relay, and itself directly.
+    let peers_for = |nodes: &[MetaNode], me: &MetaNode| -> Vec<(u64, String)> {
+        nodes
+            .iter()
+            .map(|node| match (node.id, me.id) {
+                (3, 3) => me.peer(),
+                (3, _) => (3, relay.url()),
+                _ => node.peer(),
+            })
+            .collect()
+    };
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers_for(&nodes, node), meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    let stream = format!("{}/relayed/replacement", nodes[0].url());
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "formed;").await;
+    let mut acknowledged = vec!["formed;".to_owned()];
+    let read = |node: &MetaNode| {
+        format!(
+            "{}/relayed/replacement?offset=0&max_bytes=65536",
+            node.url()
+        )
+    };
+
+    // 1. The relay serves node 2 as node 3: nobody fences, writes go on.
+    relay.point(nodes[1].port, Open::Closed);
+    let load = WriteLoad::start(&client, &stream, "misdelivered");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let misdelivered = load.stop().await;
+    assert!(
+        !misdelivered.is_empty(),
+        "writes go on while the relay serves node 2"
+    );
+    acknowledged.extend(misdelivered);
+    for node in &nodes {
+        let (_, report) = readiness(&client, node).await.expect("readiness");
+        assert!(
+            !matches!(
+                report.reason,
+                Some(ServingReadinessReason::Superseded | ServingReadinessReason::DiskLeaseLost)
+            ),
+            "node {} fenced itself: {report:?}",
+            node.id
+        );
+    }
+    relay.point(nodes[2].port, Open::Closed);
+    wait_readiness_reason(&client, &mut procs, &nodes[2], None).await;
+
+    // 2. Node 3's old process stops with its WAL intact, its root is
+    // released, and a replacement starts on an empty WAL behind the relay.
+    let old_root = bound_root(&cluster, 3);
+    let old = procs.0.remove(&3).expect("node 3 runs");
+    signal(&old, "-STOP");
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    let released = ursula_ctl::placement::replace_disk(&ctl, &ctl_nodes, 3, old_root, true)
+        .await
+        .expect("release node 3's root while its old process is stopped");
+    assert_eq!(
+        released.record.root,
+        ursula_proto::placement::RootSlot::Released(old_root)
+    );
+    let old_node = nodes.pop().expect("node 3");
+    let replacement = MetaNode {
+        id: 3,
+        port: free_port(),
+        admin_port: free_port(),
+        config: root.path().join("node-3-replacement.toml"),
+        wal: root.path().join("node-3-replacement-log"),
+        cold_root: None,
+    };
+    nodes.push(replacement);
+    let replacement = &nodes[2];
+    replacement.write(&peers_for(&nodes, replacement), meta);
+    procs.start(binary, replacement);
+    relay.point(replacement.port, Open::Kept);
+    let load = WriteLoad::start(&client, &stream, "replaced");
+    signal(&old, "-CONT");
+
+    // 3. The continued old process reports `superseded`, and the
+    // replacement serves once it waited out its predecessor.
+    // A fenced process answers every client request `503`, so its
+    // readiness is read on its admin listener.
+    let mut old_procs = Processes::default();
+    old_procs.0.insert(3, old);
+    eventually(
+        &mut old_procs,
+        "the old process reports superseded",
+        async || {
+            let url = format!("{}/__ursula/ready", old_node.admin());
+            let report: ursula_proto::admin::ServingReadiness = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|err| format!("GET {url}: {err}"))?
+                .json()
+                .await
+                .map_err(|err| format!("GET {url}: {err}"))?;
+            if report.reason == Some(ServingReadinessReason::Superseded) {
+                Ok(())
+            } else {
+                Err(format!("{report:?}"))
+            }
+        },
+    )
+    .await;
+    wait_readiness_reason(&client, &mut procs, replacement, None).await;
+    let replaced = load.stop().await;
+    assert!(!replaced.is_empty(), "writes go on around the replacement");
+    acknowledged.extend(replaced);
+
+    // 4. Node 1 is killed: no acknowledged write is lost, on node 2 or on
+    // the replacement.
+    procs.kill(1);
+    read_until_holding(&client, &read(&nodes[1]), &acknowledged).await;
+    read_until_holding(&client, &read(&nodes[2]), &acknowledged).await;
+}
+
+/// Whether a relay's open connections stay where they were opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    Kept,
+    Closed,
+}
+
+/// A TCP relay on a port of its own: each connection goes to the port it
+/// points at when the connection opens.
+struct Relay {
+    port: u16,
+    target: Arc<Mutex<u16>>,
+    closed: tokio::sync::watch::Sender<u64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Relay {
+    async fn start(target: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let port = listener.local_addr().expect("relay address").port();
+        let target = Arc::new(Mutex::new(target));
+        let (closed, closes) = tokio::sync::watch::channel(0_u64);
+        let current = Arc::clone(&target);
+        let task = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let to = *current.lock().unwrap();
+                let mut closes = closes.clone();
+                closes.mark_unchanged();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await
+                    else {
+                        return;
+                    };
+                    tokio::select! {
+                        _copied = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _closed = closes.changed() => {}
+                    }
+                });
+            }
+        });
+        Self {
+            port,
+            target,
+            closed,
+            task,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Sends the relay's new connections to `target`, and closes its open
+    /// ones unless `open` keeps them.
+    fn point(&self, target: u16, open: Open) {
+        *self.target.lock().unwrap() = target;
+        if open == Open::Closed {
+            self.closed
+                .send_modify(|closes| *closes = closes.saturating_add(1));
+        }
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Appends to a stream every 20 ms until stopped, keeping each write that
+/// was acknowledged.
+struct WriteLoad {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<String>>,
+}
+
+impl WriteLoad {
+    /// Writes `{prefix}-{n};` to `stream`.
+    fn start(client: &reqwest::Client, stream: &str, prefix: &'static str) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let client = client.clone();
+            let stream = stream.to_owned();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut acknowledged = Vec::new();
+                for write in 0_u32.. {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let payload = format!("{prefix}-{write};");
+                    let response = client
+                        .post(&stream)
+                        .header("content-type", "text/plain")
+                        .body(payload.clone())
+                        .send()
+                        .await;
+                    if response
+                        .is_ok_and(|response| response.status() == reqwest::StatusCode::NO_CONTENT)
+                    {
+                        acknowledged.push(payload);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                acknowledged
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops the load once its write in flight answered, and answers the
+    /// acknowledged writes in order.
+    async fn stop(self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the write load ends")
+    }
+}
+
+/// Sends `signal` (`-STOP`, `-CONT`) to `child`.
+fn signal(child: &ChildGuard, signal: &str) {
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(child.child.id().to_string())
+        .status()
+        .expect("send a signal");
+    assert!(status.success(), "kill {signal}");
+}
+
+/// The committed index of each data group, as its leader among `nodes`
+/// reports it.
+async fn leaders_committed(client: &reqwest::Client, nodes: &[MetaNode]) -> BTreeMap<u64, u64> {
+    let mut committed = BTreeMap::new();
+    for node in nodes {
+        let Ok(metrics) = try_node_metrics(client, &node.url()).await else {
+            continue;
+        };
+        for group in &metrics.groups {
+            if group.current_leader == Some(node.id)
+                && let Some(index) = group.committed_index
+            {
+                committed.insert(group.raft_group_id, index);
+            }
+        }
+    }
+    committed
+}
+
 async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
     let status = Command::new("kill")
         .arg("-TERM")
