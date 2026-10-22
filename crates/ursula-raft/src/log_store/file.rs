@@ -412,14 +412,21 @@ impl RaftGroupFileLogStore {
 
     /// A crash may lose an enqueued tail that followers already persisted,
     /// even under `always` and even if this replica lost no acknowledged I/O.
+    /// A negative control turns it off (`Defence::CrashedLeaderDemotion`),
+    /// and OpenRaft then restores such a replica as the leader of its term.
     pub(crate) async fn prevent_crashed_leader_resume(
         &self,
         node_id: u64,
     ) -> Result<(), CoreJournalError> {
-        if self.core_writer.previous_run != super::run_state::PreviousRun::Clean {
-            self.start_as_follower(node_id).await?;
+        use ursula_stream::sim_controls::Defence;
+        if self.core_writer.previous_run == super::run_state::PreviousRun::Clean {
+            return Ok(());
         }
-        Ok(())
+        if ursula_stream::sim_controls::off(Defence::CrashedLeaderDemotion) {
+            ursula_stream::sim_controls::note_fired(Defence::CrashedLeaderDemotion);
+            return Ok(());
+        }
+        self.start_as_follower(node_id).await
     }
 
     /// A recovering replica that led its group may have lost entries it

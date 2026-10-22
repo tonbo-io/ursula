@@ -533,6 +533,13 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         generate: generate_placement_move,
     },
     SeedFamily {
+        name: "identity-fence-extended",
+        start: 1160,
+        end: 1161,
+        kind: "identity-fence",
+        generate: generate_identity_fence,
+    },
+    SeedFamily {
         name: "deleted-data-after-expiry",
         start: 532,
         end: 539,

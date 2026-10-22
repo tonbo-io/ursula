@@ -52,7 +52,7 @@ impl GroupLeadership {
     /// leadership ([`fence_lets_lead`]).
     pub fn of(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, fence: &NodeFence) -> Self {
         let now = fence_now();
-        let role = if !fence.admits(now) {
+        let role = if !fence.admits(now) && fence_rules_leadership() {
             LeaderRole::Unknown
         } else if metrics.state == ServerState::Leader {
             let own_quorum = metrics
@@ -67,7 +67,7 @@ impl GroupLeadership {
             let since_lift = fence
                 .lifted_at()
                 .map(|lifted| now.saturating_duration_since(lifted));
-            if fence_lets_lead(own_quorum, acked_age, since_lift) {
+            if fence_lets_lead(own_quorum, acked_age, since_lift) || !fence_rules_leadership() {
                 LeaderRole::Leads
             } else {
                 LeaderRole::Unknown
@@ -131,6 +131,19 @@ impl GroupLeadership {
             _ => None,
         }
     }
+}
+
+/// Whether the node fence takes part in the leader predicate, read only
+/// where it decides the role. A negative control turns it off
+/// (`Defence::FencedLeadership`), and the predicate then reads OpenRaft's
+/// server state alone.
+fn fence_rules_leadership() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::FencedLeadership) {
+        ursula_stream::sim_controls::note_fired(Defence::FencedLeadership);
+        return false;
+    }
+    true
 }
 
 /// Whether a leader behind an admitting fence leads: the fence never

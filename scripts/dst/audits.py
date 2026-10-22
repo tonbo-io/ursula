@@ -679,6 +679,7 @@ EXPECTED_FAMILIES = {
     "placement-move",
     "placement-move-extended",
     "identity-fence",
+    "identity-fence-extended",
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}
 

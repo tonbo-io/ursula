@@ -226,6 +226,9 @@ struct FenceState {
     owes_wait: AtomicBool,
     /// A root that the meta group has not bound yet.
     awaits_binding: AtomicBool,
+    /// When a bootstrapped cluster's meta group bound this run's unbound
+    /// root, in nanoseconds after `origin`, plus one. 0 for none.
+    bound: AtomicU64,
     /// Wakes the waiters of [`NodeFence::waited`] and
     /// [`NodeFence::bound_and_waited`].
     waited: crate::rt::sync::Notify,
@@ -246,6 +249,7 @@ impl NodeFence {
             superseded: AtomicBool::new(false),
             owes_wait: AtomicBool::new(false),
             awaits_binding: AtomicBool::new(false),
+            bound: AtomicU64::new(0),
             waited: crate::rt::sync::Notify::new(),
         }))
     }
@@ -437,10 +441,21 @@ impl NodeFence {
     /// ends, so a data replica is never free in between.
     pub fn bind(&self, owes_wait: bool) {
         if owes_wait {
+            self.0
+                .bound
+                .store(self.nanos(fence_now()).saturating_add(1), Ordering::Release);
             self.begin_wait();
         }
         self.0.awaits_binding.store(false, Ordering::Release);
         self.0.waited.notify_waiters();
+    }
+
+    /// When [`Self::bind`] bound this run's unbound root in a bootstrapped
+    /// cluster, the instant the run owes its predecessor wait from. `None`
+    /// for a root bound before this run, or by an answer before Bootstrap.
+    pub fn bound_at(&self) -> Option<FenceInstant> {
+        let bound = self.0.bound.load(Ordering::Acquire).checked_sub(1)?;
+        self.0.origin.checked_add(Duration::from_nanos(bound))
     }
 
     /// Whether this run's unbound root awaits its binding ([`Self::await_binding`]).

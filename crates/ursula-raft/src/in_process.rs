@@ -34,6 +34,7 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftStateMachine;
+use ursula_proto::placement::NodeId;
 
 use crate::registry::SnapshotInstallError;
 use crate::rejoin::GroupRejoin;
@@ -186,8 +187,8 @@ pub enum FenceLoss {
     #[error(transparent)]
     Refused(crate::PeerClusterError),
     /// The sender discarded the answer unread.
-    #[error("its answer was discarded: {0}")]
-    Discarded(crate::incarnation::Discarded),
+    #[error("its answer was discarded")]
+    Discarded(#[source] crate::incarnation::Discarded),
 }
 
 /// Why an in-process recovery call (a barrier, a probe, a forwarded control
@@ -196,13 +197,17 @@ pub enum FenceLoss {
 pub enum InProcessCallLost {
     /// The target node registered nothing to answer it.
     #[error("node {node} is not registered")]
-    NotRegistered { node: u64 },
+    NotRegistered { node: NodeId },
     /// The caller's route to the target node is cut.
     #[error("the route to node {node} is cut")]
-    Cut { node: u64 },
+    Cut { node: NodeId },
     /// The process fence lost the request or its answer.
-    #[error("node {node}: {loss}")]
-    Fence { node: u64, loss: FenceLoss },
+    #[error("the process fence lost a call to node {node}")]
+    Fence {
+        node: NodeId,
+        #[source]
+        loss: FenceLoss,
+    },
 }
 
 /// The process an in-process recovery call comes from: its node and, for a
@@ -279,8 +284,12 @@ impl InProcessCaller {
         if self.process.is_none() {
             return Ok(());
         }
-        fence_request(Some(self.node), self.sender(), target, Some(receiver), rpc)
-            .map_err(|loss| InProcessCallLost::Fence { node: target, loss })
+        fence_request(Some(self.node), self.sender(), target, Some(receiver), rpc).map_err(|loss| {
+            InProcessCallLost::Fence {
+                node: NodeId::new(target),
+                loss,
+            }
+        })
     }
 
     /// The answer's fence, from node `target`'s process `receiver`
@@ -289,8 +298,12 @@ impl InProcessCaller {
         if self.process.is_none() {
             return Ok(());
         }
-        let responder = fence_answer(self.sender(), target, Some(receiver))
-            .map_err(|loss| InProcessCallLost::Fence { node: target, loss })?;
+        let responder = fence_answer(self.sender(), target, Some(receiver)).map_err(|loss| {
+            InProcessCallLost::Fence {
+                node: NodeId::new(target),
+                loss,
+            }
+        })?;
         if let (Some(policy), Some(responder)) = (&self.policy, responder) {
             policy.notify(InProcessRaftNetworkEvent::AnswerAccepted {
                 source: Some(self.node),
@@ -560,10 +573,14 @@ impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
             .and_then(|(process, _)| self.route(*process, target));
         match route {
             Some(Route::To { endpoint, .. }) => Ok(endpoint),
-            Some(Route::Cut) => Err(InProcessCallLost::Cut { node: target }),
+            Some(Route::Cut) => Err(InProcessCallLost::Cut {
+                node: NodeId::new(target),
+            }),
             None => self
                 .endpoint(target)
-                .ok_or(InProcessCallLost::NotRegistered { node: target }),
+                .ok_or(InProcessCallLost::NotRegistered {
+                    node: NodeId::new(target),
+                }),
         }
     }
 
