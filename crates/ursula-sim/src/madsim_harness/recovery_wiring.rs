@@ -210,6 +210,33 @@ pub(super) async fn start_gated_replica(
     Ok(engine)
 }
 
+/// Waits until the replicas of `nodes` on `registry` opened their recovery
+/// gates, so the group formed as a node's readiness sees it: every voter
+/// applied a fresh leader barrier. Until then a voter that holds only the
+/// first leader's entries keeps its gate closed and does not campaign, so a
+/// scenario that took that leader away at once would wait for it forever,
+/// as a production group would.
+pub(super) async fn wait_gates_open(
+    registry: &InProcessRaftRegistry,
+    nodes: impl IntoIterator<Item = u64>,
+    timeout: Duration,
+) {
+    let deadline = madsim::time::Instant::now() + timeout;
+    for node_id in nodes {
+        while let Some(rejoin) = registry
+            .rejoin(node_id)
+            .filter(|rejoin| !rejoin.vote_gate_open())
+        {
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "node {node_id}: the recovery gate never opened ({:?})",
+                rejoin.status()
+            );
+            madsim::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct InProcessRecoveryTransport {
     registry: InProcessRaftRegistry,

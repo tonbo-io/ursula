@@ -490,6 +490,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 .await
                 .map_err(|err| leader_wait_error(placement.raft_group_id, err))?;
             let leader_id = leader_metrics.current_leader.expect("leader id");
+            super::recovery_wiring::wait_gates_open(&registry, 1..=3, LEADER_WAIT).await;
             leaders
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())

@@ -1938,6 +1938,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .await
         .expect("wait for simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
+    recovery_wiring::wait_gates_open(&registry, 1..=3, Duration::from_secs(5)).await;
     (registry, engines, wals, config, leader_id)
 }
 
@@ -2011,6 +2012,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
             .await
             .expect("wait for shared leader");
     }
+    recovery_wiring::wait_gates_open(&registry, [1, 2], Duration::from_secs(5)).await;
     (registry, engines, leader_id)
 }
 
@@ -2069,6 +2071,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .await
         .expect("wait for snapshot-purge simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
+    recovery_wiring::wait_gates_open(&registry, 1..=3, Duration::from_secs(5)).await;
     (registry, engines, wals, leader_id)
 }
 
