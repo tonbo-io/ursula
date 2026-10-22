@@ -893,9 +893,9 @@ impl RaftGroupEngine {
                 },
             ));
         }
-        // Only the gate the engine started with: one that started without a
-        // gate runs OpenRaft without log reversion, which a gated replica's
-        // leader needs.
+        // Only the gate the engine started with, whose OpenRaft runs with
+        // log reversion. A forwarded read's engine started with none and
+        // binds none.
         if !self
             .built_with_gate
             .as_ref()
