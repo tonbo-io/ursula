@@ -58,7 +58,11 @@ applied, and a collector keeps the newest replica's report per group
 node: it purges the groups the node hosts in place and sends each other
 group's purge to the group's leader candidates in turn, following the leader
 a refusal names, until a node answers as the group's leader
-(`RaftGroupHandleRegistry::purge_bucket_through_leader`).
+(`RaftGroupHandleRegistry::purge_bucket_through_leader`). A candidate that
+refuses for its leadership, or that the node cannot reach, passes the purge
+on, so a silent node holds no purge. A purge is idempotent, so a purge whose
+answer was lost and that the next candidate repeats is safe, though its
+streams are not counted in `removed_streams`.
 
 The
 egress probe judges each voter config of the effective membership of every

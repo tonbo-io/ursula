@@ -1643,7 +1643,10 @@ pub struct UsageReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketPurgeReport {
     pub bucket: String,
-    /// Streams the purge removed, across every group.
+    /// Streams the purge removed, across every group. A purge is
+    /// idempotent, so it may undercount for a group: a purge that committed
+    /// before a `503`, or through a leader candidate whose answer was lost
+    /// before the next candidate repeated it, counts its streams nowhere.
     pub removed_streams: u64,
     /// The groups in which it removed a stream, ascending.
     pub groups_with_streams: Vec<u32>,

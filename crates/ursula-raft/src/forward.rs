@@ -263,22 +263,35 @@ impl crate::RaftGroupHandleRegistry {
     /// over this node's latest placement view and `raft.peers`), following
     /// the leader a candidate's refusal names, until a node answers as the
     /// group's leader. A candidate that hosts no replica of the group, or
-    /// refuses as no leader before anything is proposed, passes the purge
-    /// on. Any other answer is the group's. With no candidate left, the
-    /// answer is a leadership refusal that names no leader.
+    /// gives a leadership refusal of any kind, passes the purge on. That
+    /// includes a candidate this node cannot reach, whose answer is outcome
+    /// unknown: a host that drops packets (powered off, partitioned,
+    /// stopped) times out the call, and must not hold every purge until it
+    /// returns. Any other answer is the group's. With no candidate left,
+    /// the answer is a leadership refusal that names no leader, and that
+    /// may have committed when any candidate's refusal may have.
+    ///
+    /// A purge is idempotent, so asking the next candidate is safe. A purge
+    /// that committed through a candidate whose answer was lost is not
+    /// counted in the answer of the next one, which then removes nothing:
+    /// `removed_streams` may undercount for the group, as it does for a
+    /// client that retries after a `503`.
     pub async fn purge_bucket_through_leader(
         &self,
         placement: ShardPlacement,
         bucket_id: &str,
     ) -> Result<PurgeBucketResponse, GroupEngineError> {
-        let no_leader =
-            || unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
         let candidates = {
             let peers = self.peer_cluster().directory();
-            let me = NodeId::new(peers.node_id().ok_or_else(no_leader)?);
+            let Some(me) = peers.node_id() else {
+                return Err(unknown_leader(
+                    LeadershipReason::LeaderUnreachable,
+                    Proposal::NotProposed,
+                ));
+            };
             let ids = peers.node_ids().map(NodeId::new).collect();
             ursula_control::leader_candidates(
-                me,
+                NodeId::new(me),
                 ursula_control::CandidatesOf::Group(placement.raft_group_id),
                 &self.placement_watch().current(),
                 None,
@@ -286,6 +299,7 @@ impl crate::RaftGroupHandleRegistry {
             )
         };
         let mut asked = std::collections::BTreeSet::new();
+        let mut proposal = Proposal::NotProposed;
         for candidate in candidates.iter() {
             let mut next = Some(candidate.get());
             while let Some(node) = next.take() {
@@ -302,33 +316,34 @@ impl crate::RaftGroupHandleRegistry {
                 };
                 match forward_purge_bucket_to_leader(&route, placement, bucket_id.to_owned()).await
                 {
-                    Err(error) if passes_on(&error) => {
-                        next = error
-                            .not_leader()
-                            .and_then(|refusal| refusal.leader.as_ref())
-                            .map(|leader| leader.node_id);
+                    Err(GroupEngineError::NotLeader(refusal)) => {
+                        if refusal.proposal == Proposal::MayHaveCommitted {
+                            proposal = Proposal::MayHaveCommitted;
+                        }
+                        next = refusal.leader.map(|leader| leader.node_id);
                     }
+                    Err(error) if hosts_no_replica(&error) => {}
                     answer => return answer,
                 }
             }
         }
-        Err(no_leader())
+        Err(unknown_leader(
+            LeadershipReason::LeaderUnreachable,
+            proposal,
+        ))
     }
 }
 
-/// Whether the node a forwarded write went to gave no answer as the
-/// group's leader and applied nothing: it runs no replica of the group
-/// (`NOT_FOUND`, before the handler looks at the write), or it refused as
-/// no leader before anything was proposed.
-fn passes_on(error: &GroupEngineError) -> bool {
-    match error {
-        GroupEngineError::NotLeader(refusal) => refusal.proposal == Proposal::NotProposed,
+/// Whether the node a forwarded write went to runs no replica of the
+/// group: it answered `NOT_FOUND`, before its handler looked at the write.
+fn hosts_no_replica(error: &GroupEngineError) -> bool {
+    matches!(
+        error,
         GroupEngineError::Infra(GroupInfraError::ForwardFailed {
             failure: ForwardFailure::Refused { grpc_code },
             ..
-        }) => *grpc_code == i32::from(tonic::Code::NotFound),
-        GroupEngineError::Infra(_) | GroupEngineError::Stream(_) => false,
-    }
+        }) if *grpc_code == i32::from(tonic::Code::NotFound)
+    )
 }
 
 /// Forwards one control command to the meta leader `route` names: a
