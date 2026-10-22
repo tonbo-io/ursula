@@ -110,28 +110,78 @@ impl CampaignStances {
     }
 }
 
-/// A node's cluster peers, and the client that asks them for their
+/// The peers a node polls and probes ([`PeerParticipation::peers`]).
+#[derive(Debug)]
+pub(crate) enum PolledPeers {
+    /// The registry's bound `raft.peers`.
+    Bound(ursula_raft::BoundPeers),
+    /// A test's own addresses.
+    #[cfg(test)]
+    Fixed(std::sync::Arc<PeerDirectory>),
+}
+
+impl std::ops::Deref for PolledPeers {
+    type Target = PeerDirectory;
+
+    fn deref(&self) -> &PeerDirectory {
+        match self {
+            Self::Bound(peers) => peers,
+            #[cfg(test)]
+            Self::Fixed(peers) => peers,
+        }
+    }
+}
+
+/// The client that asks a node's cluster peers, the ones its registry's
+/// peer cluster binds (`raft.peers`, read at each poll), for their
 /// leadership-shed state.
 #[derive(Debug, Clone)]
 pub(crate) struct PeerParticipation {
     node_id: u64,
-    /// `raft.peers`, this node among them.
-    peers: PeerDirectory,
     client: reqwest::Client,
+    /// A test's own peer addresses for the polls and probes, apart from
+    /// the ones its Raft dials.
+    #[cfg(test)]
+    addresses: Option<std::sync::Arc<PeerDirectory>>,
 }
 
 impl PeerParticipation {
-    /// `peers` may list this node too. `client` bounds each peer's answer.
-    pub(crate) fn new(node_id: u64, peers: &PeerDirectory, client: reqwest::Client) -> Self {
+    /// `client` bounds each peer's answer.
+    pub(crate) fn new(node_id: u64, client: reqwest::Client) -> Self {
         Self {
             node_id,
-            peers: peers.clone(),
             client,
+            #[cfg(test)]
+            addresses: None,
+        }
+    }
+
+    /// Polls and probes `addresses` instead of the bound peers, for a test
+    /// whose polls or probes must miss a peer its Raft reaches.
+    #[cfg(test)]
+    pub(crate) fn with_addresses(
+        node_id: u64,
+        addresses: PeerDirectory,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            addresses: Some(std::sync::Arc::new(addresses)),
+            ..Self::new(node_id, client)
         }
     }
 
     pub(crate) fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    /// The peers this node polls for their stances and probes for its
+    /// egress: the bound `raft.peers`, read at each use.
+    pub(crate) fn peers(&self, registry: &RaftGroupHandleRegistry) -> PolledPeers {
+        #[cfg(test)]
+        if let Some(addresses) = &self.addresses {
+            return PolledPeers::Fixed(addresses.clone());
+        }
+        PolledPeers::Bound(registry.peer_cluster().directory())
     }
 
     /// The campaign stance of this node and of each peer. A node shedding
@@ -146,8 +196,9 @@ impl PeerParticipation {
         // cluster at a peer's address says nothing about this one.
         let identity = registry.peer_cluster().identity();
         let local = identity.as_ref().map(ursula_raft::PeerIdentity::cluster_id);
+        let peers = self.peers(registry);
         let answers = join_all(
-            self.peers
+            peers
                 .iter()
                 .filter(|(peer_id, _)| *peer_id != self.node_id)
                 .map(|(peer_id, endpoints)| async move {
@@ -255,11 +306,12 @@ mod tests {
     }
 
     /// Node 1's registry, of [`THIS_CLUSTER`].
-    fn this_registry() -> RaftGroupHandleRegistry {
+    /// Node 1 of [`THIS_CLUSTER`], with `peers` bound as its `raft.peers`.
+    fn this_registry(peers: ursula_raft::PeerDirectory) -> RaftGroupHandleRegistry {
         let registry = RaftGroupHandleRegistry::default();
         registry.peer_cluster().bind(
             ursula_raft::PeerIdentity::new(1, cluster(THIS_CLUSTER)),
-            ursula_raft::PeerDirectory::default(),
+            peers,
         );
         registry
     }
@@ -314,28 +366,29 @@ mod tests {
 
     /// A node of another cluster at a peer's address answers the poll with
     /// its own cluster id, so its answer does not count, even before this
-    /// node ever contacted it over Raft. A node with no cluster id trusts no
-    /// answer.
+    /// node ever contacted it over Raft. A node with nothing bound has no
+    /// peers to ask.
     #[tokio::test]
     async fn a_shed_answer_of_another_cluster_is_an_unknown_stance() {
         let (willing, willing_task) = answering_peer(true).await;
         let (foreign, foreign_task) = answering_peer_in("other-cluster", true).await;
         let participation = PeerParticipation::new(
             1,
-            &shared_peers([(2, willing), (3, foreign)]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
                 .expect("client"),
         );
-        let stances = participation.campaign_stances(&this_registry()).await;
+        let stances = participation
+            .campaign_stances(&this_registry(shared_peers([(2, willing), (3, foreign)])))
+            .await;
         assert_eq!(stances.of(2), Some(CampaignStance::MayCampaign));
         assert_eq!(stances.of(3), Some(CampaignStance::Unknown));
         assert_eq!(stances.may_campaign(), HashSet::from([1, 2]));
         let unbound = participation
             .campaign_stances(&RaftGroupHandleRegistry::default())
             .await;
-        assert_eq!(unbound.of(2), Some(CampaignStance::Unknown));
+        assert_eq!(unbound.of(2), None);
         willing_task.abort();
         foreign_task.abort();
     }
@@ -347,18 +400,17 @@ mod tests {
         let (silent, _listener) = silent_peer().await;
         let participation = PeerParticipation::new(
             1,
-            &shared_peers([
-                (1, "http://unused".to_owned()),
-                (2, willing),
-                (3, refusing),
-                (4, silent),
-            ]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
                 .expect("client"),
         );
-        let registry = this_registry();
+        let registry = this_registry(shared_peers([
+            (1, "http://unused".to_owned()),
+            (2, willing),
+            (3, refusing),
+            (4, silent),
+        ]));
 
         let stances = participation.campaign_stances(&registry).await;
         assert_eq!(stances.of(1), Some(CampaignStance::MayCampaign));
@@ -388,13 +440,14 @@ mod tests {
         let (willing, willing_task) = answering_peer(true).await;
         let participation = PeerParticipation::new(
             1,
-            &shared_peers([(2, format!("{willing}/"))]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
                 .expect("client"),
         );
-        let stances = participation.campaign_stances(&this_registry()).await;
+        let stances = participation
+            .campaign_stances(&this_registry(shared_peers([(2, format!("{willing}/"))])))
+            .await;
         assert_eq!(stances.of(2), Some(CampaignStance::MayCampaign));
         willing_task.abort();
     }

@@ -250,6 +250,7 @@ pub use memberships::EchoedTarget;
 pub use memberships::LeaderMemberships;
 pub use memberships::MalformedMembership;
 pub use memberships::MembershipKind;
+pub use peer_cluster::BoundPeers;
 pub use peer_cluster::CLUSTER_ID_METADATA;
 pub use peer_cluster::ClusterCheck;
 pub use peer_cluster::NODE_ID_METADATA;

@@ -232,12 +232,20 @@ impl Cluster {
         }));
         let now_ms = Arc::new(AtomicU64::new(1_000));
         // The front door routes writes through the leadership view of the
-        // replica the runtime hosts, as a node's own registry does.
-        let state =
-            HttpState::with_static_raft_cluster(runtime.clone(), factory.front_door(), peers)
-                .with_wall_clock_handle(Arc::new(SimHttpWallClock {
-                    now_ms: Arc::clone(&now_ms),
-                }));
+        // replica the runtime hosts, and its redirects read the peers its
+        // registry binds, as a node's own registry does.
+        let front_door = factory.front_door();
+        front_door.peer_cluster().bind(
+            ursula_raft::PeerIdentity::new(
+                1,
+                ursula_headers::ClusterId::new("ursula-test").expect("a valid cluster id"),
+            ),
+            peers,
+        );
+        let state = HttpState::with_static_raft_cluster(runtime.clone(), front_door)
+            .with_wall_clock_handle(Arc::new(SimHttpWallClock {
+                now_ms: Arc::clone(&now_ms),
+            }));
         let app = router_with_http_state(state);
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let path = format!("/{}/{}", config.stream.bucket_id, config.stream.stream_id);

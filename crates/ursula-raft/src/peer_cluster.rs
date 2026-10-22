@@ -403,6 +403,23 @@ struct Bound {
     book: IncarnationBook,
 }
 
+/// The configured peers last bound ([`PeerCluster::directory`]), as a
+/// [`PeerDirectory`]. It is not `Clone`: a reader takes it at each use and
+/// keeps no copy.
+#[derive(Debug)]
+pub struct BoundPeers(Option<Arc<Bound>>);
+
+/// What a reader sees before any bind.
+static UNBOUND: PeerDirectory = PeerDirectory::empty();
+
+impl std::ops::Deref for BoundPeers {
+    type Target = PeerDirectory;
+
+    fn deref(&self) -> &PeerDirectory {
+        self.0.as_deref().map_or(&UNBOUND, |bound| &bound.peers)
+    }
+}
+
 /// This node's side of the cluster check, shared by its registry, its
 /// outbound transports and its Raft gRPC server: its identity and configured
 /// peers once a WAL binds them, and the peers refused for another cluster id.
@@ -421,14 +438,10 @@ impl PeerCluster {
         })));
     }
 
-    /// The configured peers last bound, this node among them.
-    pub fn directory(&self) -> PeerDirectory {
-        self.0
-            .bound
-            .load()
-            .as_deref()
-            .map(|bound| bound.peers.clone())
-            .unwrap_or_default()
+    /// The configured peers last bound, this node among them, read in
+    /// place: none before the bind. Every reader takes it at each use.
+    pub fn directory(&self) -> BoundPeers {
+        BoundPeers(self.0.bound.load_full())
     }
 
     /// The cluster URL `raft.peers` lists for `node_id`, the only address

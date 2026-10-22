@@ -345,14 +345,19 @@ pub(super) async fn run_leader_read_linearizability_inner(
             ursula_raft::PeerEndpoints::shared(format!("http://runtime-raft-node-{node_id}")),
         )
     }));
-    let state = HttpState::with_static_raft_cluster(
-        runtime.clone(),
-        RaftGroupHandleRegistry::default(),
+    // Its redirects read the peers its registry binds, as a node's do.
+    let registry = RaftGroupHandleRegistry::default();
+    registry.peer_cluster().bind(
+        ursula_raft::PeerIdentity::new(
+            1,
+            ursula_headers::ClusterId::new("ursula-test").expect("a valid cluster id"),
+        ),
         peers,
-    )
-    .with_wall_clock_handle(Arc::new(SimHttpWallClock {
-        now_ms: Arc::new(AtomicU64::new(1_000)),
-    }));
+    );
+    let state = HttpState::with_static_raft_cluster(runtime.clone(), registry)
+        .with_wall_clock_handle(Arc::new(SimHttpWallClock {
+            now_ms: Arc::new(AtomicU64::new(1_000)),
+        }));
     let app = router_with_http_state(state);
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
 
