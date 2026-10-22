@@ -8,7 +8,7 @@ Deterministic simulation testing (DST) runs Ursula's Raft, runtime, stream state
 
 **Property tests.** `crates/ursula-stream/src/state_machine/tests.rs` runs [proptest](https://github.com/proptest-rs/proptest) over generated command sequences against `StreamStateMachine::apply`. Properties cover offset monotonicity and snapshot round trips, producer retry idempotence and stale-epoch fencing, TTL expiry under generated `now_ms`, cold flush planning and restore, and stale cold flushes after delete and recreate. These run in the normal unit-test job.
 
-**Raft unit tests under madsim.** The workspace unit-test job of pull-request CI runs `cargo test -p ursula-raft --lib` natively, and DST Nightly runs `RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`, every test that compiles under `cfg(madsim)`, without a name filter. A pull request only checks that `ursula-raft` and `ursula-sim` build under `cfg(madsim)` (section 10).
+**Raft unit tests under madsim.** Pull-request CI's Rust test job runs `cargo test --workspace --lib --bins` natively, which includes `ursula-raft`'s unit tests, and DST Nightly runs `RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`, every test that compiles under `cfg(madsim)`, without a name filter. A pull request only checks that `ursula-raft` and `ursula-sim` build under `cfg(madsim)` (section 10).
 
 | Fixture | Native coverage | Simulation coverage |
 | --- | --- | --- |

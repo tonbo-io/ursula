@@ -584,7 +584,7 @@ timeouts (6 s), the leader steps down and campaigns.
 apply for 30 s reports its group stalled: a majority may be gated, so the group
 has no leader. Readiness answers `503` with reason `recovery_stalled`. The
 operator ranks gated replicas by `last_log_term` and `last_log_index` from the
-metrics and calls `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on
+metrics and calls `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` on
 the longest ones until the open replicas are a majority. The body names
 `expected_last_log_index` and `expected_current_term` as seen. The replica
 answers `409 Conflict` and changes nothing unless it has a durable vote floor,
@@ -774,7 +774,7 @@ matched index drop, and the barrier driver also watches apply progress. They kee
 reporting and rate-limit repeated steps. Segment pressure reaches the snapshot
 driver through `LaggingGroups`.
 
-`GET /__ursula/raft/{group}/quorum`, which requires the incarnation header,
+`GET /__ursula/raft/{target}/quorum`, which requires the incarnation header,
 confirms a fresh ReadIndex round with an unchanged committed leader vote and
 returns the group, leader, term and required applied index, the higher of the
 read index and the leader's last log index. It is an
