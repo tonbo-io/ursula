@@ -1069,14 +1069,19 @@ impl Gateway {
     /// whether that is a search hop. `named` is the upstream the redirect's
     /// `Location` names. It goes there unless the request already went to it,
     /// else to an upstream it has not tried ([`Gateway::untried_upstream`]),
-    /// else back to `named`. `None` when there is nowhere to go.
+    /// else back to `named`, unless `named` answered this request nothing
+    /// ([`Chain::answered_nothing`]). `None` when there is nowhere to go.
     fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
         match named {
             Some(leader) if !chain.tried.contains(&leader) => Some((leader, Lead::Leader)),
             named => self
                 .untried_upstream(chain)
                 .map(|upstream| (upstream, Lead::Search))
-                .or_else(|| named.map(|leader| (leader, Lead::Leader))),
+                .or_else(|| {
+                    named
+                        .filter(|leader| !chain.answered_nothing(leader))
+                        .map(|leader| (leader, Lead::Leader))
+                }),
         }
     }
 
@@ -1085,8 +1090,9 @@ impl Gateway {
     /// there only when the request has not tried it and [`Ejections::claim`]
     /// admits it, else to an upstream it has not tried
     /// ([`Gateway::untried_upstream`]), else to `named` all the same, as
-    /// selection falls back to an ejected upstream rather than none. `None`
-    /// when there is nowhere to go.
+    /// selection falls back to an ejected upstream rather than none, unless
+    /// `named` answered this request nothing ([`Chain::answered_nothing`]).
+    /// `None` when there is nowhere to go.
     fn next_hinted_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
         if let Some(host) = &named
             && !chain.tried.contains(host)
@@ -1096,7 +1102,11 @@ impl Gateway {
         }
         self.untried_upstream(chain)
             .map(|upstream| (upstream, Lead::Search))
-            .or_else(|| named.map(|host| (host, Lead::Hint)))
+            .or_else(|| {
+                named
+                    .filter(|host| !chain.answered_nothing(host))
+                    .map(|host| (host, Lead::Hint))
+            })
     }
 
     /// Counts a hop that follows a redirect, a search hop among them.
@@ -1692,6 +1702,17 @@ impl Chain {
         self.unanswered = Some(unanswered);
         self.first_redirect = None;
         self.follow(next, Lead::Search);
+    }
+
+    /// Whether `upstream` got a hop of this request and answered nothing in
+    /// time. Its peers name it while they have not yet elected a leader in
+    /// its place, as for a stopped process, and a hop back to it would only
+    /// wait out the timeout again.
+    fn answered_nothing(&self, upstream: &str) -> bool {
+        matches!(
+            &self.unanswered,
+            Some(GatewayError::UpstreamTimeout { upstream: silent, .. }) if silent == upstream
+        )
     }
 
     /// The error a request of `replay` ends with when its last hop ended

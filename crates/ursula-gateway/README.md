@@ -158,17 +158,19 @@ alone in `x-ursula-raft-group`:
 - When no upstream answers without redirecting within these limits, the
   client gets `503` with `Retry-After: 1`, as from a node whose group has no
   known leader.
-- A hop that gets no response headers within `--response-header-timeout`
-  may have delivered the request to a node that accepted it and never
-  answers. A read (`GET`, `HEAD`) and a producer append (a `POST` to a
-  stream with `Producer-Id`, `Producer-Epoch` and `Producer-Seq`) go on, once, to an upstream the
-  request has not tried and that is not ejected, which answers or redirects
-  to the current leader. That search starts its own 5 s redirect deadline.
-  A producer append's key applies it at most once, but the first node may
-  still apply it, so only a `2xx` receipt of the repeat reaches the client,
-  and any other ending is the `504 UPSTREAM_TIMEOUT` of the first hop. Any
-  other write, a keyed `DELETE` included, gets the `504` at once: sent
-  again, it could apply twice.
+- A hop that gets no response headers within `--response-header-timeout` may
+  have delivered the request to a node that accepted it and never answers. A
+  read (`GET`, `HEAD`) and a producer append (a `POST` to a stream with
+  `Producer-Id`, `Producer-Epoch` and `Producer-Seq`) go on, once, to an
+  upstream the request has not tried and that is not ejected, which answers
+  or redirects to the current leader. That search starts its own 5 s
+  redirect deadline. A producer append's key applies it at most once, but
+  the first node may still apply it, so only a `2xx` receipt of the repeat
+  reaches the client, and any other ending is the `504 UPSTREAM_TIMEOUT` of
+  the first hop. The repeat never goes back to the upstream that answered
+  nothing, though a redirect names it, as a stopped leader's peers do until
+  they elect another. Any other write, a keyed `DELETE` included, gets the
+  `504` at once: sent again, it could apply twice.
 
 Gateways before 0.7.3 followed one redirect, to a configured upstream only,
 and passed any other on to the client with a path-only `Location`.

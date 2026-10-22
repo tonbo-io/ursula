@@ -9710,11 +9710,12 @@ impl ProducerLoad {
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
-///    its key, to another node, which answers it from the new leader:
-///    every attempt is answered within [`STOPPED_LEADER_ANSWERS_WITHIN`],
-///    the first one after the stop holds, and the stream holds each seq
-///    once, in order. A gateway that waits out the client's timeout on the
-///    stopped node fails it.
+///    its key, to another node, which answers it from the new leader, or,
+///    while its peers still name the stopped node, ends with the `504` of
+///    the first hop without going back to it. Every attempt is answered
+///    within [`STOPPED_LEADER_ANSWERS_WITHIN`], a write after the stop
+///    holds, and the stream holds each seq once, in order. A gateway that
+///    waits out the client's timeout on the stopped node fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_timeout() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9798,29 +9799,42 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
             .collect();
         assert!(slow.is_empty(), "{via} answered writes late: {slow:?}");
     }
-    // The cut-off leader holds the write it proposed first until its lease
-    // ends (`until_lapsed` of ursula-raft), and refuses every later one at its front
-    // door, before the body.
-    let mut in_cut = direct_writes
+    // A write the cut-off leader proposed in the cut, sent to it directly or
+    // through the gateway, ends `OUTCOME_UNKNOWN` once its lease ends
+    // (`until_lapsed` of ursula-raft), before the heal. A write queued behind
+    // it was never proposed and ends `NO_LEADER`, and so does every later
+    // one, at the front door before its body.
+    let answered_at = |write: &LoadWrite| write.sent.checked_add(write.took);
+    let in_cut = |write: &&LoadWrite| {
+        write.sent < healed && answered_at(write).is_some_and(|answered| answered >= cut)
+    };
+    let unknown = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::OutcomeUnknown));
+    let refused = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::NoLeader));
+    assert!(
+        direct_writes
+            .iter()
+            .chain(gateway_writes.iter())
+            .filter(in_cut)
+            .any(|write| write.answer == unknown
+                && answered_at(write).is_some_and(|answered| answered < healed)),
+        "node {leader} ended no write it proposed in the cut as unknown before the heal: \
+         {direct_writes:?} {gateway_writes:?}"
+    );
+    let mut direct_in_cut = direct_writes
         .iter()
-        .filter(|write| {
-            write.sent < healed
-                && write
-                    .sent
-                    .checked_add(write.took)
-                    .is_some_and(|answered| answered >= cut)
-        })
+        .filter(in_cut)
         .skip_while(|write| write.answer == LoadAnswer::Acknowledged);
-    let held = in_cut.next().unwrap_or_else(|| {
+    let held = direct_in_cut.next().unwrap_or_else(|| {
         panic!("node {leader} refused no write while cut off: {direct_writes:?}")
     });
-    assert_eq!(
-        held.answer,
-        LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::OutcomeUnknown)),
+    assert!(
+        (held.answer == unknown || held.answer == refused)
+            && answered_at(held).is_some_and(|answered| answered < healed),
         "node {leader}'s first unacknowledged write in the cut: {held:?}"
     );
-    let refused = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::NoLeader));
-    let not_refused: Vec<&LoadWrite> = in_cut.filter(|write| write.answer != refused).collect();
+    let not_refused: Vec<&LoadWrite> = direct_in_cut
+        .filter(|write| write.answer != refused)
+        .collect();
     assert!(
         not_refused.is_empty(),
         "node {leader} answered writes after its lease ended other than NO_LEADER: \
@@ -9862,15 +9876,11 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
         .filter(|attempt| attempt.took >= STOPPED_LEADER_ANSWERS_WITHIN)
         .collect();
     assert!(slow.is_empty(), "writes answered late: {slow:?}");
-    let first = attempts
+    let held = attempts
         .iter()
-        .find(|attempt| attempt.sent >= stopped)
-        .expect("a write after the stop");
-    assert!(
-        first.outcome.holds(),
-        "the first write after node {leader} stopped does not hold: {first:?}"
-    );
-    let acknowledged: Vec<String> = (0..=first.seq)
+        .find(|attempt| attempt.sent >= stopped && attempt.outcome.holds())
+        .unwrap_or_else(|| panic!("no write after node {leader} stopped holds: {attempts:?}"));
+    let acknowledged: Vec<String> = (0..=held.seq)
         .map(|seq| format!("stopped-{seq};"))
         .collect();
     let read = read_until_holding(

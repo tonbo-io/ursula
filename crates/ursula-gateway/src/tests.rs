@@ -785,6 +785,43 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 2);
 }
 
+/// A keyed write sent again to a node that still names the silent upstream
+/// as leader, as a stopped leader's peers do until they elect another, ends
+/// with the first hop's `504` at once. Following the redirect back would
+/// only wait out the header timeout a second time.
+#[tokio::test(start_paused = true)]
+async fn a_repeat_redirected_back_to_the_silent_upstream_ends_unknown_at_once() {
+    let _frozen = FrozenClock::hold();
+    let timeout = Duration::from_secs(5);
+    let (silent, mut arrivals) = silent_upstream().await;
+    let follower = Scripted::spawn().await;
+    follower.answers(raft_redirect(
+        &format!("{}/bucket/stream", silent.url),
+        HeaderMap::new(),
+    ));
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        silent.url.clone(),
+        follower.url(),
+    ])));
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let mut sent = send(&gateway, producer_post());
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    let response = tokio::select! {
+        response = &mut sent => response.expect("request task"),
+        _again = arrivals.recv() => panic!("the repeat went back to the silent upstream"),
+    };
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+    assert_eq!(follower.hits(), 1);
+}
+
 /// A `method` request to `path` with a producer key.
 fn keyed(method: Method, path: &str) -> Request<Body> {
     Request::builder()
