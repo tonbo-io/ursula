@@ -122,7 +122,7 @@ pub(crate) fn balance_inputs(
     stances: &CampaignStances,
 ) -> Option<BalanceInputs> {
     let may_campaign = stances.may_campaign();
-    let groups = cluster.groups().iter().count();
+    let groups = cluster.groups().len();
     let eligible = cluster
         .nodes()
         .keys()
@@ -465,11 +465,20 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         /// Design 5.9 for `N` 3 to 7 and RF 2 and 3: the nodes take turns,
-        /// each planning from the counts as they stand, every transfer
-        /// strictly lowers the sum of the squared counts, and the cluster
-        /// settles at zero transfers. The bug it catches: a rule that
-        /// transfers forever once `N > RF`, as the share over the voters a
-        /// node sees did.
+        /// each planning from the counts as they stand, every transfer meets
+        /// the three conditions and strictly lowers the sum of the squared
+        /// counts, and the cluster settles at zero transfers. Every node gets
+        /// the same correct `fair`, so the property never reaches a wrong
+        /// share: the old share over the voters a node sees is
+        /// `the_fair_share_counts_every_group_over_the_nodes_that_may_lead`'s
+        /// to catch. With a shared `fair`, `count(t) + 1 < mine` also follows
+        /// from `mine > fair` and `count(t) < fair`, so it is never exercised
+        /// on its own. The bugs it catches are in the transfer rule: one that
+        /// does not settle, such as `mine > fair` with no condition on the
+        /// target, which moves a group back and forth between a node at
+        /// `fair + 1` and one at `fair`, and one without `count(t) < fair`,
+        /// which the per-transfer checks fail once it pushes a target over
+        /// its share.
         #[test]
         fn the_balancer_settles_and_every_transfer_strictly_improves(
             nodes in 3_u64..=7,
