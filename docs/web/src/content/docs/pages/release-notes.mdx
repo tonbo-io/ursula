@@ -3,6 +3,132 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.10.0
+
+**0.10.0 is a breaking release.** A meta group replaces static membership: it records every node and places every data group, so groups move between nodes and nodes join and leave a running cluster. 0.10 moves the storage and protocol format to format epoch 6. A 0.10 node refuses epoch-5 Raft WAL directories and object-storage prefixes at startup and refuses 0.9 peers, and a 0.9 node refuses 0.10 peers. The backup format stays 5, so `ursulactl restore` of 0.10 restores a 0.9 backup. There is no in-place upgrade, no rolling upgrade and no rollback.
+
+- **If you cannot move your data yet, stay on 0.9.0.**
+- **Deploy 0.10 fresh:** empty PVCs and never-used object-storage prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.9, or a failed upgrade attempt, wrote to.
+- **Move your data with a backup, and keep the 0.9 `server.cluster_id`.** Install 0.10 with the 0.9 cluster's `server.cluster_id` and `raft.group_count`. Stop client writes to 0.9, back it up with `ursulactl backup-create` and `backup-verify` of 0.9, stop the 0.9 nodes, copy their cold objects into the 0.10 cold root, skipping `URSULA_FORMAT_EPOCH` and `snapshots/`, and run `ursulactl restore` of 0.10, which checks the copy first. Every restored stream answers with a new `Stream-Incarnation`, as after any restore.
+- **`helm upgrade` from 0.9 stops at the first pod.** The new pod finds the 0.9 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`. A values file that still sets a removed value fails validation first.
+- **Keep the peer lists of 0.9 and 0.10 nodes apart.** A node that exchanges a Raft RPC with a node of the other release answers `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts.
+- **Recover the meta group first, then the data groups.** `ursulactl recover-group --target meta`, then `--target G` for each data group, whose plan reads its floor from a confirmed meta view.
+- **A lost quorum of disks is lost data,** for the meta group as for a data group. No recovery flow brings such a group back. Restore a backup into a fresh cluster.
+
+See [Upgrading to 0.10](/docs/operations#upgrading-to-010).
+
+### Formats
+
+- **Format epoch 6.** The Raft WAL journals and state files, the meta journal, the WAL directory and object-storage markers, group snapshots and the Raft gRPC protocol carry format epoch 6. A node refuses data and peers of another epoch.
+- **The run state records each journal class.** `run-state.bin` holds one record for the data journals and one for the meta journal, each with its `fsync` policy and recovery epoch, and the device the WAL root is mounted from. Every journal record, core metadata entry and group snapshot record carries a log generation, so a retired group's log leaves nothing a later life of the group restores.
+- **A WAL root is bound to its node.** `topology.bin` adds the node ID and a root ID drawn when the root is created. A root opens only under the `raft.node_id` that created it, and another ID refuses startup (`OtherNode`). The new `identity.bin` counts the root's runs and records whether the meta group bound the root. A root that holds prior state without it refuses startup (`MissingIdentity`). The new `lease.probe` holds the disk lease's probe.
+- **The meta group's journal.** `raft-log/meta/` holds the meta group's journal and its snapshot record `group-0.snapshot.json`, whose snapshot is always inline. It always runs `fsync = always`.
+- **Raft payloads name their plane.** A Raft entry's payload carries the meta group's commands beside the data groups', and a data entry keeps its epoch-5 bytes. Every Raft request names its plane and target node, a node refuses a request meant for another node, and barrier answers echo the group they answer for.
+- **`GroupEngineError` names the plane.** Every `GroupInfraError` field `raft_group_id` is now `group`, a data group's ID or the meta group, at the same position, so a refusal of the meta group no longer reads as one of data group 0. The wire form is frozen within 0.10.
+- **Backup format 5.** Unchanged: a backup holds each group's stream snapshot and no membership or placement.
+
+### Removed and replaced
+
+| Removed or changed | Kind | Replacement |
+| --- | --- | --- |
+| `raft.groups` (`[[raft.groups]]` with `raft_group_id` and `voters`) | config, refused as an unknown key | the meta group places every group at its bootstrap: group `g` on `min(raft.placement.replication_factor, N)` consecutive `raft.peers` nodes in ascending ID from index `g mod N` |
+| `raft.init_membership`, `raft.init_membership_per_group` | config, refused as unknown keys | none: the first node of a group's seed voters initializes it once every seed voter reports it empty and no leader |
+| a node with `raft.wal.path` and an empty `raft.peers` | config | refused (`NodeIdNotInPeers`): every node with `raft.wal.path`, a single node included, lists itself in `[[raft.peers]]` and sets `server.cluster_id` |
+| `raft.group_count` unset on a node whose `raft.peers` lists another node | config | refused (`GroupCountRequired`): set it, the same on every node, at most 4,096 |
+| `raft.wal.fsync` defaulting to `never` | config | unset, `always` for groups of one or two voters, `never` otherwise |
+| `ursulactl startup-admit` | command | none: a node starts unattended |
+| `ursulactl pin-incarnations` | command | each command's own incarnation check, which stops a command when a node restarts under it, and `ursulactl wait` between steps |
+| `ursulactl activate-maintenance-fence`, `retire-maintenance-fence` | commands | none: placement writes go through the meta group |
+| `ursulactl reservation-propose`, `reservation-cell`, `reservation-source`, `reservation-read`, `reservation-bootstrap`, `reservation-acknowledge`, and `reservation-request` with `reserve-host-recovery`, `admit-host-termination`, `record-host-termination`, `admit-replacement-termination`, `record-replacement-termination`, `restage-host-replacement`, `complete-host-replacement`, `admit-fenced-pod-retirement`, `bind-host-replacement`, `publish-host-inventory`, `reserve`, `takeover`, `admit-pod-deletion`, `complete-pod-replacement` and `bind-pod-replacement` | commands | a lost disk: start the node under its ID on an empty WAL and, once the old disk is revoked, `ursulactl node replace-disk`. A node that leaves: `ursulactl node decommission`. Never start a node on a copy of another node's disk, and never let two hosts mount one volume |
+| `ursulactl recover-group --group G` | flag, refused as unknown | `--target G` for a data group, `--target meta` for the meta group |
+| `--expected-groups` of `wait-ready`, `verify-quorum` and `verify-survivors` | flags | none: the groups and their target voters come from the meta leader's placement view |
+| `verify-survivors` output `excluded_voter_id`, `configured_voter_ids`, `surviving_voter_ids` | `ursulactl` JSON | `excluded_node_id`, `surviving_node_ids`. Any manifest node may be excluded |
+| `verify-quorum` output schema 3 | `ursulactl` JSON | schema 4, without `maintenance_executor_certified`, `maintenance_executor_retired_certified` and `maintenance_fence` |
+| manifest fields `expected_process_incarnation`, `expected_maintenance_fence` and the root `maintenance_fence` | `ursulactl` manifest | none: ignored, like any unknown field |
+| `POST /__ursula/raft/{group}/membership?voters=` | admin route, answers `404` | `POST /__ursula/placement/groups/{group}/move`, or `ursulactl placement move` |
+| `POST /__ursula/maintenance/fence/activate`, `/retire` | admin routes | none |
+| `/__ursula/raft/{group}/...` | admin routes | `/__ursula/raft/{target}/...`, a group ID or `meta` |
+| `x-ursula-maintenance-fence` | header | none: an admin mutation that carries it answers `400` |
+| `maintenance_fence`, `maintenance_fence_uncertain` in `/__ursula/metrics` | admin JSON | none |
+| `raft_maintenance` schema version 1 | admin JSON | version 2 ([Admin API and readiness](#admin-api-and-readiness)) |
+| `/__ursula/usage` version 1, with node-summed `buckets` | admin JSON | version 2, with one entry per hosted group under `groups` |
+| a recovery plan without `floor` | admin JSON, answers `422` | `floor`: `"meta"`, `"seeded"` or `{"certified": ...}` |
+| `URSULA_STARTUP_RESERVATION`, `URSULA_STARTUP_PROVIDER`, `URSULA_STARTUP_STATEFULSET`, `URSULA_STARTUP_NAMESPACE`, `URSULA_STARTUP_POD_NAME`, `URSULA_STARTUP_POD_UID`, `URSULA_START_MAINTENANCE_DRAINED` | environment | none: ignored. To keep a started node drained, run `ursulactl drain` once it is up |
+| `server.updateStrategy`, `server.podManagementPolicy`, `server.probes.readiness.enabled`, `server.onDeleteMigration.*`, `server.startupOwnership.*`, `server.gracefulRollout.*`, `raft.initMembership`, `raft.initMembershipPerGroup` | chart values, refused by the schema | the StatefulSet always updates by `RollingUpdate` under `Parallel`, with a readiness probe on `/__ursula/ready` and the leadership handoff on `SIGTERM` |
+| `server.replicaCount` `2`, and every pod a voter of every group | chart value | `1`, or `3` and more. Each group has at most three voters, so 5 replicas keep three copies of a group. Lower the count only after decommissioning every dropped ID |
+| `server.podDisruptionBudget.maxUnavailable` above 1 | chart value | at most `1` |
+| `raft.walFsync` defaulting to `never` | chart value | `""`, which renders no `raft.wal.fsync` |
+| `charts/ursula/files/graceful-rollout.sh`, `maintenance-rollout.sh`, `graceful-rollout_test.sh`, `templates/startup-ownership.yaml`, `graceful-rollout.yaml`, `ondelete-migration.yaml`, `scripts/maintenance_rollout_test.py`, `scripts/helm_ondelete_upgrade_test.sh` | scripts and templates | `helm upgrade` under `RollingUpdate`. Outside an upgrade, drain, restart, `wait` and `undrain`. For a listener move, every server pod deleted at once |
+| the `<StatefulSet>-rollout-state` and `<StatefulSet>-maintenance` ConfigMaps | cluster state | none: delete them |
+
+### Placement and the meta group
+
+- **Every node runs the meta group.** Every node that runs Raft, a single node included, runs a replica of the meta group, which records the cluster's bootstrap, every node with its lifecycle and WAL root, and each data group's placement. Its voters are `raft.meta_voters`, by default the smallest `min(3, N)` node IDs, read at genesis only. Every other node is a meta learner. A fresh cluster forms once every `raft.peers` node is up and claims the same genesis values. See [Placement and the meta group](/docs/operations#placement-and-the-meta-group).
+- **Placement decides what a node hosts.** A node opens the groups its journals hold, in parallel, and creates a group only from a placement view a meta read barrier confirmed. A failed open no longer stops the start: the group stays closed under its open back-off and opens again. With more nodes than the replication factor, a node hosts only the groups placed on it, where 0.9 ran every group on every peer. A 0.9 cluster of five nodes therefore runs three voters per group in 0.10, unless it sets `raft.placement.replication_factor = 5`. A node that `raft.peers` gains after genesis hosts nothing until groups move onto it.
+- **Groups move.** `POST /__ursula/placement/groups/{group}/move` and `ursulactl placement move` move a live group to other voters, as many as it has, under a move limit (`raft.placement.max_concurrent_moves`, 4 by default, `ursulactl placement set-move-limit`). The group's leader adds the new voters as learners, promotes each once it caught up and its recovery gate is open, replaces one voter at a time, and reports the new voters to the meta group. A move of a moving group retargets it, and a move back to its source cancels it.
+- **A dropped replica is torn down.** A node tears down a replica that a confirmed view gives no role once the group answered twice that the node is no member. It retires the replica's log and deletes its own snapshot objects of the group. Cold objects stay.
+- **Nodes are cordoned and decommissioned.** `ursulactl node cordon`, `uncordon` and `decommission` change a node's lifecycle. The meta leader moves a decommissioning node's groups to eligible active nodes and removes the node once it has no role. A removal cannot be undone, and a meta voter is never decommissioned.
+- **`NotHosted` redirects.** A node that hosts no replica of a group, or whose replica knows no leader and does not count as a voter, answers `307` to a node of the group's placement, a different one on successive answers. A replica that counts as a voter and knows no leader answers `503`. The gateway takes the named host as a hint and goes on to its next upstream when that host is ejected or does not connect. The backup and cold-flush admin routes on a node that does not host the group answer `503` with `NO_LEADER`, and `ursulactl` follows no redirect.
+- **Local reads need a voter.** A local read on a replica that does not count as a voter, an incoming learner or a dropped voter, is answered as a leader-only read.
+- **One node purges for the cluster.** `DELETE /__ursula/purge/{bucket}` on any node purges every group: the ones the node hosts in place, every other one through its leader. Node-wide passes such as the cold flush and cold GC skip groups the node does not host.
+- **The leadership balancer settles.** The fair share is every data group of the view over the nodes that may campaign and hold a role, and every handoff (the balancer, the shutdown handoff, the shedding gates, `ursulactl drain`) goes only to a replica whose role is `voter` or `incoming`.
+- **A damaged meta replica does not stop the node.** A node whose meta journal or replica is damaged serves its data groups, reports `meta_damaged`, and marks the new `placement-unavailable` leadership shed: it campaigns but takes no leadership transfer.
+
+### Disks and processes
+
+- **A wiped or replaced disk needs a release.** A node on a new disk under a live ID is refused by the meta group (`root_refused`) and takes part in nothing until `ursulactl node replace-disk --node N --expect-root R` releases its old root through another node's admin plane. The node then binds with no restart, waits 12 seconds and rejoins. 0.9 let a wiped voter rejoin with no operator step.
+- **A superseded process fences itself.** A process whose root was released, or whose ID the meta group binds to another root, or that a peer saw a newer run of, takes part in no Raft traffic, writes no object, answers clients `503`, reports `superseded` and records no clean end. It does not exit.
+- **The disk lease.** A node syncs a probe of its WAL disk every second. With no synced probe for `raft.wal.lease` (`5s`), it stops all Raft traffic, leads no group, writes no object, answers clients `503` and reports `disk_lease_lost`, until a probe syncs again.
+- **A possibly live predecessor is waited out.** A start after a host crash, a reboot, a remount or a lost run state waits 12 seconds before it votes, campaigns or writes a snapshot object (`predecessor_wait`). A run that did not end cleanly and is read on the same boot from another device counts as a remount and opens as after a host crash.
+- **Raft RPCs name the processes.** Every Raft request names the sender's process and, when it knows it, the target's (`ursula-incarnation`, `ursula-target-incarnation`), and every answer names the responder's (`ursula-node-id`, `ursula-incarnation`). A receiver refuses a request for another process of it, from a stale or unbound sender, a duplicate or one that names no sender, and a sender reads every such refusal as a lost RPC.
+- **`x-ursula-process-incarnation` keeps its 32 hex digits,** now the WAL root ID, the run counter and a nonce. It still changes on every restart.
+- **A clean shutdown keeps the WAL lock** until the process exits, and the node fence closes before `clean` is recorded. Shutdown stops the data groups, then the meta group, then the WAL.
+
+### Single node
+
+- **A single node runs as a cluster node.** Its data groups run the gated open path under `raft.node_id`, with the cluster's election timeouts, every gate and driver of a cluster node, its snapshots on `storage.snapshot.backend`, and writes refused with `RAFT_LOG_PRESSURE` past twice `raft.snapshot_log_budget`. It opens every group at start. Unset `raft.wal.fsync` is `always` there, so it restarts unattended after a host crash. Under an explicit `never`, each group waits behind its recovery gate after a host crash for `ursulactl recover-group`, meta first. Growing a single node into a cluster is not supported.
+- **A node without `raft.wal.path`** runs on a temporary WAL as before, and lists itself when `raft.peers` is empty.
+
+### Configuration
+
+- **New keys.** `raft.meta_voters` (unset: the smallest `min(3, N)` IDs), `[raft.placement]` with `replication_factor` (`3`) and `max_concurrent_moves` (`4`, recorded at bootstrap), and `raft.wal.lease` (`5s`, from `2s` to `10s`, `WalLeaseOutOfRange` outside). A meta voter outside `raft.peers` is refused (`MetaVoterOutsidePeers`).
+- **`raft.group_count` is at most 4,096.** A larger value is refused at config load, and the default of the available parallelism times 16 is capped there, since the meta group's snapshot holds one placement per group.
+- **`raft.wal.path` is required when `raft.peers` lists another node.** A temporary WAL may list only the node itself.
+
+### Admin API and readiness
+
+- **New routes.** `GET /__ursula/placement` and `GET /__ursula/placement/groups/{group}` on both listeners, with `?confirmed=true` on the admin listener only. On the admin listener: `POST /__ursula/placement/groups/{group}/move`, `POST /__ursula/placement/move-limit`, `POST /__ursula/placement/nodes/{node}/cordon`, `.../uncordon`, `.../decommission` and `.../replace-disk`. Every refusal is a typed `PlacementApiError`: `404` for an unknown group or node, `409` for a refusal of the meta group, `503` while it cannot answer and `504` when the write may have applied.
+- **Readiness reasons.** New, in this order before the 0.9 reasons: `superseded`, `disk_lease_lost`, `root_refused` and `predecessor_wait`. Older same-minor readers decode them as `unknown`.
+- **Maintenance report version 2.** `raft_maintenance` names the node's `placement`, lists `expected_groups` with their role and target voters and `unplaced` replicas with the last answer about them and their teardown stage. New node issues: `placement_unknown`, `placement_not_bootstrapped`, `genesis_mismatch`, `meta_unavailable`, `meta_damaged`, `node_removed`, `group_count_mismatch` and `replication_factor_mismatch`. New group issues: `unplaced_replica`, `unplaced_member`, `move_in_progress` and `move_stalled`. `unconfigured_member`, `unexpected_group` and `empty_expected_inventory` are gone, and a node with no group is ready. A replica that does not count as a voter is checked only for being stopped.
+- **Metrics.** `/__ursula/metrics` gains `meta`, the meta replica's group metrics, and every group's `reconcile` status and `needs_vote_floor`. `wal_recovery` gains the meta journal's opening and `predecessor`, and `previous_run` may read `remounted`. `recovery_gates` includes the meta replica's gate under `"meta"`, and `stalled` lists it as `"meta"`. `recovery_stalled_groups` in `/__ursula/ready` stays data groups only.
+- **Leadership shed.** `GET /__ursula/leadership-shed` gains `recovery_gates` and `leader_count`, and the shed reasons `placement-unavailable` and `fence`. Handoff planners read a peer's `should_accept_transfer`.
+- **Recovery plans.** `floor` is required: `"meta"` for the meta group, `"seeded"` or `{"certified": {"term", "leader", "index"}}` for a data group. A plan of the other plane answers `409` `floor_other_plane`, and a `certified` plan whose leader does not hold the entry answers `409` `floor_not_held`. A live group's plan keeps the membership its last convergence certified.
+- **Usage version 2.** `/__ursula/usage` reports each hosted group with its `applied_index`. A collector keeps the newest report per group and sums by bucket (`UsageReport::bucket_usage`).
+
+### `ursulactl`
+
+- **New verbs.** `placement status`, `placement move`, `placement cancel`, `placement set-move-limit`, `node cordon`, `node uncordon`, `node decommission`, `node verify-removed`, `node verify-not-removed` and `node replace-disk`. See [ursulactl](/docs/cli).
+- **The view decides.** `wait-ready` waits for every group live with no move, on exactly its target voters with a leader. `wait --node N`, `verify-cluster` and `drain` check the groups placed on the node, and the manifest-driven verbs skip removed nodes. `ursulactl` of 0.9 cannot read a 0.10 node.
+- **`recover-group`** plans the meta group with `--target meta` and a data group with the floor of a confirmed meta view, and leaves out replicas without a vote floor.
+- **`drain`** waits until the node leads no data group and not the meta group.
+
+### Helm chart
+
+- **`RollingUpdate` only.** The StatefulSet updates one pod at a time from the highest ordinal, each waiting for readiness. Start an upgrade only when `ursulactl verify-cluster` passes.
+- **Scaling.** Raising `server.replicaCount` from 3 adds pods that hold no group until groups move onto them. Lowering it is supported after `ursulactl node decommission --wait` of every dropped ID, which is permanent. The new `pre-upgrade,pre-rollback` hook (`server.scaleCheck.*`) refuses a raise from 1 and a lower count whose dropped IDs are not removed.
+
+### Observability
+
+- **New OTLP metrics.** `ursula.meta.leader`, `ursula.meta.applied_index`, `ursula.meta.wal.batches`, `ursula.meta.wal.records`, `ursula.placement.moving_groups`, `ursula.placement.retirements_pending`, `ursula.placement.oldest_move_age_seconds`, `ursula.placement.reconcile_waiting{reason}` and `ursula.placement.reconcile_steps_total{step, outcome}`. `ursula.raft.recovery_gates` counts the meta replica's gate too, and `ursula.wal.recovering` gains the reason `remounted`.
+
+### Rust library APIs
+
+- **`ursula-control` is the placement kernel.** Its 0.9 operation model, `ClusterNode`, `DataGroupPlacement`, `MetaConfig`, `NodeState`, `NodeEndpoint`, `GroupPlacementView` and `PlacementNode` are gone. `ControlPlaneState`, `ControlCommand`, `ControlResponse`, `ControlError`, `Cluster`, `GroupPlacement`, the seed rule, the planners, placement views and the admin types are new, with `ursula_proto::placement` re-exported. No shim keeps the old names.
+- **`ursula-raft` runs the meta group.** The single-node meta Raft (`MetaRaft`, `MetaRaftHandle`, `MetaRaftTypeConfig`, `MetaSnapshot` and the rest) is gone. `ursula_raft::meta` holds the meta replica, runtime, status reader and placement watch. `PlacedRaftGroupEngineFactory`, over `PlacementInputs`, is the one engine factory, in place of `StaticGrpcRaftGroupEngineFactory`, `DurableRaftGroupEngineFactory` and the single-node constructors of `RaftGroupEngine`. `RaftTarget` (in `ursula_shard`) names a data group or the meta group on the wire and in errors. `OwnerRaftHandle::change_membership_if` replaces `add_learner` and `replace_voters`.
+- **The configuration types.** `RaftGroupConfig` and `RaftConfig::{groups, init_membership, init_membership_per_group}` are gone. `RaftConfig.group_count` and `WalConfig.fsync` are `Option`s, read through `effective_group_count` and `wal_fsync`. `PlacementConfig` and `RaftConfig::{meta_voters, placement}` are new.
+- **The removed tooling.** `ursula-ctl`'s `reservation` and `startup` modules, `MetricsClient::{pin_nodes, set_maintenance_fence, change_membership}` and `ursula-proto`'s maintenance fence and startup admission types are gone. `ursula_proto::placement::ProcessIncarnation` replaces `ursula_proto::admin::ProcessIncarnation`.
+- **The server.** `ursula::Topology` is `Development` or `Cluster`, `spawn_runtime` takes the config and the topology, and `HttpState::with_raft_cluster` and `router_with_raft_cluster` take the node's placement inputs.
+
 ## 0.9.0
 
 **0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. It also moves the backup format to 5. 0.9 does not restore 0.8 backups. There is no in-place upgrade, no rolling upgrade, no backup migration and no rollback.

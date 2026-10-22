@@ -111,9 +111,9 @@ Two surfaces expose the same counters:
   snapshot for quick inspection and is what `ursulactl status` reads.
 
 For redundancy alerts, inspect the JSON metric `raft_maintenance.group_issues`.
-Alert on `incomplete_voter_set`, `unplaced_member`, `unplaced_replica` or `joint_membership`, and treat a missing
+Alert on `incomplete_voter_set`, `unplaced_member`, `unplaced_replica`, `joint_membership` or `move_stalled`, and treat a missing
 maintenance report as unavailable evidence. Also alert on nonempty
-`raft_maintenance.node_issues`. These fields remain strict when healthy
+`raft_maintenance.node_issues`, such as `meta_unavailable`, `meta_damaged` or `genesis_mismatch`. These fields remain strict when healthy
 survivors return 200 from `/__ursula/ready` while a replica catches up.
 They are JSON report fields, not new OTLP instrument names.
 
@@ -122,7 +122,23 @@ curl --fail http://NODE:4437/__ursula/metrics | jq '
   .raft_maintenance | {node_issues, group_issues}'
 ```
 
-Staged snapshot parts are reported separately: the JSON field `staged_snapshot_part_bytes` and the OTLP gauge `ursula.snapshot_parts.staged_bytes` are the bytes of unused parts in the groups the node leads. For a cluster total, read `/__ursula/usage` from every voter and keep the highest term per group (see [usage export](/docs/operations#usage-export)). Bounding or billing staged parts beyond Ursula's per-stream bound is the operator's policy.
+Staged snapshot parts are reported separately: the JSON field `staged_snapshot_part_bytes` and the OTLP gauge `ursula.snapshot_parts.staged_bytes` are the bytes of unused parts in the groups the node leads. For a cluster total, read `/__ursula/usage` from every node and keep the highest term per group (see [usage export](/docs/operations#usage-export)). Bounding or billing staged parts beyond Ursula's per-stream bound is the operator's policy.
+
+For placement, `ursula.meta.leader` is `1` on the node that leads the meta
+group, `ursula.meta.applied_index` is the last meta entry the node's placement
+view includes, and `ursula.meta.wal.batches` and `ursula.meta.wal.records`
+count the meta journal's writes. From the node's view,
+`ursula.placement.moving_groups` counts the groups that move,
+`ursula.placement.oldest_move_age_seconds` is the age of the oldest move, and
+`ursula.placement.retirements_pending` counts the replicas a finished move
+still has to tear down. `ursula.placement.reconcile_waiting{reason}` counts the
+data group replicas whose reconcile shell waits, by reason, and
+`ursula.placement.reconcile_steps_total{step, outcome}` the membership steps
+the node's shells finished. Alert when the oldest move keeps aging, and when
+no node reports `ursula.meta.leader` `1`. The JSON snapshot carries the meta
+replica's group metrics under `meta`, apart from `raft_groups`, and each
+group's `reconcile` status. `ursula.raft.recovery_gates` counts the meta
+replica's gate together with the data groups'.
 
 Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
 layer is an *export-time bridge*: it reads a snapshot at the collection

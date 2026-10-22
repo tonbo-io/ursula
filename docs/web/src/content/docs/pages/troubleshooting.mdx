@@ -45,7 +45,10 @@ it reports the first of:
 
 | `reason` | Meaning |
 | -------- | ------- |
-| `disk_lease_lost` | No probe of the WAL disk synced within `raft.wal.lease`. The node takes part in no Raft traffic and answers clients `503` until a probe succeeds |
+| `superseded` | Another process may answer as this node: the meta group released this process's WAL root or binds its node ID to another root, or a peer saw a newer run of the root. The process takes part in nothing until it exits. Stop it ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)) |
+| `disk_lease_lost` | No probe of the WAL disk synced within `raft.wal.lease`. The node takes part in no Raft traffic and answers clients `503` until a probe succeeds ([The disk lease](/docs/operations#the-disk-lease)) |
+| `root_refused` | The meta group binds this node ID to another WAL root than the new one the node runs on. The node takes part in no group until `ursulactl node replace-disk` releases the old root ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)) |
+| `predecessor_wait` | A process of an earlier run of this root may still run, after a host crash, a reboot, a remount or a lost run state, or the root is a new disk that just joined. The node grants no vote and opens no recovery gate for 12 seconds |
 | `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
 | `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |
 | `recovery_stalled` | A group's recovery gate on this node is stalled on a replica that counts as a voter. The groups are listed under `recovery_stalled_groups` |
@@ -71,6 +74,7 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 | `meta_damaged` | | | The node runs no meta replica in this run. It replaces every issue the view gives, and the replicas keep their voter checks |
 | `group_count_mismatch` | blocks | blocks | `raft.group_count` differs from the cluster's |
 | `replication_factor_mismatch` | | blocks | `raft.placement.replication_factor`, capped at the `[[raft.peers]]` count, differs from the cluster's |
+| `node_removed` | | | The view shows the node removed, or the meta group refused its registration as removed. It replaces every other node issue, and the replicas keep their group checks. Stop the node ([Cordon and decommission](/docs/operations#cordon-and-decommission)) |
 
 Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner), [`unplaced_member`](#unplaced_member), `move_in_progress` (the view shows a move of the group, reported for every role in it, a replica that does not count as a voter included) and `move_stalled` (on the leader of a moving group whose reconciler made no progress for five minutes) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `leader_unknown` or `apply_lag`, block both.
 
@@ -148,7 +152,7 @@ replica.
 
 ### `raft.wal.path is required when raft.peers lists another node`
 
-Every node of a static cluster keeps its Raft WAL in `raft.wal.path`. Set it to a directory on a persistent volume. Only a single node may omit it, and then its WAL lives in a temporary directory that is removed on clean shutdown.
+Every node of a cluster keeps its Raft WAL in `raft.wal.path`. Set it to a directory on a persistent volume. Only a single node may omit it, and then its WAL lives in a temporary directory that is removed on clean shutdown.
 
 ### `server.cluster_id is required when raft.wal.path is set`
 
@@ -160,7 +164,7 @@ The node's WAL records the cluster id of its first start, and the configured `se
 
 ### `raft.node_id must be non-zero`
 
-Static Raft mode requires a unique `raft.node_id` in the config file or a `--node-id` override.
+Every Raft node needs a unique non-zero `raft.node_id` in the config file or a `--node-id` override.
 
 ### `raft.peers` must include this node id
 
@@ -168,7 +172,23 @@ The local `raft.node_id` must appear in `[[raft.peers]]`. The peer list always i
 
 ### `raft.group_count is required when raft.peers lists another node`
 
-Every node of a cluster runs the same groups, so a node that lists another peer sets `raft.group_count` instead of the default of its own host. Set the same value on every node.
+Every node of a cluster runs the same groups, so a node that lists another peer sets `raft.group_count` instead of the default of its own host. Set the same value on every node. A value above 4,096 is refused with `raft.group_count (…) must be at most 4096`.
+
+### `raft.meta_voters names node N, which is not in raft.peers`
+
+The meta group's voters are nodes of `[[raft.peers]]`. List the node there, or leave `raft.meta_voters` unset for the smallest three node IDs.
+
+### `raft.wal.lease (…) must be from 2s to 10s`
+
+Set `raft.wal.lease` within the range, or leave it unset for `5s`.
+
+### `the WAL at … belongs to node N, but raft.node_id is M`
+
+A WAL root opens only under the node ID that created it. The volume was moved to another node, or `--node-id` changed. Start node `N` on it, or start node `M` on an empty WAL. A node ID the cluster already knows on an empty WAL then waits for `ursulactl node replace-disk` ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)).
+
+### `the WAL identity file is missing at … but prior WAL state exists`
+
+`identity.bin` counts the runs of a WAL root, so a root with prior state and no `identity.bin` cannot tell this process from an earlier one. Start the node on an empty WAL, and release its old root with `ursulactl node replace-disk` once the node reports `root_refused`. `the WAL at … counted N runs` names a root whose run counter is exhausted and is resolved the same way.
 
 ### `storage.cold.s3.bucket is required when cold backend is 's3'`
 
@@ -194,11 +214,11 @@ The node keeps serving, but maintenance readiness fails, so `ursulactl drain` an
 
 ### `raft WAL directory … holds data without a format marker`
 
-The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 5 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
+The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 6 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
 
 ### `raft WAL directory … is format epoch N`
 
-The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 5 only. Format epoch 4 is Ursula 0.8, whose data moves to this release through your applications ([Upgrading to 0.9](/docs/operations#upgrading-to-09)). Run the release that wrote it, or start on an empty directory.
+The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 6 only. Format epoch 5 is Ursula 0.9, whose data moves to this release by backup and restore ([Upgrading to 0.10](/docs/operations#upgrading-to-010)). Format epoch 4 is Ursula 0.8. Run the release that wrote it, or start on an empty directory.
 
 ### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
 
@@ -206,19 +226,19 @@ The cold root (or, with cold storage off, the S3 snapshot namespace) holds objec
 
 ### `object storage s3://… is format epoch N`
 
-The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.8 cluster (format epoch 4) moves to this release through your applications, not by copying its objects ([Upgrading to 0.9](/docs/operations#upgrading-to-09)).
+The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.9 cluster (format epoch 5) moves to this release by backup and restore, with its cold objects copied into the new prefix without the marker ([Upgrading to 0.10](/docs/operations#upgrading-to-010)).
 
 ### `journal … uses Ursula WAL version N`
 
-A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6, version 3 is 0.7, version 4 is 0.8. This release reads format epoch 5 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
+A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6, version 3 is 0.7, version 4 is 0.8, version 5 is 0.9. This release reads format epoch 6 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
 
-### `peer N (…) refused Raft protocol 5`
+### `peer N (…) refused Raft protocol 6`
 
-A configured peer runs a release of another format epoch (Ursula 0.8 speaks protocol 4, 0.7 protocol 3, 0.6 protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
+A configured peer runs a release of another format epoch (Ursula 0.9 speaks protocol 5, 0.8 protocol 4, 0.7 protocol 3, 0.6 protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
 
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
-The node exchanged a Raft RPC with a peer on another format epoch: a configured peer that was unreachable during the startup probe, or a node of this cluster on another release that sent this node a Raft RPC. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart. A sender that names no cluster id, such as a 0.7 node of another deployment, does not make this node unready (see [Peers of another cluster](/docs/operations#peers-of-another-cluster)).
+The node exchanged a Raft RPC with a peer on another format epoch: a configured peer that was unreachable during the startup probe, or a node of this cluster on another release that sent this node a Raft RPC. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart. A `[[raft.peers]]` `url` that points at a listener serving no Raft gRPC, such as a peer's client listener while that peer sets `server.cluster_listen`, answers like an older release and gives this reason too: point it at the peer's cluster listener. A sender that names no cluster id, such as a 0.7 node of another deployment, does not make this node unready (see [Peers of another cluster](/docs/operations#peers-of-another-cluster)).
 
 ### `refusing Raft traffic with a peer of another cluster`
 
@@ -252,10 +272,10 @@ leader and refuses writes. The groups are listed under
 `recovery_stalled_groups`. Restore connectivity to a healthy quorum first.
 If the stalled replicas retain their voting history, an operator can accept
 the loss of writes acknowledged after the last `fsync` with a recovery plan,
-sent through `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` to
+sent through `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` to
 the plan's leader first and then to every other replica that answers, with the
 leader's plan term (`ursulactl recover-group --accept-loss` does both). Recover the meta group first
-(`--target meta`): a data group's plan needs a confirmed meta view. The plan starts a new history of
+(`--target meta`): a data group's plan needs a confirmed meta view. A stalled meta gate shows as `"meta"` under `recovery_gates.stalled` in the metrics and in the `ursula.raft.recovery_gates` gauge, never in `recovery_stalled_groups` or readiness. The plan starts a new history of
 the group, so every stream of the group gets a new `Stream-Incarnation`. A
 voter of the group that was never gated does not report `recovery_stalled`. It
 answers `raft_replica_unready` with `leader_unknown` for the group. See
@@ -307,7 +327,7 @@ by the OS lock, not the file's existence.
 
 ### `backup manifest format_version N` or `target cluster speaks backup format N`
 
-The backup or the cluster uses another backup format. This release reads and writes backup format 5, the format of Ursula 0.9. A backup of another format, such as a 0.8 backup (format 4), cannot be restored, and a cluster that reports another backup format cannot be backed up or restored into. Move 0.8 data through your applications instead (see [Upgrading to 0.9](/docs/operations#upgrading-to-09)).
+The backup or the cluster uses another backup format. This release reads and writes backup format 5, the format of Ursula 0.9 and 0.10, so a 0.9 backup restores into it. A backup of another format, such as a 0.8 backup (format 4), cannot be restored, and a cluster that reports another backup format cannot be backed up or restored into.
 
 ### `… cold objects this backup references are missing from the target cluster's cold store`
 
@@ -317,14 +337,21 @@ The backup references cold objects that the target's `storage.cold.root` does no
 
 ### A fresh cluster never elects leaders
 
-`/__ursula/metrics` on each node should show a non-null `current_leader` and a stable `current_term` for every group in `raft_groups`. If groups stay leaderless:
+`/__ursula/metrics` on each node should show a non-null `current_leader` and a stable `current_term` for every group in `raft_groups`. A fresh cluster's groups form only after its meta group formed and bootstrapped. `GET /__ursula/placement` shows how far it got:
 
-- Every voter of a group must be up on first start: the group's initializer waits for all of them to report the group empty.
-- Every peer URL must be reachable from every node.
+- `meta_genesis`: the meta group has not formed. `unanswered` lists the `raft.peers` nodes that did not answer empty yet, and `genesis_mismatch` the nodes that claim other values of `raft.meta_voters`, `raft.peers`, `raft.group_count` or the replication factor. Start every `raft.peers` node with the same values.
+- `registering`: the meta group formed, and `waiting_for` lists the nodes that have not registered. Bootstrap waits for every `raft.peers` node. `last_bootstrap_refusal` names why a bootstrap was refused.
+- `bootstrapped`: every group is placed. Every seed voter of a group must be up: the group's initializer waits for all of them to report the group empty.
+
+Every peer URL must be reachable from every node.
 
 ### Replacing or restarting a node leaves it leaderless
 
-Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` means rehydrating from peers, which can be slow on cold-storage-only history (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)).
+Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` reports `root_refused` until `ursulactl node replace-disk` releases the old disk, and then rehydrates from peers, which can be slow on cold-storage-only history (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)).
+
+### A new node holds no group
+
+A node added to `raft.peers` after the cluster formed registers and holds nothing until groups move onto it with `ursulactl placement move` ([Adding a node](/docs/operations#adding-a-node)).
 
 ## Write path
 

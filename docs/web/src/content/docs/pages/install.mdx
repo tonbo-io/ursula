@@ -19,7 +19,7 @@ Every release publishes a multi-arch image to GHCR:
 docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.9.0
 ```
 
-The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). A container that runs a node of a multi-node cluster must set `server.cluster_id` in its configuration, the same on every node (see [Configuration](/docs/configuration#server-and-runtime)). Images are published only by the reviewed stable-release workflow, so pin the version you want to run.
+The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). A container that keeps its WAL on a volume (`raft.wal.path`), a node of a cluster or a single node, must list itself in `[[raft.peers]]` and set `server.cluster_id` in its configuration, the same on every node (see [Configuration](/docs/configuration#server-and-runtime)). Mount the WAL on a volume, never on the container's writable layer. Images are published only by the reviewed stable-release workflow, so pin the version you want to run.
 
 ## Build from source
 
