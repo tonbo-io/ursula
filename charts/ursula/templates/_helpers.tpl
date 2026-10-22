@@ -348,6 +348,14 @@ gateway then checks alone). */ -}}
 {{- if lt $gracefulShutdownTimeoutSeconds 1 -}}
 {{- fail (printf "gateway.gracefulShutdownTimeoutSeconds must be at least 1; got %v" .Values.gateway.gracefulShutdownTimeoutSeconds) -}}
 {{- end -}}
+{{- /* The grace period counts from the preStop delay on: a drain that has
+not ended when it runs out is killed, with the requests it still holds and
+the final usage window unexported. */ -}}
+{{- $preStopDelaySeconds := .Values.gateway.preStopDelaySeconds | int -}}
+{{- $terminationGracePeriodSeconds := .Values.gateway.terminationGracePeriodSeconds | int -}}
+{{- if le $terminationGracePeriodSeconds (add $preStopDelaySeconds $gracefulShutdownTimeoutSeconds) -}}
+{{- fail (printf "gateway.terminationGracePeriodSeconds (%d) must exceed gateway.preStopDelaySeconds (%d) plus gateway.gracefulShutdownTimeoutSeconds (%d)" $terminationGracePeriodSeconds $preStopDelaySeconds $gracefulShutdownTimeoutSeconds) -}}
+{{- end -}}
 {{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" -}}
 {{- if hasKey $.Values.gateway.podLabels $label -}}
 {{- fail (printf "gateway.podLabels must not set reserved selector label %q" $label) -}}

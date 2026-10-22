@@ -15,13 +15,21 @@ metadata:
 spec:
   serviceName: {{ include "ursula.headlessServiceName" . }}
   replicas: {{ $replicaCount }}
-  # Parallel: a listener move recreates every pod at once, and OrderedReady
-  # would recreate one at a time, each waiting for a readiness that needs the
-  # others.
+  # Parallel: a fresh cluster forms only once every pod is up, and a listener
+  # move recreates every pod at once. OrderedReady would create one at a time,
+  # each waiting for a readiness that needs the others.
   podManagementPolicy: Parallel
-  # RollingUpdate replaces one pod at a time, each waiting for readiness.
+  # RollingUpdate replaces one available pod at a time, each waiting for
+  # readiness. The partition is rendered so that a pod the controller
+  # recreates mid-roll takes the update revision: without rollingUpdate, one
+  # whose ordinal is below the count of old-revision pods is created at the old
+  # revision, and under Parallel the controller deletes an unready old-revision
+  # pod at once, so the pair loops until the roll is rolled back.
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "ursula.selectorLabels" . | nindent 6 }}

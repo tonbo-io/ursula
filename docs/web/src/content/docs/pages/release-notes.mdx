@@ -117,6 +117,8 @@ See [Upgrading to 0.10](/docs/operations#upgrading-to-010).
 ### Helm chart
 
 - **`RollingUpdate` only.** The StatefulSet updates one pod at a time from the highest ordinal, each waiting for readiness. Start an upgrade only when `ursulactl verify-cluster` passes.
+- **A recreated pod takes the new revision.** The StatefulSet renders `rollingUpdate` with `partition: 0` and `maxUnavailable: 1`. Without it, the controller recreated a pod that went missing during a roll, such as one deleted while unready, at the old revision when its ordinal was below the count of old-revision pods, and on Kubernetes 1.37 and later deleted it again at once, in a loop that only a rollback ended.
+- **Gateway pods drain before they stop.** A terminating gateway pod keeps serving for `gateway.preStopDelaySeconds` (`10`) in a preStop hook, so that Service proxies and load balancers stop sending it new connections before it gets `SIGTERM` and closes its listener. Its drain, `gateway.gracefulShutdownTimeoutSeconds`, now defaults to `45` (was `3600`), and the new `gateway.terminationGracePeriodSeconds` (`60`) must exceed the two together, or the chart refuses to render. A change of `server.replicaCount` rolls the gateway pods, since their upstream list names every server pod.
 - **Scaling.** Raising `server.replicaCount` from 3 adds pods that hold no group until groups move onto them. Lowering it is supported after `ursulactl node decommission --wait` of every dropped ID, which is permanent. The new `pre-upgrade,pre-rollback` hook (`server.scaleCheck.*`) refuses a raise from 1 and a lower count whose dropped IDs are not removed.
 
 ### Observability

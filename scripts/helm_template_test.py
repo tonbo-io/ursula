@@ -146,10 +146,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
     def test_statefulset_rolls_with_rolling_update_under_parallel_management(self) -> None:
-        # The policy is pinned: a listener move recreates every pod at once,
-        # and OrderedReady would recreate one at a time, each waiting for a
-        # readiness that needs the others. RollingUpdate is all that rolls a
-        # voter, and readiness is all that paces it.
+        # The policy is pinned: a fresh cluster forms only once every pod is
+        # up and a listener move recreates every pod at once, and OrderedReady
+        # would create one at a time, each waiting for a readiness that needs
+        # the others. RollingUpdate is all that rolls a voter, and readiness is
+        # all that paces it. The partition is rendered: without rollingUpdate
+        # the controller recreates a missing pod below the count of
+        # old-revision pods at the old revision, and under Parallel deletes it
+        # again at once while it is unready, in a loop.
         for name, values in {
             "one voter": ("--set", "server.replicaCount=1"),
             "three voters": (),
@@ -159,9 +163,12 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", *values)
                 statefulset = documents(rendered, "StatefulSet")["test-ursula"]
                 self.assertIn(
-                    "  podManagementPolicy: Parallel\n"
-                    "  # RollingUpdate replaces one pod at a time, each waiting for readiness.\n"
-                    "  updateStrategy:\n    type: RollingUpdate\n  selector:",
+                    "  podManagementPolicy: Parallel\n",
+                    statefulset,
+                )
+                self.assertIn(
+                    "  updateStrategy:\n    type: RollingUpdate\n    rollingUpdate:\n"
+                    "      partition: 0\n      maxUnavailable: 1\n  selector:",
                     statefulset,
                 )
                 self.assertIn(
@@ -403,6 +410,35 @@ class HelmTemplateConfigTest(unittest.TestCase):
             'trafficDistribution: "PreferSameZone"',
             gateway_service.group("spec"),
         )
+
+    def test_gateway_drains_after_a_pre_stop_delay_within_its_grace_period(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
+        gateway = documents(rendered, "Deployment")["test-ursula-gateway"]
+        self.assertIn("      terminationGracePeriodSeconds: 60\n", gateway)
+        self.assertIn(
+            "          lifecycle:\n            preStop:\n              exec:\n"
+            "                command:\n                  - /bin/sleep\n                  - \"10\"\n",
+            gateway,
+        )
+        self.assertIn('- --graceful-shutdown-timeout\n            - "45"', gateway)
+        # 0 renders no hook.
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "gateway.preStopDelaySeconds=0")
+        self.assertNotIn("preStop:", documents(rendered, "Deployment")["test-ursula-gateway"])
+        # A drain the grace period does not cover would be killed.
+        for values in (
+            ("--set", "gateway.gracefulShutdownTimeoutSeconds=3600"),
+            ("--set", "gateway.preStopDelaySeconds=15"),
+            ("--set", "gateway.terminationGracePeriodSeconds=55"),
+        ):
+            with self.subTest(values=values):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt", *values],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("gateway.terminationGracePeriodSeconds", result.stderr)
+        render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "gateway.preStopDelaySeconds=14")
 
     def test_gateway_omits_empty_traffic_distribution(self) -> None:
         rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")

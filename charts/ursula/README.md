@@ -11,7 +11,7 @@ The meta group seeds each Raft group once, at bootstrap, on up to three pods. Th
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
 - Give Ursula a workload identity with least-privilege access to its S3 prefix. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for S3 errors, storage growth, and pod restarts.
 
-This topology removes single-pod compute failures from the normal request path. Persistent Raft groups make membership initialization idempotent across restarts. `helm upgrade` rolls the voters with `RollingUpdate`: the controller replaces the highest ordinal first and moves to the next pod only once the replaced one passes its readiness probe, which waits until the pod's voter replicas caught up. Each replaced voter hands off its leaderships on `SIGTERM` before it stops. The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
+This topology removes single-pod compute failures from the normal request path. Persistent Raft groups make membership initialization idempotent across restarts. `helm upgrade` rolls the voters with `RollingUpdate`: the controller replaces the highest ordinal first and moves to the next pod only once the replaced one passes its readiness probe, which waits until the pod's voter replicas caught up. A pod the controller recreates during the roll, after a crash or an eviction, takes the new revision. On Kubernetes 1.37 and later, the controller first replaces every pod that is already unready on the old revision, all at once, and replaces a ready pod only while every other pod is ready. Each replaced voter hands off its leaderships on `SIGTERM` before it stops. The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
 
 [`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, and an IRSA workload identity. It needs the AWS resources listed under [Prerequisites](#prerequisites).
 
@@ -236,6 +236,12 @@ Raising `server.replicaCount` on a cluster of three or more pods adds pods that
 register with the meta group and hold no group: the placement keeps every
 group on its voters. Move groups onto them with `ursulactl placement move`.
 
+The gateway's generated upstream list names every server pod, so any change of
+`server.replicaCount` also rolls the gateway Deployment. Each terminating
+gateway pod keeps serving for `gateway.preStopDelaySeconds` before it gets
+`SIGTERM`, so that the Service stops sending it new connections first, and then
+drains within `gateway.gracefulShutdownTimeoutSeconds`.
+
 A scale-down is permanent. Node ids are the pod ordinal plus one, so a lower
 count drops the highest ids, and a dropped id never holds a group again. The
 meta voters (ids 1 to 3) are never decommissioned. To lower the count:
@@ -432,8 +438,10 @@ its other resources. See the operations guide's "Upgrading to 0.10".
 The StatefulSet updates by `RollingUpdate` and never changes Raft membership.
 Each replaced voter hands off its leaderships on `SIGTERM`, and the controller
 moves on only once the new pod passes its readiness probe, which waits for its
-voter replicas to catch up. Start an upgrade only when `ursulactl verify-cluster`
-passes. For a manual restart of one voter outside a rollout, run `ursulactl drain`,
+voter replicas to catch up. A pod the controller recreates during the roll
+takes the new revision. On Kubernetes 1.37 and later the controller first
+replaces every pod already unready on the old revision, all at once. Start an
+upgrade only when `ursulactl verify-cluster` passes. For a manual restart of one voter outside a rollout, run `ursulactl drain`,
 restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next voter.
 
 ## Values Reference
@@ -616,7 +624,9 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `gateway.upstreamTcpUserTimeoutSeconds` | `5` | Seconds data sent to an upstream may stay unacknowledged before the connection closes and its request fails with `502` (Linux `TCP_USER_TIMEOUT`). Idle connections are probed three times within it. At least `1`. |
 | `gateway.maxRequestBodyBytes` | `33554432` | Maximum request body bytes the gateway buffers for leader-redirect replay before returning `413 Payload Too Large`. With `gateway.bodyBudgetBytes` unset, the gateway grows its body budget to hold a body at this limit beside its 32 MiB small-body headroom. Give the pod at least twice the budget in memory. The budget cannot go below this limit plus 32 MiB, so lower this limit when the pod cannot hold that. At most `33554432`, the protocol's request limit, which every node applies: the chart refuses a larger value, and the gateway refuses to start with one. |
 | `gateway.bodyBudgetBytes` | `null` | Bytes of request bodies the gateway buffers at once, across requests. Renders `--body-budget-bytes` when set, which needs a gateway of 0.7.6 or later. Unset, the gateway uses 256 MiB or `gateway.maxRequestBodyBytes` plus 32 MiB, whichever is larger. Set, it must be at least `gateway.maxRequestBodyBytes` plus 32 MiB. |
-| `gateway.gracefulShutdownTimeoutSeconds` | `3600` | Maximum graceful shutdown drain time after SIGTERM, in seconds. |
+| `gateway.preStopDelaySeconds` | `10` | Seconds a terminating gateway pod keeps serving before it gets `SIGTERM`, so that every node's Service proxy and any load balancer in front stop sending it new connections before its listener closes. Raise it to the deregistration delay of a load balancer that targets pod IPs. `0` renders no preStop hook. |
+| `gateway.gracefulShutdownTimeoutSeconds` | `45` | Maximum graceful drain time after `SIGTERM`, in seconds. Requests in flight finish within it, and live reads end at it. Keep it above `gateway.responseHeaderTimeoutSeconds` so that a forwarded write is answered. |
+| `gateway.terminationGracePeriodSeconds` | `60` | Gateway pod grace period. Must exceed `gateway.preStopDelaySeconds` plus `gateway.gracefulShutdownTimeoutSeconds`, or the kubelet kills a drain in progress. |
 | `gateway.extraArgs` | `[]` | Extra CLI args appended after generated gateway args. |
 | `gateway.extraEnv` | `[]` | Extra container environment entries for the gateway. |
 | `gateway.extraEnvFrom` | `[]` | Extra `envFrom` blocks for the gateway. |

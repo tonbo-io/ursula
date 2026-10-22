@@ -43,6 +43,7 @@ spec:
       serviceAccountName: {{ include "ursula.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -92,6 +93,19 @@ spec:
             {{- with .Values.gateway.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if gt (.Values.gateway.preStopDelaySeconds | int) 0 }}
+          # A terminating pod leaves the Service endpoints at once, but every
+          # node's proxy and load balancer learns it later. The gateway keeps
+          # serving until they have, and only then gets SIGTERM and drains:
+          # it closes its listener, answers each request it has, and closes
+          # its connections.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sleep
+                  - {{ .Values.gateway.preStopDelaySeconds | int | quote }}
+          {{- end }}
           ports:
             - name: gateway
               containerPort: {{ .Values.gateway.ports.http }}
