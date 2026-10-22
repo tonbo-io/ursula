@@ -222,6 +222,14 @@ impl CoreMetadata {
         self.groups.get(&group_id).copied().unwrap_or_default()
     }
 
+    /// Whether some group holds state here: a vote, a log state other than
+    /// [`GroupLogState::Empty`], a recovery plan or a later log generation.
+    pub(crate) fn holds_group_state(&self) -> bool {
+        self.groups
+            .values()
+            .any(|group| *group != GroupMetadata::default())
+    }
+
     pub(crate) fn groups(&self) -> impl Iterator<Item = (u32, GroupMetadata)> + '_ {
         self.groups
             .iter()

@@ -295,7 +295,7 @@ impl MetaCluster {
     /// Shuts `node_id` down cleanly and removes every file of its meta
     /// journal (`raft-log/meta/`, the meta snapshot record included), as an
     /// operator who discards it does. Its data journals stay, so its next
-    /// start opens the lost meta journal over data history (D9).
+    /// start opens the lost meta journal over data history (design 3.2).
     pub(super) async fn discard_meta(&mut self, node_id: u64) {
         let wal = self.data.wals[&node_id].clone();
         wal.clean_shutdown(self.stop_replicas(node_id)).await;

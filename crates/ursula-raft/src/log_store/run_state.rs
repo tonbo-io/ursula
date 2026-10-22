@@ -46,7 +46,10 @@
 //! The meta journal exists once its metadata file does, or a segment of it
 //! holds a record. Its first open puts the metadata file in place, in one
 //! atomic replace, before the journal holds anything, so a directory without
-//! either is a creation that stopped and holds no journal.
+//! either is a creation that stopped and holds no journal. A node whose data
+//! journals hold records opens a meta journal that is absent or holds
+//! nothing recovering, never as a new log
+//! ([`NodeWal::create_meta_journal`]).
 
 use std::io;
 use std::path::Path;
@@ -418,13 +421,27 @@ pub enum MetaJournalDamage {
 }
 
 /// Whether the meta journal existed when the run started, before anything
-/// of the run touched the WAL root: its metadata file, or a segment holding
-/// a record. A directory with neither, which a first open that stopped
-/// before its metadata file was in place leaves, is no journal.
+/// of the run touched the WAL root, and whether it held anything. It exists
+/// once its metadata file does, or a segment of it holds a record. A
+/// directory with neither, which a first open that stopped before its
+/// metadata file was in place leaves, is no journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetaAtStart {
+    /// No meta journal.
     Absent,
-    Present,
+    /// A meta journal that holds nothing: no record, no snapshot record,
+    /// and no group's state (a vote, a log state, a recovery plan or a log
+    /// generation) in its metadata file.
+    Empty,
+    /// A meta journal that holds something, or that could not be read.
+    Holds,
+}
+
+impl MetaAtStart {
+    /// Whether a meta journal existed, so it is prior state.
+    fn exists(self) -> bool {
+        self != Self::Absent
+    }
 }
 
 /// What the start read of the meta journal.
@@ -432,8 +449,12 @@ pub(crate) enum MetaAtStart {
 enum MetaRead {
     /// No meta journal ([`MetaAtStart::Absent`]).
     Absent,
-    /// The meta journal and what it holds.
-    Read { history: JournalHistory },
+    /// The meta journal, the history of its records, and whether it holds
+    /// anything at all (a record, a snapshot record or a group's state).
+    Read {
+        history: JournalHistory,
+        holds: bool,
+    },
     /// The meta journal could not be read.
     Unread(MetaJournalDamage),
 }
@@ -449,6 +470,7 @@ impl MetaRead {
             }) => Self::Absent,
             Ok(read) => Self::Read {
                 history: JournalHistory::of(read.records, read.verified_epoch),
+                holds: read.records || read.snapshot_records || read.group_state,
             },
             Err(unread) => Self::Unread(unread.into()),
         }
@@ -457,7 +479,8 @@ impl MetaRead {
     fn at_start(&self) -> MetaAtStart {
         match self {
             Self::Absent => MetaAtStart::Absent,
-            Self::Read { .. } | Self::Unread(_) => MetaAtStart::Present,
+            Self::Read { holds: false, .. } => MetaAtStart::Empty,
+            Self::Read { holds: true, .. } | Self::Unread(_) => MetaAtStart::Holds,
         }
     }
 }
@@ -841,7 +864,7 @@ pub(crate) struct NodeWal {
     data_history: JournalHistory,
     /// How the meta journal opens.
     meta_opening: MetaOpening,
-    /// Whether the meta journal existed at start.
+    /// Whether the meta journal existed at start, and held anything.
     meta_at_start: MetaAtStart,
     run_state: Arc<RunStateFile>,
     /// This process: the root, the run this start counted and its nonce.
@@ -944,8 +967,7 @@ impl NodeWal {
         let meta_at_start = meta_read.at_start();
         // Even metadata-only cores are prior state: votes must not be
         // forgotten. So is a meta journal.
-        let has_prior_state =
-            previous.is_some() || !cores.is_empty() || meta_at_start == MetaAtStart::Present;
+        let has_prior_state = previous.is_some() || !cores.is_empty() || meta_at_start.exists();
         let bound =
             super::topology::check_or_create(&root, topology, cluster_id, node, has_prior_state)?;
         let identity = super::identity::read(&root, has_prior_state)?;
@@ -981,7 +1003,7 @@ impl NodeWal {
         );
         // Without a meta journal, the meta class's recovery warning would
         // describe a log this node does not have.
-        if meta_at_start == MetaAtStart::Present {
+        if meta_at_start.exists() {
             log_opening(
                 &root,
                 previous.as_ref(),
@@ -1214,22 +1236,26 @@ impl NodeWal {
         meta_dir(&self.root)
     }
 
-    /// Puts the meta journal's metadata file in place before its writer
-    /// first opens in this run, when the start found no meta journal
-    /// ([`MetaAtStart::Absent`]). When a data journal held records at start,
-    /// or the meta group's snapshot record is still there, the file records
-    /// the meta journal's group `raft_group_id` recovering.
+    /// Prepares the meta journal before its writer first opens in this run,
+    /// when the start found none ([`MetaAtStart::Absent`]) or found one that
+    /// holds nothing ([`MetaAtStart::Empty`]): puts its metadata file in
+    /// place, and records the meta journal's group `raft_group_id`
+    /// recovering when a data journal held records at start or the meta
+    /// group's snapshot record is still there.
     ///
-    /// A node with data history never opens a new, empty meta log: its gate
-    /// then opens closed, and the replica rejoins its meta group as a wiped
-    /// voter does, instead of answering as empty and forming a meta group
-    /// again beside the one it belonged to. Every node that holds data
-    /// creates the meta journal first, so only a discarded or lost journal
-    /// gives this. A meta journal that exists opens by what it holds, so an
-    /// empty one stays empty. Data history means a segment record. A vote,
-    /// the genesis vote floor included, lives only in a core's metadata
-    /// file, so a node whose data journals hold votes but no record opens
-    /// its lost meta journal empty, as a node without data history does.
+    /// A node with data history never opens an empty meta log fresh: its
+    /// gate then opens closed, and the replica rejoins its meta group as a
+    /// wiped voter does, instead of answering as empty and forming a meta
+    /// group again beside the one it belonged to. A data group is created
+    /// only from a placement meta confirmed, so a node whose data journals
+    /// hold records had a meta journal that applied the bootstrap. Its meta
+    /// journal empty or gone means it was discarded, lost or emptied in
+    /// place. A meta journal that holds a record, a snapshot record or a
+    /// group's state (a vote, the genesis vote floor included) opens by what
+    /// it holds. Data history means a segment record. A vote lives only in a
+    /// core's metadata file, so a node whose data journals hold votes but no
+    /// record opens an empty meta journal empty, as a node without data
+    /// history does.
     ///
     /// A meta snapshot record is written only once the journal exists, so
     /// one without its journal is meta history whose vote was lost with
@@ -1238,13 +1264,13 @@ impl NodeWal {
     ///
     /// The file appears, mark included, in one atomic replace, before the
     /// journal holds anything. A crash or a failed write before then leaves
-    /// no meta journal, and the next start, or the next open of this run,
-    /// does this again.
+    /// the meta journal as the start found it, and the next start, or the
+    /// next open of this run, does this again.
     pub(crate) fn create_meta_journal(
         &self,
         raft_group_id: ursula_shard::RaftGroupId,
     ) -> Result<(), MetaJournalDamage> {
-        if self.meta_at_start == MetaAtStart::Present {
+        if self.meta_at_start == MetaAtStart::Holds {
             return Ok(());
         }
         let dir = self.meta_dir();
@@ -1253,7 +1279,8 @@ impl NodeWal {
             source: Arc::new(source),
         })?;
         let path = core_metadata_path(&dir);
-        // An earlier open of this run may have put the file in place.
+        // An earlier start, or an earlier open of this run, may have put the
+        // file in place.
         let (mut metadata, missing) =
             CoreMetadata::load_with_presence(&path).map_err(|source| {
                 MetaJournalDamage::ReadMetadata {
@@ -1308,9 +1335,9 @@ impl NodeWal {
     }
 }
 
-/// Whether the data journals held records at start, so a lost meta journal
-/// is meta history that was lost (D9's S1 rule). A negative control turns
-/// it off (`Defence::MetaOverDataHistory`).
+/// Whether the data journals held records at start, so an empty or absent
+/// meta journal is meta history that was lost. A negative control turns it
+/// off (`Defence::MetaOverDataHistory`).
 fn held_data_history(data_history: JournalHistory) -> bool {
     let held = matches!(data_history, JournalHistory::Records { .. });
     if held
@@ -1406,7 +1433,7 @@ fn open_meta_class(
                 damage,
             });
         }
-        MetaRead::Read { history } => history,
+        MetaRead::Read { history, .. } => history,
     };
     let opening = decide(history)?;
     // Before this run records itself, as for the cores. The policy of meta
@@ -1488,6 +1515,9 @@ struct JournalRead {
     verified_epoch: u64,
     /// Whether a group's snapshot record (`group-N.snapshot.json`) exists.
     snapshot_records: bool,
+    /// Whether the metadata file holds a group's state
+    /// ([`CoreMetadata::holds_group_state`]).
+    group_state: bool,
 }
 
 /// Whether the core journal in `dir` holds metadata, a segment record or a
@@ -1531,6 +1561,7 @@ fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
         metadata: !missing,
         verified_epoch: metadata.verified_epoch(),
         snapshot_records,
+        group_state: metadata.holds_group_state(),
     })
 }
 

@@ -2936,16 +2936,22 @@ async fn an_absent_meta_journal_over_data_history_opens_recovering() {
     assert_eq!(log_ids(&store).await, [1]);
 }
 
-/// A meta journal that exists opens by what it holds: one created empty
-/// before any data journal held a record stays empty once data has history.
+/// A meta journal that holds nothing, created before any data journal held
+/// a record, opens recovering once data has history, and the mark is
+/// durable, so the next run opens it recovering by what it holds. Opening
+/// it by its presence alone, as for a journal that holds something, opened
+/// it empty: a meta voter emptied in place then answered the genesis probe
+/// as empty over live data groups.
 #[tokio::test]
-async fn an_existing_empty_meta_journal_over_data_history_opens_empty() {
+async fn an_existing_empty_meta_journal_over_data_history_opens_recovering() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
     let data = map.placement(RaftGroupId(0)).unwrap();
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    drop(wal.open_meta(group_metrics()).unwrap());
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Empty);
+    drop(meta);
     // The first open put the new journal's metadata file in place, so the
     // journal exists although it holds no record.
     assert!(core_metadata_path(&meta_journal(root)).exists());
@@ -2954,9 +2960,55 @@ async fn an_existing_empty_meta_journal_over_data_history_opens_empty() {
     drop(store);
     stop_cleanly(wal).await;
 
-    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    let meta = wal.open_meta(group_metrics()).unwrap();
-    assert_eq!(meta.log_state(), GroupLogState::Empty);
+    for run in ["the first run after data history", "the run after it"] {
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let meta = wal.open_meta(group_metrics()).unwrap();
+        assert_eq!(meta.log_state(), GroupLogState::Recovering, "{run}");
+        assert_eq!(log_ids(&meta).await, Vec::<u64>::new(), "{run}");
+        drop(meta);
+        stop_cleanly(wal).await;
+    }
+}
+
+/// The other side of the rule: a meta journal that holds a vote but no
+/// record opens by what it holds over data history, empty with its vote,
+/// and a meta journal that holds nothing opens empty beside data journals
+/// that hold only votes, which are no data history.
+#[tokio::test]
+async fn a_meta_journal_holding_a_vote_or_no_data_history_opens_empty() {
+    for meta_votes in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let data = map.placement(RaftGroupId(0)).unwrap();
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let mut meta = wal.open_meta(group_metrics()).unwrap();
+        let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
+        if meta_votes {
+            meta.save_vote(&committed_vote()).await.expect("meta vote");
+            append(&mut store, [blank_entry(1)]).await;
+        } else {
+            store.save_vote(&committed_vote()).await.expect("data vote");
+        }
+        drop((meta, store));
+        stop_cleanly(wal).await;
+
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let mut meta = wal.open_meta(group_metrics()).unwrap();
+        assert_eq!(
+            meta.log_state(),
+            GroupLogState::Empty,
+            "meta votes: {meta_votes}"
+        );
+        let vote = meta.read_vote().await.expect("read the meta vote");
+        assert_eq!(
+            vote,
+            meta_votes.then(committed_vote),
+            "meta votes: {meta_votes}"
+        );
+        drop(meta);
+        stop_cleanly(wal).await;
+    }
 }
 
 /// A meta directory without its metadata file and without a record, which

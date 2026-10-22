@@ -167,10 +167,11 @@ pub enum Defence {
     /// they ask only the claimed meta voters, so meta voters that lost
     /// everything form a second meta group beside the learners' history.
     GenesisEveryPeer,
-    /// A node whose data journals hold records opens a lost meta journal
-    /// `Recovering` (D9's S1 rule), so its closed gate rejoins the meta group
-    /// it belonged to. Off, it opens the lost journal empty, so meta voters
-    /// whose meta directories are gone form a second meta group.
+    /// A node whose data journals hold records opens a meta journal that is
+    /// gone or holds nothing `Recovering` (design 3.2), so its closed gate
+    /// rejoins the meta group it belonged to. Off, it opens such a journal
+    /// empty, so meta voters whose meta directories are gone form a second
+    /// meta group.
     MetaOverDataHistory,
     /// The meta journal syncs every append, whatever the data journals run.
     /// Off, it runs the data journals' policy, so a power loss under `never`
