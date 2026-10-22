@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::NodeLifecycle;
+use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::TeardownStage;
 use ursula_proto::placement::ViewStage;
 use ursula_shard::RaftGroupId;
@@ -17,8 +18,10 @@ use super::Counts;
 use super::HostingInput;
 use super::HostingPlan;
 use super::HostingStep;
+use super::LeftMark;
 use super::LocalLog;
 use super::LocalReplica;
+use super::ReplicaMembership;
 use super::SeedRoleOf;
 use super::Standing;
 use super::Teardown;
@@ -27,6 +30,7 @@ use super::TeardownEvent;
 use super::TeardownOutcome;
 use super::TeardownStep;
 use super::ViewInput;
+use super::counts_as_voter;
 use super::leader_candidates;
 use super::plan_hosting;
 use super::seed_role;
@@ -428,4 +432,137 @@ fn a_teardown_retires_only_after_two_not_member_answers() {
         forgetting.advance(TeardownEvent::StepDone),
         TeardownOutcome::Ended(TeardownEnd::Retired)
     );
+}
+
+/// S10's predicate over every combination of its terms. The bug it catches:
+/// an `Incoming` or unconfirmed role that counts, a learner of its
+/// membership that counts, a closed replica that stops counting before its
+/// group answers, or a left mark that does not override both terms.
+#[test]
+fn a_replica_counts_by_its_confirmed_role_or_its_membership_unless_it_left() {
+    let me = node(1);
+    let member = MembershipConfig::Uniform {
+        voters: voters(&[1, 2, 3]),
+        learners: BTreeSet::new(),
+    };
+    let learner = MembershipConfig::Uniform {
+        voters: voters(&[2, 3, 4]),
+        learners: ids(&[1]),
+    };
+    // A voter of the old side of a joint config is a voter.
+    let outgoing = MembershipConfig::Joint {
+        old: voters(&[1, 2, 3]),
+        new: voters(&[2, 3, 4]),
+        learners: BTreeSet::new(),
+    };
+    let roles = [
+        None,
+        Some(ReplicaRole::Voter),
+        Some(ReplicaRole::Incoming),
+        Some(ReplicaRole::Outgoing),
+        Some(ReplicaRole::Abandoned),
+    ];
+    let open = |effective| ReplicaMembership::Open { me, effective };
+    let memberships = [
+        (ReplicaMembership::Closed, true),
+        (open(None), false),
+        (open(Some(&member)), true),
+        (open(Some(&learner)), false),
+        (open(Some(&outgoing)), true),
+    ];
+    for role in roles {
+        for (membership, membership_voter) in memberships {
+            for left in [false, true] {
+                let expected = if (role == Some(ReplicaRole::Voter) || membership_voter) && !left {
+                    Counts::Voter
+                } else {
+                    Counts::NotVoter
+                };
+                assert_eq!(
+                    counts_as_voter(role, membership, left),
+                    expected,
+                    "{role:?} {membership:?} left {left}"
+                );
+            }
+        }
+    }
+}
+
+/// A vote that compares only partly, as OpenRaft's does: `None` compares
+/// with nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Vote(Option<u64>);
+
+impl PartialOrd for Vote {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0?.partial_cmp(&other.0?)
+    }
+}
+
+/// The left mark's vote rule. The bugs it catches: a mark a `Voter` answer
+/// sets or clears, a deposed leader's lower append that clears it, an
+/// answer overtaken by a newer append that still sets it, an append from
+/// before the question that keeps an answer out, and a vote that does not
+/// compare and still counts as "at least".
+#[test]
+fn the_left_mark_follows_the_answer_and_append_votes() {
+    let not_member = MembershipAnswer::NotMember;
+    let v = |vote| Vote(Some(vote));
+
+    // Only a learner or not-member answer sets the mark.
+    let mut mark = LeftMark::default();
+    let asked = mark.ask();
+    mark.answered(asked, MembershipAnswer::Voter, v(5));
+    assert!(!mark.is_left());
+    mark.answered(asked, MembershipAnswer::Learner, v(5));
+    assert!(mark.is_left());
+    // A `Voter` answer does not clear it, nor does a lower append.
+    mark.answered(mark.ask(), MembershipAnswer::Voter, v(6));
+    mark.appended(v(4));
+    assert!(mark.is_left());
+    // An append at the mark's vote clears it.
+    mark.appended(v(5));
+    assert!(!mark.is_left());
+
+    // An append of at least the answer's vote after the question keeps the
+    // answer out, one below it does not.
+    let mut mark = LeftMark::default();
+    let asked = mark.ask();
+    mark.appended(v(7));
+    mark.answered(asked, not_member, v(7));
+    assert!(!mark.is_left());
+    let asked = mark.ask();
+    mark.appended(v(7));
+    mark.answered(asked, not_member, v(8));
+    assert!(mark.is_left());
+
+    // An append before the question keeps nothing out.
+    let mut mark = LeftMark::default();
+    mark.appended(v(9));
+    let asked = mark.ask();
+    mark.answered(asked, not_member, v(9));
+    assert!(mark.is_left());
+
+    // A newer answer raises the mark, so an append between the two votes
+    // no longer clears it, and an older answer does not lower it.
+    let mut mark = LeftMark::default();
+    mark.answered(mark.ask(), not_member, v(3));
+    mark.answered(mark.ask(), not_member, v(6));
+    mark.answered(mark.ask(), not_member, v(2));
+    mark.appended(v(4));
+    assert!(mark.is_left());
+    mark.appended(v(6));
+    assert!(!mark.is_left());
+
+    // A vote that does not compare is never "at least": it clears nothing
+    // and keeps no answer out.
+    let mut mark = LeftMark::default();
+    mark.answered(mark.ask(), not_member, v(3));
+    mark.appended(Vote(None));
+    assert!(mark.is_left());
+    let mut mark = LeftMark::default();
+    let asked = mark.ask();
+    mark.appended(Vote(None));
+    mark.answered(asked, not_member, v(1));
+    assert!(mark.is_left());
 }

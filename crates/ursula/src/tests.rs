@@ -6444,6 +6444,14 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     .await
     .expect("recovering engine");
     let registry = RaftGroupHandleRegistry::default();
+    // The node is the group's placed voter, so its empty replica counts as
+    // a voter (S10) while it holds no membership yet.
+    gate.bind_placement(
+        Arc::new(ursula_raft::FixedRole(Some(
+            ursula_control::SeedRoleOf::Initializer,
+        ))),
+        &ursula_raft::LeftMarks::default(),
+    );
     engine.publish_recovery(gate, &registry).unwrap();
     let runtime = spawn_runtime(
         &test_config(1, 1),
@@ -10183,19 +10191,10 @@ mod leadership_balance {
 mod cluster_egress {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
-    use axum::Router;
-    use axum::http::StatusCode;
-    use axum::routing::post;
-    use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_shard::RaftGroupId;
 
-    use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedDrain;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::ShedTargets;
@@ -10219,10 +10218,6 @@ mod cluster_egress {
                 can_take_over,
             )
             .plan
-    }
-
-    fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
-        snap_with_leader(group_id, 1, Some(1), voters)
     }
 
     fn snap_with_leader(
@@ -10260,8 +10255,8 @@ mod cluster_egress {
             (2, "http://node2/".to_owned()),
             (3, "http://node3//".to_owned()),
         ]);
-        let voters = BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]);
-        let plan = cluster_egress_probe_plan(1, &peers, &voters, &[]);
+        let voters = BTreeMap::from([(RaftGroupId(0), vec![BTreeSet::from([1, 2, 3])])]);
+        let plan = cluster_egress_probe_plan(1, &peers, &voters);
         assert_eq!(
             plan.peer_urls,
             BTreeMap::from([
@@ -10271,17 +10266,13 @@ mod cluster_egress {
         );
     }
 
-    /// Each group is judged by its own voters: node 1 votes in group 0
-    /// only, so it probes nodes 2 and 3 and needs one of them.
+    /// Each group is judged by its own voters: node 1 counts as a voter of
+    /// group 0 only, so it probes nodes 2 and 3 and needs one of them.
     #[test]
     fn per_group_probe_plan_uses_only_that_groups_voters() {
-        let voters = BTreeMap::from([
-            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
-            (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
-        ]);
-        let snaps = vec![snap(0, vec![1, 2, 3]), snap(1, vec![2, 3, 4])];
+        let voters = BTreeMap::from([(RaftGroupId(0), vec![BTreeSet::from([1, 2, 3])])]);
 
-        let plan = cluster_egress_probe_plan(1, &peers(), &voters, &snaps);
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters);
 
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].raft_group_id, RaftGroupId(0));
@@ -10290,6 +10281,35 @@ mod cluster_egress {
         assert_eq!(plan.peer_urls.keys().copied().collect::<Vec<_>>(), vec![
             2, 3
         ]);
+    }
+
+    /// Each config of a joint membership is judged on its own, and a config
+    /// without this node needs a majority of its voters from its peers.
+    /// The bug it catches: a joint group judged by one config, or by a
+    /// quorum count that takes this node to be a voter of each config.
+    #[test]
+    fn each_config_of_a_joint_membership_is_judged_on_its_own() {
+        let voters = BTreeMap::from([(RaftGroupId(5), vec![
+            BTreeSet::from([1, 2, 3]),
+            BTreeSet::from([2, 3, 4]),
+        ])]);
+
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters);
+
+        let needed: Vec<_> = plan
+            .groups
+            .iter()
+            .map(|group| (group.peers.clone(), group.needed_peers))
+            .collect();
+        assert_eq!(needed, vec![
+            (BTreeSet::from([2, 3]), 1),
+            (BTreeSet::from([2, 3, 4]), 2),
+        ]);
+        assert!(plan.degraded(&BTreeSet::from([2, 3])).is_none());
+        let (group, healthy) = plan
+            .degraded(&BTreeSet::from([2]))
+            .expect("one of 2, 3 and 4 is no majority of them");
+        assert_eq!((group.peers.len(), healthy), (3, 1));
     }
 
     /// The plan probes each peer once whatever the group count: 1,024
@@ -10302,7 +10322,14 @@ mod cluster_egress {
             1024,
             ursula_config::PlacementConfig::default().replication_factor,
         );
-        let plan = cluster_egress_probe_plan(1, &peers(), &seeds.voter_table(), &[]);
+        // The groups whose seed voters list node 1, as its replicas count.
+        let voters = seeds
+            .voter_table()
+            .into_iter()
+            .filter(|(_, voters)| voters.contains(&1))
+            .map(|(group, voters)| (group, vec![voters]))
+            .collect();
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters);
 
         // Node 1 is in three of every four seed windows.
         assert_eq!(plan.groups.len(), 768);
@@ -10316,10 +10343,10 @@ mod cluster_egress {
     #[test]
     fn a_group_is_degraded_by_its_own_voters_answers() {
         let voters = BTreeMap::from([
-            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
-            (RaftGroupId(1), BTreeSet::from([1, 3, 4])),
+            (RaftGroupId(0), vec![BTreeSet::from([1, 2, 3])]),
+            (RaftGroupId(1), vec![BTreeSet::from([1, 3, 4])]),
         ]);
-        let plan = cluster_egress_probe_plan(1, &peers(), &voters, &[]);
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters);
 
         assert!(plan.degraded(&BTreeSet::from([3])).is_none());
         let (group, healthy) = plan
@@ -10374,73 +10401,6 @@ mod cluster_egress {
             },
         ]);
     }
-
-    async fn serve_counting_probe_peer(
-        counter: Arc<AtomicU64>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind probe peer");
-        let addr = listener.local_addr().expect("probe peer addr");
-        let app = Router::new().route(
-            crate::CLUSTER_PROBE_PATH,
-            post(move |_body: axum::body::Bytes| {
-                let counter = counter.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::NO_CONTENT
-                }
-            }),
-        );
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve probe peer");
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    #[tokio::test]
-    async fn spawned_gate_uses_per_group_voters_for_probe_targets() {
-        let node2_probes = Arc::new(AtomicU64::new(0));
-        let node3_probes = Arc::new(AtomicU64::new(0));
-        let node4_probes = Arc::new(AtomicU64::new(0));
-        let (node2_url, node2_task) = serve_counting_probe_peer(node2_probes.clone()).await;
-        let (node3_url, node3_task) = serve_counting_probe_peer(node3_probes.clone()).await;
-        let (node4_url, node4_task) = serve_counting_probe_peer(node4_probes.clone()).await;
-        let peers = crate::shared_peers([
-            (1, "http://node1".to_owned()),
-            (2, node2_url),
-            (3, node3_url),
-            (4, node4_url),
-        ]);
-        let per_group_voters = BTreeMap::from([
-            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
-            (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
-        ]);
-        let registry = RaftGroupHandleRegistry::default();
-
-        crate::bootstrap::spawn_egress_gate(
-            &registry,
-            &PeerParticipation::new(1, &peers, reqwest::Client::new()),
-            &peers,
-            per_group_voters,
-            &ursula_config::UrsulaConfig::default()
-                .governance
-                .cluster_probe,
-        );
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
-
-        assert!(node2_probes.load(Ordering::SeqCst) > 0);
-        assert!(node3_probes.load(Ordering::SeqCst) > 0);
-        assert_eq!(
-            node4_probes.load(Ordering::SeqCst),
-            0,
-            "node 4 is not a voter for any group hosted by node 1"
-        );
-
-        node2_task.abort();
-        node3_task.abort();
-        node4_task.abort();
-    }
 }
 
 /// Leadership sheds on a real three-node cluster: twelve groups, each led by
@@ -10486,17 +10446,6 @@ mod leadership_shed {
 
     const GROUPS: u32 = 12;
     const PER_TICK: usize = 4;
-
-    /// The seed voters of the [`GROUPS`] groups over `peers`, as the server
-    /// hands them to its egress gate.
-    fn seed_voters(peers: &ursula_raft::PeerDirectory) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
-        ursula_raft::ConfigSeeds::new(
-            peers,
-            usize::try_from(GROUPS).unwrap(),
-            ursula_config::PlacementConfig::default().replication_factor,
-        )
-        .voter_table()
-    }
 
     struct Cluster {
         nodes: Vec<StaticGrpcTestNode>,
@@ -11180,7 +11129,6 @@ mod leadership_shed {
             &node_1.registry,
             &participation,
             &peers,
-            seed_voters(&peers),
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(5),
                 unhealthy_ticks: 1,
@@ -11333,7 +11281,6 @@ mod leadership_shed {
             &node_1.registry,
             &participation,
             &peers,
-            seed_voters(&peers),
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(1),
                 unhealthy_ticks: 1,

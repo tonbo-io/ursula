@@ -5,11 +5,17 @@
 //! replica. The replica publishes a view per applied batch, per snapshot
 //! install and per startup restore. A view is never current by itself: a
 //! reader takes it as current only with a confirmation
-//! (`ursula_control::ConfirmedView`). The channel is the runtime shim's
+//! (`ursula_control::ConfirmedView`). The publisher keeps the stamp of the
+//! node's last meta read barrier, which confirms each later view that
+//! still carries it. The channel is the runtime shim's
 //! `watch`, so a simulation wakes its receivers in a replayable order.
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
+use ursula_control::ConfirmedStamp;
+use ursula_control::ConfirmedView;
 use ursula_control::GroupPlacement;
 use ursula_control::PlacementView;
 use ursula_shard::RaftGroupId;
@@ -23,6 +29,9 @@ use crate::rt::sync::watch;
 pub struct PlacementPublisher {
     sender: Arc<watch::Sender<Arc<PlacementView>>>,
     peers: Option<crate::PeerCluster>,
+    /// The stamp of this node's last meta read barrier
+    /// ([`Self::record_confirmation`]).
+    confirmation: Arc<Mutex<Option<ConfirmedStamp>>>,
 }
 
 impl Default for PlacementPublisher {
@@ -33,6 +42,7 @@ impl Default for PlacementPublisher {
         Self {
             sender: Arc::new(sender),
             peers: None,
+            confirmation: Arc::default(),
         }
     }
 }
@@ -57,6 +67,25 @@ impl PlacementPublisher {
     /// A watch of the views published from now on, starting at the latest.
     pub fn subscribe(&self) -> PlacementWatch {
         PlacementWatch(self.sender.subscribe())
+    }
+
+    /// Records the stamp of a meta read barrier this node passed. The last
+    /// one recorded is kept.
+    pub(crate) fn record_confirmation(&self, stamp: ConfirmedStamp) {
+        *self
+            .confirmation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stamp);
+    }
+
+    /// The latest view, confirmed by the last recorded stamp while it still
+    /// carries it, by the kernel's rule ([`ConfirmedView::new`]).
+    pub(crate) fn confirmed(&self) -> Option<ConfirmedView> {
+        let stamp = (*self
+            .confirmation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))?;
+        ConfirmedView::new(Arc::clone(&self.sender.borrow()), stamp).ok()
     }
 }
 

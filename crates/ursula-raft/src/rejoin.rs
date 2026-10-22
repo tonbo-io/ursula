@@ -1007,7 +1007,7 @@ pub(crate) enum PlanTaken {
 pub struct GroupRejoin {
     node_id: u64,
     group: RaftTarget,
-    metrics: OnceLock<MetricsReceiver>,
+    metrics: OnceLock<BoundRaft>,
     gate: Mutex<VoteGate>,
     vote_floor: Mutex<Option<UrsulaVote>>,
     /// The group's log store, which keeps its log state and where the gate
@@ -1049,6 +1049,26 @@ pub struct GroupRejoin {
     /// An accept job runs on this replica (m4, #581 review): a second one is
     /// refused until it ends, so two never interleave.
     plan_in_flight: AtomicBool,
+    /// A data replica's placed role and its group's left mark, which the
+    /// voter predicate reads (`crate::voter`). Bound once, at attach.
+    placed: OnceLock<PlacedReplica>,
+}
+
+/// The Raft a gate is bound to ([`GroupRejoin::bind`]).
+struct BoundRaft {
+    metrics: MetricsReceiver,
+    /// Whether the replica's log held entries or a purge when its Raft was
+    /// bound. Until the Raft's first metrics report, which comes only after
+    /// its startup, the metrics show no membership, also when the log holds
+    /// one. Such a replica's membership reads as closed until the Raft
+    /// reports one ([`GroupRejoin::counts`]).
+    held_log: bool,
+}
+
+/// What a data replica's voter predicate reads beyond its engine.
+struct PlacedReplica {
+    role: Arc<dyn crate::SeedRole>,
+    left: crate::voter::LeftMarkCell,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -1226,6 +1246,7 @@ impl GroupRejoin {
             #[cfg(any(test, feature = "fault-injection"))]
             plan_pause: Mutex::new(None),
             plan_in_flight: AtomicBool::new(false),
+            placed: OnceLock::new(),
         })
     }
 
@@ -1282,7 +1303,11 @@ impl GroupRejoin {
                 },
             ));
         }
-        self.metrics.set(raft.metrics()).map_err(|_already_bound| {
+        let bound = BoundRaft {
+            metrics: raft.metrics(),
+            held_log: self.last_log_id().is_some(),
+        };
+        self.metrics.set(bound).map_err(|_already_bound| {
             ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryAlreadyBound { group: self.group },
             )
@@ -1296,7 +1321,7 @@ impl GroupRejoin {
     fn metrics(&self) -> Option<RaftMetrics<UrsulaRaftTypeConfig>> {
         self.metrics
             .get()
-            .map(|metrics| metrics.borrow_watched().clone())
+            .map(|bound| bound.metrics.borrow_watched().clone())
     }
 
     /// Whether the vote gate is open.
@@ -1341,7 +1366,7 @@ impl GroupRejoin {
         let current = self
             .metrics
             .get()
-            .map(|metrics| metrics.borrow_watched().vote);
+            .map(|bound| bound.metrics.borrow_watched().vote);
         Some(match current {
             Some(vote) if vote > floor => vote,
             Some(_) | None => floor,
@@ -2397,7 +2422,9 @@ impl GroupRejoin {
         self.store.upgrade()?.last_log_id()
     }
 
-    /// Follower side: record an inbound AppendEntries.
+    /// Follower side: record an inbound AppendEntries. A committed vote
+    /// also reaches the group's left mark, which an append of at least the
+    /// mark's vote clears.
     pub fn observe_inbound_append(&self, request: &UrsulaAppendEntriesRequest) {
         self.gate()
             .observe_append(log_index(request.leader_commit.as_ref()));
@@ -2407,7 +2434,106 @@ impl GroupRejoin {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) =
                 Some((request.vote, UrsulaRaftTypeConfig::now()));
+            if let Some(placed) = self.placed.get() {
+                placed
+                    .left
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .appended(request.vote);
+            }
         }
+    }
+
+    /// Binds a data replica's voter predicate to its placed role and to its
+    /// group's left mark in `marks`. The first binding holds: a replica is
+    /// attached once. The meta replica binds nothing, so its gate counts
+    /// for nothing the predicate decides.
+    pub fn bind_placement(&self, role: Arc<dyn crate::SeedRole>, marks: &crate::LeftMarks) {
+        let RaftTarget::Data(group) = self.group else {
+            return;
+        };
+        let placed = PlacedReplica {
+            role,
+            left: marks.cell(group),
+        };
+        if self.placed.set(placed).is_err() {
+            tracing::debug!(
+                raft_group_id = group.0,
+                "recovery gate: the replica's placement is bound already"
+            );
+        }
+    }
+
+    /// Records that a membership question goes out now, for the left mark
+    /// its answer may set.
+    pub(crate) fn ask_membership(&self) -> Option<ursula_control::Asked> {
+        self.placed.get().map(|placed| {
+            placed
+                .left
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ask()
+        })
+    }
+
+    /// Records a live leader's barrier answer to the question asked at
+    /// `asked`: classified for this node, it sets the left mark when it
+    /// shows the node a learner or no member.
+    pub(crate) fn observe_membership_answer(
+        &self,
+        asked: Option<ursula_control::Asked>,
+        answer: &crate::BarrierAnswer,
+    ) {
+        let (Some(placed), Some(asked)) = (self.placed.get(), asked) else {
+            return;
+        };
+        let node = ursula_proto::placement::NodeId::new(self.node_id);
+        match answer.memberships.answer(node) {
+            Ok(classified) => placed
+                .left
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .answered(asked, classified, answer.vote),
+            // Checked on arrival, so this is no live leader's answer.
+            Err(error) => {
+                tracing::debug!(%error, "recovery barrier: an answer's memberships are malformed")
+            }
+        }
+    }
+
+    /// Whether this replica counts as a voter, by the one voter predicate
+    /// (`crate::voter`): its placed role, its effective membership while
+    /// its Raft is bound, and its group's left mark.
+    ///
+    /// A replica whose log held anything when its Raft was bound reads as
+    /// closed until its Raft reports a membership: before the Raft's first
+    /// metrics report the metrics show none, whatever the log lists, so a
+    /// gated replica its log lists as a voter would otherwise stop counting
+    /// in that window.
+    pub fn counts(&self) -> ursula_control::Counts {
+        let placed = self.placed.get();
+        let left = placed.is_some_and(|placed| crate::voter::is_left(&placed.left));
+        let role = placed.and_then(|placed| placed.role.placed_role());
+        let me = ursula_proto::placement::NodeId::new(self.node_id);
+        let effective = self.metrics.get().and_then(|bound| {
+            let effective = crate::memberships::membership_config(
+                &bound.metrics.borrow_watched().membership_config,
+                crate::MembershipKind::Effective,
+            )
+            .ok();
+            match effective {
+                None if bound.held_log => None,
+                effective => Some(effective),
+            }
+        });
+        let membership = match &effective {
+            None => ursula_control::ReplicaMembership::Closed,
+            Some(effective) => ursula_control::ReplicaMembership::Open {
+                me,
+                effective: effective.as_ref(),
+            },
+        };
+        ursula_control::counts_as_voter(role, membership, left)
     }
 }
 

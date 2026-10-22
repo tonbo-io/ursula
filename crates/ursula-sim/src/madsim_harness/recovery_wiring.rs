@@ -53,7 +53,7 @@ pub(super) fn fixed_placement(
 #[derive(Debug)]
 pub(super) enum RecoveryProbeError {
     Partitioned,
-    Proof(ursula_raft::QuorumProofError),
+    Proof(ursula_raft::InProcessBarrierError),
 }
 impl From<RecoveryProbeError> for BarrierFailure {
     fn from(error: RecoveryProbeError) -> Self {
@@ -75,9 +75,10 @@ impl std::fmt::Display for RecoveryProbeError {
 
 /// A fresh outbound ReadIndex barrier of `target` from `leader_id`,
 /// confirmed the way the barrier RPC confirms one: a new ReadIndex round
-/// with a quorum, applied by the leader, while it still leads. `policy`
-/// cuts the RPC off as it cuts off the Raft RPCs between `node_id` and the
-/// leader.
+/// with a quorum, applied by the leader, while it still leads, and its
+/// answer checked as every seam checks one
+/// ([`ursula_raft::BarrierAnswer::accept`]). `policy` cuts the RPC off as
+/// it cuts off the Raft RPCs between `node_id` and the leader.
 pub(super) async fn in_process_barrier(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
@@ -89,7 +90,7 @@ pub(super) async fn in_process_barrier(
         return Err(RecoveryProbeError::Partitioned);
     }
     registry
-        .confirm_recovery_barrier(leader_id, target)
+        .barrier(leader_id, target)
         .await
         .map_err(RecoveryProbeError::Proof)
 }

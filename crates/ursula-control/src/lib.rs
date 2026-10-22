@@ -11,7 +11,8 @@
 //! - `placement`: the kernel and its planners. The state, the seven
 //!   commands and their pure dispatcher, the seed rule, placement views, the
 //!   membership reconciler's planner, the hosting rules with the teardown
-//!   steps, the decommission planner and the admin JSON types. Everything
+//!   steps, the voter predicate with the left mark, the decommission planner
+//!   and the admin JSON types. Everything
 //!   is re-exported here, together with the shared vocabulary of
 //!   [`ursula_proto::placement`].
 //! - `samples` (tests and the `test-support` feature only): one sample of
@@ -21,6 +22,7 @@
 mod placement;
 
 pub use placement::Admission;
+pub use placement::Asked;
 pub use placement::BlockReason;
 pub use placement::BlockedMove;
 pub use placement::BootstrapProblem;
@@ -48,6 +50,7 @@ pub use placement::HostingStep;
 pub use placement::LeaderCandidates;
 pub use placement::LeaderView;
 pub use placement::Leadership;
+pub use placement::LeftMark;
 pub use placement::LifecycleChange;
 pub use placement::LocalLog;
 pub use placement::LocalReplica;
@@ -73,6 +76,7 @@ pub use placement::Placements;
 pub use placement::Registration;
 pub use placement::RegistrationStatus;
 pub use placement::ReplaceDiskRequest;
+pub use placement::ReplicaMembership;
 pub use placement::Requeue;
 pub use placement::Retirement;
 pub use placement::SeedRoleOf;
@@ -87,6 +91,7 @@ pub use placement::TeardownStep;
 pub use placement::UnconfirmedView;
 pub use placement::ViewFreshness;
 pub use placement::ViewInput;
+pub use placement::counts_as_voter;
 pub use placement::default_meta_voters;
 pub use placement::effective_replication_factor;
 pub use placement::free_slots;

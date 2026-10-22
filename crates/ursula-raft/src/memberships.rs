@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 
 use openraft::type_config::alias::StoredMembershipOf;
+use openraft::vote::RaftLeaderId;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_control::MembershipConfig;
@@ -18,7 +19,9 @@ use ursula_control::membership_answer;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::VoterSet;
+use ursula_shard::RaftTarget;
 
+use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 
@@ -141,6 +144,78 @@ pub struct BarrierAnswer {
     pub memberships: LeaderMemberships,
 }
 
+/// The target a barrier answer says it is about, as its wire form carries
+/// it: a plane number and a group id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoedTarget {
+    pub plane: i32,
+    pub raft_group_id: u32,
+}
+
+impl From<RaftTarget> for EchoedTarget {
+    /// What a responder that served `target` echoes.
+    fn from(target: RaftTarget) -> Self {
+        Self {
+            plane: i32::from(target.plane()),
+            raft_group_id: target.wire_group_id(),
+        }
+    }
+}
+
+/// Why an asker refuses a barrier answer. Every seam, gRPC and in process,
+/// refuses it by the one check ([`BarrierAnswer::accept`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BarrierAnswerRefusal {
+    /// The answer is about another plane or group than the one asked.
+    #[error("the barrier answer is about plane {plane} group {raft_group_id}")]
+    OtherTarget { plane: i32, raft_group_id: u32 },
+    /// The answer's vote is not a committed vote of the node asked.
+    #[error("the barrier answer's vote is not node {leader}'s committed vote")]
+    NotLeader { leader: u64 },
+    /// The answer's memberships are not a live leader's.
+    #[error("the barrier answer's memberships: {0}")]
+    Memberships(#[from] MalformedMembership),
+}
+
+impl BarrierAnswerRefusal {
+    /// How a meta read barrier classifies the refusal: an answer from a
+    /// node that no longer leads, or a malformed one.
+    pub fn failure(self) -> crate::meta::confirm::BarrierFailure {
+        match self {
+            Self::NotLeader { .. } => crate::meta::confirm::BarrierFailure::NotLeader,
+            Self::OtherTarget { .. } | Self::Memberships(_) => {
+                crate::meta::confirm::BarrierFailure::Malformed
+            }
+        }
+    }
+}
+
+impl BarrierAnswer {
+    /// The answer `leader` gave about `asked`, echoing `echoed`, once it
+    /// passes the checks every seam runs, in order: it is about the target
+    /// asked, its vote is `leader`'s committed vote, and its memberships
+    /// are a live leader's ([`LeaderMemberships::check`]). The gRPC seam
+    /// runs it after the responder check of the answer's process stamp.
+    pub fn accept(
+        self,
+        leader: u64,
+        asked: RaftTarget,
+        echoed: EchoedTarget,
+    ) -> Result<Self, BarrierAnswerRefusal> {
+        if echoed != EchoedTarget::from(asked) {
+            return Err(BarrierAnswerRefusal::OtherTarget {
+                plane: echoed.plane,
+                raft_group_id: echoed.raft_group_id,
+            });
+        }
+        if !self.vote.is_committed() || *self.vote.leader_id().node_id() != leader {
+            return Err(BarrierAnswerRefusal::NotLeader { leader });
+        }
+        self.memberships.check()?;
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use openraft::type_config::alias::LogIdOf;
@@ -148,11 +223,17 @@ mod tests {
     use openraft::vote::RaftLeaderId;
     use ursula_proto::placement::MembershipAnswer;
     use ursula_proto::placement::NodeId;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::RaftTarget;
 
+    use super::BarrierAnswer;
+    use super::BarrierAnswerRefusal;
+    use super::EchoedTarget;
     use super::LeaderMemberships;
     use super::MalformedMembership;
     use super::MembershipKind;
     use crate::types::UrsulaRaftTypeConfig;
+    use crate::types::UrsulaVote;
 
     type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
@@ -235,6 +316,55 @@ mod tests {
                 Err(MalformedMembership::EmptyVoterConfig { membership: kind })
             );
         }
+    }
+
+    /// The one check of a barrier answer, which the gRPC and the in-process
+    /// seam both run. The bugs it catches: an answer taken about another
+    /// plane or group, from a node other than the one asked or under a vote
+    /// not committed, or with memberships no live leader holds.
+    #[test]
+    fn a_barrier_answer_is_taken_only_about_the_target_asked_from_the_leader_asked() {
+        let live = membership(10, vec![vec![1, 2, 3]], &[]);
+        let answer = |vote: UrsulaVote, committed| BarrierAnswer {
+            vote,
+            index: 7,
+            memberships: LeaderMemberships {
+                committed,
+                effective: live.clone(),
+            },
+        };
+        let leader = 2;
+        let asked = RaftTarget::Data(RaftGroupId(3));
+        let vote = UrsulaVote::new_committed(4, leader);
+        assert!(
+            answer(vote, live.clone())
+                .accept(leader, asked, asked.into())
+                .is_ok_and(|taken| taken.index == 7)
+        );
+        for echoed in [RaftTarget::Meta, RaftTarget::Data(RaftGroupId(4))] {
+            let echoed = EchoedTarget::from(echoed);
+            assert_eq!(
+                answer(vote, live.clone()).accept(leader, asked, echoed),
+                Err(BarrierAnswerRefusal::OtherTarget {
+                    plane: echoed.plane,
+                    raft_group_id: echoed.raft_group_id,
+                })
+            );
+        }
+        for vote in [UrsulaVote::new_committed(4, 3), UrsulaVote::new(4, leader)] {
+            assert_eq!(
+                answer(vote, live.clone()).accept(leader, asked, asked.into()),
+                Err(BarrierAnswerRefusal::NotLeader { leader })
+            );
+        }
+        assert_eq!(
+            answer(vote, membership(10, Vec::new(), &[])).accept(leader, asked, asked.into()),
+            Err(BarrierAnswerRefusal::Memberships(
+                MalformedMembership::EmptyVoterConfig {
+                    membership: MembershipKind::Committed,
+                }
+            ))
+        );
     }
 
     /// A config is uniform or joint: a membership of three voter configs is

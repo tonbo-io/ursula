@@ -30,6 +30,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use ursula_control::Admission;
 use ursula_control::SeedRoleOf;
+use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
 use crate::hosting::HostingSet;
@@ -55,6 +56,11 @@ pub trait SeedRole: Send + Sync + 'static {
     /// The role from a confirmed placement. `Ok(None)` stops the driver
     /// that asks, and `Err` makes it retry.
     fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>>;
+    /// The node's role in the group in a placement it holds confirmed now,
+    /// without asking: the first term of the voter predicate
+    /// ([`ursula_control::counts_as_voter`]). `None` without a confirmation
+    /// or without a role.
+    fn placed_role(&self) -> Option<ReplicaRole>;
 }
 
 /// The node sets of one group that its replica's recovery drivers read at
@@ -79,6 +85,12 @@ impl SeedRole for FixedRole {
 
     fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>> {
         Box::pin(std::future::ready(Ok(self.0)))
+    }
+
+    /// A seed role, decided without asking, is a seed voter's: the role
+    /// `Voter` of a seeded group.
+    fn placed_role(&self) -> Option<ReplicaRole> {
+        self.0.map(|_role| ReplicaRole::Voter)
     }
 }
 
@@ -181,6 +193,17 @@ impl SeedRole for MetaSeedRole {
                 self.group,
             ))
         })
+    }
+
+    /// The role in this node's latest view while the last meta read
+    /// barrier's stamp still covers it
+    /// ([`crate::RaftGroupHandleRegistry::confirmed_view`]).
+    fn placed_role(&self) -> Option<ReplicaRole> {
+        let confirmed = self.meta.registry().confirmed_view()?;
+        confirmed
+            .view()
+            .cluster()?
+            .role(self.group, self.meta.node())
     }
 }
 

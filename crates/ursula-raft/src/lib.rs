@@ -84,6 +84,9 @@
 //!   recovery plan's orchestration, generic over the state machine.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
+//! - [`voter`]: the one voter predicate on this node: whether a data
+//!   replica counts as a voter, and the left mark ([`LeftMarks`]) its
+//!   group's barrier answers set and its appends clear.
 
 #[expect(
     clippy::allow_attributes,
@@ -142,6 +145,7 @@ mod state_machine;
 mod target;
 mod telemetry;
 mod types;
+mod voter;
 pub mod wal;
 
 pub use election::ElectionPolicy;
@@ -182,6 +186,8 @@ pub use hosting::HostingSet;
 pub use hosting::HostingStatus;
 pub use hosting::HostingStatusWatch;
 pub use hosting::HostingTask;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessBarrierError;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessEndpoint;
 #[cfg(any(test, madsim))]
@@ -239,6 +245,8 @@ pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
 pub use memberships::BarrierAnswer;
+pub use memberships::BarrierAnswerRefusal;
+pub use memberships::EchoedTarget;
 pub use memberships::LeaderMemberships;
 pub use memberships::MalformedMembership;
 pub use memberships::MembershipKind;
@@ -341,6 +349,7 @@ pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
 pub use ursula_shard::RaftTarget;
+pub use voter::LeftMarks;
 
 #[cfg(test)]
 mod tests;

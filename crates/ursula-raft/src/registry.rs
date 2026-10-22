@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -230,6 +231,8 @@ pub struct RaftGroupHandleRegistry {
     /// Changes whenever a data group's entry is published or removed, so
     /// the hosting driver plans again ([`crate::hosting`]).
     group_changes: Arc<crate::rt::sync::watch::Sender<()>>,
+    /// Each data group's left mark, for the run (`crate::voter`).
+    left_marks: crate::LeftMarks,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -257,6 +260,7 @@ impl Default for RaftGroupHandleRegistry {
             follower_log_reversions: Default::default(),
             meta: Arc::default(),
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
+            left_marks: crate::LeftMarks::default(),
         }
     }
 }
@@ -1212,7 +1216,8 @@ impl RaftGroupHandleRegistry {
 
     /// This node's leadership-shed state, as a node of `cluster_id` answers
     /// it. A node cannot receive a planned leadership handoff until the
-    /// recovery gate of every registered group is open.
+    /// recovery gate of every data replica that counts as a voter is open
+    /// ([`Self::recovery_barriers_ready`]).
     pub fn participation_status(
         &self,
         cluster_id: ursula_headers::ClusterId,
@@ -1229,15 +1234,84 @@ impl RaftGroupHandleRegistry {
         }
     }
 
-    /// Every recovery gate on this node is open. A group stopped by an apply
-    /// failure has no gate to open: its own campaign and transfer eligibility
-    /// close, and it must not close planned handoffs of the node's other groups.
+    /// Every recovery gate of a data replica that counts as a voter is open
+    /// (S10, [`Self::counts_as_voter`]). An incoming learner, or a replica
+    /// its group answered is no voter, does not close the node's
+    /// participation. A group stopped by an apply failure has no gate to
+    /// open: its own campaign and transfer eligibility close, and it must
+    /// not close planned handoffs of the node's other groups.
     pub fn recovery_barriers_ready(&self) -> bool {
         self.groups.load().values().all(|entry| {
-            entry
-                .participating_gate()
-                .is_none_or(|gate| gate.may_campaign())
+            entry.participating_gate().is_none_or(|gate| {
+                gate.may_campaign() || gate.counts() == ursula_control::Counts::NotVoter
+            })
         })
+    }
+
+    /// Whether this node's replica of `group` counts as a voter, by the one
+    /// voter predicate (`crate::voter`): an open replica by its gate, a
+    /// replica without a running gate as a closed one, which counts unless
+    /// its group marked this node left.
+    pub fn counts_as_voter(&self, group: RaftGroupId) -> ursula_control::Counts {
+        let groups = self.groups.load();
+        Self::entry_counts(
+            &self.left_marks,
+            group,
+            groups.get(&group.0).map(Arc::as_ref),
+        )
+    }
+
+    fn entry_counts(
+        marks: &crate::LeftMarks,
+        group: RaftGroupId,
+        entry: Option<&GroupEntry>,
+    ) -> ursula_control::Counts {
+        match entry
+            .and_then(GroupEntry::active)
+            .and_then(|active| active.core.recovery.as_ref())
+        {
+            Some(gate) => gate.counts(),
+            None => crate::voter::closed_counts(marks, group),
+        }
+    }
+
+    /// The voter configs of the effective membership of every open data
+    /// replica that counts as a voter, by group: the groups the egress
+    /// probe judges.
+    pub fn counting_voter_configs(&self) -> BTreeMap<RaftGroupId, Vec<BTreeSet<u64>>> {
+        self.groups
+            .load()
+            .iter()
+            .filter_map(|(id, entry)| {
+                let group = RaftGroupId(*id);
+                let active = entry.active()?;
+                if Self::entry_counts(&self.left_marks, group, Some(entry))
+                    != ursula_control::Counts::Voter
+                {
+                    return None;
+                }
+                let configs = active
+                    .raft()
+                    .metrics()
+                    .borrow_watched()
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .clone();
+                Some((group, configs))
+            })
+            .collect()
+    }
+
+    /// This node's left marks, which its data replicas bind at attach.
+    pub(crate) fn left_marks(&self) -> &crate::LeftMarks {
+        &self.left_marks
+    }
+
+    /// This node's latest placement view, while the stamp of its last meta
+    /// read barrier still covers it.
+    pub fn confirmed_view(&self) -> Option<ursula_control::ConfirmedView> {
+        self.placement.confirmed()
     }
 
     pub fn metrics_snapshot(&self) -> Vec<RaftGroupMetricsSnapshot> {

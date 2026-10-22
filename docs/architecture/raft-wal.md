@@ -450,6 +450,25 @@ replica that applied that index holds every entry it could count. Inbound
 replication alone never opens the gate. The gate records `initialized`, opens,
 and the driver refreshes the election policy.
 
+**Node participation.** While the gate of a data replica that counts as a
+voter is closed, the node answers its peers that it may not campaign or take a
+transfer, and readiness reports `recovery_gate_closed`
+(`RaftGroupHandleRegistry::recovery_barriers_ready`). One predicate decides
+whether a replica counts (`counts_as_voter` in
+`crates/ursula-control/src/placement/hosting.rs`): a confirmed placement gives
+its node the role `Voter`, or its node is a voter of a config of its effective
+membership, and its group has not marked it left. A closed replica counts
+unless it is marked left. So does a replica whose log held entries when its
+Raft started, until the Raft first reports a membership: before that report
+its metrics show none, whatever the log lists. The mark belongs to the node for the run
+(`crates/ursula-raft/src/voter.rs`). A live leader's barrier answer that shows
+the node a learner or no member, under the leader's vote `v`, sets it, unless an
+append with a vote of at least `v` arrived after the question. Only such an
+append clears it, so a deposed leader's heartbeat clears nothing. An incoming
+learner and a voter that a membership step dropped therefore never hold the
+node back. The meta replica's gate counts for none of this. The egress probe
+and the hosting driver read the same predicate.
+
 **Rewind in place.** A follower that answers `Conflict` at or below the index it
 had matched in this leadership lost entries. Every group with a recovery gate
 runs OpenRaft with `allow_log_reversion`, and the network passes every conflict
