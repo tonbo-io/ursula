@@ -184,7 +184,12 @@ The data class covers the core journals and runs the configured policy. The
 meta class always runs `always` and covers the meta journal under `meta/`.
 Every node that runs Raft opens it at start, before its runtime starts and so
 before any data group of the run opens. A meta journal that does not open
-leaves the node without a meta replica and never stops the start.
+leaves the node without a meta replica and never stops the start. A node whose
+data journals hold records never opens a new, empty meta log. When its meta
+journal is gone or holds nothing (no record, no snapshot record, no vote and no
+log state), the meta group opens recovering, so its replica rejoins the meta
+group as a wiped voter does instead of forming a second one. A meta snapshot
+record left without its journal opens the group recovering too.
 
 The journal and state-file version is the format epoch, 6. There is no
 migration: other epochs and files without the Ursula magic are refused, and the

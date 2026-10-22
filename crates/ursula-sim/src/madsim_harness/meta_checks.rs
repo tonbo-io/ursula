@@ -11,11 +11,15 @@
 //! - I11 ([`I11`]): a registered node is a meta learner (or the voter it is
 //!   claimed as) whose view reaches the meta leader's applied entry within
 //!   a bound, after a meta plan too.
-//! - I12 ([`I12`]), in its S1 form: one genesis history event per run. No
+//! - I12 ([`I12`]): no meta genesis while any node holds history, and none
+//!   while the claims differ. On a placed cluster a data group forms only
+//!   from a bootstrapped placement (the hosting check), so data history
+//!   comes after the run's genesis, and a genesis over data or meta history
+//!   is a second genesis of the run. I12 therefore reads meta's replicas: no
 //!   two nodes ever apply meta histories that began at different geneses,
-//!   and none while the claims differ. Data history alone does not block a
-//!   genesis while data forms statically, so I12 reads meta's replicas, not
-//!   the cores.
+//!   and none applies one while the claims differ. The negative controls
+//!   over static data groups, which form beside meta's genesis, hold to the
+//!   same check.
 //! - The meta plan check ([`PLAN`]): a meta plan adds one history event,
 //!   which every placement's `since` moves to, drops every retirement, cuts
 //!   a formation, and marks no `PlacementUnavailable` shed (r1 L12).

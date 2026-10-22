@@ -22,9 +22,11 @@
 //!   record;
 //! - two rules for how a Raft WAL journal opens: a journal read below its
 //!   class's recovery epoch opens its groups recovering, and the meta
-//!   journal's group opens recovering when the meta journal holds neither
-//!   its metadata file nor a record while a data journal holds records or
-//!   the meta group's snapshot record remains;
+//!   journal's group opens recovering when the meta journal is gone (neither
+//!   its metadata file nor a record) or holds nothing (no record, no
+//!   snapshot record, and no group's vote, log state, recovery plan or
+//!   generation in its metadata file) while a data journal holds records,
+//!   and when it is gone while the meta group's snapshot record remains;
 //! - a Raft entry payload with the meta group's commands beside the data
 //!   groups' (`RaftCommand`), whose data entries keep their epoch-5 bytes;
 //! - the meta state machine's dispatch of that payload: it stops its apply

@@ -11,7 +11,7 @@
 //! formed, and the order of the meta faults. Each run:
 //!
 //! - forms meta, on some seeds while the last node claims other genesis
-//!   values until it restarts with the fixed claim (D9, r1 H1): meta forms
+//!   values until it restarts with the fixed claim (design 3.5): meta forms
 //!   only once the claims agree (I12), and no node hosts a data replica
 //!   before meta bootstrapped (the hosting check);
 //! - on most seeds kills the initializer of a drawn group as soon as it
@@ -29,10 +29,10 @@
 //!   `never`, and finds every acknowledged control write on every meta
 //!   replica (I10);
 //! - discards the meta journal of one meta voter, which opens `Recovering`
-//!   over its data history (D9) and rejoins through the meta leader (I11),
-//!   then loses the run state of the meta leader and one more meta voter,
-//!   whose meta gates open `Recovering` and stall, and recovers meta by a
-//!   plan through `ursulactl recover-group --target meta --accept-loss`'s
+//!   over its data history (design 3.2) and rejoins through the meta leader
+//!   (I11), then loses the run state of the meta leader and one more meta
+//!   voter, whose meta gates open `Recovering` and stall, and recovers meta
+//!   by a plan through `ursulactl recover-group --target meta --accept-loss`'s
 //!   loop, planner and sender (the meta plan check), after which every node
 //!   learns the view again (I11), and then every data group those two
 //!   stalled by a data plan through the same tool;
@@ -89,7 +89,8 @@ pub(super) enum Controls {
     /// with the genesis probe of every peer on (`true`) or off.
     WipedMetaVoters { defended: bool },
     /// Every meta voter's meta journal is discarded while data holds
-    /// history, with D9's `Recovering` opening on (`true`) or off.
+    /// history, with the `Recovering` opening of design 3.2 on (`true`) or
+    /// off.
     MetaDiscardedOverData { defended: bool },
     /// Every node loses its power under data `never`, with the meta
     /// journal's own `always` on (`true`) or off.
@@ -324,7 +325,7 @@ impl Run {
     }
 
     /// The last node claims another group count, then restarts with the
-    /// fixed claim (D9, r1 H1). Meanwhile no genesis forms meta, and no node
+    /// fixed claim (design 3.5). Meanwhile no genesis forms meta, and no node
     /// hosts a data replica, which only a bootstrapped placement creates
     /// (the hosting check, at every step of the watch).
     async fn claim_mismatch(&mut self) {
@@ -427,7 +428,7 @@ impl Run {
     }
 
     /// One meta voter's meta journal discarded: it opens `Recovering` over
-    /// its data history (D9) and rejoins through the meta leader (I11).
+    /// its data history (design 3.2) and rejoins through the meta leader (I11).
     /// Then the meta leader and one more meta voter lose their run state, so
     /// a majority of meta's gates open `Recovering`, where a replica neither
     /// votes nor campaigns, and stall. A meta plan recovers meta. Their data
