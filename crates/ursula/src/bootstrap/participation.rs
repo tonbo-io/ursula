@@ -14,12 +14,19 @@
 //! the transfer.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 
+use futures_util::future::BoxFuture;
 use futures_util::future::join_all;
+use ursula_control::PeerGate;
 use ursula_proto::admin::LeadershipShedStatus;
+use ursula_proto::admin::RaftTargetKey;
+use ursula_proto::placement::NodeId;
 use ursula_raft::PeerDirectory;
+use ursula_raft::PeerGates;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_shard::RaftTarget;
 
 use crate::bootstrap::health_gate::ShedTargets;
 
@@ -44,6 +51,10 @@ pub(crate) struct CampaignStances {
     /// This node.
     node_id: u64,
     by_node: BTreeMap<u64, CampaignStance>,
+    /// How many data groups each node leads: this node's from its own
+    /// replicas, each peer's from its answer. A peer that did not answer
+    /// has none.
+    leader_counts: BTreeMap<u64, u32>,
 }
 
 impl CampaignStances {
@@ -92,7 +103,17 @@ impl CampaignStances {
             .collect()
     }
 
-    /// The stances of `node_id` and its peers as given.
+    /// How many data groups each node leads: this node's own count, and
+    /// each peer's that answered.
+    pub(crate) fn leader_counts(&self) -> BTreeMap<u64, usize> {
+        self.leader_counts
+            .iter()
+            .map(|(node_id, count)| (*node_id, usize::try_from(*count).unwrap_or(usize::MAX)))
+            .collect()
+    }
+
+    /// The stances of `node_id` and its peers as given, none of which
+    /// answered a leader count.
     #[cfg(test)]
     pub(crate) fn of_nodes(
         node_id: u64,
@@ -101,7 +122,18 @@ impl CampaignStances {
         Self {
             node_id,
             by_node: stances.into_iter().collect(),
+            leader_counts: BTreeMap::new(),
         }
+    }
+
+    /// These stances with `counts` as the nodes' leader counts.
+    #[cfg(test)]
+    pub(crate) fn with_leader_counts(
+        mut self,
+        counts: impl IntoIterator<Item = (u64, u32)>,
+    ) -> Self {
+        self.leader_counts = counts.into_iter().collect();
+        self
     }
 
     #[cfg(test)]
@@ -110,14 +142,33 @@ impl CampaignStances {
     }
 }
 
-/// The peers a node polls and probes ([`PeerParticipation::peers`]).
+/// The peers a node polls and probes ([`PeerParticipation::peers`]), with
+/// the identity of the same bind.
 #[derive(Debug)]
 pub(crate) enum PolledPeers {
     /// The registry's bound `raft.peers`.
     Bound(ursula_raft::BoundPeers),
-    /// A test's own addresses.
+    /// A test's own addresses, with the identity the registry had bound
+    /// when they were read.
     #[cfg(test)]
-    Fixed(std::sync::Arc<PeerDirectory>),
+    Fixed(
+        std::sync::Arc<PeerDirectory>,
+        Option<ursula_raft::PeerIdentity>,
+    ),
+}
+
+impl PolledPeers {
+    /// This node's cluster id, from the bind the peers come from: an
+    /// answer of another cluster says nothing about this one. `None`
+    /// before any bind, when there are no peers either.
+    fn cluster_id(&self) -> Option<&ursula_headers::ClusterId> {
+        let identity = match self {
+            Self::Bound(peers) => peers.identity(),
+            #[cfg(test)]
+            Self::Fixed(_, identity) => identity.as_ref(),
+        };
+        identity.map(ursula_raft::PeerIdentity::cluster_id)
+    }
 }
 
 impl std::ops::Deref for PolledPeers {
@@ -127,14 +178,14 @@ impl std::ops::Deref for PolledPeers {
         match self {
             Self::Bound(peers) => peers,
             #[cfg(test)]
-            Self::Fixed(peers) => peers,
+            Self::Fixed(peers, _) => peers,
         }
     }
 }
 
 /// The client that asks a node's cluster peers, the ones its registry's
 /// peer cluster binds (`raft.peers`, read at each poll), for their
-/// leadership-shed state.
+/// participation answers (`GET /__ursula/leadership-shed`).
 #[derive(Debug, Clone)]
 pub(crate) struct PeerParticipation {
     node_id: u64,
@@ -174,52 +225,75 @@ impl PeerParticipation {
         self.node_id
     }
 
-    /// The peers this node polls for their stances and probes for its
+    /// The peers this node polls for their answers and probes for its
     /// egress: the bound `raft.peers`, read at each use.
     pub(crate) fn peers(&self, registry: &RaftGroupHandleRegistry) -> PolledPeers {
         #[cfg(test)]
         if let Some(addresses) = &self.addresses {
-            return PolledPeers::Fixed(addresses.clone());
+            return PolledPeers::Fixed(addresses.clone(), registry.peer_cluster().identity());
         }
         PolledPeers::Bound(registry.peer_cluster().directory())
     }
 
-    /// The campaign stance of this node and of each peer. A node shedding
-    /// for cold health may campaign, because that reason does not stop it
-    /// from campaigning: cold-health backlogs are often cluster-wide, and
-    /// leaving every hot node out could leave no node to lead.
+    /// The answer of every peer `ask` names, `None` for a peer that did not
+    /// answer in time, answered unreadably or answered for another cluster.
+    async fn answers(
+        &self,
+        registry: &RaftGroupHandleRegistry,
+        ask: impl Fn(u64) -> bool,
+    ) -> Vec<(u64, Option<LeadershipShedStatus>)> {
+        let peers = self.peers(registry);
+        let Some(local) = peers.cluster_id() else {
+            return Vec::new();
+        };
+        join_all(
+            peers
+                .iter()
+                .filter(|(peer_id, _)| *peer_id != self.node_id && ask(*peer_id))
+                .map(|(peer_id, endpoints)| async move {
+                    (
+                        peer_id,
+                        self.answer(peer_id, endpoints.cluster_url(), local).await,
+                    )
+                }),
+        )
+        .await
+    }
+
+    /// The campaign stance and leader count of this node and of each peer.
+    /// A node shedding for cold health may campaign, because that reason
+    /// does not stop it from campaigning: cold-health backlogs are often
+    /// cluster-wide, and leaving every hot node out could leave no node to
+    /// lead.
     pub(crate) async fn campaign_stances(
         &self,
         registry: &RaftGroupHandleRegistry,
     ) -> CampaignStances {
-        // Only an answer of this node's cluster counts: a node of another
-        // cluster at a peer's address says nothing about this one.
-        let identity = registry.peer_cluster().identity();
-        let local = identity.as_ref().map(ursula_raft::PeerIdentity::cluster_id);
-        let peers = self.peers(registry);
-        let answers = join_all(
-            peers
-                .iter()
-                .filter(|(peer_id, _)| *peer_id != self.node_id)
-                .map(|(peer_id, endpoints)| async move {
-                    (
-                        peer_id,
-                        self.peer_stance(peer_id, endpoints.cluster_url(), local)
-                            .await,
-                    )
-                }),
-        )
-        .await;
-        let mut by_node: BTreeMap<u64, CampaignStance> = answers.into_iter().collect();
+        let answers = self.answers(registry, |_peer| true).await;
+        let mut by_node = BTreeMap::new();
+        let mut leader_counts = BTreeMap::new();
+        for (peer_id, answer) in answers {
+            let stance = match &answer {
+                Some(status) if status.should_accept_transfer => CampaignStance::MayCampaign,
+                Some(_) => CampaignStance::MayNotCampaign,
+                None => CampaignStance::Unknown,
+            };
+            by_node.insert(peer_id, stance);
+            if let Some(status) = answer {
+                leader_counts.insert(peer_id, status.leader_count);
+            }
+        }
         let own = if registry.should_accept_transfer() {
             CampaignStance::MayCampaign
         } else {
             CampaignStance::MayNotCampaign
         };
         by_node.insert(self.node_id, own);
+        leader_counts.insert(self.node_id, registry.leader_count());
         CampaignStances {
             node_id: self.node_id,
             by_node,
+            leader_counts,
         }
     }
 
@@ -233,12 +307,38 @@ impl PeerParticipation {
         self.campaign_stances(registry).await.may_campaign()
     }
 
-    async fn peer_stance(
+    /// The recovery gate each of `learners` answers for `replica`'s group,
+    /// asked of the learners only. A learner without an answer, or whose
+    /// answer lists no gate of the group, is left out, so it counts as
+    /// `Unknown`.
+    pub(crate) async fn recovery_gates(
+        &self,
+        registry: &RaftGroupHandleRegistry,
+        replica: RaftTarget,
+        learners: &BTreeSet<NodeId>,
+    ) -> BTreeMap<NodeId, PeerGate> {
+        let key = match replica {
+            RaftTarget::Data(group) => RaftTargetKey::Data(group.0),
+            RaftTarget::Meta => RaftTargetKey::Meta,
+        };
+        self.answers(registry, |peer| learners.contains(&NodeId::new(peer)))
+            .await
+            .into_iter()
+            .filter_map(|(peer_id, answer)| {
+                let status = answer?.recovery_gates.get(&key).copied()?;
+                Some((NodeId::new(peer_id), PeerGate::of_status(status)))
+            })
+            .collect()
+    }
+
+    /// The answer of `peer_id` at `peer_url`, when it is one of this node's
+    /// cluster, `local`.
+    async fn answer(
         &self,
         peer_id: u64,
         peer_url: &str,
-        local: Option<&ursula_headers::ClusterId>,
-    ) -> CampaignStance {
+        local: &ursula_headers::ClusterId,
+    ) -> Option<LeadershipShedStatus> {
         let url = format!("{peer_url}{}", crate::LEADERSHIP_SHED_PATH);
         let response = match self.client.get(url).send().await {
             Ok(response) if response.status().is_success() => response,
@@ -248,50 +348,80 @@ impl PeerParticipation {
                     status = %response.status(),
                     "leadership-shed state request refused"
                 );
-                return CampaignStance::Unknown;
+                return None;
             }
             Err(err) => {
                 tracing::debug!(peer_id, %err, "leadership-shed state request failed");
-                return CampaignStance::Unknown;
+                return None;
             }
         };
         let body = match response.text().await {
             Ok(body) => body,
             Err(err) => {
                 tracing::debug!(peer_id, %err, "leadership-shed state body failed");
-                return CampaignStance::Unknown;
+                return None;
             }
         };
         match serde_json::from_str::<LeadershipShedStatus>(&body) {
-            Ok(status) if local != Some(&status.cluster_id) => {
+            Ok(status) if *local != status.cluster_id => {
                 tracing::debug!(
                     peer_id,
                     peer_cluster_id = %status.cluster_id,
                     "ignoring the leadership-shed state of a node of another cluster"
                 );
-                CampaignStance::Unknown
+                None
             }
-            Ok(status) if status.should_accept_transfer => CampaignStance::MayCampaign,
-            Ok(_) => CampaignStance::MayNotCampaign,
+            Ok(status) => Some(status),
             Err(err) => {
                 tracing::debug!(peer_id, %err, "unreadable leadership-shed state");
-                CampaignStance::Unknown
+                None
             }
         }
     }
 }
 
+/// A node's peer gates (design 5.8): each learner's recovery gate as its
+/// participation answer shows it, asked right before a promotion.
+#[derive(Debug, Clone)]
+pub(crate) struct ParticipationGates {
+    pub(crate) participation: PeerParticipation,
+    pub(crate) registry: RaftGroupHandleRegistry,
+}
+
+impl PeerGates for ParticipationGates {
+    fn gates(
+        &self,
+        replica: RaftTarget,
+        learners: &BTreeSet<NodeId>,
+    ) -> BoxFuture<'_, BTreeMap<NodeId, PeerGate>> {
+        let learners = learners.clone();
+        Box::pin(async move {
+            self.participation
+                .recovery_gates(&self.registry, replica, &learners)
+                .await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::collections::HashSet;
     use std::time::Duration;
 
     use axum::Json;
     use axum::Router;
     use axum::routing::get;
+    use ursula_control::PeerGate;
     use ursula_proto::admin::LeadershipShedStatus;
+    use ursula_proto::admin::RaftTargetKey;
+    use ursula_proto::admin::RecoveryGateStatus;
+    use ursula_proto::placement::NodeId;
     use ursula_raft::LeadershipShedReason;
     use ursula_raft::RaftGroupHandleRegistry;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::RaftTarget;
 
     use super::CampaignStance;
     use super::CampaignStances;
@@ -328,11 +458,13 @@ mod tests {
         cluster_id: &str,
         should_campaign: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind peer");
-        let address = listener.local_addr().expect("peer address");
-        let status = LeadershipShedStatus {
+        serving(status(cluster_id, should_campaign)).await
+    }
+
+    /// The answer of a node of `cluster_id` that leads nothing and runs no
+    /// gated replica.
+    fn status(cluster_id: &str, should_campaign: bool) -> LeadershipShedStatus {
+        LeadershipShedStatus {
             cluster_id: cluster(cluster_id),
             bits: 0,
             state: String::new(),
@@ -340,7 +472,17 @@ mod tests {
             should_campaign,
             recovery_barriers_ready: true,
             should_shed_current_leaders: false,
-        };
+            recovery_gates: BTreeMap::new(),
+            leader_count: 0,
+        }
+    }
+
+    /// A peer that answers `status`.
+    async fn serving(status: LeadershipShedStatus) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind peer");
+        let address = listener.local_addr().expect("peer address");
         let app = Router::new().route(
             crate::LEADERSHIP_SHED_PATH,
             get(move || {
@@ -450,6 +592,96 @@ mod tests {
             .await;
         assert_eq!(stances.of(2), Some(CampaignStance::MayCampaign));
         willing_task.abort();
+    }
+
+    /// A learner's gate comes from its own answer for the group: open only
+    /// when it answers `open`, closed in every gated state, and unknown
+    /// (left out) when it does not answer, answers for another cluster or
+    /// lists no gate of the group. The bugs it catches: a missing gate read
+    /// as open, which promotes a learner that refuses votes, and an answer
+    /// of another group or cluster trusted. Each peer's leader count comes
+    /// from its answer.
+    #[tokio::test]
+    async fn a_learner_gate_and_a_leader_count_come_from_the_peer_answer() {
+        let group = RaftGroupId(7);
+        let answer = |gates: &[(RaftTargetKey, RecoveryGateStatus)], leads| LeadershipShedStatus {
+            recovery_gates: gates.iter().copied().collect(),
+            leader_count: leads,
+            ..status(THIS_CLUSTER, true)
+        };
+        let (open, open_task) = serving(answer(
+            &[
+                (RaftTargetKey::Data(7), RecoveryGateStatus::Open),
+                (RaftTargetKey::Data(8), RecoveryGateStatus::CatchingUp),
+            ],
+            5,
+        ))
+        .await;
+        let (closed, closed_task) = serving(answer(
+            &[
+                (RaftTargetKey::Data(7), RecoveryGateStatus::CatchingUp),
+                (RaftTargetKey::Meta, RecoveryGateStatus::Open),
+            ],
+            2,
+        ))
+        .await;
+        let (other_group, other_task) = serving(answer(
+            &[(RaftTargetKey::Data(8), RecoveryGateStatus::Open)],
+            3,
+        ))
+        .await;
+        let (foreign, foreign_task) = serving(LeadershipShedStatus {
+            recovery_gates: BTreeMap::from([(RaftTargetKey::Data(7), RecoveryGateStatus::Open)]),
+            ..status("other-cluster", true)
+        })
+        .await;
+        let (silent, _listener) = silent_peer().await;
+        let participation = PeerParticipation::new(
+            1,
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(300))
+                .build()
+                .expect("client"),
+        );
+        let registry = this_registry(shared_peers([
+            (2, open),
+            (3, closed),
+            (4, other_group),
+            (5, foreign),
+            (6, silent),
+        ]));
+        let learners: BTreeSet<NodeId> = (2..=6).map(NodeId::new).collect();
+        let gates = participation
+            .recovery_gates(&registry, RaftTarget::Data(group), &learners)
+            .await;
+        assert_eq!(
+            gates,
+            BTreeMap::from([
+                (NodeId::new(2), PeerGate::Open),
+                (NodeId::new(3), PeerGate::Closed),
+            ])
+        );
+        // Only learners are asked, and the meta group by its own key.
+        let only_three = participation
+            .recovery_gates(
+                &registry,
+                RaftTarget::Meta,
+                &BTreeSet::from([NodeId::new(3)]),
+            )
+            .await;
+        assert_eq!(
+            only_three,
+            BTreeMap::from([(NodeId::new(3), PeerGate::Open)])
+        );
+
+        let counts = participation
+            .campaign_stances(&registry)
+            .await
+            .leader_counts();
+        assert_eq!(counts, BTreeMap::from([(1, 0), (2, 5), (3, 2), (4, 3)]));
+        for task in [open_task, closed_task, other_task, foreign_task] {
+            task.abort();
+        }
     }
 
     #[test]

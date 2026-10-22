@@ -110,7 +110,7 @@ fn pick_successor(
                     && peer.voter_ids.contains(id)
                     && peer.last_applied_index.is_some()
                     && peer.last_applied_index >= required_applied
-            })
+            }) && takes_leadership(snapshot, *id, group.raft_group_id)
         })
         .map(|id| {
             let applied = peer_views.get(&id).and_then(|view| view.last_applied_index);
@@ -130,6 +130,28 @@ fn pick_successor(
         },
     });
     scored.first().map(|(id, _, _)| *id)
+}
+
+/// Whether `node`'s own report lets it take `group`'s leadership: under its
+/// bootstrapped view, only a role that takes one
+/// ([`ursula_proto::placement::ReplicaRole::takes_leadership`], the rule of
+/// the server's handoffs), so a drain never hands a leadership to an
+/// outgoing or abandoned replica or to one the view places nowhere. A report
+/// without a view lists the group in neither map and is not judged here.
+fn takes_leadership(snapshot: &ClusterSnapshot, node: u64, group: u64) -> bool {
+    let Some(report) = snapshot
+        .node(node)
+        .and_then(|view| view.raft_maintenance.as_ref())
+    else {
+        return true;
+    };
+    let Ok(group) = u32::try_from(group) else {
+        return false;
+    };
+    match report.expected_groups.get(&group) {
+        Some(expected) => expected.role.takes_leadership(),
+        None => !report.unplaced.contains_key(&group),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +390,39 @@ mod tests {
         snapshot.per_node[1].groups[0]
             .maintenance
             .accepting_transfers = false;
+        assert!(plan_drain(&snapshot, 1).is_empty());
+    }
+
+    /// The bug it catches: a drain that hands a moving group's leadership
+    /// to the replica the move takes out, whose own report shows it
+    /// outgoing, or to one its view places nowhere.
+    #[test]
+    fn drain_never_selects_a_successor_its_report_shows_leaving_the_group() {
+        let group_on = |node| {
+            view(node, vec![group(
+                7,
+                node,
+                Some(1),
+                Some(100),
+                Some(100),
+                vec![1, 2, 3],
+            )])
+        };
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![group_on(1), group_on(2), group_on(3)],
+        };
+        assert_eq!(plan_drain(&snapshot, 1).transfers[0].preferred_successor, 2);
+        let report = snapshot.per_node[1].raft_maintenance.as_mut().unwrap();
+        report.expected_groups.get_mut(&7).unwrap().role =
+            ursula_proto::placement::ReplicaRole::Outgoing;
+        assert_eq!(plan_drain(&snapshot, 1).transfers[0].preferred_successor, 3);
+        let report = snapshot.per_node[2].raft_maintenance.as_mut().unwrap();
+        report.expected_groups.remove(&7);
+        report
+            .unplaced
+            .insert(7, ursula_proto::placement::UnplacedReplica {
+                counts_as_voter: true,
+            });
         assert!(plan_drain(&snapshot, 1).is_empty());
     }
 

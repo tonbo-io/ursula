@@ -662,6 +662,9 @@ pub enum RaftMaintenanceIssue {
     LeaderOutsideVoters,
     NotApplied,
     ApplyLag,
+    /// The node leads a moving group whose reconciler made no progress
+    /// for five minutes (`ReconcileStatus::progress_ms`).
+    MoveStalled,
     /// An issue a newer server of the same minor version reports that this
     /// build does not know. It blocks both readinesses.
     #[serde(other)]
@@ -702,6 +705,7 @@ impl RaftMaintenanceIssue {
             | Self::JointMembership
             | Self::IncompleteVoterSet
             | Self::UnplacedMember
+            | Self::MoveStalled
             | Self::ApplyStopped => false,
         }
     }
@@ -969,6 +973,14 @@ pub struct LeadershipShedStatus {
     pub should_campaign: bool,
     pub recovery_barriers_ready: bool,
     pub should_shed_current_leaders: bool,
+    /// The recovery gate of every replica the node runs with one, open
+    /// gates included, the meta replica's under `"meta"`. A group the map
+    /// leaves out has no running gated replica on the node. A leader
+    /// promotes a learner only while this map shows its gate `open`.
+    pub recovery_gates: BTreeMap<RaftTargetKey, RecoveryGateStatus>,
+    /// How many data groups the node leads. The leadership balancer reads
+    /// its peers' counts here.
+    pub leader_count: u32,
 }
 /// Answer of `POST /__ursula/backup/group/{group}/import`. The import is a
 /// history event keyed by the backup's BLAKE3 digest (#581 section 4.4): a
@@ -1565,6 +1577,7 @@ mod serving_readiness_tests {
             (Issue::ApplyStopped, false),
             (Issue::UnplacedReplica, false),
             (Issue::MoveInProgress, false),
+            (Issue::MoveStalled, false),
             (Issue::LocalReplicaNotVoter, true),
             (Issue::RecoveryBarrier, true),
             (Issue::RaftStopped, true),

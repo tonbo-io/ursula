@@ -562,9 +562,11 @@ impl MetaReplica {
         let apply_health = state_machine.apply_health.clone();
         let (openraft_work, work) = OpenRaftWork::start();
         let installs = Arc::new(WorkAdmission::new(work.as_kind(WorkKind::Install)));
+        let snapshot_sends = crate::openraft_work::SnapshotSends::default();
         let network = crate::openraft_work::TrackedNetworkFactory::new(
             network,
             work.as_kind(WorkKind::Client),
+            snapshot_sends.clone(),
         );
         let store =
             crate::openraft_work::TrackedLogStore::new(store, work.as_kind(WorkKind::Reader));
@@ -591,6 +593,7 @@ impl MetaReplica {
             history: Arc::clone(&history),
             apply_health,
             reconcile: tasks.reconcile.clone(),
+            snapshot_sends,
         };
         let replica = Self {
             active: Arc::new(ActiveMeta {

@@ -101,11 +101,14 @@ async fn enter_pressure(
     registry.mark_leadership_shed(LeadershipShedReason::WalDiskPressure);
     let snapshots = registry.metrics_snapshot();
     let counts = leader_counts(&snapshots);
+    let view = registry.placement_watch().current();
     for snapshot in snapshots {
         if snapshot.current_leader != Some(node_id) {
             continue;
         }
-        for target in prioritized_transfer_targets(&snapshot, node_id, &counts) {
+        for target in
+            prioritized_transfer_targets(&snapshot, node_id, view.cluster(), |_node| true, &counts)
+        {
             match registry
                 .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
                 .await

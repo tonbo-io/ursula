@@ -111,10 +111,16 @@ async fn hand_off_meta_leadership(
     if meta.current_leader != Some(node_id) {
         return None;
     }
-    let targets =
-        crate::bootstrap::util::prioritized_transfer_targets(&meta, node_id, &HashMap::new());
+    // The meta group has no placement.
+    let targets = crate::bootstrap::util::prioritized_transfer_targets(
+        &meta,
+        node_id,
+        None,
+        |node| eligible.contains(&node),
+        &HashMap::new(),
+    );
     for target in targets {
-        if !eligible.contains(&target) || registry.check_meta_handoff(target).is_err() {
+        if registry.check_meta_handoff(target).is_err() {
             continue;
         }
         match registry.transfer_meta_leader(target).await {

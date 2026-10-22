@@ -16,6 +16,8 @@
 //! - **membership target** ([`MembershipTargetSource`]): what the replica's
 //!   reconcile shell takes the group's membership toward when it leads, and
 //!   where it reports each convergence.
+//! - **peer gates** ([`PeerGates`]): the recovery gates of the learners the
+//!   shell would promote, asked right before it decides.
 //!
 //! [`MetaPlacement`] answers from meta: admission from the hosting driver's
 //! [`HostingSet`], the seed role, the node sets and the target from this
@@ -47,6 +49,8 @@ use crate::meta::status::MetaStatusReader;
 use crate::meta::watch::GroupPlacementWatch;
 use crate::rejoin::Convergence;
 use crate::rejoin::MembershipTargetSource;
+use crate::rejoin::NoPeerGates;
+use crate::rejoin::PeerGates;
 use crate::rejoin::TargetRead;
 
 /// Every placement input of a data replica's open, by group.
@@ -60,6 +64,12 @@ pub trait PlacementInputs: std::fmt::Debug + Send + Sync + 'static {
     /// The membership target of `group` that the replica's reconcile shell
     /// pursues and reports to.
     fn target_source(&self, group: RaftGroupId) -> Arc<dyn MembershipTargetSource>;
+    /// The peer gates the replica's reconcile shell asks before it
+    /// promotes a learner of `group`. By default no gate answers, so the
+    /// shell promotes no learner ([`NoPeerGates`]).
+    fn peer_gates(&self, _group: RaftGroupId) -> Arc<dyn PeerGates> {
+        Arc::new(NoPeerGates)
+    }
 }
 
 /// A replica's seed role in its group.
@@ -168,7 +178,8 @@ impl GroupNodes for FixedNodes {
 ///   ([`MembershipTarget::of_placement`]), confirmed by a meta read barrier
 ///   and reported through the meta leader
 ///   ([`MetaStatusReader::report_converged`]). A group without a placement
-///   has no target.
+///   has no target;
+/// - the peer gates [`Self::with_peer_gates`] gives, none by default.
 ///
 /// The engine factory takes the inputs before the meta runtime starts, so
 /// the meta read barrier binds later ([`Self::bind_meta`]). Until then the
@@ -181,6 +192,17 @@ pub struct MetaPlacement {
     registry: RaftGroupHandleRegistry,
     hosting: HostingSet,
     meta: Arc<OnceLock<MetaStatusReader>>,
+    gates: Gates,
+}
+
+/// The peer gates of every replica's shell.
+#[derive(Clone)]
+struct Gates(Arc<dyn PeerGates>);
+
+impl std::fmt::Debug for Gates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gates")
+    }
 }
 
 impl MetaPlacement {
@@ -192,7 +214,14 @@ impl MetaPlacement {
             registry,
             hosting,
             meta: Arc::default(),
+            gates: Gates(Arc::new(NoPeerGates)),
         }
+    }
+
+    /// The inputs with `gates` as every replica's peer gates.
+    pub fn with_peer_gates(mut self, gates: Arc<dyn PeerGates>) -> Self {
+        self.gates = Gates(gates);
+        self
     }
 
     /// Confirms views through `meta`, the meta runtime of this node and
@@ -228,6 +257,10 @@ impl PlacementInputs for MetaPlacement {
             watch: GroupPlacementWatch::new(self.registry.placement_watch(), group),
             meta: Arc::clone(&self.meta),
         })
+    }
+
+    fn peer_gates(&self, _group: RaftGroupId) -> Arc<dyn PeerGates> {
+        Arc::clone(&self.gates.0)
     }
 }
 

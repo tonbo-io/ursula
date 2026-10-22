@@ -206,6 +206,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let report = crate::check_raft_maintenance(crate::MaintenanceInputs {
         node_id: 1,
         lag_tolerance: 0,
+        now_ms: 0,
         groups: &groups,
         counts: |_group| ursula_control::Counts::Voter,
         placement: None,
@@ -311,6 +312,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let report = crate::check_raft_maintenance(crate::MaintenanceInputs {
         node_id: 1,
         lag_tolerance: 0,
+        now_ms: 0,
         groups: &state,
         counts: |_group| ursula_control::Counts::Voter,
         placement: None,

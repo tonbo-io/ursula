@@ -425,10 +425,16 @@ pub struct BoundPeers(Option<Arc<Bound>>);
 static UNBOUND: PeerDirectory = PeerDirectory::empty();
 
 impl BoundPeers {
+    /// The identity bound with these peers, `None` before any bind: read
+    /// from the same bind as the peers, so the two never mix binds.
+    pub fn identity(&self) -> Option<&PeerIdentity> {
+        self.0.as_deref().map(|bound| &bound.identity)
+    }
+
     /// This node's id in the bind, read with its peers: none before any
     /// bind.
     pub fn node_id(&self) -> Option<u64> {
-        self.0.as_deref().map(|bound| bound.identity.node_id())
+        self.identity().map(PeerIdentity::node_id)
     }
 }
 

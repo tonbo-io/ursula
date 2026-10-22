@@ -46,6 +46,10 @@ pub const LAG_TOLERANCE: u64 = 16;
 /// `meta_unavailable`: the window after which it also registers again.
 pub const META_UNAVAILABLE_AFTER: Duration = crate::meta::registration::REREGISTER_AFTER;
 
+/// How long the leader of a moving group may see its reconciler make no
+/// progress before it reports `move_stalled` (design 11.4).
+pub const MOVE_STALLED_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// What a node's maintenance report reads of its placement.
 #[derive(Debug, Clone, Copy)]
 pub struct NodePlacement<'a> {
@@ -66,6 +70,8 @@ pub struct NodePlacement<'a> {
 pub struct MaintenanceInputs<'a, C> {
     pub node_id: u64,
     pub lag_tolerance: u64,
+    /// The wall clock the reconcile statuses' times are read against.
+    pub now_ms: u64,
     /// The node's data replicas' metrics.
     pub groups: &'a [RaftGroupMetricsSnapshot],
     /// Whether the node's replica of a group counts as a voter, by the one
@@ -95,7 +101,9 @@ pub struct MaintenanceInputs<'a, C> {
 /// placement's target is `incomplete_voter_set`, and one whose membership
 /// names a node without a role is `unplaced_member`. A `voter` or
 /// `incoming` role without a running replica is `missing_group`, and any
-/// role in a group the view shows moving is `move_in_progress`.
+/// role in a group the view shows moving is `move_in_progress`. The leader
+/// of a moving group whose reconciler made no progress for
+/// [`MOVE_STALLED_AFTER`] also reports `move_stalled`.
 pub fn check_raft_maintenance(
     inputs: MaintenanceInputs<'_, impl Fn(RaftGroupId) -> Counts>,
 ) -> RaftMaintenanceReport {
@@ -104,6 +112,7 @@ pub fn check_raft_maintenance(
     let MaintenanceInputs {
         node_id,
         lag_tolerance,
+        now_ms,
         groups,
         counts,
         placement,
@@ -152,6 +161,7 @@ pub fn check_raft_maintenance(
             counts(id),
             placed,
             lag_tolerance,
+            now_ms,
             &mut issues,
         );
         if !issues.is_empty() {
@@ -317,6 +327,7 @@ fn voter_checks(
     counts: bool,
     placed: Option<&GroupPlacement>,
     lag_tolerance: u64,
+    now_ms: u64,
     issues: &mut Vec<RaftMaintenanceIssue>,
 ) {
     use RaftMaintenanceIssue as Issue;
@@ -371,6 +382,16 @@ fn voter_checks(
         {
             issues.push(Issue::UnplacedMember);
         }
+        let stalled_after = u64::try_from(MOVE_STALLED_AFTER.as_millis()).unwrap_or(u64::MAX);
+        if placed.moving().is_some()
+            && group.current_leader == Some(node_id)
+            && group
+                .reconcile
+                .as_ref()
+                .is_some_and(|status| now_ms.saturating_sub(status.progress_ms) >= stalled_after)
+        {
+            issues.push(Issue::MoveStalled);
+        }
     }
     let applied = group.last_applied.map(|id| id.index);
     if group.maintenance.membership_log_index.is_none()
@@ -418,6 +439,7 @@ pub fn raft_maintenance_report(
     check_raft_maintenance(MaintenanceInputs {
         node_id,
         lag_tolerance: LAG_TOLERANCE,
+        now_ms: ursula_runtime::unix_time_ms(),
         groups: &groups,
         counts: |group| registry.counts_as_voter(group),
         placement,

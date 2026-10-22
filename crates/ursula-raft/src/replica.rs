@@ -154,6 +154,8 @@ pub(crate) struct ReplicaCore<
     /// its metrics. `None` for a replica that runs no shell.
     pub(crate) reconcile:
         Option<crate::rt::sync::watch::Receiver<ursula_proto::placement::ReconcileStatus>>,
+    /// The snapshot sends of the replica's network clients that run.
+    pub(crate) snapshot_sends: crate::openraft_work::SnapshotSends,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore<SM> {
@@ -164,6 +166,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore
             history: self.history.clone(),
             apply_health: self.apply_health.clone(),
             reconcile: self.reconcile.clone(),
+            snapshot_sends: self.snapshot_sends.clone(),
         }
     }
 }
