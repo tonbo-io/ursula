@@ -282,7 +282,7 @@ pub async fn wait_node_ready(
     let mut last_advance = Instant::now();
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
-        let view = read_view(client, nodes).await;
+        let view = read_view(client, nodes).await?;
         let placed = view
             .as_ref()
             .map(|view| view.voter_groups(target.id))
@@ -341,7 +341,10 @@ pub async fn wait_cluster_ready(
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
         let mut unready = Vec::new();
-        match read_view(client, nodes).await {
+        match read_view(client, nodes)
+            .await
+            .with_context(|| format!("{phase}: placement view"))?
+        {
             Err(refusal) => unready.push(refusal.to_string()),
             Ok(view) => {
                 if let Err(refusal) = view
@@ -651,6 +654,10 @@ mod tests {
             let app = Router::new()
                 .route("/__ursula/metrics", get(mock_metrics))
                 .route(
+                    "/__ursula/placement",
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                )
+                .route(
                     "/__ursula/leadership-shed/maintenance",
                     post(mock_drain).delete(mock_undrain),
                 )
@@ -686,8 +693,8 @@ mod tests {
         }
     }
 
-    /// The mock nodes answer no placement status, so they name no meta
-    /// leader, and the timeout says so.
+    /// The mock nodes run no meta runtime, so they name no meta leader, and
+    /// the timeout says so.
     #[tokio::test]
     async fn cluster_verification_timeout_names_the_missing_view() {
         let (nodes, _) = mock_cluster().await;

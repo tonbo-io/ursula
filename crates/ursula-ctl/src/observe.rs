@@ -136,9 +136,11 @@ pub fn check_maintenance_snapshot(
 /// Wait until every node's maintenance report is ready and it serves, the
 /// meta leader's view shows the cluster bootstrapped with every group live
 /// and no move, and every group runs on exactly its target voters with a
-/// leader among them ([`crate::view::check_groups`]). Transport failures
-/// and refusals are retried until the deadline. Decoding failures are
-/// terminal. Every error retains its original source.
+/// leader among them ([`crate::view::check_groups`]). Transport failures,
+/// `503` answers and refusals are retried until the deadline. Any other
+/// failed answer, a body that does not decode included, is terminal
+/// ([`crate::view::UnreadableStatus`] for a placement status). Every error
+/// retains its original source.
 ///
 /// Each poll observes the processes afresh with `client`'s HTTP settings, so
 /// a node may restart during the wait.
@@ -166,7 +168,7 @@ pub async fn wait_ready(
                 }
             }
             let view = crate::view::read_view(&poll, nodes)
-                .await
+                .await?
                 .map_err(ReadinessRefusal::from)?;
             let targets = view.targets().map_err(ReadinessRefusal::from)?;
             crate::view::check_groups(&targets, &snapshot, None).map_err(ReadinessRefusal::from)?;
@@ -179,12 +181,7 @@ pub async fn wait_ready(
                 let retryable = error.downcast_ref::<ReadinessRefusal>().is_some()
                     || error
                         .downcast_ref::<reqwest::Error>()
-                        .is_some_and(|source| {
-                            source.is_connect()
-                                || source.is_timeout()
-                                || source.is_body()
-                                || (source.is_request() && !source.is_builder())
-                        });
+                        .is_some_and(crate::metrics::is_transport_failure);
                 if !retryable || started.elapsed() >= timeout {
                     return Err(error);
                 }
@@ -238,7 +235,7 @@ mod tests {
     async fn wait_ready_uses_existing_probes_and_preserves_refusal_causes() {
         use axum::response::IntoResponse;
         use ursula_proto::admin::ServingReadinessReason;
-        for mode in [0, 2, 3, 4, 5, 6, 7, 8] {
+        for mode in [0, 2, 3, 4, 5, 6, 7, 8, 9] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let mut metrics =
@@ -300,6 +297,16 @@ mod tests {
                         )
                             .into_response()
                     }),
+                )
+                .route(
+                    "/__ursula/placement",
+                    axum::routing::get(move || async move {
+                        if mode == 9 {
+                            return (axum::http::StatusCode::OK, "not json").into_response();
+                        }
+                        // A node with no meta runtime.
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }),
                 );
             // No /maintenance/ready route: this is the existing 0.7 endpoint set.
             let task = tokio::spawn(async move {
@@ -321,10 +328,10 @@ mod tests {
                     node.client_url = Some(url);
                 }
             }
-            let timeout = if mode >= 7 {
-                Duration::from_millis(40)
-            } else {
-                Duration::ZERO
+            let timeout = match mode {
+                7 | 8 => Duration::from_millis(40),
+                9 => Duration::from_secs(30),
+                _ => Duration::ZERO,
             };
             let started = Instant::now();
             let result = wait_ready(
@@ -335,8 +342,8 @@ mod tests {
             )
             .await;
             if mode == 0 {
-                // A ready, serving node that answers no placement status
-                // names no meta leader.
+                // A ready, serving node that runs no meta runtime names no
+                // meta leader.
                 assert!(matches!(
                     result.unwrap_err().downcast_ref::<ReadinessRefusal>(),
                     Some(ReadinessRefusal::View(ViewRefusal::NoMetaLeader))
@@ -364,6 +371,22 @@ mod tests {
                     7 | 8 => {
                         assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_connect());
                         assert!(started.elapsed() >= timeout);
+                    }
+                    9 => {
+                        // An undecodable placement status stops the wait at
+                        // once, with the decoding failure as its source.
+                        let unreadable = error
+                            .downcast_ref::<crate::view::UnreadableStatus>()
+                            .unwrap();
+                        assert_eq!(unreadable.node, 1);
+                        assert!(
+                            unreadable
+                                .source
+                                .downcast_ref::<reqwest::Error>()
+                                .unwrap()
+                                .is_decode()
+                        );
+                        assert!(started.elapsed() < timeout);
                     }
                     _ => assert!(matches!(
                         error.downcast_ref::<ReadinessRefusal>(),
@@ -432,6 +455,10 @@ mod tests {
                         wal_disk_stat_errors: 0,
                     })
                 }),
+            )
+            .route(
+                "/__ursula/placement",
+                axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base: Url = format!("http://{}", listener.local_addr().unwrap())
@@ -447,8 +474,9 @@ mod tests {
         let timeout = Duration::from_millis(300);
 
         // The replacement passes the maintenance and serving checks, so the
-        // wait gets as far as the placement view, which this node does not
-        // serve: no poll was refused for the changed incarnation.
+        // wait gets as far as the placement view, which this node, with no
+        // meta runtime, does not give: no poll was refused for the changed
+        // incarnation.
         let refusal = wait_ready(
             &client,
             std::slice::from_ref(&node),

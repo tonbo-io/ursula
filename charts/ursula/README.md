@@ -462,7 +462,7 @@ container receives only chart-managed container settings plus explicit
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `raft.groupCount` | `64` | Number of Raft groups. Helm tests expect every node to report this count. |
+| `raft.groupCount` | `64` | Number of Raft groups. Renders `raft.group_count` and the gateway's `--raft-group-count`. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` PVC. Renders `raft.wal.path`. Must be non-empty. |
 | `raft.walFsync` | `""` | When Raft WAL appends reach stable storage. Empty renders no `raft.wal.fsync`, so the server takes `always` when each group has one or two voters and `never` otherwise. `never` acknowledges once the write is in the page cache: a host crash can cost this replica its unsynced tail, and it rejoins through the recovery gate. `always` acknowledges a batch after `fsync`. Votes, group log states and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
 | `raft.walSegmentBytes` | `67108864` | Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is also how much disk space comes back at a time. Renders `raft.wal.segment_size`. |

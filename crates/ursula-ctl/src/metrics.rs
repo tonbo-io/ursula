@@ -334,6 +334,16 @@ impl MetricsClient {
     }
 }
 
+/// Whether `error` is a transport failure: no connection, a timeout, or a
+/// request or body cut off. A poll retries these. Any other failure is the
+/// node's own answer: a refusal, or a body that does not decode.
+pub(crate) fn is_transport_failure(error: &reqwest::Error) -> bool {
+    error.is_connect()
+        || error.is_timeout()
+        || error.is_body()
+        || (error.is_request() && !error.is_builder())
+}
+
 /// Base URL of the read-only observations, metrics and serving readiness:
 /// `metrics_url`, else `client_url`, else `admin_url`. The client and admin
 /// planes serve them, so the rollout's Pod-bound admin tunnel suffices. The

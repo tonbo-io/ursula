@@ -140,7 +140,7 @@ async fn verify_observed_quorum(
         .cloned()
         .collect::<Vec<_>>();
     let observe = async {
-        let targets = crate::view::read_view(client, nodes).await?.targets()?;
+        let targets = crate::view::read_view(client, nodes).await??.targets()?;
         let initial = observe_on_targets(client, &observed, &targets, excluded).await?;
         let mut probes = Vec::new();
         for (&group_id, target) in &targets {

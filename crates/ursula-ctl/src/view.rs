@@ -14,6 +14,11 @@
 //! test pod does not reach. A view behind the meta log can only name a
 //! placement the replicas' memberships still show: a group whose replicas
 //! report other voters fails [`check_groups`].
+//!
+//! A node that gives no status, through a transport failure or a `503` (it
+//! runs no meta runtime yet), is skipped. Any other failed answer, a body
+//! that does not decode included, is an [`UnreadableStatus`]: polling again
+//! reads the same answer, so the verbs stop on it.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,6 +37,7 @@ use ursula_shard::RaftGroupId;
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
 use crate::metrics::RaftGroupView;
+use crate::metrics::is_transport_failure;
 use crate::provider::NodeInfo;
 
 /// Every group's target voters, by group id.
@@ -46,6 +52,17 @@ pub enum ViewRefusal {
         "the meta leader, node {leader}, has not bootstrapped the cluster: its view is {stage:?}"
     )]
     NotBootstrapped { leader: u64, stage: ClusterStage },
+}
+
+/// A node answered its placement status with a refusal other than `503`,
+/// or with a body that does not decode as one: `ursulactl` and the node are
+/// of different minors, or the address is not a node's.
+#[derive(Debug, thiserror::Error)]
+#[error("node {node} gave a placement status that cannot be read")]
+pub struct UnreadableStatus {
+    pub node: u64,
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 /// Why a group does not run on its target voters.
@@ -106,13 +123,14 @@ impl MetaLeaderView {
 }
 
 /// The meta leader's view: the leader the first answering node of `nodes`
-/// names, read from that leader's own status once it names itself.
+/// names, read from that leader's own status once it names itself. The
+/// inner refusal may pass on a later poll. The outer error does not.
 pub async fn read_view(
     client: &MetricsClient,
     nodes: &[NodeInfo],
-) -> Result<MetaLeaderView, ViewRefusal> {
+) -> Result<Result<MetaLeaderView, ViewRefusal>, UnreadableStatus> {
     for node in nodes {
-        let Some(status) = status_of(client, node).await else {
+        let Some(status) = status_of(client, node).await? else {
             continue;
         };
         let Some(leader) = named_leader(&status) else {
@@ -122,7 +140,7 @@ pub async fn read_view(
             Some(status)
         } else {
             match nodes.iter().find(|candidate| candidate.id == leader) {
-                Some(leader_node) => status_of(client, leader_node).await,
+                Some(leader_node) => status_of(client, leader_node).await?,
                 None => None,
             }
         };
@@ -131,24 +149,42 @@ pub async fn read_view(
         else {
             continue;
         };
-        return match own.view {
+        return Ok(match own.view {
             ClusterView::Bootstrapped(cluster) => Ok(MetaLeaderView { leader, cluster }),
             other => Err(ViewRefusal::NotBootstrapped {
                 leader,
                 stage: other.stage(),
             }),
-        };
+        });
     }
-    Err(ViewRefusal::NoMetaLeader)
+    Ok(Err(ViewRefusal::NoMetaLeader))
 }
 
-async fn status_of(client: &MetricsClient, node: &NodeInfo) -> Option<PlacementStatus> {
-    match client.placement_status(node).await {
-        Ok(status) => Some(status),
-        Err(error) => {
-            tracing::debug!(node_id = node.id, %error, "view: no placement status");
-            None
+/// Node `node`'s placement status, `None` when it gives none for now.
+async fn status_of(
+    client: &MetricsClient,
+    node: &NodeInfo,
+) -> Result<Option<PlacementStatus>, UnreadableStatus> {
+    let error = match client.placement_status(node).await {
+        Ok(status) => return Ok(Some(status)),
+        Err(error) => error,
+    };
+    match error.downcast::<reqwest::Error>() {
+        Ok(error)
+            if is_transport_failure(&error)
+                || error.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE) =>
+        {
+            tracing::debug!(node_id = node.id, %error, "view: no placement status for now");
+            Ok(None)
         }
+        Ok(error) => Err(UnreadableStatus {
+            node: node.id,
+            source: Box::new(error),
+        }),
+        Err(error) => Err(UnreadableStatus {
+            node: node.id,
+            source: error.into(),
+        }),
     }
 }
 
