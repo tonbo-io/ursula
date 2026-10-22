@@ -14,6 +14,7 @@ from ursula_chaos_agent import (
     CATCH_UP_RECOVERY_SLO_SECS,
     IMPAIRMENT_SCENARIOS,
     NODE_SERVICE_UNIT,
+    PLACEMENT_SCENARIOS,
     WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS,
     ChaosAgent,
     Node,
@@ -30,6 +31,7 @@ from ursula_chaos_agent import (
     placement_refusal,
     plan_moves,
 )
+from ursula_chaos_faultd import wal_mount_check
 
 
 class ChaosAgentStateTest(unittest.TestCase):
@@ -183,8 +185,8 @@ class ChaosAgentStateTest(unittest.TestCase):
     def test_reconciles_unresolved_impairment_injection(self) -> None:
         agent = object.__new__(ChaosAgent)
         agent.nodes = [
-            Node("ursula-chaos-node-1", "i-1", "http://172.31.80.22:4491"),
-            Node("ursula-chaos-node-2", "i-2", "http://172.31.31.150:4491"),
+            Node("ursula-chaos-node-1", "i-1", "http://192.0.2.1:4491"),
+            Node("ursula-chaos-node-2", "i-2", "http://192.0.2.2:4491"),
         ]
         recover_at = datetime.now(timezone.utc) + timedelta(minutes=1)
         agent.injections = deque(
@@ -232,9 +234,9 @@ class ChaosAgentStateTest(unittest.TestCase):
     def test_apply_fault_scenario_emits_expected_faultd_payloads(self) -> None:
         agent = object.__new__(ChaosAgent)
         agent.nodes = [
-            Node("ursula-chaos-node-1", "i-1", "http://172.31.80.22:4491"),
-            Node("ursula-chaos-node-2", "i-2", "http://172.31.31.150:4491"),
-            Node("ursula-chaos-node-3", "i-3", "http://172.31.47.237:4491"),
+            Node("ursula-chaos-node-1", "i-1", "http://192.0.2.1:4491"),
+            Node("ursula-chaos-node-2", "i-2", "http://192.0.2.2:4491"),
+            Node("ursula-chaos-node-3", "i-3", "http://192.0.2.3:4491"),
         ]
         calls: list[tuple[str, dict]] = []
         agent.apply_node_impairment = lambda node, payload: bool(
@@ -258,7 +260,7 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(payload["kind"], "partition")
         self.assertEqual(payload["direction"], "inbound")
         # peers are the two non-target nodes, never the target itself.
-        self.assertEqual(set(payload["peer_hosts"]), {"172.31.31.150", "172.31.47.237"})
+        self.assertEqual(set(payload["peer_hosts"]), {"192.0.2.2", "192.0.2.3"})
 
         agent.apply_fault_scenario("netem_reorder", [target])
         self.assertEqual(calls[-1][1]["reorder_percent"], 25)
@@ -266,6 +268,27 @@ class ChaosAgentStateTest(unittest.TestCase):
 
         agent.apply_fault_scenario("netem_duplicate", [target])
         self.assertEqual(calls[-1][1]["duplicate_percent"], 1)
+
+        # The cluster-plane faults take their peers from the node hosts, so a
+        # cluster of any size and addressing is covered: a netem scoped to
+        # each target's peers, a partition from every node outside the
+        # targets. The bug this catches: a fixed address list, which covers
+        # only the hosts it names.
+        calls.clear()
+        agent.apply_fault_scenario("cluster_netem_delay", agent.nodes)
+        self.assertEqual(
+            {name: payload["cluster_subnets"] for name, payload in calls},
+            {
+                "ursula-chaos-node-1": ["192.0.2.2/32", "192.0.2.3/32"],
+                "ursula-chaos-node-2": ["192.0.2.1/32", "192.0.2.3/32"],
+                "ursula-chaos-node-3": ["192.0.2.1/32", "192.0.2.2/32"],
+            },
+        )
+        self.assertEqual((calls[0][1]["delay_ms"], calls[0][1]["jitter_ms"]), (250, 75))
+        for scenario in ("cluster_partition", "asymmetric_partition"):
+            calls.clear()
+            agent.apply_fault_scenario(scenario, [target])
+            self.assertEqual(calls, [("ursula-chaos-node-1", {"kind": "partition", "peer_hosts": ["192.0.2.2", "192.0.2.3"]})])
 
     def test_overall_status_full_raft_sag_reads_degraded_not_outage(self) -> None:
         # full_raft_nodes sags to 0/3 on every injection while the 2/3 quorum
@@ -850,6 +873,92 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(placement_refusal(json.dumps({"reason": "no_leader"}).encode()), "no_leader")
         self.assertIsNone(placement_refusal(b"Not Found"))
 
+    def test_each_placement_scenario_plans_its_change_and_its_companion_on_the_named_role(self) -> None:
+        # Groups 0 to 2 vote on [1, 2, 3] and each is led by node 2. Meta
+        # votes on [2, 3, 5] and node 5 leads it. A third of the groups is one
+        # move, of a random group: its voter with the most replicas (node 1,
+        # the first of a tie) leaves and the active node with the fewest
+        # (node 4, the first of a tie) joins. So the source is 1, the target
+        # 4, the data leader 2, the meta leader 5 and the voter that stays
+        # and does not lead 3: every role is another node.
+        moves = {group: ("stable", [1, 2, 3]) for group in range(3)}
+        filled = {**moves, 3: ("stable", [2, 3, 4])}
+        rows = [
+            # (scenario, backend, groups, lifecycles, expected targets, expected fault, bug caught)
+            ("move_third", "ec2", moves, {}, [4], None, "no companion targets the change's incoming nodes"),
+            ("move_netem", "ec2", moves, {}, [1, 2, 3, 4, 5], "cluster_netem_delay",
+             "netem on one node, or a second netem path beside cluster_netem_delay"),
+            ("move_kill_source", "ec2", moves, {}, [1], "process_kill", "the source taken from the incoming side"),
+            ("move_kill_source", "kubernetes", moves, {}, [1], "pod_force_delete",
+             "a kill on Kubernetes that needs faultd"),
+            ("move_kill_target", "ec2", moves, {}, [4], "process_kill", "the target taken from the outgoing side"),
+            ("move_kill_target", "kubernetes", moves, {}, [4], "pod_force_delete", "kill not mapped per backend"),
+            ("move_kill_data_leader", "ec2", moves, {}, [2], "process_kill",
+             "the data leader read as the meta leader or a mover"),
+            ("move_kill_meta_leader", "kubernetes", moves, {}, [5], "pod_force_delete",
+             "the meta leader read as a data group's leader"),
+            ("move_power_cycle", "ec2", moves, {}, [4], "power_cycle", "the power cycle off the target"),
+            ("move_slow_disk", "ec2", moves, {}, [4], "slow_disk", "the slow disk off the target"),
+            ("move_blackhole_voter", "ec2", moves, {}, [3], "asymmetric_partition",
+             "the blackholed staying voter is the group's leader, or a second partition path"),
+            # Node 4 holds a replica, so node 5 holds the fewest.
+            ("move_fill_node", "ec2", filled, {}, [5], None, "the fill lands on a node that is not the emptiest"),
+            # Nodes 1, 2 and 3 hold the most replicas, and 2 and 3 vote in
+            # meta: 1 leaves.
+            ("decommission", "ec2", moves, {}, [1], None, "a meta voter decommissioned"),
+            # Without node 4 three nodes stay active, and one leaving drops
+            # below the replication factor of 3.
+            ("decommission", "ec2", moves, {4: "cordoned", 5: "cordoned"}, None, None,
+             "a decommission that drops below the replication factor"),
+        ]
+        self.assertEqual({row[0] for row in rows}, set(PLACEMENT_SCENARIOS))
+        for scenario, backend, groups, lifecycles, expected, fault, bug in rows:
+            with self.subTest(scenario=scenario, backend=backend, bug=bug):
+                agent = self.placement_agent()
+                agent.nodes = [Node(f"ursula-{node}", f"i-{node}", f"http://192.0.2.{node}:4437") for node in range(1, 6)]
+                agent.node_ids = {node.name: index for index, node in enumerate(agent.nodes, start=1)}
+                agent.fault_backend = backend
+                agent.placement_change = None
+                cluster = placement_cluster(groups, lifecycles=lifecycles)
+                cluster["params"]["meta_voters"] = [2, 3, 5]
+                status = {"view": {"bootstrapped": cluster}, "applied": {"term": 2, "leader": 5, "index": 50},
+                          "meta": {"running": {"leader": 5}}}
+                agent.confirmed_cluster = lambda cluster=cluster: (agent.nodes[0], cluster)
+
+                def sample_node(node, groups=groups, status=status):
+                    node_id = agent.node_ids[node.name]
+                    return {
+                        "name": node.name, "node_id": node_id, "metrics_state": "ok", "placement": status,
+                        "raft_group_states": [
+                            {**replica(group, voters, leader=2), "node_id": node_id}
+                            for group, (_state, voters) in groups.items()
+                            if node_id in voters
+                        ],
+                    }
+
+                agent.sample_node = sample_node
+                started = agent.start_placement_change(scenario, 1)
+                if expected is None:
+                    self.assertIsInstance(started, str)
+                    self.assertIsNone(agent.placement_change)
+                    continue
+                targets, companion = started
+                self.assertEqual(sorted(agent.node_ids[node.name] for node in targets), expected)
+                self.assertEqual(companion, fault)
+                change = agent.placement_change
+                if scenario == "decommission":
+                    self.assertEqual(change["decommission"]["node"], 1)
+                    self.assertEqual(change["queue"], [])
+                    continue
+                for move in change["queue"]:
+                    self.assertEqual(len(move["to"]), 3)
+                if scenario == "move_fill_node":
+                    self.assertTrue(change["queue"])
+                    self.assertTrue(all(move["incoming"] == 5 for move in change["queue"]))
+                else:
+                    (move,) = change["queue"]
+                    self.assertEqual((move["from"], move["to"]), ([1, 2, 3], [2, 3, 4]))
+
     def placement_agent(self) -> ChaosAgent:
         agent = object.__new__(ChaosAgent)
         agent.nodes = [Node("ursula-0", "ursula-0", "http://ursula-0:4437")]
@@ -909,8 +1018,12 @@ class PlacementTest(unittest.TestCase):
         }
         # Group 0 moves, group 1 does not: before the change both write
         # fast, during it the moving group's writes are slow.
+        # Group 0's worst append inside its move (accepted at 100, stable at
+        # 110) is 80 ms. A slower one after it is stable counts toward the
+        # moving p99 over the change, never toward the move's own spike.
         agent.append_latencies.extend(
-            [(95.0, 0, 5.0), (96.0, 1, 6.0), (101.0, 0, 80.0), (102.0, 1, 9.0), (103.0, None, 500.0)]
+            [(95.0, 0, 5.0), (96.0, 1, 6.0), (101.0, 0, 80.0), (102.0, 1, 9.0), (103.0, None, 500.0),
+             (112.0, 0, 400.0)]
         )
         topology = {"raft_groups": [{"raft_group_id": 0, "replicas": [{"current_term": 5}, {"current_term": 4}]}]}
 
@@ -931,10 +1044,68 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(measures["move_secs_max"], 10.0)
         self.assertEqual(measures["teardown_secs_max"], 5.0)
         self.assertEqual(measures["elections_total"], 2)
-        self.assertEqual(measures["write_p99_ms_moving"], 80.0)
+        self.assertEqual(measures["write_p99_ms_moving"], 400.0)
         self.assertEqual(measures["write_p99_ms_not_moving"], 9.0)
         self.assertEqual(measures["write_p99_ms_before"], 6.0)
+        self.assertEqual(measures["move_write_max_ms"], 80.0)
+        self.assertEqual(measures["move_write_max_group"], 0)
         self.assertEqual(measures["moves_refused"], {"stale_placement": 1})
+
+    def test_groups_another_actor_moves_count_as_moving_and_get_their_time(self) -> None:
+        # The bug this catches: classifying a group as moving only when the
+        # agent's own move of it was accepted. The decommission driver moves
+        # every group off its node, and a move recorded as refused after a
+        # lost answer may still commit: both would count as not moving, so
+        # their joint-phase writes would land in the not-moving p99.
+        agent = self.placement_agent()
+        agent.placement_change = {
+            "injection_id": 1, "action": "decommission", "started_at": 100.0, "queue": [], "moves": {},
+            "refused": {"placement_changed": 1}, "observed": {},
+            "decommission": {"node": 1, "accepted_at": 100.0, "removed_at": None, "refused": None},
+        }
+        agent.append_latencies.extend([(105.0, 0, 300.0), (106.0, 1, 9.0), (107.0, 2, 120.0)])
+        topology = {"raft_groups": [{"raft_group_id": 0, "replicas": [{"current_term": 4}]}]}
+
+        def observe(at, groups, retirements, lifecycle):
+            cluster = placement_cluster(groups, retirements=retirements, lifecycles={1: lifecycle})
+            placement = {"stage": "bootstrapped", "cluster": cluster, "targets": group_targets(cluster),
+                         "retirements": cluster_retirements(cluster)}
+            with patch("ursula_chaos_agent.time.monotonic", return_value=at):
+                agent.observe_placement_change(placement, topology)
+
+        # Group 0 is seen moving, then stable with node 1's replica owed,
+        # then torn down. Group 2 moved between two samples: first seen
+        # stable with its retirement pending, so it counts as moving but has
+        # no time. Group 1 never moves.
+        observe(102.0, {0: ("moving", [1, 2, 3], [2, 3, 4]), 1: ("stable", [2, 3, 4]), 2: ("stable", [2, 3, 5])},
+                {2: [1]}, "decommissioning")
+        observe(110.0, {0: ("stable", [2, 3, 4]), 1: ("stable", [2, 3, 4]), 2: ("stable", [2, 3, 5])},
+                {0: [1], 2: [1]}, "decommissioning")
+        self.assertIsNotNone(agent.placement_change)
+        observe(114.0, {0: ("stable", [2, 3, 4]), 1: ("stable", [2, 3, 4]), 2: ("stable", [2, 3, 5])},
+                {}, "removed")
+        self.assertIsNone(agent.placement_change)
+        measures = agent.injections[0]["placement"]
+        self.assertEqual(measures["moves_accepted"], 0)
+        self.assertEqual(measures["moves_observed"], 2)
+        self.assertEqual(measures["write_p99_ms_not_moving"], 9.0)
+        self.assertEqual(measures["write_p99_ms_moving"], 300.0)
+        self.assertEqual(measures["move_secs_max"], 8.0)
+        self.assertEqual(measures["teardown_secs_max"], 4.0)
+        self.assertEqual(measures["elections_total"], 1)
+        self.assertEqual(measures["move_write_max_ms"], 300.0)
+        self.assertEqual(measures["decommission_secs"], 14.0)
+
+
+class FaultdTest(unittest.TestCase):
+    def test_disk_faults_refuse_a_wal_path_on_the_root_filesystem(self) -> None:
+        # The bug this catches: `fsfreeze` or the disk limits on a WAL that
+        # sits on `/`, which freezes or throttles the host's root filesystem
+        # and faultd with it, so the `/clear` that thaws it may never run.
+        with self.assertRaises(ValueError):
+            wal_mount_check("/")
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            wal_mount_check(directory)
 
 
 if __name__ == "__main__":

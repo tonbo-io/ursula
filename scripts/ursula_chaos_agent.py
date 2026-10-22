@@ -86,8 +86,6 @@ IMPAIRMENT_SCENARIOS = {
     "oneway_partition",
     "netem_reorder",
     "netem_duplicate",
-    "move_netem_delay",
-    "blackhole",
     # The WAL disk throttled, or its filesystem frozen (a fence case: the node
     # stops all Raft traffic once its disk lease ends and returns after the
     # thaw). faultd's clear lifts both.
@@ -138,14 +136,14 @@ FAULT_PROFILES = {
 PLACEMENT_SCENARIOS: dict[str, tuple[str, str | None, str | None]] = {
     "move_third": ("move_third", None, None),
     "move_fill_node": ("move_fill_node", None, None),
-    "move_netem": ("move_third", "move_netem_delay", "all"),
+    "move_netem": ("move_third", "cluster_netem_delay", "all"),
     "move_kill_source": ("move_third", "kill", "source"),
     "move_kill_target": ("move_third", "kill", "target"),
     "move_kill_data_leader": ("move_third", "kill", "data_leader"),
     "move_kill_meta_leader": ("move_third", "kill", "meta_leader"),
     "move_power_cycle": ("move_third", "power_cycle", "target"),
     "move_slow_disk": ("move_third", "slow_disk", "target"),
-    "move_blackhole_voter": ("move_third", "blackhole", "staying_voter"),
+    "move_blackhole_voter": ("move_third", "asymmetric_partition", "staying_voter"),
     "decommission": ("decommission", None, None),
 }
 MOVE_FILL_NODE_GROUPS = 64
@@ -160,22 +158,6 @@ KUBERNETES_FAULT_SCENARIOS = {"pod_delete", "pod_force_delete"} | {
     scenario
     for scenario, (_action, companion, _role) in PLACEMENT_SCENARIOS.items()
     if companion in (None, "kill")
-}
-# Per-node raft endpoints used to scope netem to inter-node raft traffic.
-# Single-port deployment: raft replication shares the primary interface
-# (ens5) with the client API on :4491, so we target each peer's ens5 IP as a
-# /32. Client traffic originates from the agent host (not in this set) and S3
-# egresses to different destinations, so neither is impaired.
-CLUSTER_SUBNETS = [
-    "172.31.80.22/32",
-    "172.31.31.150/32",
-    "172.31.47.237/32",
-]
-# Per-node ens5 IPs, used by cluster_partition to drop raft connections.
-CLUSTER_IPS_BY_NAME = {
-    "ursula-chaos-node-1": "172.31.80.22",
-    "ursula-chaos-node-2": "172.31.31.150",
-    "ursula-chaos-node-3": "172.31.47.237",
 }
 # Error codes of Ursula's error body, {"error":{"code":...,"message":...}}
 # (extensions Section 11). The agent matches codes, never message text.
@@ -2835,6 +2817,7 @@ class ChaosAgent:
             "queue": [],
             "moves": {},
             "refused": {},
+            "observed": {},
             "decommission": None,
         }
         roles: Counter[int] = Counter(node for target in targets.values() for node in target.target)
@@ -2965,8 +2948,11 @@ class ChaosAgent:
     def observe_placement_change(self, placement: dict[str, Any], topology: dict[str, Any]) -> None:
         """Stamps each accepted move when its group is stable at its target and
         when the outgoing replica's retirement is gone, and the decommission
-        when its node is removed. Once nothing is owed, the injection gets
-        the change's measures."""
+        when its node is removed. Every group a sample sees moving or with a
+        retirement pending is recorded in `observed`, whoever moved it (the
+        decommission driver, an operator, a move whose lost answer the agent
+        counted as refused), with the same stamps. Once nothing is owed, the
+        injection gets the change's measures."""
         change = self.placement_change
         if change is None or placement["stage"] != "bootstrapped":
             return
@@ -2974,6 +2960,21 @@ class ChaosAgent:
         targets = placement["targets"]
         retirements = placement["retirements"]
         terms = group_terms(topology)
+        observed = change.setdefault("observed", {})
+        for group, target in targets.items():
+            if group not in observed and (target.state == "moving" or retirements.get(group)):
+                observed[group] = {
+                    "seen_at": now,
+                    "seen_moving": target.state == "moving",
+                    "start_term": self.last_group_terms.get(group, terms.get(group)),
+                }
+        for group, seen in observed.items():
+            target = targets.get(group)
+            if seen.get("stable_at") is None and target is not None and target.state == "stable":
+                seen["stable_at"] = now
+                seen["end_term"] = terms.get(group)
+            if seen.get("stable_at") is not None and seen.get("retired_at") is None and not retirements.get(group):
+                seen["retired_at"] = now
         for group, move in change["moves"].items():
             target = targets.get(group)
             if (
@@ -3008,39 +3009,70 @@ class ChaosAgent:
         self.event("info", f"placement change {change['action']} settled: {json.dumps(measures, sort_keys=True)}")
 
     def placement_measures(self, change: dict[str, Any], now: float) -> dict[str, Any]:
-        """The measures of design 15.4 for one settled change. Write p99s are
-        client-observed append latencies (redirects included) during the
-        change, split by whether the stream's group moved, and over the
-        same length of time before it."""
+        """The measures of design 15.4 for one settled change.
+
+        A group counts as moving when the agent's move of it was accepted
+        or when any sample during the change saw it moving or retiring, so
+        a group the decommission driver moved, or one whose lost answer was
+        recorded as refused, never counts as not moving. Each move's span
+        runs from its accepted submit (or, for a move the agent did not
+        submit, the first sample that saw it moving) to the first sample
+        that saw it stable, so such a span is as coarse as the sampling.
+        Write latencies are client-observed appends (redirects included): a
+        p99 over the change for the groups not moving and the moving ones,
+        the same over as long before the change, and each move's worst
+        append inside its own span (the joint phase), whose maximum over the
+        moves is the spike a move costs its group.
+        """
         started = change["started_at"]
-        moved = set(change["moves"])
         with self.state_lock:
             latencies = list(self.append_latencies)
+        spans: dict[int, dict[str, Any]] = {}
+        for group, seen in (change.get("observed") or {}).items():
+            # A group first seen already stable, its retirement pending, moved
+            # between two samples: it counts as moving, but has no span.
+            spans[group] = {**seen, "start_at": seen["seen_at"] if seen["seen_moving"] else None}
+        for group, move in change["moves"].items():
+            spans[group] = {**move, "start_at": move["accepted_at"]}
+        moving = set(spans)
 
-        def write_p99(low: float, high: float, moving: bool | None) -> float | None:
+        def write_p99(low: float, high: float, in_moving: bool | None) -> float | None:
             values = [
                 ms
                 for at, group, ms in latencies
-                if low <= at <= high and group is not None and (moving is None or (group in moved) == moving)
+                if low <= at <= high and group is not None and (in_moving is None or (group in moving) == in_moving)
             ]
             value = percentile(values, 0.99)
             return None if value is None else round(value, 1)
 
-        moves = list(change["moves"].values())
-        move_secs = [move["stable_at"] - move["accepted_at"] for move in moves]
-        teardown_secs = [move["retired_at"] - move["stable_at"] for move in moves]
+        timed = [span for span in spans.values() if span["start_at"] is not None and span.get("stable_at") is not None]
+        move_secs = [span["stable_at"] - span["start_at"] for span in timed]
+        teardown_secs = [span["retired_at"] - span["stable_at"] for span in timed if span.get("retired_at") is not None]
         elections = [
-            move["end_term"] - move["start_term"]
-            for move in moves
-            if isinstance(move.get("end_term"), int) and isinstance(move.get("start_term"), int)
+            span["end_term"] - span["start_term"]
+            for span in timed
+            if isinstance(span.get("end_term"), int) and isinstance(span.get("start_term"), int)
         ]
+        worst_in_span: dict[int, float] = {}
+        for at, group, ms in latencies:
+            span = spans.get(group) if group is not None else None
+            if (
+                span is None
+                or span["start_at"] is None
+                or span.get("stable_at") is None
+                or not span["start_at"] <= at <= span["stable_at"]
+            ):
+                continue
+            worst_in_span[group] = max(ms, worst_in_span.get(group, 0.0))
+        spike_group = max(worst_in_span, key=lambda group: worst_in_span[group], default=None)
         decommission = change["decommission"]
 
         def rounded(value: float | None) -> float | None:
             return None if value is None else round(value, 1)
 
         return {
-            "moves_accepted": len(moves),
+            "moves_accepted": len(change["moves"]),
+            "moves_observed": len(moving),
             "moves_refused": dict(change["refused"]),
             "change_secs": round(now - started, 1),
             "move_secs_p50": rounded(percentile(move_secs, 0.5)),
@@ -3051,6 +3083,9 @@ class ChaosAgent:
             "write_p99_ms_not_moving": write_p99(started, now, False),
             "write_p99_ms_moving": write_p99(started, now, True),
             "write_p99_ms_before": write_p99(2 * started - now, started, None),
+            "move_write_max_ms": rounded(None if spike_group is None else worst_in_span[spike_group]),
+            "move_write_max_ms_p50": rounded(percentile(list(worst_in_span.values()), 0.5)),
+            "move_write_max_group": spike_group,
             "decommission_secs": (
                 rounded(decommission["removed_at"] - decommission["accepted_at"])
                 if decommission is not None and decommission["removed_at"] is not None
@@ -3091,30 +3126,14 @@ class ChaosAgent:
         if scenario in {"pod_force_delete", "power_cycle"}:
             self.stop_instances(targets, wait=scenario == "power_cycle", force=True)
             return
-        if scenario in {"move_netem_delay", "blackhole", "slow_disk", "fsfreeze"}:
-            # Every node's own host stands for its Raft traffic, which shares
-            # the client interface: a cluster grown past the three fixed
-            # chaos hosts is covered too.
-            hosts = [urllib.parse.urlparse(node.base_url).hostname for node in self.nodes]
-            payloads = {
-                "move_netem_delay": {
-                    "kind": "netem",
-                    "scope": "cluster",
-                    "delay_ms": 250,
-                    "jitter_ms": 75,
-                    "loss_percent": 0,
-                    "cluster_subnets": [f"{host}/32" for host in hosts if host],
-                },
-                "slow_disk": {"kind": "disk", "write_iops": 50, "write_bytes_per_sec": 4 * 1024 * 1024},
-                "fsfreeze": {"kind": "fsfreeze"},
-            }
+        if scenario in {"slow_disk", "fsfreeze"}:
+            payload = (
+                {"kind": "disk", "write_iops": 50, "write_bytes_per_sec": 4 * 1024 * 1024}
+                if scenario == "slow_disk"
+                else {"kind": "fsfreeze"}
+            )
             applied = True
             for node in targets:
-                own = urllib.parse.urlparse(node.base_url).hostname
-                payload = payloads.get(scenario) or {
-                    "kind": "partition",
-                    "peer_hosts": [host for host in hosts if host and host != own],
-                }
                 applied = self.apply_node_impairment(node, payload) and applied
             self.mark_current_injection_apply_result(applied)
             return
@@ -3137,7 +3156,7 @@ class ChaosAgent:
             self.mark_current_injection_apply_result(applied)
             return
         if scenario == "asymmetric_partition":
-            peers = [urllib.parse.urlparse(node.base_url).hostname for node in self.nodes if node not in targets]
+            peers = self.peer_hosts(targets)
             applied = True
             for node in targets:
                 applied = self.apply_node_impairment(node, {"kind": "partition", "peer_hosts": peers}) and applied
@@ -3154,7 +3173,7 @@ class ChaosAgent:
                         "delay_ms": 250,
                         "jitter_ms": 75,
                         "loss_percent": 0,
-                        "cluster_subnets": CLUSTER_SUBNETS,
+                        "cluster_subnets": self.cluster_subnets(node),
                     },
                 ) and applied
             self.mark_current_injection_apply_result(applied)
@@ -3170,19 +3189,15 @@ class ChaosAgent:
                         "delay_ms": 0,
                         "jitter_ms": 0,
                         "loss_percent": 15,
-                        "cluster_subnets": CLUSTER_SUBNETS,
+                        "cluster_subnets": self.cluster_subnets(node),
                     },
                 ) and applied
             self.mark_current_injection_apply_result(applied)
             return
         if scenario == "cluster_partition":
-            peer_cluster_ips = [
-                CLUSTER_IPS_BY_NAME[node.name]
-                for node in self.nodes
-                if node not in targets and node.name in CLUSTER_IPS_BY_NAME
-            ]
+            peer_cluster_ips = self.peer_hosts(targets)
             if not peer_cluster_ips:
-                self.event("warn", "cluster_partition: no cluster IPs known for peers; skipping")
+                self.event("warn", "cluster_partition: no peer outside the targets; skipping")
                 self.mark_current_injection_apply_result(False)
                 return
             applied = True
@@ -3217,13 +3232,9 @@ class ChaosAgent:
             self.mark_current_injection_apply_result(applied)
             return
         if scenario == "oneway_partition":
-            peer_cluster_ips = [
-                CLUSTER_IPS_BY_NAME[node.name]
-                for node in self.nodes
-                if node not in targets and node.name in CLUSTER_IPS_BY_NAME
-            ]
+            peer_cluster_ips = self.peer_hosts(targets)
             if not peer_cluster_ips:
-                self.event("warn", "oneway_partition: no cluster IPs known for peers; skipping")
+                self.event("warn", "oneway_partition: no peer outside the targets; skipping")
                 self.mark_current_injection_apply_result(False)
                 return
             applied = True
@@ -3244,7 +3255,7 @@ class ChaosAgent:
                         "scope": "cluster",
                         "delay_ms": 50,
                         "reorder_percent": 25,
-                        "cluster_subnets": CLUSTER_SUBNETS,
+                        "cluster_subnets": self.cluster_subnets(node),
                     },
                 ) and applied
             self.mark_current_injection_apply_result(applied)
@@ -3258,13 +3269,30 @@ class ChaosAgent:
                         "kind": "netem",
                         "scope": "cluster",
                         "duplicate_percent": 1,
-                        "cluster_subnets": CLUSTER_SUBNETS,
+                        "cluster_subnets": self.cluster_subnets(node),
                     },
                 ) and applied
             self.mark_current_injection_apply_result(applied)
             return
         self.event("warn", f"unknown fault scenario {scenario}; falling back to clean stop")
         self.stop_instances(targets, wait=False)
+
+    def peer_hosts(self, excluding: list[Node]) -> list[str]:
+        """The hosts of every node outside `excluding`, which stand for their
+        Raft traffic: replication shares the client interface, client traffic
+        comes from the agent's host (in no node's set) and S3 goes to other
+        destinations, so impairing these hosts impairs the cluster plane only.
+        A cluster of any size and addressing is covered."""
+        return [
+            host
+            for host in (urllib.parse.urlparse(node.base_url).hostname for node in self.nodes if node not in excluding)
+            if host
+        ]
+
+    def cluster_subnets(self, node: Node) -> list[str]:
+        """The `/32` of each of `node`'s peers, for a netem scoped to the
+        cluster plane (`peer_hosts`)."""
+        return [f"{host}/32" for host in self.peer_hosts([node])]
 
     def mark_current_injection_apply_result(self, applied: bool) -> None:
         injection = self.current_injection()

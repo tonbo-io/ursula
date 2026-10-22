@@ -19,13 +19,16 @@ Fault payload schema:
   write_iops/write_bytes_per_sec  disk: the write limits of the units on the WAL disk
                   (cgroup io.max through systemd), a slow disk
   fsfreeze        freezes the WAL filesystem (`--wal-path`): every write and sync
-                  on it blocks until the thaw, a hung disk
+                  on it blocks until the thaw, a hung disk. "disk" and "fsfreeze"
+                  refuse a `--wal-path` that is not a mount point of its own
+                  other than `/`
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +83,21 @@ def default_dev() -> str:
     return "eth0"
 
 
+def wal_mount_check(path: str) -> None:
+    """Refuses a disk fault unless `path` is a filesystem of its own.
+
+    `fsfreeze` freezes the whole filesystem holding `path` and the disk limits
+    throttle its whole device. On a host whose WAL sits on the root filesystem
+    that would freeze or throttle `/`, and faultd itself, which then may never
+    serve the `/clear` that thaws it. So `path` must be a mount point other
+    than `/`, on another device than `/`.
+    """
+    if not os.path.ismount(path):
+        raise ValueError(f"--wal-path {path} is not a mount point: disk faults need the WAL on its own filesystem")
+    if os.path.realpath(path) == "/" or os.stat(path).st_dev == os.stat("/").st_dev:
+        raise ValueError(f"--wal-path {path} is the root filesystem: disk faults need the WAL on its own filesystem")
+
+
 class FaultState:
     def __init__(self, dev: str, wal_path: str) -> None:
         self.dev = default_dev() if dev == "auto" else dev
@@ -110,6 +128,12 @@ class FaultState:
         s3_patterns: list[str] | None = None,
         units: list[str] | None = None,
     ) -> None:
+        # Thaw first: a frozen WAL filesystem blocks every write on it, so a
+        # later step of this clear (systemd writes its runtime properties)
+        # could hang behind it. A thaw of a filesystem that is not frozen
+        # fails harmlessly.
+        run([self.fsfreeze, "--unfreeze", self.wal_path])
+        self.frozen_fs = False
         # Stateless: always attempt to remove the root qdisc. A daemon restart
         # or a concurrent ThreadingHTTPServer request can lose has_*_qdisc,
         # which would otherwise leave a netem delay/loss qdisc permanently
@@ -144,10 +168,7 @@ class FaultState:
         for unit in unique([*self.frozen_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
             run([self.systemctl, "thaw", unit])
         self.frozen_units = []
-        # Stateless too: a thaw of a filesystem that is not frozen fails
-        # harmlessly, and an empty limit resets the unit's runtime limit.
-        run([self.fsfreeze, "--unfreeze", self.wal_path])
-        self.frozen_fs = False
+        # Stateless too: an empty limit resets the unit's runtime limit.
         for unit in unique([*self.throttled_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
             run([self.systemctl, "set-property", "--runtime", unit, "IOWriteIOPSMax=", "IOWriteBandwidthMax="])
         self.throttled_units = []
@@ -234,8 +255,10 @@ class FaultState:
         if kind == "process":
             return self._apply_process(payload)
         if kind == "disk":
+            wal_mount_check(self.wal_path)
             return self._apply_disk(payload)
         if kind == "fsfreeze":
+            wal_mount_check(self.wal_path)
             self._must_run([self.fsfreeze, "--freeze", self.wal_path])
             self.frozen_fs = True
             return {"ok": True, "kind": "fsfreeze", "path": self.wal_path}
@@ -435,7 +458,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=4492)
     parser.add_argument("--dev", default="auto")
     parser.add_argument("--wal-path", default="/var/lib/ursula",
-                        help="mount point of the node's Raft WAL, for the disk and fsfreeze faults")
+                        help="mount point of the node's Raft WAL, for the disk and fsfreeze faults, "
+                             "which refuse a path that is not a mount point of its own other than /")
     args = parser.parse_args()
     Handler.state = FaultState(args.dev, args.wal_path)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
