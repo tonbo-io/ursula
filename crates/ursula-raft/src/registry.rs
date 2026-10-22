@@ -1216,7 +1216,8 @@ impl RaftGroupHandleRegistry {
 
     /// This node's leadership-shed state, as a node of `cluster_id` answers
     /// it. A node cannot receive a planned leadership handoff until the
-    /// recovery gate of every registered group is open.
+    /// recovery gate of every data replica that counts as a voter is open
+    /// ([`Self::recovery_barriers_ready`]).
     pub fn participation_status(
         &self,
         cluster_id: ursula_headers::ClusterId,

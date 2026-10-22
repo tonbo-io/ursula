@@ -1007,7 +1007,7 @@ pub(crate) enum PlanTaken {
 pub struct GroupRejoin {
     node_id: u64,
     group: RaftTarget,
-    metrics: OnceLock<MetricsReceiver>,
+    metrics: OnceLock<BoundRaft>,
     gate: Mutex<VoteGate>,
     vote_floor: Mutex<Option<UrsulaVote>>,
     /// The group's log store, which keeps its log state and where the gate
@@ -1052,6 +1052,17 @@ pub struct GroupRejoin {
     /// A data replica's placed role and its group's left mark, which the
     /// voter predicate reads (`crate::voter`). Bound once, at attach.
     placed: OnceLock<PlacedReplica>,
+}
+
+/// The Raft a gate is bound to ([`GroupRejoin::bind`]).
+struct BoundRaft {
+    metrics: MetricsReceiver,
+    /// Whether the replica's log held entries or a purge when its Raft was
+    /// bound. Until the Raft's first metrics report, which comes only after
+    /// its startup, the metrics show no membership, also when the log holds
+    /// one. Such a replica's membership reads as closed until the Raft
+    /// reports one ([`GroupRejoin::counts`]).
+    held_log: bool,
 }
 
 /// What a data replica's voter predicate reads beyond its engine.
@@ -1292,7 +1303,11 @@ impl GroupRejoin {
                 },
             ));
         }
-        self.metrics.set(raft.metrics()).map_err(|_already_bound| {
+        let bound = BoundRaft {
+            metrics: raft.metrics(),
+            held_log: self.last_log_id().is_some(),
+        };
+        self.metrics.set(bound).map_err(|_already_bound| {
             ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryAlreadyBound { group: self.group },
             )
@@ -1306,7 +1321,7 @@ impl GroupRejoin {
     fn metrics(&self) -> Option<RaftMetrics<UrsulaRaftTypeConfig>> {
         self.metrics
             .get()
-            .map(|metrics| metrics.borrow_watched().clone())
+            .map(|bound| bound.metrics.borrow_watched().clone())
     }
 
     /// Whether the vote gate is open.
@@ -1351,7 +1366,7 @@ impl GroupRejoin {
         let current = self
             .metrics
             .get()
-            .map(|metrics| metrics.borrow_watched().vote);
+            .map(|bound| bound.metrics.borrow_watched().vote);
         Some(match current {
             Some(vote) if vote > floor => vote,
             Some(_) | None => floor,
@@ -2489,17 +2504,27 @@ impl GroupRejoin {
     /// Whether this replica counts as a voter, by the one voter predicate
     /// (`crate::voter`): its placed role, its effective membership while
     /// its Raft is bound, and its group's left mark.
+    ///
+    /// A replica whose log held anything when its Raft was bound reads as
+    /// closed until its Raft reports a membership: before the Raft's first
+    /// metrics report the metrics show none, whatever the log lists, so a
+    /// gated replica its log lists as a voter would otherwise stop counting
+    /// in that window.
     pub fn counts(&self) -> ursula_control::Counts {
         let placed = self.placed.get();
         let left = placed.is_some_and(|placed| crate::voter::is_left(&placed.left));
         let role = placed.and_then(|placed| placed.role.placed_role());
         let me = ursula_proto::placement::NodeId::new(self.node_id);
-        let effective = self.metrics.get().map(|metrics| {
-            crate::memberships::membership_config(
-                &metrics.borrow_watched().membership_config,
+        let effective = self.metrics.get().and_then(|bound| {
+            let effective = crate::memberships::membership_config(
+                &bound.metrics.borrow_watched().membership_config,
                 crate::MembershipKind::Effective,
             )
-            .ok()
+            .ok();
+            match effective {
+                None if bound.held_log => None,
+                effective => Some(effective),
+            }
         });
         let membership = match &effective {
             None => ursula_control::ReplicaMembership::Closed,

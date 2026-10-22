@@ -458,7 +458,9 @@ whether a replica counts (`counts_as_voter` in
 `crates/ursula-control/src/placement/hosting.rs`): a confirmed placement gives
 its node the role `Voter`, or its node is a voter of a config of its effective
 membership, and its group has not marked it left. A closed replica counts
-unless it is marked left. The mark belongs to the node for the run
+unless it is marked left. So does a replica whose log held entries when its
+Raft started, until the Raft first reports a membership: before that report
+its metrics show none, whatever the log lists. The mark belongs to the node for the run
 (`crates/ursula-raft/src/voter.rs`). A live leader's barrier answer that shows
 the node a learner or no member, under the leader's vote `v`, sets it, unless an
 append with a vote of at least `v` arrived after the question. Only such an

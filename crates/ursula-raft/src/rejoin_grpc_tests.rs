@@ -275,6 +275,12 @@ async fn new_recovery_engine(
     )
     .await
     .expect("new engine on an empty WAL");
+    // Attach binds a data replica's placed role: a seed voter's counts as a
+    // voter while its empty log holds no membership (S10).
+    gate.bind_placement(
+        Arc::new(crate::FixedRole(Some(ursula_control::SeedRoleOf::Voter))),
+        registry.left_marks(),
+    );
     engine.publish_recovery(gate.clone(), registry).unwrap();
     (engine, store, gate, wal_root)
 }

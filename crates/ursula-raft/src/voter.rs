@@ -4,7 +4,10 @@
 //! A replica counts when a confirmed placement gives its node the role
 //! `Voter` ([`crate::SeedRole::placed_role`]) or its node is a voter of a
 //! config of its effective membership, and its group has not marked it
-//! left. A closed replica counts unless it is marked left.
+//! left. A closed replica counts unless it is marked left. So does an open
+//! replica whose log held anything at open while its Raft has not reported
+//! a membership yet: until that first report the metrics show none, also
+//! when the log lists the node ([`crate::GroupRejoin::counts`]).
 //!
 //! The left mark of each group ([`LeftMarks`]) belongs to the node, not to
 //! a replica's engine, so a replica closed and opened again keeps it for
@@ -34,8 +37,9 @@ use crate::types::UrsulaVote;
 /// One group's left mark, shared by the node's replicas of the group.
 pub(crate) type LeftMarkCell = Arc<Mutex<LeftMark<UrsulaVote>>>;
 
-/// The left mark of every data group this node marked, for the run. Cloning
-/// shares it.
+/// The left mark of every data group attached on this node in the run,
+/// set or not, created when its replica binds ([`LeftMarks::cell`]).
+/// Cloning shares it.
 #[derive(Debug, Clone, Default)]
 pub struct LeftMarks(Arc<Mutex<BTreeMap<RaftGroupId, LeftMarkCell>>>);
 
