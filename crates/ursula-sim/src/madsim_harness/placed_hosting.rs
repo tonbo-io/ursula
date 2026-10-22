@@ -45,6 +45,10 @@
 //!   only while its own view is bootstrapped. It does not see whether the
 //!   placement that created a replica was confirmed.
 //!
+//! A run that moved a group fails when I4, I8, I9 or the creation rule
+//! judged nothing of that group ([`HostingChecks::judged_the_moves`]), so a
+//! check that never saw the move cannot pass it.
+//!
 //! I1 ([`I1`]), I7 ([`I7`]), I14 ([`I14`]) and I15 ([`I15`]) are waits:
 //! every voter reads the acknowledged appends, a node restarted without
 //! meta serves its groups, a settled cluster's leaderships stay where they
@@ -264,6 +268,17 @@ impl Creations {
             .iter()
             .filter(|creation| !creation.bootstrapped)
             .copied()
+            .collect()
+    }
+
+    /// The nodes that created a log of `group`.
+    fn creators(&self, group: u32) -> BTreeSet<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|creation| creation.group == group)
+            .map(|creation| creation.node_id)
             .collect()
     }
 }
@@ -1415,6 +1430,20 @@ pub(super) struct HostingChecks {
     /// The placement of each group in the latest view at the last
     /// observation.
     last: BTreeMap<u32, ursula_control::GroupPlacement>,
+    /// What I4, I8 and I9 judged.
+    judged: Judged,
+}
+
+/// What I4, I8 and I9 judged across a run, by group.
+#[derive(Debug, Default)]
+struct Judged {
+    /// I4: the membership entries whose leader it checked, by index and
+    /// term.
+    entries: BTreeMap<u32, BTreeSet<(u64, u64)>>,
+    /// I8: the voter changes among the entries, by index and term.
+    voter_changes: BTreeMap<u32, BTreeSet<(u64, u64)>>,
+    /// I9: how many moves it saw converge.
+    convergences: BTreeMap<u32, u64>,
 }
 
 /// `nodes` as node ids.
@@ -1602,13 +1631,20 @@ impl HostingChecks {
 
     /// I4 and I8 over every membership entry of `group` the run's replicas
     /// showed.
-    fn entries(&self, placed: &Placed, group: u32, trace: &mut SimTrace, after_event: &str) {
+    fn entries(&mut self, placed: &Placed, group: u32, trace: &mut SimTrace, after_event: &str) {
         for ((index, term), entry) in placed.memberships.of(group) {
             // The initial membership has no leader.
             if term == 0 {
                 continue;
             }
             let rf_one_step = entry.configs.iter().all(|config| config.len() == 1);
+            if !rf_one_step {
+                self.judged
+                    .entries
+                    .entry(group)
+                    .or_default()
+                    .insert((index, term));
+            }
             if !rf_one_step
                 && !entry
                     .configs
@@ -1629,6 +1665,13 @@ impl HostingChecks {
             let [old, new] = entry.configs.as_slice() else {
                 continue;
             };
+            if old != new {
+                self.judged
+                    .voter_changes
+                    .entry(group)
+                    .or_default()
+                    .insert((index, term));
+            }
             for added in new.difference(old) {
                 if let Some(lost) = self.lost.get(&(group, *added))
                     && term > *lost
@@ -1667,6 +1710,8 @@ impl HostingChecks {
             && previous.moving().is_some()
             && placement.moving().is_none()
         {
+            let convergences = self.judged.convergences.entry(group).or_default();
+            *convergences = convergences.saturating_add(1);
             let reported = converged_at.get().index;
             let later: Vec<(u64, u64)> = placed
                 .memberships
@@ -1704,6 +1749,75 @@ impl HostingChecks {
                     format!(
                         "group {group}'s latest committed membership {configs:?} (index {index}) \
                          lists retired nodes {listed:?} as voters"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// At a run's end, for each group whose voters are no longer its seed
+    /// voters: I4 checked some entry's leader (unless the group has one
+    /// voter, whose entries I4 exempts), I8 saw a voter change, I9 saw the
+    /// move converge, and the creation rule judged a node outside the seed
+    /// voters creating the group's log. A check that judged nothing of a
+    /// moved group fails, so a vacuous pass shows.
+    pub(super) fn judged_the_moves(
+        &self,
+        cluster: &MetaCluster,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        let Some(placed) = cluster.placed.as_ref() else {
+            return;
+        };
+        for group in JOURNAL_GROUPS {
+            let seeds = cluster.seeds(group);
+            let voters = cluster.placed_voters(group);
+            if voters == seeds {
+                continue;
+            }
+            let moved = format!("group {group} moved from {seeds:?} to {voters:?}");
+            let judged = |judged: &BTreeMap<u32, BTreeSet<(u64, u64)>>| {
+                judged.get(&group).map_or(0, BTreeSet::len)
+            };
+            if voters.len() > 1 && judged(&self.judged.entries) == 0 {
+                fail(
+                    trace,
+                    I4,
+                    after_event,
+                    format!("{moved}, but I4 judged no membership entry of it"),
+                );
+            }
+            if judged(&self.judged.voter_changes) == 0 {
+                fail(
+                    trace,
+                    I8,
+                    after_event,
+                    format!("{moved}, but I8 judged no voter change of it"),
+                );
+            }
+            if self.judged.convergences.get(&group).copied().unwrap_or(0) == 0 {
+                fail(
+                    trace,
+                    I9,
+                    after_event,
+                    format!("{moved}, but I9 saw no move of it converge"),
+                );
+            }
+            let created: BTreeSet<u64> = placed
+                .creations
+                .creators(group)
+                .difference(&seeds)
+                .copied()
+                .collect();
+            if created.is_empty() {
+                fail(
+                    trace,
+                    HOSTED,
+                    after_event,
+                    format!(
+                        "{moved}, but the creation rule judged no creation of it outside its \
+                         seed voters"
                     ),
                 );
             }

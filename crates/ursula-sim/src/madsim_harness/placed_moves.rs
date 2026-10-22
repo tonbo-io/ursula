@@ -118,14 +118,20 @@ impl MetaCluster {
     }
 
     /// Whether `node_id`'s shell of `group` publishes that it takes a step
-    /// of kind `step`: one held at its pause point, while it is closed.
+    /// of kind `step`: one held at its pause point, while it is closed. The
+    /// shell publishes a report as [`ReconcileState::Reporting`], every
+    /// other step as [`ReconcileState::Stepping`].
     pub(super) fn stepping(&self, node_id: u64, group: u32, step: StepKind) -> bool {
+        let published = match step {
+            StepKind::ReportConverged => ReconcileState::Reporting,
+            step => ReconcileState::Stepping { step },
+        };
         self.registry(node_id)
             .metrics_snapshot()
             .into_iter()
             .find(|snapshot| snapshot.raft_group_id == group)
             .and_then(|snapshot| snapshot.reconcile)
-            .is_some_and(|status| status.state == ReconcileState::Stepping { step })
+            .is_some_and(|status| status.state == published)
     }
 
     /// Asks `from`'s replica of `group` to hand its leadership to `to`,

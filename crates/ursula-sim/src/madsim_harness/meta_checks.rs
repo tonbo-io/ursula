@@ -124,6 +124,16 @@ impl MetaChecks {
         }
     }
 
+    /// [`HostingChecks::judged_the_moves`] at a run's end.
+    pub(super) fn judged_the_moves(
+        &self,
+        cluster: &MetaCluster,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        self.hosting.judged_the_moves(cluster, trace, after_event);
+    }
+
     /// I12 while the claims differ: no node applied a genesis.
     pub(super) fn no_genesis(&self, trace: &mut SimTrace, after_event: &str) {
         if !self.geneses.is_empty() {

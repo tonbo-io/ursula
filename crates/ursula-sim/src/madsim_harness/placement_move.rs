@@ -47,15 +47,17 @@
 //!
 //! The moves ([`super::placed_moves`]), each to nodes that hold no role in
 //! the group and no retirement of it, with keyed appends between steps:
-//! on some seeds a move of each group at the move limit 1, the second
-//! refused until the first converged, then of each group one move of one
+//! on five nodes, on some seeds a move of each group at the move limit 1,
+//! the second refused until the first converged, then of each group one
+//! move of one
 //! voter (two at RF 2 on four nodes), its outgoing voter the leader on some
 //! seeds, and on some seeds the leader cut off on the data plane while it
 //! moves, or the move cancelled or retargeted at a drawn time or while the
 //! leader's shell holds a drawn step at its pause point. Every group then
 //! settles live on its placement (I3), a settled five-node cluster keeps
 //! its leaderships (I14, narrowed: the balancer runs in crate `ursula`), and
-//! every voter reads every acknowledged append back (I1).
+//! every voter reads every acknowledged append back (I1). A run that moved
+//! a group fails a check that judged nothing of it.
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
 //! run that decides again how its journals open. I12, I2, I3 and the
@@ -63,7 +65,8 @@
 //! every poll of the waits. The negative controls ([`Controls`]) each run a
 //! script of their own with one defence off: the three meta ones over
 //! static data groups, N3 and the reconciler's N1, N5 and N9 over placed
-//! ones.
+//! ones. N5 and N9 turn theirs off inside the script, at the step it
+//! judges, so their setup runs defended.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -176,16 +179,19 @@ impl Switched {
             Defence::MembershipCas,
             controls == Controls::StaleStep { defended: false },
         );
-        set_off(
-            Defence::PlacementBarrier,
-            controls == Controls::LaggingLeader { defended: false },
-        );
-        set_off(
-            Defence::ConvergeLeadershipProof,
-            controls == Controls::DeposedReport { defended: false },
-        );
+        // These two go off inside their scripts, at the step they judge
+        // ([`defence_off_from_here`]), so the setup runs defended.
+        set_off(Defence::PlacementBarrier, false);
+        set_off(Defence::ConvergeLeadershipProof, false);
         Self
     }
+}
+
+/// Turns `defence` off from here to the run's end when `off`, so a
+/// control's undefended run differs from its defended one only inside its
+/// script.
+fn defence_off_from_here(defence: Defence, off: bool) {
+    set_off(defence, off);
 }
 
 impl Drop for Switched {
@@ -1104,6 +1110,20 @@ impl Run {
         let before = leaders(&self.cluster);
         self.watch(phase, SETTLED).await;
         let after = leaders(&self.cluster);
+        // A group without a running leader keeps none to move, so I14
+        // would pass without judging it.
+        if let Some((group, _)) = before
+            .iter()
+            .chain(&after)
+            .find(|(_, leader)| leader.is_none())
+        {
+            meta_checks::fail(
+                &mut self.trace,
+                placed_hosting::I14,
+                phase,
+                format!("group {group} had no running leader, so I14 judged nothing of it"),
+            );
+        }
         if before != after {
             meta_checks::fail(
                 &mut self.trace,
@@ -1130,7 +1150,11 @@ impl Run {
         self.step("final_reads");
     }
 
+    /// Ends the run: a moved group fails a check that judged nothing of it
+    /// ([`MetaChecks::judged_the_moves`]).
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
+        self.checks
+            .judged_the_moves(&self.cluster, &mut self.trace, "finished");
         self.trace.push(SimEvent::PlacementMoveMetaHeld {
             genesis: self.checks.genesis().unwrap_or(0),
             nodes: self.cluster.running(),
@@ -1158,8 +1182,8 @@ pub(super) async fn run_placement_move_inner(
         Controls::PowerLossUnderNever { .. } => power_loss_under_never(seed).await,
         Controls::SeededFormation { .. } => seeded_formation(seed).await,
         Controls::StaleStep { .. } => stale_step(seed).await,
-        Controls::LaggingLeader { .. } => lagging_leader(seed).await,
-        Controls::DeposedReport { .. } => deposed_report(seed).await,
+        Controls::LaggingLeader { .. } => lagging_leader(seed, controls).await,
+        Controls::DeposedReport { .. } => deposed_report(seed, controls).await,
     }
 }
 
@@ -1411,13 +1435,14 @@ async fn stale_step(seed: u64) -> ThreeNodeRaftSimOutcome {
 }
 
 /// `negative_control_placement_barrier` (N5): group 0 moves toward a first
-/// target, and its voter B's meta replica is cut off once B's view shows
-/// it. The move is retargeted, and the leader converges without the first
-/// target's node z, which the report retires. The leadership goes to B,
-/// whose view still shows the first target: B adds z back as a learner,
-/// and its voter change waits for a confirmation it cannot get. With the
-/// defence off B promotes z (I8).
-async fn lagging_leader(seed: u64) -> ThreeNodeRaftSimOutcome {
+/// target, its leader A holding its first learner addition, and its voter
+/// B's meta replica is cut off once B's view shows the target. The move is
+/// retargeted, and A converges without the first target's node z, which
+/// the report retires. The leadership goes to B, whose view still shows
+/// the first target: B adds z back as a learner, and its voter change
+/// waits for a confirmation it cannot get. With the defence off from the
+/// handoff on, B promotes z (I8).
+async fn lagging_leader(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcome {
     const PHASE: &str = "lagging_leader";
     const GROUP: u32 = 0;
     let (mut run, roles) = placed_five(seed).await;
@@ -1426,20 +1451,23 @@ async fn lagging_leader(seed: u64) -> ThreeNodeRaftSimOutcome {
     let a = roles.leader;
     let first = roles.with(c, z);
     let second = roles.with(c, w);
-    run.cluster.hold(a, GROUP, StepKind::ConfirmView);
+    // Every leader's first step toward a new voter is its learner
+    // addition, whatever its view's freshness, so the hold is reached in
+    // the defended run and the undefended one alike.
+    run.cluster.hold(a, GROUP, StepKind::AddLearners);
     run.accepted(PHASE, GROUP, &first, None).await;
     let targets = first.clone();
     assert!(
         run.within(PHASE, MOVE_BOUND, move |cluster| {
-            cluster.stepping(a, GROUP, StepKind::ConfirmView)
+            cluster.stepping(a, GROUP, StepKind::AddLearners)
                 && cluster.every_view_targets(GROUP, &targets)
         })
         .await,
-        "node {a} never held its confirmation"
+        "node {a} never held its learner addition"
     );
     run.cluster.cut_meta(b);
     run.accepted(PHASE, GROUP, &second, Some(b)).await;
-    run.cluster.release(a, GROUP, StepKind::ConfirmView);
+    run.cluster.release(a, GROUP, StepKind::AddLearners);
     let retired = second.clone();
     run.until(PHASE, I3, MOVE_BOUND, move |cluster| {
         let view = cluster.latest_view();
@@ -1452,6 +1480,10 @@ async fn lagging_leader(seed: u64) -> ThreeNodeRaftSimOutcome {
             .then(|| format!("group {GROUP} has not converged on {retired:?}"))
     })
     .await;
+    defence_off_from_here(
+        Defence::PlacementBarrier,
+        controls == Controls::LaggingLeader { defended: false },
+    );
     run.transfer(PHASE, GROUP, a, b).await;
     run.watch(PHASE, Duration::from_secs(5)).await;
     run.cluster.heal_meta(b);
@@ -1461,14 +1493,14 @@ async fn lagging_leader(seed: u64) -> ThreeNodeRaftSimOutcome {
 }
 
 /// `negative_control_converge_leadership_proof` (N9): group 0 moves toward a
-/// first target, and its voter B's meta replica is cut off once B's view
-/// shows it. The move is retargeted, and the leader A reaches the new
-/// target and holds its report. The leadership goes to B and A is cut off
-/// on the data plane. B, whose view still shows the first target, adds the
-/// first target's node as a learner. A's report then runs: its leadership
-/// proof fails. With the defence off A reports the membership B changed
-/// (I9).
-async fn deposed_report(seed: u64) -> ThreeNodeRaftSimOutcome {
+/// first target, its leader A holding its first learner addition, and its
+/// voter B's meta replica is cut off once B's view shows the target. The
+/// move is retargeted, and A reaches the new target and holds its report.
+/// The leadership goes to B and A is cut off on the data plane. B, whose
+/// view still shows the first target, adds the first target's node as a
+/// learner. A's report then runs: its leadership proof fails. With the
+/// defence off from there on, A reports the membership B changed (I9).
+async fn deposed_report(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcome {
     const PHASE: &str = "deposed_report";
     const GROUP: u32 = 0;
     let (mut run, roles) = placed_five(seed).await;
@@ -1477,21 +1509,24 @@ async fn deposed_report(seed: u64) -> ThreeNodeRaftSimOutcome {
     let a = roles.leader;
     let first = roles.with(c, y);
     let second = roles.with(c, x);
-    run.cluster.hold(a, GROUP, StepKind::ConfirmView);
+    // Every leader's first step toward a new voter is its learner
+    // addition, whatever its view's freshness, so the hold is reached in
+    // the defended run and the undefended one alike.
+    run.cluster.hold(a, GROUP, StepKind::AddLearners);
     run.accepted(PHASE, GROUP, &first, None).await;
     let targets = first.clone();
     assert!(
         run.within(PHASE, MOVE_BOUND, move |cluster| {
-            cluster.stepping(a, GROUP, StepKind::ConfirmView)
+            cluster.stepping(a, GROUP, StepKind::AddLearners)
                 && cluster.every_view_targets(GROUP, &targets)
         })
         .await,
-        "node {a} never held its confirmation"
+        "node {a} never held its learner addition"
     );
     run.cluster.cut_meta(b);
     run.cluster.hold(a, GROUP, StepKind::ReportConverged);
     run.accepted(PHASE, GROUP, &second, Some(b)).await;
-    run.cluster.release(a, GROUP, StepKind::ConfirmView);
+    run.cluster.release(a, GROUP, StepKind::AddLearners);
     assert!(
         run.within(PHASE, MOVE_BOUND, move |cluster| {
             cluster.stepping(a, GROUP, StepKind::ReportConverged)
@@ -1514,6 +1549,10 @@ async fn deposed_report(seed: u64) -> ThreeNodeRaftSimOutcome {
         })
         .await,
         "node {b} never added node {y} back as a learner"
+    );
+    defence_off_from_here(
+        Defence::ConvergeLeadershipProof,
+        controls == Controls::DeposedReport { defended: false },
     );
     run.cluster.release(a, GROUP, StepKind::ReportConverged);
     run.watch(PHASE, Duration::from_secs(3)).await;
