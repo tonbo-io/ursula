@@ -55,11 +55,7 @@ impl GroupLeadership {
         let role = if !fence.admits(now) && fence_rules_leadership() {
             LeaderRole::Unknown
         } else if metrics.state == ServerState::Leader {
-            let own_quorum = metrics
-                .membership_config
-                .membership()
-                .voter_ids()
-                .all(|voter| voter == metrics.id);
+            let own_quorum = own_quorum(metrics);
             let acked_age = metrics
                 .last_quorum_acked
                 .as_ref()
@@ -137,6 +133,19 @@ impl GroupLeadership {
 /// where it decides the role. A negative control turns it off
 /// (`Defence::FencedLeadership`), and the predicate then reads OpenRaft's
 /// server state alone.
+/// Whether the replica whose metrics are `metrics` is the only voter of its
+/// effective membership, joint configs included, and so its own quorum.
+/// OpenRaft's leader then has no follower to acknowledge it: its
+/// `last_quorum_acked` stays at the time it was elected, and only
+/// `is_self_quorum` tells it leads.
+pub(crate) fn own_quorum(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .all(|voter| voter == metrics.id)
+}
+
 fn fence_rules_leadership() -> bool {
     use ursula_stream::sim_controls::Defence;
     if ursula_stream::sim_controls::off(Defence::FencedLeadership) {
