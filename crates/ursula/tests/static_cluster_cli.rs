@@ -5850,12 +5850,8 @@ const JOURNAL_RECLAIM_WAIT: Duration = Duration::from_secs(220);
 /// 64 KiB so that a few writes seal them, and a follower's install copy
 /// fits inside a 20 s `raft.install_snapshot_timeout`.
 ///
-/// The test applies it to the torn-down source only. With 64 KiB segments
-/// the journal reports a group lagging as soon as its live log keeps a
-/// sealed segment, and the snapshot cadence then builds that group's
-/// snapshot unasked, which stores the node's own object of it. On every
-/// node that would leave the dead-node phase without a group whose objects
-/// the dead node never owned.
+/// The test applies it to the torn-down source only, the one node whose
+/// journal it inspects.
 fn bound_dead_journal_data(node: &MetaNode) {
     let text = std::fs::read_to_string(&node.config).expect("read node config");
     assert!(
@@ -6221,13 +6217,11 @@ async fn assert_move_refused_as_removed(
 ///    `placement-unavailable`. A move naming it answers `409 node_removed`
 ///    and applies nothing, and `verify-removed` passes. A removed node that
 ///    keeps a replica open fails it.
-/// 3. Node 5 snapshots group 1, so it owns an object of the group, and it
-///    holds a group it owns no object of (only node 4 runs the small
-///    journal segments that make the snapshot cadence build unasked). The
-///    test fails if node 5 owns objects of every group it holds. Node 5 is
-///    killed and decommissioned: it is removed once its last group
-///    converged without it, and every group ends on nodes 1 to 3 and takes
-///    writes.
+/// 3. Node 5 snapshots group 1, so it records and owns an object of the
+///    group. It is killed, and the groups it holds a snapshot record and an
+///    object of are those the sweep takes. Node 5 is decommissioned: it is
+///    removed once its last group converged without it, and every group
+///    ends on nodes 1 to 3 and takes writes.
 /// 4. The meta leader hands the meta leadership alone to another meta
 ///    voter, so data leaderships stay put, and the new leader's sweep runs
 ///    at once (a pass runs when a leadership begins). A pass that leaves a
@@ -6243,11 +6237,17 @@ async fn assert_move_refused_as_removed(
 /// 5. Node 5 restarts with its old disk. It ends running no data replica,
 ///    keeping none open, reporting `node_removed`, ready, and shedding
 ///    `placement-unavailable`, and stays so for longer than its asker's
-///    interval. Its metrics never list a replica of group 1, whose object
-///    the sweep took, while the test polls them. It leads nothing, so no
-///    leadership it may have won stays with it. A move naming it answers
-///    `409 node_removed`, `verify-removed` passes for nodes 4 and 5, and
-///    `verify-not-removed` refuses node 5. Every group still serves.
+///    interval. Its metrics never list a replica of a group whose object
+///    the sweep took, group 1 among them, while the test polls them. It
+///    leads nothing, so no leadership it may have won stays with it. A move
+///    naming it answers `409 node_removed`, `verify-removed` passes for
+///    nodes 4 and 5, and `verify-not-removed` refuses node 5. Every group
+///    still serves. This holds whichever of its groups node 5 owns objects
+///    of, and on S3 it owns one of every group it holds: every replica
+///    snapshots a group it applied log of and holds no snapshot of, and an
+///    install stores the receiver's own copy. So the phase does not show
+///    that a removed node closes a group it opens from its log after one
+///    asker round. S5(d)'s DST covers that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_groups() {
     use ursula_ctl::placement::lifecycle::LifecycleEnd;
@@ -6571,31 +6571,39 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
     .await
     .expect("verify-removed passes for node 4");
 
-    // 3. Node 5 owns an object of group 1 and none of another group it
-    // holds, is killed and is decommissioned.
+    // 3. Node 5 records and owns a snapshot of group 1, is killed and is
+    // decommissioned.
     let dead = &nodes[4];
     let held = placed_on(&cluster, 5);
     assert!(held.contains(&1), "{cluster:?}");
     snapshot_group(&client, &dead.admin(), 1).await;
-    let swept = eventually(
+    eventually(
         &mut procs,
-        "node 5 stores its snapshot of group 1",
+        "node 5 records and stores its snapshot of group 1",
         async || {
-            let swept = groups_with_objects(&cold_store, &prefix, 5).await?;
-            if swept.contains(&1) {
-                Ok(swept)
+            let objects = owned_objects(&cold_store, &prefix, 5, 1).await?;
+            let records = data_snapshot_records(&dead.wal, 1);
+            if objects.is_empty() || records.is_empty() {
+                Err(format!("objects {objects:?}, records {records:?}"))
             } else {
-                Err(format!("objects of groups {swept:?}"))
+                Ok(())
             }
         },
     )
     .await;
-    assert!(
-        held.iter()
-            .any(|group| !swept.contains(&u32::try_from(*group).unwrap())),
-        "node 5 owns objects of every group it holds, {held:?}: {swept:?}"
-    );
     procs.kill(5);
+    // The groups whose snapshot record on node 5's disk names an object the
+    // sweep takes. An object without a record (a build cut short by the
+    // kill) is left out: its group opens from the log.
+    let objects = eventually(&mut procs, "list node 5's snapshot objects", async || {
+        groups_with_objects(&cold_store, &prefix, 5).await
+    })
+    .await;
+    let swept: BTreeSet<u32> = objects
+        .into_iter()
+        .filter(|group| !data_snapshot_records(&dead.wal, *group).is_empty())
+        .collect();
+    assert!(swept.contains(&1), "{swept:?}");
     let mut out = Vec::new();
     let end = ursula_ctl::placement::lifecycle::decommission(
         &ctl(),
