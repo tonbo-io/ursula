@@ -13,9 +13,10 @@
 //! [`state_machine`], [`watch`]) encode nothing of their own, and
 //! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
 //! The runtime and its tasks ([`runtime`], [`handle`], [`genesis_driver`],
-//! [`registration`], `root`, [`formation`], [`damage`], [`pause`] and the meta
-//! membership target) encode nothing either: they write only the commands
-//! above. The placement status ([`status`]) and the placement routes'
+//! [`registration`], `root`, [`formation`], [`decommission`], [`liveness`],
+//! [`damage`], [`pause`] and the meta membership target) encode nothing
+//! either: they write only the commands above. The placement status
+//! ([`status`]) with the meta leader's report and the placement routes'
 //! refusals (`api`) are admin JSON.
 //!
 //! `#[serde(other)]` is allowed only on admin JSON enums (the admin
@@ -36,6 +37,9 @@
 //!   ([`confirm::MetaBarrierError`]), never encoded.
 //! - [`damage`]: which refusals of the commit screen damage the meta
 //!   replica for good.
+//! - [`decommission`]: the meta leader's decommission driver, which moves
+//!   decommissioning nodes' groups away, and its report
+//!   (`ursula_control::MetaLeaderReport`).
 //! - [`formation`]: the meta leader's `Bootstrap` of the cluster.
 //! - [`genesis`]: the genesis probe a node sends before the meta group
 //!   forms, and its answer.
@@ -43,6 +47,9 @@
 //!   probe, and what the probes last heard ([`genesis_driver::GenesisStatus`]).
 //! - [`handle`]: how this node writes to the meta group and confirms its
 //!   view ([`handle::MetaHandle`], [`handle::MetaWriteError`]).
+//! - [`liveness`]: which nodes the meta leader takes as live move targets,
+//!   from its heartbeat acknowledgements and the peers' WAL-disk sheds
+//!   ([`liveness::WalDiskSheds`]).
 //! - [`pause`]: the pause points tests stop the meta runtime at.
 //! - [`registration`]: this node's registration with the meta group.
 //! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
@@ -69,10 +76,12 @@
 mod api;
 pub mod confirm;
 pub mod damage;
+pub mod decommission;
 pub mod formation;
 pub mod genesis;
 pub mod genesis_driver;
 pub mod handle;
+pub mod liveness;
 pub mod pause;
 pub mod registration;
 pub mod replica;

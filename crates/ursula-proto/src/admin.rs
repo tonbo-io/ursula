@@ -624,6 +624,10 @@ pub enum RaftMaintenanceIssue {
     /// The node runs no meta replica in this run. It replaces every issue
     /// the view gives: the replicas keep only their voter checks.
     MetaDamaged,
+    /// The node's view or the meta group's answer to its registration says
+    /// it is removed. It replaces every other node issue and blocks
+    /// neither readiness. The node's replicas keep their group checks.
+    NodeRemoved,
     /// `raft.group_count` differs from the cluster's.
     GroupCountMismatch,
     /// The configured effective replication factor, `raft.placement.
@@ -699,6 +703,7 @@ impl RaftMaintenanceIssue {
             | Self::GenesisMismatch
             | Self::MetaUnavailable
             | Self::MetaDamaged
+            | Self::NodeRemoved
             | Self::ReplicationFactorMismatch
             | Self::UnplacedReplica
             | Self::MoveInProgress
@@ -712,7 +717,10 @@ impl RaftMaintenanceIssue {
 
     /// Whether the issue keeps a second disruption from being safe.
     fn blocks_ready(&self) -> bool {
-        !matches!(self, Self::MetaUnavailable | Self::MetaDamaged)
+        !matches!(
+            self,
+            Self::MetaUnavailable | Self::MetaDamaged | Self::NodeRemoved
+        )
     }
 
     /// Whether the issue is one a replica that does not count as a voter
@@ -1560,6 +1568,7 @@ mod serving_readiness_tests {
             (Issue::GenesisMismatch, false, true),
             (Issue::MetaUnavailable, false, false),
             (Issue::MetaDamaged, false, false),
+            (Issue::NodeRemoved, false, false),
             (Issue::GroupCountMismatch, true, true),
             (Issue::ReplicationFactorMismatch, false, true),
             (Issue::Unknown, true, true),

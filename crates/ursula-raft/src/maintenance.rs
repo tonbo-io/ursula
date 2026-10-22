@@ -85,7 +85,9 @@ pub struct MaintenanceInputs<'a, C> {
 ///
 /// Node issues: a node without a meta runtime reports `placement_unknown`.
 /// A damaged meta replica reports `meta_damaged` and replaces every issue
-/// the view gives, the inventory included. Otherwise the bootstrapped view
+/// the view gives, the inventory included. A node whose view or
+/// registration says it is removed reports `node_removed` alone among its
+/// node issues, and its replicas keep their group checks. Otherwise the bootstrapped view
 /// gives the inventory and the mismatches with the node's genesis claim. A
 /// view that has not bootstrapped gives `placement_not_bootstrapped` when
 /// the node holds or runs replicas, and `placement_unknown` when it holds
@@ -133,7 +135,13 @@ pub fn check_raft_maintenance(
         .map(|group| group.raft_group_id)
         .collect::<BTreeSet<_>>();
     let cluster = match placement {
-        Some(placement) => read_placement(&mut report, placement, &running, &counts),
+        Some(placement) => {
+            let cluster = read_placement(&mut report, placement, &running, &counts);
+            if knows_removed(placement.status) {
+                report.node_issues = vec![Issue::NodeRemoved];
+            }
+            cluster
+        }
         None => {
             report.node_issues.push(Issue::PlacementUnknown);
             None
@@ -200,6 +208,22 @@ pub fn check_raft_maintenance(
         }
     }
     report
+}
+
+/// Whether the node's status says it is removed, by its view or its
+/// registration's answers ([`ursula_control::Standing::knows_removed`]).
+fn knows_removed(status: &PlacementStatus) -> bool {
+    let cluster = match &status.view {
+        ClusterView::Bootstrapped(cluster) => Some(cluster),
+        ClusterView::MetaGenesis { .. }
+        | ClusterView::MetaCatchingUp
+        | ClusterView::Registering { .. }
+        | ClusterView::FormationCut => None,
+    };
+    status
+        .registration
+        .standing()
+        .knows_removed(cluster, status.node)
 }
 
 /// Fills the report's placement, inventory and node issues from

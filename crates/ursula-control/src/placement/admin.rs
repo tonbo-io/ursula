@@ -32,6 +32,7 @@ use ursula_shard::RaftGroupId;
 use super::command::ControlError;
 use super::decommission::BlockedMove;
 use super::decommission::NodeEligibility;
+use super::hosting::Standing;
 use super::state::Cluster;
 use super::state::GroupPlacement;
 use super::state::MoveLimit;
@@ -135,6 +136,10 @@ pub struct PlacementStatus {
     /// Why the last `Bootstrap` this node submitted was refused, if it was.
     #[serde(deserialize_with = "required_option")]
     pub last_bootstrap_refusal: Option<ControlError>,
+    /// The meta leader's report, when this node leads the meta group with
+    /// a settled history, else `null`.
+    #[serde(deserialize_with = "required_option")]
+    pub leader_report: Option<MetaLeaderReport>,
 }
 
 /// How this node's meta replica runs. Closed, like [`MetaDamageKind`].
@@ -180,6 +185,19 @@ pub enum RegistrationStatus {
     /// The meta group refused the node as removed: it treats itself as
     /// removed until it restarts.
     Removed,
+}
+
+impl RegistrationStatus {
+    /// What the answers say of the node's standing: removed only after a
+    /// `NodeRemoved` refusal.
+    pub fn standing(&self) -> Standing {
+        match self {
+            Self::Removed => Standing::Removed,
+            Self::Pending | Self::Answered(_) | Self::RootRefused { .. } | Self::Refused(_) => {
+                Standing::Member
+            }
+        }
+    }
 }
 
 /// `POST /__ursula/placement/groups/{group}/move`: move the group to `to`

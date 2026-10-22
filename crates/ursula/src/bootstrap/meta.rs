@@ -33,6 +33,7 @@ use ursula_raft::meta::status::MetaStatusReader;
 use ursula_shard::ShardMapError;
 
 use crate::bootstrap::hosting::SpawnedHosting;
+use crate::bootstrap::participation::ParticipationSheds;
 use crate::bootstrap::participation::PeerParticipation;
 
 /// What the spawn path prepared for the meta runtime: the opened meta
@@ -254,6 +255,10 @@ pub(crate) fn open_meta(
             },
             engine,
             snapshots: Some(snapshots),
+            wal_disk_sheds: Arc::new(ParticipationSheds {
+                participation: participation.clone(),
+                registry: registry.clone(),
+            }),
         },
         participation,
     })
