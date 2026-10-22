@@ -8728,6 +8728,314 @@ async fn cli_a_wiped_voter_is_not_ready_before_its_groups() {
     }
 }
 
+/// One-way delay of every link in the first phase of
+/// [`cli_slow_links_slow_writes_instead_of_stopping_them`]: a round trip of
+/// 400 ms, longer than 0.9's 250 ms heartbeat interval and shorter than the
+/// 600 ms one.
+const SLOW_LINK_IDLE_ONE_WAY: Duration = Duration::from_millis(200);
+/// One-way delay of every link in the second phase: a round trip of 800 ms,
+/// longer than the 600 ms heartbeat interval, which OpenRaft passes each
+/// Append call as its option, and shorter than the 1.5 s minimum election
+/// timeout.
+const SLOW_LINK_BUSY_ONE_WAY: Duration = Duration::from_millis(400);
+/// A cluster group's leader lease, its `election_timeout_max`.
+const SLOW_LINK_LEADER_LEASE: Duration = Duration::from_secs(3);
+/// The cluster-egress probe timeout of the slow-link test, in milliseconds:
+/// longer than either phase's round trip, plus a window update for the
+/// probe's payload.
+const SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS: u64 = 5000;
+
+/// A TCP link in front of a node's listener that holds every byte it
+/// carries for the same one-way delay in each direction, as a `netem delay`
+/// on a host's interface does. The delay starts at zero and applies to the
+/// bytes read after it changes. Bytes keep their order.
+struct DelayedLink {
+    url: String,
+    delay: tokio::sync::watch::Sender<Duration>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedLink {
+    async fn start(target: &str) -> Self {
+        let target = target.trim_start_matches("http://").to_owned();
+        // A reserved port, as for `RaftProxy`.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free_port()))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (delay, delays) = tokio::sync::watch::channel(Duration::ZERO);
+        let task = tokio::spawn(async move {
+            // Dropped with the task, which aborts every connection.
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                // A listener that fails to accept ends the link.
+                let Ok((inbound, _peer)) = listener.accept().await else {
+                    return;
+                };
+                while connections.try_join_next().is_some() {}
+                let target = target.clone();
+                let delays = delays.clone();
+                connections.spawn(async move {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    inbound.set_nodelay(true).unwrap();
+                    outbound.set_nodelay(true).unwrap();
+                    let (inbound_read, inbound_write) = inbound.into_split();
+                    let (outbound_read, outbound_write) = outbound.into_split();
+                    tokio::join!(
+                        delayed_copy(inbound_read, outbound_write, delays.clone()),
+                        delayed_copy(outbound_read, inbound_write, delays),
+                    );
+                });
+            }
+        });
+        Self { url, delay, task }
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay.send_replace(delay);
+    }
+}
+
+impl Drop for DelayedLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Copies `from` to `to`, writing each chunk once the delay `delays` held
+/// when it was read has passed.
+async fn delayed_copy(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delays: tokio::sync::watch::Receiver<Duration>,
+) {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let (chunks, mut due) =
+        tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let read = async move {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = match from.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let at = tokio::time::Instant::now()
+                .checked_add(*delays.borrow())
+                .unwrap();
+            if chunks.send((at, buffer[..read].to_vec())).is_err() {
+                break;
+            }
+        }
+    };
+    let write = async move {
+        while let Some((at, chunk)) = due.recv().await {
+            tokio::time::sleep_until(at).await;
+            if to.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        // The peer reads the end of the stream where this side's ended.
+        to.shutdown().await.unwrap_or_default();
+    };
+    tokio::join!(read, write);
+}
+
+/// Each group's `(leader, term)` as every node of `nodes` reports it.
+async fn group_leaders_and_terms(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> BTreeMap<u64, BTreeSet<(Option<u64>, u64)>> {
+    let mut views: BTreeMap<u64, BTreeSet<(Option<u64>, u64)>> = BTreeMap::new();
+    for node in nodes {
+        let what = format!("node {} answers its metrics", node.id);
+        let metrics = eventually(procs, &what, async || {
+            try_node_metrics(client, &node.url()).await
+        })
+        .await;
+        for group in metrics.groups {
+            views
+                .entry(group.raft_group_id)
+                .or_default()
+                .insert((group.current_leader, group.current_term));
+        }
+    }
+    views
+}
+
+/// Appends `payload` to `url` once: how long its `204` took, or why the
+/// append was not acknowledged.
+async fn append_once(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &'static str,
+) -> Result<Duration, String> {
+    let started = std::time::Instant::now();
+    let response = client
+        .post(url)
+        .header("content-type", "text/plain")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|err| format!("append {payload} to {url} failed: {err}"))?;
+    let status = response.status();
+    if status != reqwest::StatusCode::NO_CONTENT {
+        return Err(format!(
+            "append {payload} to {url}: {status} {:?}",
+            response.text().await
+        ));
+    }
+    Ok(started.elapsed())
+}
+
+/// Checks `appended`, the outcome of one append of `payload` to `url`: it
+/// was acknowledged, and after at least `round_trip`.
+fn check_slow_append(
+    url: &str,
+    payload: &str,
+    round_trip: Duration,
+    appended: Result<Duration, String>,
+) -> Result<(), String> {
+    let took = appended?;
+    if took < round_trip {
+        return Err(format!(
+            "append {payload} to {url} took {took:?}, less than a round trip of {round_trip:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A slow link slows replication instead of stopping it. Once every group's
+/// leadership settled, every node's Raft traffic passes a link that holds
+/// each byte for a one-way delay, in two phases, and no group changes its
+/// leader or term in either.
+///
+/// - At [`SLOW_LINK_IDLE_ONE_WAY`] every group stays idle for longer than
+///   [`SLOW_LINK_LEADER_LEASE`], so only heartbeat answers keep a leader's
+///   lease. The first write to each group is then acknowledged. With a
+///   heartbeat interval shorter than the round trip, every heartbeat goes
+///   unanswered in time, the lease lapses and the write is refused.
+/// - At [`SLOW_LINK_BUSY_ONE_WAY`] one writer per group appends back to back,
+///   and every append is acknowledged at its first attempt. A transport that
+///   waits for an Append's answer only the heartbeat interval OpenRaft gives
+///   the call as its option fails every append over such links. This also
+///   pins that OpenRaft puts no timeout of its own on replication calls.
+///
+/// Linearizable reads, back at the first delay, return every write.
+///
+/// The nodes' cluster-egress probes wait [`SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS`]
+/// instead of the default 200 ms. The egress gate judges added delay as
+/// impaired egress by design and would shed every node's leaderships, which
+/// is not what this test pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the slow-link test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let mut links = Vec::new();
+    for node in &nodes {
+        links.push(DelayedLink::start(&node.url()).await);
+    }
+    let peers = nodes
+        .iter()
+        .zip(&links)
+        .map(|(node, link)| (node.id, link.url.clone()))
+        .collect::<Vec<_>>();
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        egress_probe_timeout_ms: Some(SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let streams = stream_per_group("slowlink");
+    let url = |stream: &str| format!("{}/slowlink/{stream}", nodes[0].url());
+    for stream in &streams {
+        put_until_created(&client, &url(stream)).await;
+        post_until_no_content(&client, &url(stream), "fast;").await;
+    }
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let settled_leaders = group_leaders_and_terms(&client, &mut procs, &nodes).await;
+    assert!(
+        settled_leaders.values().all(|views| views.len() == 1),
+        "{settled_leaders:?}"
+    );
+
+    // Idle groups: only heartbeats renew the leases.
+    for link in &links {
+        link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
+    }
+    tokio::time::sleep(
+        SLOW_LINK_LEADER_LEASE
+            .checked_add(Duration::from_secs(1))
+            .unwrap(),
+    )
+    .await;
+    let idle_round_trip = SLOW_LINK_IDLE_ONE_WAY.checked_mul(2).unwrap();
+    for stream in &streams {
+        let url = url(stream);
+        let appended = append_once(&client, &url, "idle;").await;
+        if let Err(err) = check_slow_append(&url, "idle;", idle_round_trip, appended) {
+            panic!("{err}\n{}", procs.reports());
+        }
+    }
+
+    // Busy groups: append answers renew the leases, and heartbeats go
+    // unanswered in time.
+    for link in &links {
+        link.set_delay(SLOW_LINK_BUSY_ONE_WAY);
+    }
+    let busy_round_trip = SLOW_LINK_BUSY_ONE_WAY.checked_mul(2).unwrap();
+    let mut writers = tokio::task::JoinSet::new();
+    for stream in &streams {
+        let client = client.clone();
+        let url = url(stream);
+        writers.spawn(async move {
+            for payload in ["busy-1;", "busy-2;", "busy-3;"] {
+                let appended = append_once(&client, &url, payload).await;
+                check_slow_append(&url, payload, busy_round_trip, appended)?;
+            }
+            Ok::<(), String>(())
+        });
+    }
+    while let Some(writer) = writers.join_next().await {
+        if let Err(err) = writer.expect("a writer task") {
+            panic!("{err}\n{}", procs.reports());
+        }
+    }
+    assert_eq!(
+        group_leaders_and_terms(&client, &mut procs, &nodes).await,
+        settled_leaders,
+        "a group changed its leader or term over the slow links"
+    );
+
+    // A ReadIndex read needs heartbeat answers within the heartbeat interval.
+    for link in &links {
+        link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
+    }
+    for stream in &streams {
+        read_until_matches(
+            &client,
+            &format!("{}?offset=0&max_bytes=64", url(stream)),
+            b"fast;idle;busy-1;busy-2;busy-3;",
+        )
+        .await;
+    }
+}
+
 /// IT-4 (#768): a WAL root opens only under the node id that created it.
 /// Node 2 started on node 1's WAL refuses to start, naming both ids, and
 /// leaves the root as it was.
@@ -9366,8 +9674,8 @@ fn write_node_toml(
     admin_port
 }
 
-/// The meta, placement and cold-flush keys of a node config. `None` leaves
-/// a key out, so the server's default applies.
+/// The meta, placement, cold-flush and egress-probe keys of a node config.
+/// `None` leaves a key out, so the server's default applies.
 #[derive(Debug, Clone, Copy, Default)]
 struct MetaToml<'a> {
     /// `raft.meta_voters`.
@@ -9376,6 +9684,8 @@ struct MetaToml<'a> {
     replication_factor: Option<u8>,
     /// `storage.cold.flush_min_hot_size`, in bytes.
     flush_min_hot_bytes: Option<u64>,
+    /// `governance.cluster_probe.timeout`, in milliseconds.
+    egress_probe_timeout_ms: Option<u64>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -9508,6 +9818,14 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
+        }
+
+        if let Some(timeout_ms) = meta.egress_probe_timeout_ms {
+            writeln!(
+                config,
+                "\n[governance.cluster_probe]\ntimeout = \"{timeout_ms}ms\""
+            )
+            .unwrap();
         }
 
         std::fs::write(path, config).expect("write node toml config");

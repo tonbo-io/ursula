@@ -29,13 +29,34 @@ use crate::rejoin::GroupRejoin;
 use crate::rejoin::RECOVERY_INTERVAL;
 use crate::rejoin::RECOVERY_STALL_AFTER;
 
-/// Minimum election timeout of every data-group Raft, in milliseconds.
-const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+/// Minimum election timeout of every cluster Raft group, in milliseconds.
+pub(crate) const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+
+/// Heartbeat interval of every cluster Raft group, in milliseconds: two
+/// fifths of the minimum election timeout.
+///
+/// OpenRaft waits at most one heartbeat interval for a heartbeat's answer.
+/// That makes it the longest round trip over which an idle group keeps
+/// working: its leader takes writes only while a quorum answered within the
+/// leader lease (`election_timeout_max`), and only heartbeats answer while
+/// nothing replicates. ReadIndex reads, `leads_live` and the meta leader's
+/// view of which nodes are live count those answers too. So the interval is
+/// as long as the followers allow. A follower hears a heartbeat at least
+/// every interval plus one tick (13/64 of the interval), 721 ms, under half
+/// the minimum election timeout, so a heartbeat may arrive one more such
+/// wait late before the follower campaigns.
+const GROUP_HEARTBEAT_INTERVAL_MS: u64 = GROUP_ELECTION_TIMEOUT_MIN_MS * 2 / 5;
 
 /// The OpenRaft config of a Raft group of a cluster, of either plane: the
 /// static data groups and the meta group run with the same timeouts,
 /// snapshot install timeout and log retention, and OpenRaft never takes a
 /// snapshot by itself.
+///
+/// The election timeouts bound the slowest link a group keeps a leader
+/// over. Replication is not held to the heartbeat interval: the gRPC
+/// transport gives each Append call `election_timeout_min` to answer
+/// (`grpc::RAFT_GRPC_APPEND_TIMEOUT`), so a slow link slows commits instead
+/// of stopping them.
 pub(crate) fn cluster_raft_config(
     cluster_name: String,
     engine: &RaftEngineConfig,
@@ -43,13 +64,7 @@ pub(crate) fn cluster_raft_config(
 ) -> Config {
     Config {
         cluster_name,
-        // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
-        // The chaos test injects netem_delay 250ms±75ms; under that load,
-        // the previous 100/300/600 produced 100s+ of spurious elections
-        // (term 200-600 in 30 min). Heartbeat must stay well below
-        // election_timeout_min, and election_timeout_min must stay above
-        // worst-case fault-induced inter-heartbeat arrival.
-        heartbeat_interval: 250,
+        heartbeat_interval: GROUP_HEARTBEAT_INTERVAL_MS,
         election_timeout_min: GROUP_ELECTION_TIMEOUT_MIN_MS,
         election_timeout_max: 3000,
         install_snapshot_timeout: engine.install_snapshot_timeout_ms,
