@@ -34,8 +34,6 @@ spec:
         - wait-ready
         - --config
         - /etc/ursula/test/cluster-manifest.json
-        - --expected-groups
-        - {{ .Values.raft.groupCount | quote }}
         - --timeout-secs
         - {{ .Values.tests.timeoutSeconds | quote }}
       volumeMounts:

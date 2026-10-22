@@ -196,8 +196,11 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- include "ursula.validateDnsLabel" (dict "name" "generated pod DNS label" "value" $podName) -}}
 {{- end -}}
-{{- if has $replicaCount (list 1 3 5) | not -}}
-{{- fail (printf "server.replicaCount must be 1, 3, or 5; got %v" .Values.server.replicaCount) -}}
+{{- if lt $replicaCount 1 -}}
+{{- fail (printf "server.replicaCount must be at least 1; got %v" .Values.server.replicaCount) -}}
+{{- end -}}
+{{- if eq $replicaCount 2 -}}
+{{- fail "server.replicaCount=2 tolerates no node loss: every group and the meta group need both nodes. Run 1, or 3 and more" -}}
 {{- end -}}
 {{- if lt $coreCount 1 -}}
 {{- fail (printf "server.coreCount must be at least 1; got %v" .Values.server.coreCount) -}}

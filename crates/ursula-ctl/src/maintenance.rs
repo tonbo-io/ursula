@@ -24,6 +24,8 @@ use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
 use crate::plan::plan_drain_at_barriers;
 use crate::provider::NodeInfo;
+use crate::view::check_groups;
+use crate::view::read_view;
 
 /// A timeout measured from its start. Comparing elapsed time cannot overflow
 /// the way `Instant::now() + timeout` does for an operator-supplied timeout.
@@ -264,9 +266,11 @@ pub enum CatchUpOutcome {
     Stalled { reason: String },
 }
 
-/// Wait until `target` is back as a voter in every group and its applied index
-/// is within `lag_tolerance` of peers' committed index. Progress-gated, not a
-/// fixed timeout: any forward motion resets the stall clock.
+/// Wait until `target` is a voter again in every group the meta leader's
+/// view places it among and every group its report counts it a voter of,
+/// with its applied index within `lag_tolerance` of peers' committed index
+/// ([`check_readiness`]). Progress-gated, not a fixed timeout: any forward
+/// motion resets the stall clock.
 pub async fn wait_node_ready(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -278,8 +282,13 @@ pub async fn wait_node_ready(
     let mut last_advance = Instant::now();
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
-        let report = check_readiness(&snap, target.id, options.lag_tolerance);
-        if report.all_ready {
+        let view = read_view(client, nodes).await?;
+        let placed = view
+            .as_ref()
+            .map(|view| view.voter_groups(target.id))
+            .unwrap_or_default();
+        let report = check_readiness(&snap, &placed, target.id, options.lag_tolerance);
+        if report.all_ready && view.is_ok() {
             return Ok(CatchUpOutcome::Ready);
         }
 
@@ -301,7 +310,10 @@ pub async fn wait_node_ready(
             } else {
                 format!("no catch-up progress for {:?}", options.stall_timeout)
             };
-            let mut reason = format!("{cause}: {}", format_unready(&report));
+            let mut reason = match &view {
+                Ok(_) => format!("{cause}: {}", format_unready(&report)),
+                Err(refusal) => format!("{cause}: {refusal}"),
+            };
             if let Some(hint) = missing_target_timeout_hint(&report) {
                 reason.push_str("; ");
                 reason.push_str(hint);
@@ -312,8 +324,10 @@ pub async fn wait_node_ready(
     }
 }
 
-/// Wait until every node in the cluster is a voter everywhere it should be and
-/// caught up, sampled twice to avoid acting on a transient view.
+/// Wait until, in the meta leader's view, every group is live with no move
+/// and runs on exactly its target voters ([`check_groups`]), and every node
+/// is a caught-up voter where the view places it or its report counts it
+/// ([`check_readiness`]), sampled twice to avoid acting on a transient view.
 pub async fn wait_cluster_ready(
     phase: &str,
     nodes: &[NodeInfo],
@@ -327,10 +341,25 @@ pub async fn wait_cluster_ready(
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
         let mut unready = Vec::new();
-        for node in nodes {
-            let report = check_readiness(&snap, node.id, lag_tolerance);
-            if !report.all_ready {
-                unready.push(format!("node {}: {}", node.id, format_unready(&report)));
+        match read_view(client, nodes)
+            .await
+            .with_context(|| format!("{phase}: placement view"))?
+        {
+            Err(refusal) => unready.push(refusal.to_string()),
+            Ok(view) => {
+                if let Err(refusal) = view
+                    .targets()
+                    .and_then(|targets| check_groups(&targets, &snap, None))
+                {
+                    unready.push(refusal.to_string());
+                }
+                for node in nodes {
+                    let placed = view.voter_groups(node.id);
+                    let report = check_readiness(&snap, &placed, node.id, lag_tolerance);
+                    if !report.all_ready {
+                        unready.push(format!("node {}: {}", node.id, format_unready(&report)));
+                    }
+                }
             }
         }
         if unready.is_empty() {
@@ -625,6 +654,10 @@ mod tests {
             let app = Router::new()
                 .route("/__ursula/metrics", get(mock_metrics))
                 .route(
+                    "/__ursula/placement",
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                )
+                .route(
                     "/__ursula/leadership-shed/maintenance",
                     post(mock_drain).delete(mock_undrain),
                 )
@@ -660,8 +693,10 @@ mod tests {
         }
     }
 
+    /// The mock nodes run no meta runtime, so they name no meta leader, and
+    /// the timeout says so.
     #[tokio::test]
-    async fn cluster_verification_timeout_explains_a_single_ready_sample() {
+    async fn cluster_verification_timeout_names_the_missing_view() {
         let (nodes, _) = mock_cluster().await;
         let error = wait_cluster_ready(
             "strict cluster verification",
@@ -677,7 +712,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cluster was ready for 1/2 required consecutive sample(s)"),
+                .contains("no node of the manifest names a meta leader"),
             "{error:#}"
         );
     }
@@ -731,7 +766,7 @@ mod tests {
             ],
         };
 
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &std::collections::BTreeSet::new(), 1, 5);
 
         assert!(!report.all_ready);
         let formatted = format_unready(&report);
@@ -749,7 +784,8 @@ mod tests {
                 100,
             )])],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        // The view places node 1 in group 7, and node 1 gave no metrics.
+        let report = check_readiness(&snapshot, &std::collections::BTreeSet::from([7]), 1, 5);
         assert!(!report.all_ready);
 
         let hint = missing_target_timeout_hint(&report).expect("missing target hint");
@@ -840,7 +876,7 @@ mod tests {
                 crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(2), 100, 100)]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &std::collections::BTreeSet::new(), 1, 5);
         assert!(!report.all_ready);
         assert!(missing_target_timeout_hint(&report).is_none());
     }

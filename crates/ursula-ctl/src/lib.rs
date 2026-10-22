@@ -12,12 +12,16 @@
 //!
 //! - [`metrics`]: HTTP client for `/__ursula/metrics` and the admin endpoints.
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
+//! - [`view`]: the meta leader's placement view and each group checked on
+//!   its target voters, which `wait`, `wait-ready` and the verifications
+//!   read.
 //! - [`placement`]: confirmed placement views and `node replace-disk`.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).
 //! - [`provider`]: cluster manifest loading and node addressing.
-//! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
+//! - [`quorum`]: fresh fixed-prefix verification of every group on its target
+//!   voters.
 //! - [`recovery`]: recovery plans for a group stalled after an accepted loss.
 
 pub mod backup;
@@ -29,6 +33,7 @@ pub mod plan;
 pub mod provider;
 pub mod quorum;
 pub mod recovery;
+pub mod view;
 
 pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;

@@ -1,4 +1,4 @@
-Ursula has been installed as a static-membership Raft cluster.
+Ursula has been installed as a Raft cluster whose meta group places every Raft group.
 
 Release: {{ .Release.Name }}
 Namespace: {{ .Release.Namespace }}
@@ -28,12 +28,14 @@ Cluster readiness test:
 {{ end }}
 
 Bootstrap:
-  Each Raft group runs on three consecutive pods by node id (all pods when
-  there are three or fewer), and the first of them initializes it once every
-  voter reports it empty and no leader. A replica that ever held its group
-  never initializes it again.
+  The meta group seeds each Raft group once, at bootstrap, on three
+  consecutive pods by node id (all pods when there are three or fewer), and
+  the first of them initializes it once every voter reports it empty and no
+  leader. A replica that ever held its group never initializes it again.
 
-Static membership warning:
-  server.replicaCount controls the initial voter set for a fresh cluster. Changing it
-  on an initialized cluster is not safe Raft voter reconfiguration. Use the
-  future Ursula operator for safe learner add, voter promotion, and voter removal.
+Rollouts and scaling:
+  The StatefulSet rolls by RollingUpdate under Parallel pod management, paced
+  by each pod's readiness probe. Start an upgrade only once
+  `ursulactl verify-cluster` passes.
+  Raising server.replicaCount from 3 or more adds nodes that register and hold
+  no group. Lowering it, or growing a single node, is not supported.

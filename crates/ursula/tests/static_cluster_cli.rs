@@ -781,11 +781,13 @@ async fn cli_single_voter_passes_verify_cluster_and_wait_node() {
     let node = ctl_node(1, admin_port, &base_url);
     let nodes = std::slice::from_ref(&node);
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).unwrap();
+    // The wait covers the group turning live, once its leader reported its
+    // voters to meta.
     ursula_ctl::wait_cluster_ready(
         "single-voter verification",
         nodes,
         &client,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         Duration::from_millis(20),
         0,
     )
@@ -3248,7 +3250,6 @@ async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_rele
 
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
     let options = ursula_ctl::quorum::QuorumVerificationOptions {
-        group_count: 6,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
     };
@@ -3329,9 +3330,33 @@ async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_rele
     let replacement_config = children[2].config_path.clone().unwrap();
     let replacement_text = std::fs::read_to_string(&replacement_config).unwrap();
     drop(children.pop());
+    // Every group runs on nodes 1 to 3 in the meta leader's view, which the
+    // drain moved off node 3. With node 3 down the full proof refuses its
+    // missing voter, and a proof that excludes node 2 leaves node 1 alone
+    // and refuses node 3 too.
+    let quorum_refusal = |error: anyhow::Error| {
+        error
+            .downcast_ref::<ursula_ctl::view::GroupRefusal>()
+            .cloned()
+            .unwrap_or_else(|| panic!("a typed group refusal: {error:#}"))
+    };
+    for refused in [
+        ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+            .await
+            .map(|_proof| ()),
+        ursula_ctl::quorum::verify_surviving_quorum(&nodes, 2, &ctl, &options)
+            .await
+            .map(|_proof| ()),
+    ] {
+        assert!(matches!(
+            quorum_refusal(refused.expect_err("node 3 is down")),
+            ursula_ctl::view::GroupRefusal::Unobserved { node: 3, .. }
+        ));
+    }
     let survivors = ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options)
         .await
         .expect("with the drained source stopped, both survivors are eligible");
+    assert_eq!(survivors.surviving_node_ids, BTreeSet::from([1, 2]));
     assert!(!survivors.full_redundancy_restored);
     // The replacement comes back on an empty WAL: the source's disk is lost.
     snapshot_proxy.release.send_replace(false);
@@ -3415,13 +3440,12 @@ async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_rele
             ));
             // The gated replica's own report blocks another maintenance.
             assert!(matches!(
-                ursula_ctl::observe::check_maintenance_snapshot(&snapshot, 3, 6),
+                ursula_ctl::observe::check_maintenance_snapshot(&snapshot),
                 Err(ursula_ctl::observe::ReadinessRefusal::Maintenance { .. })
             ));
             let refusal = ursula_ctl::wait_ready(
                 &readiness_client,
                 &nodes,
-                6,
                 Duration::ZERO,
                 Duration::from_millis(10),
             )
@@ -3480,7 +3504,7 @@ async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_rele
                 "node 3 opened its vote gate as an empty voter of group {group_id}: {snapshot:?}"
             );
         }
-        if ursula_ctl::plan::check_readiness(&snapshot, 3, 0).all_ready {
+        if ursula_ctl::plan::check_readiness(&snapshot, &(0..6).collect(), 3, 0).all_ready {
             break;
         }
         assert!(
@@ -3520,6 +3544,22 @@ async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_rele
     // The rejoined voter takes leaderships back. The proof needs every
     // group's leader known on every node, so it waits for that to settle.
     wait_leadership_balanced(&ctl, &nodes, 6).await;
+    // Every group is live on its three target voters again, as the meta
+    // leader's view shows it.
+    let (_ready, view) = ursula_ctl::wait_ready(
+        &ctl,
+        &nodes,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("every group is live on nodes 1 to 3");
+    assert_eq!(
+        view.targets().expect("no group is seeded or moving"),
+        (0..6)
+            .map(|group| (group, BTreeSet::from([1, 2, 3])))
+            .collect()
+    );
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
         .await
         .expect("current process full prefix proof");
@@ -3704,7 +3744,8 @@ async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
                         .groups
                         .iter()
                         .all(|group| group.current_leader.is_some())
-            }) && ursula_ctl::plan::check_readiness(&snapshot, node.id, 0).all_ready
+            }) && ursula_ctl::plan::check_readiness(&snapshot, &(0..6).collect(), node.id, 0)
+                .all_ready
         }) {
             break snapshot;
         }

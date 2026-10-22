@@ -30,12 +30,12 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 |------|--------|
 | `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
-| `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
+| `wait --node N` | Block until the node is a voter, within `--lag-tolerance` of peers, in every group the meta leader's placement view places it in and every group its own maintenance report counts it a voter of. Progress-gated: a node that keeps advancing is never timed out |
 | `status` | Per-node group counts and leadership distribution |
-| `wait-ready` | Wait for complete maintenance evidence and local serving health on every node |
-| `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
-| `verify-quorum` | Confirm every configured group with a fresh ReadIndex round and require every replica to apply its fixed prefix under the same leader term |
-| `verify-survivors` | Confirm fresh prefixes on two observed survivors while preserving the three-voter configuration; does not certify full redundancy or physical fencing |
+| `wait-ready` | Wait for ready maintenance reports and serving health on every node, and every group live on exactly its target voters in the meta leader's placement view |
+| `verify-cluster` | Require every group to run on exactly its target voters, each caught up, in two consecutive samples before the next rollout step |
+| `verify-quorum` | Confirm every group of the meta leader's placement view with a fresh ReadIndex round and require every target voter to apply its fixed prefix under the same leader term |
+| `verify-survivors` | Confirm fresh prefixes on every target voter but one excluded node, while each group keeps its whole target as its voters. Does not certify full redundancy or physical fencing |
 | `backup-create` | Export every Raft group into a backup at a local directory or `s3://bucket/prefix` |
 | `backup-verify` | Check a backup's manifest, sizes, checksums and every group snapshot without contacting a cluster |
 | `restore` | Restore a verified backup into a fresh, empty cluster with the same group count, once the cluster confirms it holds every cold object the backup references |
@@ -143,13 +143,15 @@ node 3 (10.0.0.3): groups=4 leaders={1: 2, 2: 2}
 
 ## `wait-ready`
 
-Wait until every node reports `--expected-groups` initialized Raft groups with leaders, and a complete uniform voter set in `raft_maintenance`. Each node must also return 200 from `/__ursula/ready`, read from the same address as its metrics.
+Wait until every node's `raft_maintenance` report is ready and every node returns 200 from `/__ursula/ready`, and until the meta leader's placement view shows the cluster bootstrapped with every Raft group `live`, no move, and running on exactly its target voters: each target voter's replica reports the target as its voters, no learner, an open gate and a leader among them. The group count and the voters come from the view, so the command takes no group count.
 
 ```bash
-ursulactl wait-ready --config cluster.json --expected-groups 4
+ursulactl wait-ready --config cluster.json
 ```
 
-Exits non-zero with the maintenance report or serving refusal when the timeout passes. Connection failures are retried until the timeout, so the wait can start while a node restarts. Every poll observes the processes afresh, so a node may restart during the wait. Only an invalid response stops the wait early with its original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
+Every check reads a node at the same address as its metrics. The first node that answers `GET /__ursula/placement` names the meta leader, and the leader's own status, naming itself, gives the view. A meta read barrier (`?confirmed=true`) is served on the admin listener only, which a chart's test pod does not reach. A view behind the meta log can only name a placement the replicas' memberships still show, and a group whose replicas report other voters keeps the wait going. `wait`, `verify-cluster`, `verify-quorum` and `verify-survivors` read the same view.
+
+Exits non-zero when the timeout passes, with the refusal of the last poll: a maintenance report, a serving refusal, a view that names no meta leader or is not bootstrapped, or a group that is seeded, moves or does not run on its target voters. Connection failures and `503` answers are retried until the timeout, so the wait can start while a node restarts. Every poll observes the processes afresh, so a node may restart during the wait. Any other failed answer, such as a body that does not decode because `ursulactl` and the node are of different minors, stops the wait early with its original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
 
 ## Underlying HTTP surface
 
@@ -157,8 +159,9 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 
 | Verb | Endpoint |
 |------|----------|
-| `status`, `wait` | `GET /__ursula/metrics` |
-| `wait-ready` | `GET /__ursula/metrics` and `GET /__ursula/ready` |
+| `status` | `GET /__ursula/metrics` |
+| `wait` | `GET /__ursula/metrics` and `GET /__ursula/placement` |
+| `wait-ready` | `GET /__ursula/metrics`, `GET /__ursula/ready` and `GET /__ursula/placement` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 | `backup-create` | `GET /__ursula/backup/info`, `GET /__ursula/backup/group/{raft_group_id}` |
@@ -188,13 +191,13 @@ Each command exits `0` on success and non-zero with an error that names the fail
 
 ## `verify-quorum`
 
-This source provides a bounded observation for recovery measurements and maintenance tooling. Supply the deployed group count explicitly; the example below uses 256 groups:
+This source provides a bounded observation for recovery measurements and maintenance tooling. Every group and its target voters come from the meta leader's placement view, as for `wait-ready`:
 
 ```bash
-ursulactl verify-quorum --config cluster.json --expected-groups 256 --timeout-secs 120
+ursulactl verify-quorum --config cluster.json --timeout-secs 120
 ```
 
-The command requires each configured voter exactly once, every configured group on every voter, complete uniform membership, no learners, and eligible local participation reports. It confirms each group's leader through a new outbound ReadIndex probe, then waits for all replicas to apply the captured prefix under that leader's term. Continuous writes can advance without moving this target. One absolute deadline covers metrics requests, RPCs and waits. The JSON output includes the observation start/end times, each group's leader/term/prefix and every replica's applied index.
+The command requires every group to be `live` with no move, a ready maintenance report from every node it reaches, and on every target voter of each group a replica whose voters are exactly the target, with no learner and an eligible participation report. A target voter that gives no metrics refuses the observation. A node outside a group's target is not asked for that group. It confirms each group's leader through a new outbound ReadIndex probe, then waits for all replicas to apply the captured prefix under that leader's term. Continuous writes can advance without moving this target. One absolute deadline covers metrics requests, RPCs and waits. The JSON output includes the observation start/end times, each group's leader/term/prefix and every replica's applied index.
 
 The prefix is confirmed through the incarnation-bound admin route
 `GET /__ursula/raft/{group}/quorum`. The CLI uses shared admin protocol types
@@ -205,13 +208,13 @@ A successful observation holds for the moment it was taken. It is not a continuo
 
 ## `verify-survivors`
 
-After one voter becomes unavailable, this source can separately observe the two survivors. Keep all three voters in the manifest and explicitly exclude exactly one known node:
+After one node becomes unavailable, this source can separately observe the others. Keep every node in the manifest and explicitly exclude exactly one of them:
 
 ```bash
-ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected-groups 256 --timeout-secs 120
+ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --timeout-secs 120
 ```
 
-Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology. It never shrinks the configured membership to fit observations.
+Every group must still have its whole target as its voters, with no learners, and open participation gates on every observed target voter, and the observed target voters of each group must form a quorum of its target. They must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing target voter or an exclusion outside the manifest. It never shrinks a group's target to fit observations.
 
-The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Run the complete `verify-quorum` check before any subsequent disruption.
+The output is scoped as `surviving_quorum`, records the excluded node and the observed nodes, and always reports `full_redundancy_restored=false`. Excluding a node from observation does not prove its old process or host is stopped. Run the complete `verify-quorum` check before any subsequent disruption.
 
