@@ -1,8 +1,9 @@
 # Cluster membership and maintenance
 
 This document describes how Ursula decides which nodes replicate each Raft
-group, how a group recovers a replica that lost its log, and how operators and
-Kubernetes replace a voter without losing quorum.
+group, how a group moves and a node leaves, how a node tears down a replica
+it no longer holds a role for, how a group recovers a replica that lost its
+log, and how operators and Kubernetes replace a voter without losing quorum.
 
 ## 1. Membership model
 
@@ -32,7 +33,7 @@ creates a group only from a view a meta read barrier confirmed, on a node
 that view places in the group. No open failure stops the start: such a group
 stays closed under its open back-off, and the driver opens it again. A node
 that `raft.peers` gained after genesis is in no group's seeds, so it hosts
-nothing.
+nothing until a move places a group on it.
 
 A node tears a replica down when a confirmed view gives it no role in the
 group (`crates/ursula-raft/src/hosting/teardown.rs`, over the kernel's
@@ -86,8 +87,7 @@ on, so a silent node holds no purge. A purge is idempotent, so a purge whose
 answer was lost and that the next candidate repeats is safe, though its
 streams are not counted in `removed_streams`.
 
-The
-egress probe judges each voter config of the effective membership of every
+The egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
 
@@ -133,12 +133,41 @@ not pass meta from voter to voter. A data group's leader reports the voters
 it formed on to the meta group, which makes the group `Live` (section 2).
 No admin route changes a data group's OpenRaft membership directly.
 
+### Node lifecycle
+
+Each node record in meta carries a lifecycle, `active`, `cordoned`,
+`decommissioning` or `removed`, which `SetNodeLifecycle` changes
+(`plan_lifecycle` in `crates/ursula-control/src/placement/apply.rs`). A
+node registers `active`. A cordon makes an active node `cordoned`, a
+decommission makes an active or cordoned node `decommissioning`, and an
+uncordon makes either `active` again, which ends a decommission. A cordon of
+a decommissioning node is refused (`decommissioning`), and so is the
+decommission of a meta voter (`meta_voter`), which is only ever replaced
+under its id. A move's target may hold a cordoned or decommissioning node
+only where the node already is a voter of the group, so neither gains a
+group (`ineligible_target`). A target never holds a removed node
+(`node_removed`), nor a node whose retirement of the group is still pending
+(`retirement_pending`). Every entry that leaves a decommissioning node
+without a role in any group marks the node `removed` in that same entry and
+drops its retirement records, so the decommission of a node with no role
+removes it at once. `removed` is final: the node's registration, a release
+of its root, a teardown report of it, a seeded group's convergence report
+that names it and every lifecycle change of it are refused with
+`node_removed`. A removal
+deletes nothing, and the node's replicas close as their groups answer.
+
 The meta leader runs the decommission driver
 (`crates/ursula-raft/src/meta/decommission.rs`). While it leads under a
 committed vote with a settled history, every second and on each new view, it
-plans with `plan_decommission` and submits the planned moves of the
-decommissioning nodes' groups as `RequestMove`, which the meta state machine
-decides as it decides an operator's. The first refusal ends the pass, and a
+plans with `plan_decommission`
+(`crates/ursula-control/src/placement/decommission.rs`): it takes the
+decommissioning nodes in ascending id and each of their stable groups in
+ascending id, and moves the leaving voter to the eligible active node outside
+the group with the fewest roles, the smallest id on a tie. A pass plans at
+most the free move slots and leaves one to operators when the move limit is
+two or more. It submits the planned moves as `RequestMove`, which the meta
+state machine decides as it decides an operator's, through the same target
+check. The first refusal ends the pass, and a
 refusal of a plan made from an old view confirms the view and plans again. A
 node is an eligible move target when it acknowledged the meta leader's
 heartbeats within 10 seconds and its leadership-shed answer says it does not
@@ -206,8 +235,15 @@ from its placement in the node's latest view: the placement's target voters,
 that does not move. It asks the pure planner
 (`crates/ursula-control/src/placement/reconcile.rs`) for one step and runs it
 under a compare-and-set on the leadership and the membership it was planned
-from. A seeded group only reports, and a settled group changes no voter, so
-until a move the shell flattens a joint configuration and reports. When the
+from. A joint configuration is first flattened onto one of its sides, the
+target when that side has a live majority, else the side with more live
+voters, and a leader that is not on that side hands its leadership off
+first. A uniform membership whose voters equal the target, or any uniform
+membership under a seeded target, only loses the learners the target does
+not keep and then reports. Under a settled target a membership of other
+voters waits (`target_settled`): a settled group changes no voter. Under a
+moving target the leader adds the missing target voters as learners,
+confirms its view, and then changes one voter per step. When the
 committed uniform membership has the target's voters under a seeded or
 moving target, the leader proves it still leads with a fresh quorum barrier,
 reads its vote and committed membership again, and submits
@@ -247,7 +283,11 @@ than this node, so every transfer lowers the spread and the balancer
 settles. The balancer, the shutdown handoff, the shedding gates and
 `ursulactl drain` pick their targets through one rule: a voter that may
 campaign, and under a bootstrapped view one whose role in the group is
-`voter` or `incoming`, never an outgoing or abandoned replica.
+`voter` or `incoming`, never an outgoing or abandoned replica. Two handoffs
+keep only part of it. The WAL-disk pressure handoff takes any voter whose
+role is `voter` or `incoming`, whether it may campaign or not, and the
+commit-stall watchdog, which escapes a leader whose log stopped committing,
+takes any other voter, a leaving one included.
 
 A replica that lost its vote history, such as one on a wiped disk, answers
 errors until a quorum without it proves a vote. Two such replicas of three
@@ -334,7 +374,7 @@ or destroyed, or its host is shut down. A process without its disk stops
 within its disk lease, and the new root waits longer than any lease from its
 binding, so the old process falls silent first.
 
-## 3. Admin membership surface
+## 3. Admin surface
 
 The admin plane binds `server.admin_listen`, which is pod loopback by default
 (`admin_router` in `crates/ursula/src/lib.rs`). Its per-group routes name a
@@ -427,11 +467,14 @@ held without a role (`unplaced_replica`, listed with the last answer the
 node's membership asker got about it and the stage of its teardown), an incomplete voter set, a member
 without a role (`unplaced_member`: the leader removes such a learner once the
 group is seeded or its voters equal the target, and such a voter only by a
-move or by leaving a joint configuration; nothing restores a missing voter),
+move or by leaving a joint configuration),
 a move of the group in the view (`move_in_progress`, for every role, a
 replica that does not count as a voter included), `joint_membership`,
 `apply_lag`, `apply_stopped` or `move_stalled` on the leader of a stalled
-move. A node with no group is ready. `GET /__ursula/ready` uses
+move. A voter missing from an incomplete voter set comes back only under a
+moving target that holds it, since the leader of a moving group adds every
+target voter its membership lacks as a learner. A node with no group is
+ready. `GET /__ursula/ready` uses
 `serving_ready()`, which ignores incomplete voter sets, members and replicas
 without a role, moves, joint membership, stopped apply and a stalled move, so
 healthy survivors keep serving while a peer catches up. Maintenance tooling
@@ -449,10 +492,20 @@ replaced voter runs the graceful shutdown on `SIGTERM`: it hands off its
 leaderships, then records a clean shutdown, so its restart reads its journals
 strictly. The controller does not look at the other pods, so an upgrade starts
 only once `ursulactl verify-cluster` passes, and the default
-PodDisruptionBudget limits evictions to one voter at a time.
+PodDisruptionBudget limits evictions to one server pod at a time.
 
 `Parallel` matters for a listener move (`server.clusterListen`,
 `server.ports.cluster`). Every server pod is deleted at once after the
 `helm upgrade`, and the controller recreates them together. Under
 `OrderedReady` it would recreate one at a time, each waiting for a readiness
 that needs the others.
+
+A pod's node id is its ordinal plus one, so `server.replicaCount` names the
+node ids. A higher count adds nodes that host nothing until groups move onto
+them, and a lower count drops the highest ids for good. Before every upgrade
+and rollback that changes the count, the chart's `scale-check` hook
+(`charts/ursula/templates/scale-check.yaml`) reads the live StatefulSet's
+count and runs `ursulactl node verify-removed` for every id a lower count
+drops and `verify-not-removed` for every id a higher count starts, against
+the meta leader's view. It refuses a raise from one pod, whose cluster
+recorded one meta voter and a replication factor of 1 at its bootstrap.
