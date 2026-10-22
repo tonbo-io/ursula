@@ -5097,7 +5097,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     put_until_created(&client, &stream).await;
     post_until_no_content(&client, &stream, "before-the-loss;").await;
     let read =
-        |node: &MetaNode| format!("{}/replace-disk/served?offset=0&max_bytes=64", node.url());
+        |node: &MetaNode| format!("{}/replace-disk/served?offset=0&max_bytes=128", node.url());
 
     // 1. Node 3 loses its disk and starts on an empty WAL.
     procs.kill(3);
