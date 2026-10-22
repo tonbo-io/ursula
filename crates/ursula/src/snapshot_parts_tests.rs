@@ -1736,7 +1736,9 @@ async fn usage_reports_staged_part_bytes_per_group() {
     stage(&app, "/parts/s", vec![2; 5]).await;
     let report = usage_report(&app).await;
     assert_eq!(report.node_id, None, "a node without an id names none");
-    assert_eq!(report.buckets["parts"].stream_count, 2);
+    let (buckets, _complete) =
+        ursula_proto::admin::UsageReport::bucket_usage(std::slice::from_ref(&report));
+    assert_eq!(buckets["parts"].stream_count, 2);
     let group = &report.staged_snapshot_parts[0];
     assert_eq!((group.raft_group_id, group.term), (0, 0));
     assert!(group.counting_finished);

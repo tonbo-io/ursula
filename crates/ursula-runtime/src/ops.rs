@@ -331,7 +331,7 @@ macro_rules! runtime_operations {
             }
             op BucketUsage {
                 fields {}
-                reply { response_tx: Vec<ursula_stream::BucketUsageSnapshot> }
+                reply { response_tx: crate::engine::GroupBucketUsage }
                 guard { none }
                 handle { call bucket_usage(engine, metrics, placement) }
                 client { pub group fn bucket_usage }

@@ -1817,7 +1817,7 @@ impl CoreWorker {
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
         placement: ShardPlacement,
-    ) -> Result<Vec<ursula_stream::BucketUsageSnapshot>, RuntimeError> {
+    ) -> Result<crate::engine::GroupBucketUsage, RuntimeError> {
         let exec_started_at = Instant::now();
         let response = group
             .bucket_usage(placement)

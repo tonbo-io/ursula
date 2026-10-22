@@ -70,8 +70,8 @@ async fn committed_records(app: &Router, bucket: &str) -> u64 {
         .expect("usage body");
     let usage: ursula_proto::admin::UsageReport =
         serde_json::from_slice(&body).expect("typed usage");
-    usage
-        .buckets
+    ursula_proto::admin::UsageReport::bucket_usage(&[usage])
+        .0
         .get(bucket)
         .map_or(0, |bucket| bucket.committed_records)
 }

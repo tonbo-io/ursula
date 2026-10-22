@@ -1569,7 +1569,14 @@ impl GroupEngine for RaftGroupEngine {
             // leadership requirement would break node-local aggregation
             // whenever any group is led elsewhere.
             self.with_state_machine(move |state_machine| {
-                Box::pin(async move { Ok(state_machine.engine.bucket_usage_report()) })
+                Box::pin(async move {
+                    Ok(ursula_runtime::GroupBucketUsage {
+                        applied_index: state_machine
+                            .last_applied_log_id
+                            .map_or(0, |log_id| log_id.index()),
+                        buckets: state_machine.engine.bucket_usage_report(),
+                    })
+                })
             })
             .await?
         })

@@ -278,12 +278,48 @@ pub struct ColdIndexRepairStep {
     pub cycle_completed: bool,
 }
 
-/// Cluster-local summary of a bucket purge across all Raft groups.
+/// A bucket purge's answers across the Raft groups, summed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PurgeBucketReport {
     pub removed_streams: u64,
-    pub groups_with_streams: Vec<usize>,
+    /// The groups whose purge removed a stream, ascending.
+    pub groups_with_streams: Vec<RaftGroupId>,
     pub pending_cold_gc_entries: u64,
+    /// The groups this node hosts no replica of, which the pass did not
+    /// purge. The caller purges each through its leader and adds the
+    /// answer ([`Self::add`]).
+    pub not_hosted: Vec<ShardPlacement>,
+}
+
+impl PurgeBucketReport {
+    /// Adds one group's purge answer.
+    pub fn add(&mut self, response: &PurgeBucketResponse) {
+        let group = response.placement.raft_group_id;
+        if response.removed_streams > 0
+            && let Err(at) = self.groups_with_streams.binary_search(&group)
+        {
+            self.groups_with_streams.insert(at, group);
+        }
+        self.removed_streams = self
+            .removed_streams
+            .saturating_add(response.removed_streams);
+        self.pending_cold_gc_entries = self
+            .pending_cold_gc_entries
+            .saturating_add(response.pending_cold_gc_entries);
+    }
+}
+
+/// One group's answer in a node-wide pass, which covers the groups this
+/// node hosts: `None` for a group it hosts no replica of, which
+/// [`RuntimeError::GroupNotHosted`] answers at once. Placement decides
+/// which groups a node hosts, so a pass meets such groups on every node of
+/// a cluster larger than its replication factor.
+pub(crate) fn hosted<T>(answer: Result<T, RuntimeError>) -> Result<Option<T>, RuntimeError> {
+    match answer {
+        Ok(answer) => Ok(Some(answer)),
+        Err(RuntimeError::GroupNotHosted { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 impl ShardRuntime {
@@ -930,35 +966,24 @@ impl ShardRuntime {
         self.flush_cold_candidates_batch(candidates).await
     }
 
-    /// Sums per-bucket committed usage across every Raft group on this node.
-    ///
-    /// Groups are read serially from their local applied state (leader or
-    /// follower); usage export consumers tolerate replication lag, so this
-    /// never requires leadership and never blocks on quorum.
-    /// Purges one tenant bucket from every Raft group: streams, bucket, and
-    /// usage entries. Idempotent — a re-run over an already purged bucket
-    /// reports zero removals. Cold objects are reclaimed by the enqueued GC
-    /// entries; callers wanting synchronous reclamation run the cold GC pass
+    /// Purges one tenant bucket from every Raft group this node hosts:
+    /// streams, bucket, and usage entries. The report lists the groups it
+    /// hosts no replica of, which the caller purges through their leaders.
+    /// Idempotent: a re-run over an already purged bucket reports zero
+    /// removals. Cold objects are reclaimed by the enqueued GC entries;
+    /// callers wanting synchronous reclamation run the cold GC pass
     /// afterwards.
     pub async fn purge_bucket_all_groups(
         &self,
         bucket_id: &str,
     ) -> Result<PurgeBucketReport, RuntimeError> {
         let mut report = PurgeBucketReport::default();
-        let group_count = self.shard_map.raft_group_count();
-        for group_id in 0..group_count {
-            let response = self
-                .purge_bucket(RaftGroupId(group_id), bucket_id.to_owned())
-                .await?;
-            if response.removed_streams > 0 {
-                report.groups_with_streams.push(group_id as usize);
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let group = RaftGroupId(group_id);
+            match hosted(self.purge_bucket(group, bucket_id.to_owned()).await)? {
+                Some(response) => report.add(&response),
+                None => report.not_hosted.push(self.placement_for_group(group)?),
             }
-            report.removed_streams = report
-                .removed_streams
-                .saturating_add(response.removed_streams);
-            report.pending_cold_gc_entries = report
-                .pending_cold_gc_entries
-                .saturating_add(response.pending_cold_gc_entries);
         }
         Ok(report)
     }
@@ -977,37 +1002,24 @@ impl ShardRuntime {
         erase_prefix_and_prove(cold_store, &crate::cold_bucket_prefix(bucket_id)).await
     }
 
+    /// The per-bucket committed usage of every Raft group this node hosts,
+    /// by group in ascending order.
+    ///
+    /// Groups are read serially from their local applied state (leader or
+    /// follower); usage export consumers tolerate replication lag, so this
+    /// never requires leadership and never blocks on quorum. A group this
+    /// node hosts no replica of is left out.
     pub async fn bucket_usage_all_groups(
         &self,
-    ) -> Result<Vec<ursula_stream::BucketUsageSnapshot>, RuntimeError> {
-        let mut merged: std::collections::HashMap<String, ursula_stream::BucketUsage> =
-            std::collections::HashMap::new();
-        let group_count = self.shard_map.raft_group_count();
-        for group_id in 0..group_count {
-            let report = self.bucket_usage(RaftGroupId(group_id)).await?;
-            for entry in report {
-                let usage = merged.entry(entry.bucket_id).or_default();
-                usage.committed_append_bytes = usage
-                    .committed_append_bytes
-                    .saturating_add(entry.usage.committed_append_bytes);
-                usage.committed_records = usage
-                    .committed_records
-                    .saturating_add(entry.usage.committed_records);
-                usage.committed_write_units = usage
-                    .committed_write_units
-                    .saturating_add(entry.usage.committed_write_units);
-                usage.retained_bytes = usage
-                    .retained_bytes
-                    .saturating_add(entry.usage.retained_bytes);
-                usage.stream_count = usage.stream_count.saturating_add(entry.usage.stream_count);
+    ) -> Result<Vec<(RaftGroupId, crate::engine::GroupBucketUsage)>, RuntimeError> {
+        let mut groups = Vec::new();
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let group = RaftGroupId(group_id);
+            if let Some(usage) = hosted(self.bucket_usage(group).await)? {
+                groups.push((group, usage));
             }
         }
-        let mut report = merged
-            .into_iter()
-            .map(|(bucket_id, usage)| ursula_stream::BucketUsageSnapshot { bucket_id, usage })
-            .collect::<Vec<_>>();
-        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
-        Ok(report)
+        Ok(groups)
     }
 
     /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
@@ -1045,8 +1057,9 @@ impl ShardRuntime {
         for group_id in 0..self.shard_map.raft_group_count() {
             let request =
                 crate::cold_refs::OffloadColdRefsRequest::new(now_ms, max_streams_per_group);
-            match self.offload_cold_refs(RaftGroupId(group_id), request).await {
-                Ok(step) => report.add(&step),
+            match hosted(self.offload_cold_refs(RaftGroupId(group_id), request).await) {
+                Ok(Some(step)) => report.add(&step),
+                Ok(None) => {}
                 Err(err) => tracing::warn!(
                     raft_group_id = group_id,
                     error = %err,
@@ -1057,7 +1070,8 @@ impl ShardRuntime {
         report
     }
 
-    /// One leader-side tidy pass over every Raft group (bounded-state F0):
+    /// One leader-side tidy pass over every Raft group this node hosts
+    /// (bounded-state F0):
     /// each group this node leads first sweeps expired streams with at most
     /// `request.max_expiry_sweeps` `ExpireStreams` entries
     /// ([`crate::expiry_sweep`]), then proposes `TidyStream` for at most
@@ -1071,11 +1085,12 @@ impl ShardRuntime {
         let mut total = TidyStreamsResponse::default();
         let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
-            let error = match self.tidy_streams(RaftGroupId(group_id), request).await {
-                Ok(pass) => {
+            let error = match hosted(self.tidy_streams(RaftGroupId(group_id), request).await) {
+                Ok(Some(pass)) => {
                     total.add(&pass.report);
                     pass.error
                 }
+                Ok(None) => None,
                 Err(err) => Some(err),
             };
             if let Some(err) = error {
@@ -1100,6 +1115,9 @@ impl ShardRuntime {
         }
     }
 
+    /// One cold flush pass over every Raft group this node hosts: each
+    /// group's leader flushes its candidates, and a group the node hosts no
+    /// replica of is skipped.
     pub async fn flush_cold_all_groups_once(
         &self,
         request: PlanGroupColdFlushRequest,
@@ -1134,14 +1152,16 @@ impl ShardRuntime {
                     let group_id = RaftGroupId(next_group_id);
                     next_group_id = next_group_id.saturating_add(1);
                     tasks.spawn(async move {
-                        runtime
-                            .flush_cold_group_batch_once(
-                                group_id,
-                                request,
-                                COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS,
-                            )
-                            .await
-                            .map(|responses| responses.len())
+                        hosted(
+                            runtime
+                                .flush_cold_group_batch_once(
+                                    group_id,
+                                    request,
+                                    COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS,
+                                )
+                                .await,
+                        )
+                        .map(|responses| responses.map_or(0, |responses| responses.len()))
                     });
                 }
                 if let Some(result) = tasks.join_next().await {
@@ -1166,14 +1186,15 @@ impl ShardRuntime {
     ) -> Result<usize, RuntimeError> {
         let mut flushed = 0_usize;
         for group_id in 0..self.shard_map.raft_group_count() {
-            let group_flushed = self
-                .flush_cold_group_batch_once(
+            let group_flushed = hosted(
+                self.flush_cold_group_batch_once(
                     RaftGroupId(group_id),
                     request.clone(),
                     COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS,
                 )
-                .await?
-                .len();
+                .await,
+            )?
+            .map_or(0, |responses| responses.len());
             flushed = flushed.saturating_add(group_flushed);
         }
         Ok(flushed)
@@ -1650,8 +1671,8 @@ impl ShardRuntime {
         })
     }
 
-    /// One repair step in every group. A failing group is logged and
-    /// skipped, so it cannot stall the others.
+    /// One repair step in every group this node hosts. A failing group is
+    /// logged and skipped, so it cannot stall the others.
     pub async fn repair_cold_index_all_groups_once(
         &self,
         max_streams_per_group: usize,
@@ -1661,11 +1682,12 @@ impl ShardRuntime {
             return report;
         }
         for group_id in 0..self.shard_map.raft_group_count() {
-            match self
-                .repair_cold_index_group_once(RaftGroupId(group_id), max_streams_per_group)
-                .await
-            {
-                Ok(step) => {
+            match hosted(
+                self.repair_cold_index_group_once(RaftGroupId(group_id), max_streams_per_group)
+                    .await,
+            ) {
+                Ok(None) => {}
+                Ok(Some(step)) => {
                     report.add(&step.report);
                     if step.cycle_completed {
                         tracing::debug!(
@@ -1692,16 +1714,17 @@ impl ShardRuntime {
             return Ok(0);
         }
         // F14b: one group's failure must not stall reclamation in the groups
-        // after it. Every group runs; the first error is reported once all
-        // have had their pass.
+        // after it. Every group this node hosts runs; the first error is
+        // reported once all have had their pass.
         let mut reclaimed = 0_usize;
         let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
-            match self
-                .run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
-                .await
-            {
-                Ok(group_reclaimed) => {
+            match hosted(
+                self.run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
+                    .await,
+            ) {
+                Ok(None) => {}
+                Ok(Some(group_reclaimed)) => {
                     reclaimed = reclaimed.saturating_add(group_reclaimed);
                 }
                 Err(err) => {

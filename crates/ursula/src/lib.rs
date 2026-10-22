@@ -51,7 +51,6 @@ mod snapshot_parts;
 mod staged_parts;
 mod wal_disk;
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -2017,17 +2016,17 @@ fn producer_refusal_message(answer: &ProducerAnswer) -> String {
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
-/// every Raft group, then runs one cold-GC pass so the enqueued cold-object
-/// prefixes are reclaimed before the report returns, and finally erases and
-/// proves empty `{bucket}/`. Idempotent — purging an
-/// absent bucket returns the same report shape with zero counts, and a
-/// crashed purge converges on re-run because cold reclamation is
-/// list-then-delete over object prefixes.
+/// every Raft group ([`purge_every_group`]), then runs one cold-GC pass over
+/// the groups this node hosts so the enqueued cold-object prefixes are
+/// reclaimed before the report returns, and finally erases and proves empty
+/// `{bucket}/`. Idempotent — purging an absent bucket returns the same
+/// report shape with zero counts, and a crashed purge converges on re-run
+/// because cold reclamation is list-then-delete over object prefixes.
 pub(crate) async fn purge_bucket(
     State(state): State<HttpState>,
     Path(bucket): Path<String>,
 ) -> Response {
-    let report = match state.runtime.purge_bucket_all_groups(&bucket).await {
+    let report = match purge_every_group(&state, &bucket).await {
         Ok(report) => report,
         Err(err) => return purge_error_response(err),
     };
@@ -2055,7 +2054,7 @@ pub(crate) async fn purge_bucket(
     // queue after reclamation. The number reclaimed by one pass is only
     // diagnostic: delayed entries, a partial failure, or another leader's
     // background worker can all make it zero without proving cold absence.
-    let proof = match state.runtime.purge_bucket_all_groups(&bucket).await {
+    let proof = match purge_every_group(&state, &bucket).await {
         Ok(report) => report,
         Err(err) => return purge_error_response(err),
     };
@@ -2076,17 +2075,50 @@ pub(crate) async fn purge_bucket(
     };
     let cold_gc_complete =
         proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none() && bucket_prefix_absent;
-    axum::Json(serde_json::json!({
-        "bucket": bucket,
-        "removed_streams": report.removed_streams,
-        "groups_with_streams": report.groups_with_streams,
-        "cold_gc_entries_reclaimed": cold_gc_reclaimed,
-        "cold_gc_pending_entries": proof.pending_cold_gc_entries,
-        "cold_gc_complete": cold_gc_complete,
-        "cold_gc_error": cold_gc_error,
-        "bucket_prefix_absent": bucket_prefix_absent,
-    }))
+    axum::Json(ursula_proto::admin::BucketPurgeReport {
+        bucket,
+        removed_streams: report.removed_streams,
+        groups_with_streams: report
+            .groups_with_streams
+            .iter()
+            .map(|group| group.0)
+            .collect(),
+        cold_gc_entries_reclaimed: u64::try_from(cold_gc_reclaimed).unwrap_or(u64::MAX),
+        cold_gc_pending_entries: proof.pending_cold_gc_entries,
+        cold_gc_complete,
+        cold_gc_error,
+        bucket_prefix_absent,
+    })
     .into_response()
+}
+
+/// Purges `bucket` from every Raft group: in place in the groups this node
+/// hosts a replica of, and through its leader each group it hosts none of
+/// ([`ursula_raft::RaftGroupHandleRegistry::purge_bucket_through_leader`]).
+async fn purge_every_group(
+    state: &HttpState,
+    bucket: &str,
+) -> Result<ursula_runtime::PurgeBucketReport, RuntimeError> {
+    let mut report = state.runtime.purge_bucket_all_groups(bucket).await?;
+    for placement in std::mem::take(&mut report.not_hosted) {
+        // Only a Raft node hosts some groups and not others.
+        let Some(registry) = state.raft_registry() else {
+            return Err(RuntimeError::GroupNotHosted {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+            });
+        };
+        let response = registry
+            .purge_bucket_through_leader(placement, bucket)
+            .await
+            .map_err(|error| RuntimeError::GroupEngine {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+                error,
+            })?;
+        report.add(&response);
+    }
+    Ok(report)
 }
 
 /// Purge runs on the admin listener, so it never redirects to a peer's client
@@ -2113,29 +2145,39 @@ pub(crate) async fn create_bucket(Path(bucket): Path<String>) -> Response {
     }
 }
 
-/// Versioned, self-described per-bucket usage summed across this node's Raft
-/// groups. Served from local replica state; consumers tolerate replication
-/// lag and validate the contract before interpreting derived counters.
+/// Versioned, self-described per-bucket usage of each Raft group this node
+/// hosts, with the index its replica applied. Served from local replica
+/// state; consumers tolerate replication lag, keep the newest replica's
+/// report per group ([`ursula_proto::admin::UsageReport::bucket_usage`]) and
+/// validate the contract before interpreting derived counters.
 pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
     match state.runtime.bucket_usage_all_groups().await {
         Ok(report) => {
-            let buckets = report
+            let groups = report
                 .into_iter()
-                .map(|entry| {
-                    (entry.bucket_id, ursula_proto::admin::BucketUsageReport {
-                        committed_append_bytes: entry.usage.committed_append_bytes,
-                        committed_records: entry.usage.committed_records,
-                        committed_write_units: entry.usage.committed_write_units,
-                        retained_bytes: entry.usage.retained_bytes,
-                        stream_count: entry.usage.stream_count,
-                    })
+                .map(|(group, usage)| ursula_proto::admin::GroupUsage {
+                    raft_group_id: group.0,
+                    applied_index: usage.applied_index,
+                    buckets: usage
+                        .buckets
+                        .into_iter()
+                        .map(|entry| {
+                            (entry.bucket_id, ursula_proto::admin::BucketUsageReport {
+                                committed_append_bytes: entry.usage.committed_append_bytes,
+                                committed_records: entry.usage.committed_records,
+                                committed_write_units: entry.usage.committed_write_units,
+                                retained_bytes: entry.usage.retained_bytes,
+                                stream_count: entry.usage.stream_count,
+                            })
+                        })
+                        .collect(),
                 })
-                .collect::<BTreeMap<_, _>>();
+                .collect();
             axum::Json(ursula_proto::admin::UsageReport {
                 version: ursula_proto::admin::SchemaVersion,
                 node_id: state.node_id(),
                 write_unit_bytes: ursula_runtime::COMMITTED_WRITE_UNIT_BYTES,
-                buckets,
+                groups,
                 raft_group_count: state.runtime.raft_group_count(),
                 staged_snapshot_parts: state
                     .staged_part_report()

@@ -4588,6 +4588,297 @@ async fn cli_four_nodes_host_only_the_groups_meta_seeds_on_them() {
     read_until_matches(&client, &read, b"placed;").await;
 }
 
+/// S2(n) (#768): at replication factor 3 each of five nodes hosts only
+/// some of the groups, and the node-wide passes and the cluster-wide admin
+/// answers still cover every group. One node's purge removes the bucket
+/// from every group, through the leaders of the groups it hosts no replica
+/// of. The nodes' usage reports, kept per group by the newest replica,
+/// count every stream once. `backup-create` exports every group, and its
+/// restore into the wiped cluster imports every group. Each group's leader
+/// flushes its hot bytes to the cold tier, though its node's cold flush
+/// pass meets groups the node does not host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let peers = peers_of(&nodes);
+    let mut meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let settled_view = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&settled_view[0]).expect("settled").clone();
+    let hosted = |node: &MetaNode| -> BTreeSet<u32> {
+        cluster
+            .groups()
+            .iter()
+            .filter(|(_, placement)| placement.current_voters().contains(NodeId::new(node.id)))
+            .map(|(group, _)| group.0)
+            .collect()
+    };
+    // Twelve replicas on five nodes: the node with the fewest hosts at
+    // most two of the four groups.
+    let purger = nodes
+        .iter()
+        .min_by_key(|node| hosted(node).len())
+        .expect("five nodes");
+    assert!(
+        hosted(purger).len() < META_TEST_GROUPS,
+        "node {} hosts every group: {cluster:?}",
+        purger.id
+    );
+    let every_group: Vec<u32> = (0..u32::try_from(META_TEST_GROUPS).unwrap()).collect();
+    let streams = stream_per_group("wide");
+    for stream in &streams {
+        let url = format!("{}/wide/{stream}", purger.url());
+        put_until_created(&client, &url).await;
+        post_until_no_content(&client, &url, "before;").await;
+    }
+
+    // Every node reports exactly the groups it hosts, and the newest
+    // replica of each group counts its one stream.
+    for node in &nodes {
+        let what = format!("node {} reports the usage of its groups", node.id);
+        eventually(&mut procs, &what, async || {
+            let report = usage_report(&client, node).await?;
+            let groups: BTreeSet<u32> = report
+                .groups
+                .iter()
+                .map(|group| group.raft_group_id)
+                .collect();
+            if groups == hosted(node) {
+                Ok(())
+            } else {
+                Err(format!("reports {groups:?}"))
+            }
+        })
+        .await;
+    }
+    wait_bucket_streams(&client, &mut procs, &nodes, "wide", 4).await;
+
+    let backup_store = ursula_ctl::backup::BackupStore::open(
+        root.path().join("backup").to_str().expect("a UTF-8 path"),
+    )
+    .expect("backup store");
+    let manifest =
+        ursula_ctl::backup::create(&backup_client(&nodes), &backup_store, 1_760_000_000_000)
+            .await
+            .expect("backup-create");
+    assert_eq!(
+        manifest
+            .groups
+            .iter()
+            .map(|group| (group.raft_group_id, group.streams))
+            .collect::<Vec<_>>(),
+        every_group
+            .iter()
+            .map(|group| (*group, 1))
+            .collect::<Vec<_>>(),
+        "every group exported with its stream"
+    );
+
+    let purge = purge_bucket(&client, &mut procs, purger, "wide").await;
+    assert_eq!(purge.removed_streams, 4, "{purge:?}");
+    assert_eq!(purge.groups_with_streams, every_group, "{purge:?}");
+    wait_bucket_streams(&client, &mut procs, &nodes, "wide", 0).await;
+
+    // A wiped cluster, whose cold flush takes any hot byte.
+    for node in &nodes {
+        procs.kill(node.id);
+        remove_test_path(&node.wal);
+    }
+    meta.flush_min_hot_bytes = Some(1);
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let restored = ursula_ctl::backup::restore(&backup_client(&nodes), &backup_store)
+        .await
+        .expect("restore");
+    assert_eq!(
+        (restored.groups, restored.streams, restored.already()),
+        (4, 4, 0)
+    );
+    assert_eq!(
+        restored
+            .imports
+            .iter()
+            .map(|import| import.raft_group_id)
+            .collect::<Vec<_>>(),
+        every_group
+    );
+    wait_bucket_streams(&client, &mut procs, &nodes, "wide", 4).await;
+
+    for stream in &streams {
+        let url = format!("{}/wide/{stream}", purger.url());
+        post_until_no_content(&client, &url, "after;").await;
+    }
+    eventually(&mut procs, "every group's leader flushed it", async || {
+        let mut flushed = BTreeSet::new();
+        for node in &nodes {
+            let metrics = runtime_metrics(&client, node).await?;
+            for group in &every_group {
+                let index = usize::try_from(*group).unwrap();
+                let hot = metrics["per_group_cold_hot_bytes"][index].as_u64();
+                let peak = metrics["per_group_cold_hot_bytes_max"][index].as_u64();
+                match (hot, peak) {
+                    (Some(0), Some(peak)) if peak > 0 => {
+                        flushed.insert(*group);
+                    }
+                    (Some(0), Some(_)) => {}
+                    _ => return Err(format!("node {} holds {hot:?} of group {group}", node.id)),
+                }
+            }
+        }
+        if flushed.len() == META_TEST_GROUPS {
+            Ok(())
+        } else {
+            Err(format!("flushed {flushed:?}"))
+        }
+    })
+    .await;
+}
+
+/// One stream name of each data group, as `bucket`'s streams hash to the
+/// groups of a meta test cluster.
+fn stream_per_group(bucket: &str) -> Vec<String> {
+    let map = ursula_shard::StaticShardMap::new(1, META_TEST_GROUPS).expect("shard map");
+    let mut streams: BTreeMap<u32, String> = BTreeMap::new();
+    for candidate in 0_u32.. {
+        let stream = format!("s{candidate}");
+        let group = map
+            .locate(&ursula_shard::BucketStreamId::new(bucket, &stream))
+            .raft_group_id;
+        streams.entry(group.0).or_insert(stream);
+        if streams.len() == META_TEST_GROUPS {
+            break;
+        }
+    }
+    streams.into_values().collect()
+}
+
+/// Node `node`'s usage report, from its client listener.
+async fn usage_report(
+    client: &reqwest::Client,
+    node: &MetaNode,
+) -> Result<ursula_proto::admin::UsageReport, String> {
+    let url = format!("{}/__ursula/usage", node.url());
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("GET {url}: {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))
+}
+
+/// Waits until the usage reports of `nodes`, as a collector keeps them per
+/// group, name every group and count `streams` streams of `bucket`.
+async fn wait_bucket_streams(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    bucket: &str,
+    streams: u64,
+) {
+    let what = format!("the usage reports count {streams} streams of {bucket}");
+    eventually(procs, &what, async || {
+        let mut reports = Vec::new();
+        for node in nodes {
+            reports.push(usage_report(client, node).await?);
+        }
+        let (buckets, complete) = ursula_proto::admin::UsageReport::bucket_usage(&reports);
+        let counted = buckets.get(bucket).map_or(0, |usage| usage.stream_count);
+        if complete && counted == streams {
+            Ok(())
+        } else {
+            Err(format!("complete {complete}, {buckets:?}"))
+        }
+    })
+    .await;
+}
+
+/// The `ursulactl` backup client of `nodes`.
+fn backup_client(nodes: &[MetaNode]) -> ursula_ctl::backup::BackupClient {
+    ursula_ctl::backup::BackupClient::new(
+        ursula_ctl::MetricsClient::new(Duration::from_secs(10)).expect("metrics client"),
+        nodes.iter().map(MetaNode::ctl).collect(),
+    )
+    .expect("backup client")
+}
+
+/// Node `node`'s `/__ursula/metrics` as JSON, its runtime counters
+/// included.
+async fn runtime_metrics(
+    client: &reqwest::Client,
+    node: &MetaNode,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/__ursula/metrics", node.url());
+    client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))
+}
+
+/// Purges `bucket` through `node`'s admin listener, again while a group's
+/// leader is unknown (`503`).
+async fn purge_bucket(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    bucket: &str,
+) -> ursula_proto::admin::BucketPurgeReport {
+    let url = format!("{}/__ursula/purge/{bucket}", node.admin());
+    let what = format!("node {} purges {bucket}", node.id);
+    eventually(procs, &what, async || {
+        let metrics = runtime_metrics(client, node).await?;
+        let incarnation = metrics["process_incarnation"]
+            .as_str()
+            .ok_or_else(|| format!("no process incarnation: {metrics}"))?
+            .to_owned();
+        let response = client
+            .delete(&url)
+            .header(ursula_proto::admin::PROCESS_INCARNATION_HEADER, incarnation)
+            .send()
+            .await
+            .map_err(|err| format!("DELETE {url}: {err}"))?;
+        match response.status() {
+            reqwest::StatusCode::OK => response
+                .json()
+                .await
+                .map_err(|err| format!("DELETE {url}: {err}")),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE => Err(format!("DELETE {url}: 503")),
+            status => panic!(
+                "DELETE {url}: {status} {}",
+                response.text().await.unwrap_or_default()
+            ),
+        }
+    })
+    .await
+}
+
 /// Waits until `node` runs a replica of exactly the groups `groups`.
 async fn runs_exactly(
     client: &reqwest::Client,
@@ -6103,14 +6394,16 @@ fn write_node_toml(
     admin_port
 }
 
-/// The meta and placement keys of a node config. `None` leaves a key out,
-/// so the server's default applies.
+/// The meta, placement and cold-flush keys of a node config. `None` leaves
+/// a key out, so the server's default applies.
 #[derive(Debug, Clone, Copy, Default)]
 struct MetaToml<'a> {
     /// `raft.meta_voters`.
     meta_voters: Option<&'a [u64]>,
     /// `raft.placement.replication_factor`.
     replication_factor: Option<u8>,
+    /// `storage.cold.flush_min_hot_size`, in bytes.
+    flush_min_hot_bytes: Option<u64>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -6206,6 +6499,9 @@ gc_interval = "1s"
 "#
         )
         .unwrap();
+        if let Some(bytes) = meta.flush_min_hot_bytes {
+            writeln!(config, "flush_min_hot_size = {bytes}").unwrap();
+        }
 
         if let Some(root) = cold_root {
             writeln!(config, r#"root = "{root}""#).unwrap();

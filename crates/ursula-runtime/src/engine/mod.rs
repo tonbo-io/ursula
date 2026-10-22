@@ -109,7 +109,18 @@ pub type GroupPlanNextColdFlushBatchFuture<'a> =
 pub type GroupColdHotBacklogFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ColdHotBacklog, GroupEngineError>> + Send + 'a>>;
 pub type GroupBucketUsageFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<BucketUsageSnapshot>, GroupEngineError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<GroupBucketUsage, GroupEngineError>> + Send + 'a>>;
+
+/// One group's per-bucket committed usage, as its replica on this node
+/// applied it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupBucketUsage {
+    /// The index of the last entry the replica applied, read with the
+    /// usage: of two replicas' reports of one group, the one with the
+    /// higher index is the newer.
+    pub applied_index: u64,
+    pub buckets: Vec<BucketUsageSnapshot>,
+}
 pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupRouteWriteFuture<'a> =

@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_proto::placement::NodeId;
 use ursula_runtime::AnswerProblem;
 use ursula_runtime::CommittedLeader;
 use ursula_runtime::ErrorChain;
@@ -253,6 +254,96 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         "bucket purge answer",
     )?;
     PurgeBucketResponse::try_from(response)
+}
+
+impl crate::RaftGroupHandleRegistry {
+    /// Purges `bucket_id` from `placement`'s group, which this node hosts
+    /// no replica of, through the group's leader. The purge goes to the
+    /// group's leader candidates in turn (`ursula_control::leader_candidates`
+    /// over this node's latest placement view and `raft.peers`), following
+    /// the leader a candidate's refusal names, until a node answers as the
+    /// group's leader. A candidate that hosts no replica of the group, or
+    /// gives a leadership refusal of any kind, passes the purge on. That
+    /// includes a candidate this node cannot reach, whose answer is outcome
+    /// unknown: a host that drops packets (powered off, partitioned,
+    /// stopped) times out the call, and must not hold every purge until it
+    /// returns. Any other answer is the group's. With no candidate left,
+    /// the answer is a leadership refusal that names no leader, and that
+    /// may have committed when any candidate's refusal may have.
+    ///
+    /// A purge is idempotent, so asking the next candidate is safe. A purge
+    /// that committed through a candidate whose answer was lost is not
+    /// counted in the answer of the next one, which then removes nothing:
+    /// `removed_streams` may undercount for the group, as it does for a
+    /// client that retries after a `503`.
+    pub async fn purge_bucket_through_leader(
+        &self,
+        placement: ShardPlacement,
+        bucket_id: &str,
+    ) -> Result<PurgeBucketResponse, GroupEngineError> {
+        let candidates = {
+            let peers = self.peer_cluster().directory();
+            let Some(me) = peers.node_id() else {
+                return Err(unknown_leader(
+                    LeadershipReason::LeaderUnreachable,
+                    Proposal::NotProposed,
+                ));
+            };
+            let ids = peers.node_ids().map(NodeId::new).collect();
+            ursula_control::leader_candidates(
+                NodeId::new(me),
+                ursula_control::CandidatesOf::Group(placement.raft_group_id),
+                &self.placement_watch().current(),
+                None,
+                &ids,
+            )
+        };
+        let mut asked = std::collections::BTreeSet::new();
+        let mut proposal = Proposal::NotProposed;
+        for candidate in candidates.iter() {
+            let mut next = Some(candidate.get());
+            while let Some(node) = next.take() {
+                if !asked.insert(node) {
+                    break;
+                }
+                let Some(address) = self.peer_cluster().cluster_url(node) else {
+                    break;
+                };
+                let route = LeaderRoute {
+                    peer_cluster: self.peer_cluster().clone(),
+                    leader_id: node,
+                    address,
+                };
+                match forward_purge_bucket_to_leader(&route, placement, bucket_id.to_owned()).await
+                {
+                    Err(GroupEngineError::NotLeader(refusal)) => {
+                        if refusal.proposal == Proposal::MayHaveCommitted {
+                            proposal = Proposal::MayHaveCommitted;
+                        }
+                        next = refusal.leader.map(|leader| leader.node_id);
+                    }
+                    Err(error) if hosts_no_replica(&error) => {}
+                    answer => return answer,
+                }
+            }
+        }
+        Err(unknown_leader(
+            LeadershipReason::LeaderUnreachable,
+            proposal,
+        ))
+    }
+}
+
+/// Whether the node a forwarded write went to runs no replica of the
+/// group: it answered `NOT_FOUND`, before its handler looked at the write.
+fn hosts_no_replica(error: &GroupEngineError) -> bool {
+    matches!(
+        error,
+        GroupEngineError::Infra(GroupInfraError::ForwardFailed {
+            failure: ForwardFailure::Refused { grpc_code },
+            ..
+        }) if *grpc_code == i32::from(tonic::Code::NotFound)
+    )
 }
 
 /// Forwards one control command to the meta leader `route` names: a

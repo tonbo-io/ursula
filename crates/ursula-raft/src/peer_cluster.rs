@@ -424,6 +424,14 @@ pub struct BoundPeers(Option<Arc<Bound>>);
 /// What a reader sees before any bind.
 static UNBOUND: PeerDirectory = PeerDirectory::empty();
 
+impl BoundPeers {
+    /// This node's id in the bind, read with its peers: none before any
+    /// bind.
+    pub fn node_id(&self) -> Option<u64> {
+        self.0.as_deref().map(|bound| bound.identity.node_id())
+    }
+}
+
 impl std::ops::Deref for BoundPeers {
     type Target = PeerDirectory;
 

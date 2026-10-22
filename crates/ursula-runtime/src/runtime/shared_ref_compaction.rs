@@ -135,8 +135,8 @@ impl ShardRuntime {
         Ok(report)
     }
 
-    /// One F2 driver pass in every group. A failing group is logged and
-    /// skipped, so it cannot stall the others.
+    /// One F2 driver pass in every group this node hosts. A failing group
+    /// is logged and skipped, so it cannot stall the others.
     pub async fn compact_shared_refs_all_groups_once(
         &self,
         config: &SharedRefCompactionConfig,
@@ -146,11 +146,12 @@ impl ShardRuntime {
             return report;
         }
         for group_id in 0..self.shard_map.raft_group_count() {
-            match self
-                .compact_shared_refs_group_once(RaftGroupId(group_id), config)
-                .await
-            {
-                Ok(group_report) => report.add(&group_report),
+            match super::hosted(
+                self.compact_shared_refs_group_once(RaftGroupId(group_id), config)
+                    .await,
+            ) {
+                Ok(Some(group_report)) => report.add(&group_report),
+                Ok(None) => {}
                 Err(err) => tracing::warn!(
                     raft_group_id = group_id,
                     error = %err,
