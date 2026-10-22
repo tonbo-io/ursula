@@ -64,6 +64,8 @@ pub enum StoreOp {
     ListOwn,
     /// [`SnapshotStore::delete_own`], the DELETE.
     DeleteOwn,
+    /// [`SnapshotStore::list_node_groups`], the LIST of a node's directory.
+    ListNodeGroups,
     /// [`SnapshotStore::read_stored`], the GET.
     Get,
     /// [`SnapshotStore::verify_uploaded`], the HEAD.
@@ -491,6 +493,14 @@ impl SnapshotStore for GatedSnapshotStore {
     fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
         let subject = object.path().to_owned();
         Box::pin(self.gated(StoreOp::DeleteOwn, subject, self.inner.delete_own(object)))
+    }
+
+    fn list_node_groups<'a>(&'a self, node: u64) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
+        Box::pin(self.gated(
+            StoreOp::ListNodeGroups,
+            format!("node-{node}"),
+            self.inner.list_node_groups(node),
+        ))
     }
 
     fn read_stored<'a>(

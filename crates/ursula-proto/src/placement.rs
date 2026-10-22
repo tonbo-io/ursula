@@ -768,6 +768,10 @@ pub struct UnplacedReplica {
     /// asker about it in this run, `null` before an answer.
     #[serde(deserialize_with = "crate::admin::required_option")]
     pub last_answer: Option<MembershipAnswer>,
+    /// How far the node's teardown of the replica went, `null` while none
+    /// runs.
+    #[serde(deserialize_with = "crate::admin::required_option")]
+    pub stage: Option<TeardownStage>,
 }
 
 /// What the meta group answered a node's registration.

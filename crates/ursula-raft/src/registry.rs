@@ -1087,6 +1087,13 @@ impl RaftGroupHandleRegistry {
         self.snapshot_install.clone()
     }
 
+    /// Forgets what the snapshot coordinators keep of `group`, whose
+    /// replica the node tore down (design 7.3, step 6).
+    pub(crate) fn forget_group_snapshots(&self, group: RaftGroupId) {
+        self.snapshot_build_coordinator().forget_group(group.0);
+        self.snapshot_install.forget_group(group.0);
+    }
+
     pub fn snapshot_build_coordinator(&self) -> SnapshotBuildCoordinator {
         self.snapshot_build
             .lock()

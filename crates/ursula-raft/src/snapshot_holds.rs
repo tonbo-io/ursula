@@ -62,7 +62,7 @@ use crate::rt::time::Instant;
 
 /// How long after a failed GC pass of a group the next one runs, doubled
 /// for each failed pass in a row up to [`SNAPSHOT_GC_MAX_RETRY`].
-const SNAPSHOT_GC_RETRY: Duration = Duration::from_secs(30);
+pub(crate) const SNAPSHOT_GC_RETRY: Duration = Duration::from_secs(30);
 /// The longest wait before a failed group's next GC pass.
 const SNAPSHOT_GC_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
 
@@ -644,13 +644,7 @@ impl SnapshotHolds {
         let held_before_list =
             ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::HoldsAfterList)
                 .then(|| self.held_keys());
-        let listing = store
-            .list_own(self.group)
-            .await
-            .map_err(SnapshotGcError::List)?;
-        // Read after the LIST returned: an object whose PUT the LIST shows
-        // was held before that PUT was sent.
-        let held = match held_before_list {
+        let deleted = delete_unheld(store, self.group, || match held_before_list {
             Some(held) => {
                 ursula_stream::sim_controls::note_fired(
                     ursula_stream::sim_controls::Defence::HoldsAfterList,
@@ -658,35 +652,62 @@ impl SnapshotHolds {
                 held
             }
             None => self.held_keys(),
-        };
-        if !listing.foreign.is_empty() {
-            tracing::warn!(
-                raft_group_id = self.group.0,
-                files = ?listing.foreign,
-                "snapshot GC leaves files in the node's snapshot directory that are not its objects"
-            );
-        }
-        let mut deleted = 0_u64;
-        for object in listing.owned {
-            if held.contains(object.path()) {
-                continue;
-            }
-            store
-                .delete_own(object)
-                .await
-                .map_err(SnapshotGcError::Delete)?;
-            deleted = deleted.saturating_add(1);
-        }
-        if deleted > 0 {
-            tracing::info!(
-                raft_group_id = self.group.0,
-                deleted,
-                held = held.len(),
-                "deleted snapshot objects this node no longer holds"
-            );
-        }
+        })
+        .await?;
         Ok(SnapshotPass::Collected { deleted })
     }
+}
+
+/// The pass over `group`'s objects when no replica of it runs on this node
+/// (design 7.3): the group's log here is absent or retired and the hosting
+/// driver admits no open of it, so nothing holds any of its objects, and
+/// the pass deletes every object it listed. The number it deleted.
+pub(crate) async fn collect_unowned(
+    store: &SharedSnapshotStore,
+    group: RaftGroupId,
+) -> Result<u64, SnapshotGcError> {
+    delete_unheld(store, group, BTreeSet::new).await
+}
+
+/// Lists the node's directory for `group`, then reads `held`, then deletes
+/// every listed object `held` leaves out: one GC pass. The number it
+/// deleted.
+async fn delete_unheld(
+    store: &SharedSnapshotStore,
+    group: RaftGroupId,
+    held: impl FnOnce() -> BTreeSet<String>,
+) -> Result<u64, SnapshotGcError> {
+    let listing = store.list_own(group).await.map_err(SnapshotGcError::List)?;
+    // Read after the LIST returned: an object whose PUT the LIST shows
+    // was held before that PUT was sent.
+    let held = held();
+    if !listing.foreign.is_empty() {
+        tracing::warn!(
+            raft_group_id = group.0,
+            files = ?listing.foreign,
+            "snapshot GC leaves files in the node's snapshot directory that are not its objects"
+        );
+    }
+    let mut deleted = 0_u64;
+    for object in listing.owned {
+        if held.contains(object.path()) {
+            continue;
+        }
+        store
+            .delete_own(object)
+            .await
+            .map_err(SnapshotGcError::Delete)?;
+        deleted = deleted.saturating_add(1);
+    }
+    if deleted > 0 {
+        tracing::info!(
+            raft_group_id = group.0,
+            deleted,
+            held = held.len(),
+            "deleted snapshot objects this node no longer holds"
+        );
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -737,9 +758,18 @@ mod tests {
         index: u64,
         body: &'static [u8],
     ) -> SnapshotLocation {
+        write_to(store, GROUP, index, body).await
+    }
+
+    async fn write_to(
+        store: &SharedSnapshotStore,
+        group: RaftGroupId,
+        index: u64,
+        body: &'static [u8],
+    ) -> SnapshotLocation {
         let staged = store
             .stage(
-                GROUP,
+                group,
                 index,
                 Box::new(std::iter::once(Ok(Bytes::from_static(body)))),
             )
@@ -977,6 +1007,75 @@ mod tests {
                 .node_id(),
             10
         );
+    }
+
+    /// The pass over a group no replica of the node runs deletes exactly
+    /// the objects its LIST showed in the node's directory for the group:
+    /// on the S3 store and on the simulated bucket, an object written after
+    /// the LIST, another group's and another node's survive it, and the
+    /// node's listing of its groups names each group it holds an object
+    /// of. Through a fenced store it deletes nothing.
+    #[tokio::test]
+    async fn a_pass_over_a_group_no_replica_runs_deletes_exactly_what_it_listed() {
+        use ursula_runtime::FencedSnapshotStore;
+        use ursula_runtime::NodeFence;
+        use ursula_runtime::snapshot_harness::Gate;
+        use ursula_runtime::snapshot_harness::GatedSnapshotStore;
+        use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
+        use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+        use ursula_runtime::snapshot_harness::SnapshotStoreGates;
+        use ursula_runtime::snapshot_harness::StoreOp;
+
+        let prefix = SnapshotPrefix::try_from("snapshots").unwrap();
+        let bucket = MemorySnapshotBucket::new(3, prefix, SnapshotStoreFaults::none());
+        let s3 = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
+        let backends: [(SharedSnapshotStore, SharedSnapshotStore); 2] = [
+            (Arc::new(s3.sibling_for_tests(10)), Arc::new(s3)),
+            (Arc::new(bucket.store(10)), Arc::new(bucket.store(1))),
+        ];
+        for (ten, inner) in backends {
+            let gates = SnapshotStoreGates::new();
+            let one: SharedSnapshotStore =
+                Arc::new(GatedSnapshotStore::new(1, inner.clone(), gates.clone()));
+            let listed = [write(&one, 1, b"a").await, write(&one, 2, b"b").await];
+            let other_group = write_to(&one, RaftGroupId(8), 3, b"c").await;
+            let other_node = write(&ten, 4, b"d").await;
+            assert_eq!(
+                one.list_node_groups(1).await.unwrap(),
+                std::collections::BTreeSet::from([GROUP, RaftGroupId(8)])
+            );
+            assert_eq!(
+                one.list_node_groups(10).await.unwrap(),
+                std::collections::BTreeSet::from([GROUP])
+            );
+
+            let after = Gate::after(1, StoreOp::ListOwn);
+            gates.hold(after);
+            let pass = tokio::spawn({
+                let one = one.clone();
+                async move { super::collect_unowned(&one, GROUP).await }
+            });
+            gates.wait_arrived(after, 1).await;
+            let late = write(&inner, 5, b"e").await;
+            gates.open(after);
+            assert_eq!(pass.await.unwrap().unwrap(), 2);
+
+            for deleted in &listed {
+                assert!(gone(one.download(deleted).await));
+            }
+            assert_eq!(one.download(&late).await.unwrap(), b"e");
+            assert_eq!(one.download(&other_group).await.unwrap(), b"c");
+            assert_eq!(ten.download(&other_node).await.unwrap(), b"d");
+
+            let fence = NodeFence::unleased();
+            fence.close();
+            let fenced = FencedSnapshotStore::wrap(inner, fence);
+            assert!(matches!(
+                super::collect_unowned(&fenced, GROUP).await,
+                Err(SnapshotGcError::Delete(_))
+            ));
+            assert_eq!(fenced.download(&late).await.unwrap(), b"e");
+        }
     }
 
     /// The holds of one group write no object of another group: the check

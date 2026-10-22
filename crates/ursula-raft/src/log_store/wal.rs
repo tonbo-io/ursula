@@ -850,8 +850,8 @@ impl RaftWal {
     }
 
     /// Waits until the OpenRaft work of `raft_group_id`'s latest engine
-    /// ended.
-    #[cfg(test)]
+    /// ended: nothing it runs writes for the group again (design 7.3, step
+    /// 4).
     pub(crate) async fn engine_work_ended(&self, raft_group_id: ursula_shard::RaftGroupId) {
         self.engine_work.ended(raft_group_id).await;
     }

@@ -28,13 +28,18 @@
 //!   core. No failed open stops anything: the group stays closed under its
 //!   open back-off and a pass one [`PLAN_INTERVAL`] later opens it again.
 //!   A failed close is retried likewise.
-//! - closes every running replica the plan does not admit (7.3's steps 1
-//!   to 3), then forgets its gauges and its open back-off.
+//! - closes every running replica the plan does not admit and no teardown
+//!   holds (7.3's steps 1 to 3), then forgets its gauges and its open
+//!   back-off.
+//! - starts, runs and cancels the plan's teardowns and reports each
+//!   retirement it tore down (`hosting::teardown`), and deletes the
+//!   snapshot objects of groups no replica here runs.
 //! - asks, for each held replica that may have left its group, the
 //!   group's leader whether the node is still a member (`hosting::asker`),
-//!   with the room the opens and closes leave in each core's budget.
+//!   with the room the opens, closes and teardowns leave in each core's
+//!   budget.
 //! - publishes a [`HostingStatus`] for readiness, with the latest answer
-//!   of each group.
+//!   and the teardown stage of each group.
 //! - refreshes the elections of every running replica whose placed voters
 //!   made it its group's only voter and no longer do, or the reverse
 //!   ([`RaftGroupHandleRegistry::refresh_only_voter_elections`]): the shed
@@ -47,13 +52,11 @@
 //! `PlacementUnavailable` leadership shed, which refuses transfers to it,
 //! and its plan closes each replica once it stops counting (design 8.1).
 //!
-//! While the node fence refuses, the driver creates and closes nothing:
-//! every admission it publishes is `Open`, and no group leaves the set.
+//! While the node fence refuses, the driver creates, closes, tears down,
+//! reports and deletes nothing: every admission it publishes is `Open`, and
+//! no group leaves the set.
 //!
-//! The teardown executor comes later (S4). The driver logs a plan's
-//! teardown and report steps and starts neither, so such a replica stays
-//! admitted, which is the safe direction. Each held replica counts as a
-//! voter by the one voter predicate
+//! Each held replica counts as a voter by the one voter predicate
 //! ([`RaftGroupHandleRegistry::counts_as_voter`]).
 //!
 //! A [`GroupHost`] runs the replicas: the server's over its shard runtime,
@@ -77,11 +80,14 @@ use ursula_control::HostingStep;
 use ursula_control::LocalReplica;
 use ursula_control::PlacementView;
 use ursula_control::Standing;
+use ursula_control::TeardownStep;
 use ursula_control::ViewInput;
 use ursula_control::leader_candidates;
 use ursula_control::plan_hosting;
+use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::TeardownStage;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 
@@ -95,10 +101,16 @@ use crate::rt::task::JoinHandle;
 use crate::rt::time::Instant;
 
 mod asker;
+mod teardown;
 
 pub use asker::ASK_INTERVAL;
 use asker::Askers;
 pub use asker::GroupAnswer;
+pub use teardown::OBJECT_PASSES_PER_NODE;
+use teardown::ObjectPasses;
+use teardown::StepEnd;
+pub use teardown::TEARDOWNS_PER_NODE;
+use teardown::Teardowns;
 
 /// How often the driver plans without a trigger, and the least time
 /// between two of its confirmations.
@@ -170,6 +182,8 @@ pub struct HostingStatus {
     /// The latest live leader's answer about each held replica the
     /// membership asker asked for (`hosting::asker`).
     pub answers: BTreeMap<RaftGroupId, GroupAnswer>,
+    /// The stage of each running teardown (`hosting::teardown`).
+    pub teardowns: BTreeMap<RaftGroupId, TeardownStage>,
 }
 
 /// A reader of the hosting driver's status.
@@ -258,14 +272,20 @@ impl<H: GroupHost> HostingDriver<H> {
         let (mut views_open, mut groups_open, mut answers_open) = (true, true, true);
         let mut actions = Actions::new();
         let mut confirms = Confirms::default();
-        let mut askers = Askers::default();
+        let mut work = Work {
+            askers: Askers::default(),
+            teardowns: Teardowns::default(),
+            objects: ObjectPasses::starting(
+                self.registry.snapshot_install_coordinator().late_write(),
+            ),
+        };
         let mut only_voter = BTreeSet::new();
         // The node's standing, latched `Removed` for the rest of the run
         // once a pass knows it removed.
         let mut standing = Standing::Member;
         loop {
-            actions.reap(&mut askers);
-            self.pass(&mut actions, &mut confirms, &mut askers, &mut standing)
+            actions.reap(&mut work);
+            self.pass(&mut actions, &mut confirms, &mut work, &mut standing)
                 .await;
             self.registry.refresh_only_voter_elections(&mut only_voter);
             let ended = crate::rt::select! {
@@ -286,21 +306,22 @@ impl<H: GroupHost> HostingDriver<H> {
                 () = crate::rt::time::sleep(PLAN_INTERVAL) => None,
             };
             if let Some((group, end)) = ended {
-                actions.end(group, end, &mut askers);
+                actions.end(group, end, &mut work);
             }
         }
     }
 
     /// One pass: read the journals, confirm when the plan asks for it and
-    /// the interval allows, plan, act on the plan, then ask about the held
-    /// replicas that may have left their groups. `standing` is the run's
-    /// latched standing: once the node knows itself removed, it stays
-    /// `Removed` whatever a later view or answer says.
+    /// the interval allows, plan, act on the plan, run the teardowns and
+    /// the object passes, then ask about the held replicas that may have
+    /// left their groups. `standing` is the run's latched standing: once the
+    /// node knows itself removed, it stays `Removed` whatever a later view
+    /// or answer says.
     async fn pass(
         &self,
         actions: &mut Actions,
         confirms: &mut Confirms,
-        askers: &mut Askers,
+        work: &mut Work,
         standing: &mut Standing,
     ) {
         let local = match self.wal.local_groups() {
@@ -316,7 +337,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 (group, LocalReplica {
                     log,
                     counts: self.registry.counts_as_voter(group),
-                    teardown: None,
+                    teardown: work.teardowns.state(group),
                 })
             })
             .collect();
@@ -373,36 +394,69 @@ impl<H: GroupHost> HostingDriver<H> {
             .filter(|(_, replica)| replica.log.is_held())
             .map(|(group, _)| *group)
             .collect();
-        askers.retain(|group| held.contains(&group));
-        self.act(plan, actions, held, confirmed, askers.answers());
-        self.ask(&local, &view, actions, askers);
+        work.askers.retain(|group| held.contains(&group));
+        let peers: BTreeSet<NodeId> = self
+            .registry
+            .peer_cluster()
+            .directory()
+            .node_ids()
+            .map(NodeId::new)
+            .collect();
+        let (published, reports) = self.act(plan, actions, held, confirmed, work);
+        self.tear_down(
+            actions,
+            &mut work.teardowns,
+            &work.askers,
+            &published,
+            &view,
+            &peers,
+        );
+        self.report_torn_down(actions, reports);
+        self.collect_objects(
+            actions,
+            &mut work.objects,
+            &work.teardowns,
+            &local,
+            &published,
+        );
+        self.ask(&local, &view, &peers, actions, work);
     }
 
-    /// Publishes the plan's admissions, opens what the node does not run
-    /// and closes what it may no longer run.
+    /// Starts and cancels the plan's teardowns, publishes its admissions,
+    /// opens what the node does not run and closes what it may no longer
+    /// run and no teardown holds. Returns the published admissions and the
+    /// retirements the plan reports torn down.
     fn act(
         &self,
         plan: HostingPlan,
         actions: &mut Actions,
         held: BTreeSet<RaftGroupId>,
         confirmed: Option<ConfirmedStamp>,
-        answers: BTreeMap<RaftGroupId, GroupAnswer>,
+        work: &mut Work,
+    ) -> (
+        BTreeMap<RaftGroupId, Admission>,
+        Vec<(RaftGroupId, MetaLogId)>,
     ) {
+        let fenced = !self.wal.fence().admits_now();
+        let mut reports = Vec::new();
         for step in &plan.steps {
             match *step {
-                HostingStep::ConfirmView | HostingStep::CancelTeardown { .. } => {}
-                HostingStep::TearDown { group } => tracing::debug!(
-                    group = group.0,
-                    "hosting: the plan tears this replica down; no teardown runs yet, so it stays admitted"
-                ),
-                HostingStep::ReportTornDown { group, .. } => tracing::debug!(
-                    group = group.0,
-                    "hosting: the plan reports this replica torn down; no report is sent yet"
-                ),
+                HostingStep::ConfirmView => {}
+                HostingStep::TearDown { group } => {
+                    if !fenced && work.teardowns.start(group, &work.askers) {
+                        work.askers.rearm(group);
+                    }
+                }
+                HostingStep::CancelTeardown { group } => {
+                    work.teardowns
+                        .advance(group, ursula_control::TeardownEvent::Cancel);
+                }
+                HostingStep::ReportTornDown { group, created_at } => {
+                    reports.push((group, created_at));
+                }
             }
         }
-        let fenced = !self.wal.fence().admits_now();
-        let admitted = if fenced {
+        let mut admitted = if fenced {
             // Nothing is created and nothing leaves the set.
             let previous = self.hosting.admitted();
             previous
@@ -413,12 +467,16 @@ impl<H: GroupHost> HostingDriver<H> {
         } else {
             plan.admitted
         };
+        // A pass over the group's objects runs: its new replica waits.
+        admitted.retain(|group, admission| {
+            *admission != Admission::Create || !work.objects.running(*group)
+        });
         // Step 1 of every close below: no request reopens a dropped group.
         self.hosting.publish(admitted.clone());
         let running = self.registry.registered_groups();
         if !fenced {
             for group in running.iter().copied() {
-                if admitted.contains_key(&group) {
+                if admitted.contains_key(&group) || work.teardowns.fenced(group) {
                     continue;
                 }
                 let host = Arc::clone(&self.host);
@@ -461,10 +519,11 @@ impl<H: GroupHost> HostingDriver<H> {
         }
         let status = HostingStatus {
             held,
-            admitted,
+            admitted: admitted.clone(),
             unplaced: plan.unplaced,
             last_confirmed: confirmed,
-            answers,
+            answers: work.askers.answers(),
+            teardowns: work.teardowns.stages(),
         };
         self.status.send_if_modified(|current| {
             let modified = **current != status;
@@ -473,6 +532,7 @@ impl<H: GroupHost> HostingDriver<H> {
             }
             modified
         });
+        (admitted, reports)
     }
 
     /// Asks, for each held replica that may have left its group and is due
@@ -480,27 +540,23 @@ impl<H: GroupHost> HostingDriver<H> {
     /// still a member: a closed replica, and an open one that does not lead
     /// and whose bootstrapped view gives the node the role `Outgoing`,
     /// `Abandoned` or none. An open replica adds its effective membership to
-    /// the candidates. While the node fence refuses, nothing is asked.
+    /// the candidates. A teardown past its first step asks for itself.
+    /// While the node fence refuses, nothing is asked.
     fn ask(
         &self,
         local: &BTreeMap<RaftGroupId, LocalReplica>,
         view: &PlacementView,
+        peers: &BTreeSet<NodeId>,
         actions: &mut Actions,
-        askers: &mut Askers,
+        work: &mut Work,
     ) {
         if !self.wal.fence().admits_now() {
             return;
         }
-        let peers: BTreeSet<NodeId> = self
-            .registry
-            .peer_cluster()
-            .directory()
-            .node_ids()
-            .map(NodeId::new)
-            .collect();
+        let askers = &mut work.askers;
         let marks = self.registry.left_marks();
         for (group, replica) in local {
-            if !replica.log.is_held() {
+            if !replica.log.is_held() || work.teardowns.fenced(*group) {
                 continue;
             }
             let raft = self.registry.get(*group);
@@ -536,18 +592,22 @@ impl<H: GroupHost> HostingDriver<H> {
                 CandidatesOf::Group(*group),
                 view,
                 membership.as_ref(),
-                &peers,
+                peers,
             )
             .iter()
             .collect();
-            let work = asker::ask(
+            let asked = asker::ask(
                 self.meta.clone(),
                 marks.clone(),
                 self.me,
                 *group,
                 candidates,
             );
-            if self.begin(actions, *group, work) {
+            if self.begin(
+                actions,
+                *group,
+                async move { ActionEnd::Asked(asked.await) },
+            ) {
                 askers.started(*group, vote, marks);
             }
         }
@@ -618,7 +678,7 @@ impl Confirms {
     }
 }
 
-/// How an open, close or ask ended.
+/// How an open, close, ask, teardown step, report or object pass ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionEnd {
     Done,
@@ -626,6 +686,23 @@ enum ActionEnd {
     Failed,
     /// An ask ended, with a live leader's answer or none.
     Asked(Option<GroupAnswer>),
+    /// The action of a teardown's step `at` ended.
+    Teardown {
+        at: TeardownStep,
+        end: StepEnd,
+    },
+    /// A pass over the objects of a group no replica here runs ended.
+    Objects {
+        collected: bool,
+    },
+}
+
+/// What the driver keeps of its asks, teardowns and object passes between
+/// passes.
+struct Work {
+    askers: Askers,
+    teardowns: Teardowns,
+    objects: ObjectPasses,
 }
 
 /// One open, close or ask the driver runs.
@@ -657,17 +734,17 @@ impl Actions {
 
     /// Forgets every action that ended, and every failure older than
     /// [`PLAN_INTERVAL`].
-    fn reap(&mut self, askers: &mut Askers) {
+    fn reap(&mut self, work: &mut Work) {
         while let Ok((group, end)) = self.done.try_recv() {
-            self.end(group, end, askers);
+            self.end(group, end, work);
         }
         self.failed
             .retain(|_, failed| failed.elapsed() < PLAN_INTERVAL);
     }
 
-    /// Forgets the action of `group`, which ended by `end`, and records an
-    /// ask's answer in `askers`.
-    fn end(&mut self, group: RaftGroupId, end: ActionEnd, askers: &mut Askers) {
+    /// Forgets the action of `group`, which ended by `end`, and records
+    /// what it learned in `work`.
+    fn end(&mut self, group: RaftGroupId, end: ActionEnd, work: &mut Work) {
         self.running.remove(&group);
         match end {
             ActionEnd::Done => {
@@ -676,7 +753,17 @@ impl Actions {
             ActionEnd::Failed => {
                 self.failed.insert(group, Instant::now());
             }
-            ActionEnd::Asked(answered) => askers.ended(group, answered),
+            ActionEnd::Asked(answered) => work.askers.ended(group, answered),
+            ActionEnd::Teardown { at, end } => {
+                self.failed.remove(&group);
+                if let StepEnd::Answered(answered) = end {
+                    work.askers.ended(group, answered);
+                }
+                if work.teardowns.step_ended(group, at, end) {
+                    work.objects.retired(group);
+                }
+            }
+            ActionEnd::Objects { collected } => work.objects.ended(group, collected),
         }
     }
 

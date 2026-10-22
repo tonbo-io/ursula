@@ -912,6 +912,26 @@ impl BucketState {
         }
     }
 
+    /// A LIST of the groups of `node`'s directory under `prefix`. It reads
+    /// what the bucket holds, without the stale listings of [`Self::list`]:
+    /// a group left out would only wait for the next listing.
+    fn node_groups(
+        &mut self,
+        prefix: &SnapshotPrefix,
+        node: u64,
+    ) -> Result<BTreeSet<RaftGroupId>, SnapshotStoreError> {
+        self.transient(
+            node,
+            SnapshotStoreOperation::List,
+            &format!("{prefix}/node-{node}/"),
+        )?;
+        Ok(crate::snapshot_store::node_groups(
+            prefix,
+            node,
+            self.objects.keys().map(String::as_str),
+        ))
+    }
+
     /// A LIST of `owner`'s directory under `prefix` at `now`.
     fn list(
         &mut self,
@@ -1310,6 +1330,15 @@ impl SnapshotStore for MemorySnapshotStore {
             let node_id = self.node_id;
             self.bucket
                 .request(move |state, now| state.delete(node_id, object.path, now))
+                .await
+        })
+    }
+
+    fn list_node_groups<'a>(&'a self, node: u64) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
+        Box::pin(async move {
+            let prefix = self.prefix().clone();
+            self.bucket
+                .request(move |state, _now| state.node_groups(&prefix, node))
                 .await
         })
     }
