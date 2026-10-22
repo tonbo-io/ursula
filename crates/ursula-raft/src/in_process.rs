@@ -169,11 +169,63 @@ impl From<InProcessBarrierError> for crate::meta::confirm::BarrierFailure {
 }
 
 /// The in-process registry of one plane's replicas, by node id.
+///
+/// A node may run two processes at once, as when its volume moved while
+/// its old process still runs. The process registered last answers for
+/// the node, and a route ([`Self::pin_route`], [`Self::cut_route`]) sends
+/// the RPCs of one sending process to another process of the node, or
+/// drops them.
 pub struct InProcessRegistry<SM: InProcessEndpoint> {
     endpoints: Arc<Mutex<BTreeMap<u64, SM::Endpoint>>>,
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, SM>>>>,
     barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier<SM>>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
+    /// The route of each (sending process, target node) the simulation set.
+    routes: Arc<Mutex<Routes<SM>>>,
+}
+
+/// The routes of a registry, by (sending process, target node).
+type Routes<SM> = BTreeMap<(u64, u64), Route<SM>>;
+
+/// Where the RPCs of one sending process to one node go
+/// ([`InProcessRegistry::pin_route`], [`InProcessRegistry::cut_route`]).
+enum Route<SM: InProcessEndpoint> {
+    /// To the process of the node registered when the route was pinned.
+    To {
+        endpoint: SM::Endpoint,
+        raft: Option<Raft<UrsulaRaftTypeConfig, SM>>,
+    },
+    /// Nowhere, as to a peer that cannot be reached.
+    Cut,
+}
+
+impl<SM: InProcessEndpoint> Clone for Route<SM> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::To { endpoint, raft } => Self::To {
+                endpoint: endpoint.clone(),
+                raft: raft.clone(),
+            },
+            Self::Cut => Self::Cut,
+        }
+    }
+}
+
+/// The process an in-process network sends from: the simulation's tag for
+/// it, and what it registered to answer RPCs, whose fence and incarnation
+/// its requests carry ([`InProcessNetworkFactory::with_process`]).
+struct InProcessSender<SM: InProcessEndpoint> {
+    process: u64,
+    endpoint: SM::Endpoint,
+}
+
+impl<SM: InProcessEndpoint> Clone for InProcessSender<SM> {
+    fn clone(&self) -> Self {
+        Self {
+            process: self.process,
+            endpoint: self.endpoint.clone(),
+        }
+    }
 }
 
 /// The data plane's in-process registry.
@@ -186,6 +238,7 @@ impl<SM: InProcessEndpoint> Clone for InProcessRegistry<SM> {
             nodes: self.nodes.clone(),
             barriers: self.barriers.clone(),
             full_snapshot_calls: self.full_snapshot_calls.clone(),
+            routes: self.routes.clone(),
         }
     }
 }
@@ -197,6 +250,7 @@ impl<SM: InProcessEndpoint> Default for InProcessRegistry<SM> {
             nodes: Arc::default(),
             barriers: Arc::default(),
             full_snapshot_calls: Arc::default(),
+            routes: Arc::default(),
         }
     }
 }
@@ -248,6 +302,45 @@ impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
             .unwrap_or(0)
     }
 
+    /// Pins the RPCs that the sending process `process` sends to node
+    /// `target` to the target's process registered now, so they keep
+    /// reaching it once another process of the node registers. Answers
+    /// whether one is registered.
+    pub fn pin_route(&self, process: u64, target: u64) -> bool {
+        let Some(endpoint) = self.endpoint(target) else {
+            return false;
+        };
+        let raft = self.get(target);
+        self.routes
+            .lock()
+            .expect("in-process routes mutex")
+            .insert((process, target), Route::To { endpoint, raft });
+        true
+    }
+
+    /// Drops the RPCs that the sending process `process` sends to node
+    /// `target`, as to a peer it cannot reach.
+    pub fn cut_route(&self, process: u64, target: u64) {
+        self.routes
+            .lock()
+            .expect("in-process routes mutex")
+            .insert((process, target), Route::Cut);
+    }
+
+    /// Forgets every route: each RPC reaches the process its target
+    /// registered last.
+    pub fn clear_routes(&self) {
+        self.routes.lock().expect("in-process routes mutex").clear();
+    }
+
+    fn route(&self, process: u64, target: u64) -> Option<Route<SM>> {
+        self.routes
+            .lock()
+            .expect("in-process routes mutex")
+            .get(&(process, target))
+            .cloned()
+    }
+
     fn record_full_snapshot(&self, node_id: u64) {
         let mut calls = self
             .full_snapshot_calls
@@ -260,13 +353,35 @@ impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
 
 impl InProcessRegistry<RaftGroupStateMachine> {
     pub fn register(&self, node_id: u64, engine: &crate::RaftGroupEngine) {
+        let endpoint = crate::RaftGroupHandleRegistry::default();
+        endpoint.register_engine(engine);
+        self.register_through(node_id, engine, endpoint);
+    }
+
+    /// Registers `engine` as node `node_id`'s replica, answering through
+    /// `registry`, the production registry of the process that runs it, in
+    /// which the engine published its recovery: RPCs to it meet that
+    /// process's fence and incarnation, as over gRPC.
+    pub fn register_process(
+        &self,
+        node_id: u64,
+        engine: &crate::RaftGroupEngine,
+        registry: &crate::RaftGroupHandleRegistry,
+    ) {
+        self.register_through(node_id, engine, registry.clone());
+    }
+
+    fn register_through(
+        &self,
+        node_id: u64,
+        engine: &crate::RaftGroupEngine,
+        endpoint: crate::RaftGroupHandleRegistry,
+    ) {
         let raft = engine.raft_handle();
         self.barriers
             .lock()
             .expect("in-process barrier mutex")
             .insert(node_id, engine.read_barrier.clone());
-        let endpoint = crate::RaftGroupHandleRegistry::default();
-        endpoint.register_engine(engine);
         self.endpoints
             .lock()
             .expect("endpoint registry")
@@ -599,6 +714,7 @@ pub(crate) async fn forward_control_in_process(
 pub struct InProcessNetworkFactory<SM: InProcessEndpoint> {
     registry: InProcessRegistry<SM>,
     source: Option<u64>,
+    sender: Option<InProcessSender<SM>>,
     policy: InProcessRaftNetworkPolicy,
 }
 
@@ -610,6 +726,7 @@ impl<SM: InProcessEndpoint> Clone for InProcessNetworkFactory<SM> {
         Self {
             registry: self.registry.clone(),
             source: self.source,
+            sender: self.sender.clone(),
             policy: self.policy.clone(),
         }
     }
@@ -628,12 +745,23 @@ impl<SM: InProcessEndpoint> InProcessNetworkFactory<SM> {
         Self {
             registry,
             source: None,
+            sender: None,
             policy: InProcessRaftNetworkPolicy::default(),
         }
     }
 
     pub fn with_source(mut self, source: u64) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    /// Sends as the process the simulation tags `process`, whose RPCs carry
+    /// the fence and incarnation of `endpoint`, what that process registers
+    /// to answer RPCs, and follow its routes
+    /// ([`InProcessRegistry::pin_route`]). Without it a network sends as the
+    /// process its source node registered last.
+    pub fn with_process(mut self, process: u64, endpoint: SM::Endpoint) -> Self {
+        self.sender = Some(InProcessSender { process, endpoint });
         self
     }
 
@@ -651,6 +779,7 @@ impl<SM: InProcessEndpoint> RaftNetworkFactory<UrsulaRaftTypeConfig>
     async fn new_client(&mut self, target: u64, _node: &EmptyNode) -> Self::Network {
         InProcessNetwork {
             source: self.source,
+            sender: self.sender.clone(),
             target,
             registry: self.registry.clone(),
             policy: self.policy.clone(),
@@ -1056,6 +1185,7 @@ impl InProcessRaftNetworkDecision {
 /// The in-process network of one plane, from one source to one target.
 pub struct InProcessNetwork<SM: InProcessEndpoint> {
     source: Option<u64>,
+    sender: Option<InProcessSender<SM>>,
     target: u64,
     registry: InProcessRegistry<SM>,
     policy: InProcessRaftNetworkPolicy,
@@ -1068,6 +1198,7 @@ impl<SM: InProcessEndpoint> Clone for InProcessNetwork<SM> {
     fn clone(&self) -> Self {
         Self {
             source: self.source,
+            sender: self.sender.clone(),
             target: self.target,
             registry: self.registry.clone(),
             policy: self.policy.clone(),
@@ -1167,9 +1298,40 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
 
 impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
     fn sender(&self) -> Option<crate::PeerCluster> {
-        self.source
-            .and_then(|source| self.registry.endpoint(source))
-            .map(|endpoint| SM::peer_cluster(&endpoint))
+        match &self.sender {
+            Some(sender) => Some(SM::peer_cluster(&sender.endpoint)),
+            None => self
+                .source
+                .and_then(|source| self.registry.endpoint(source))
+                .map(|endpoint| SM::peer_cluster(&endpoint)),
+        }
+    }
+
+    /// The sending process's route to the target, if the simulation set one.
+    fn route(&self) -> Option<Route<SM>> {
+        let sender = self.sender.as_ref()?;
+        self.registry.route(sender.process, self.target)
+    }
+
+    /// The target's process this RPC goes to: the one its route pins, else
+    /// the one the target registered last. A cut route loses the RPC.
+    fn target_endpoint(&self) -> Result<Option<SM::Endpoint>, Unreachable<UrsulaRaftTypeConfig>> {
+        match self.route() {
+            Some(Route::To { endpoint, .. }) => Ok(Some(endpoint)),
+            Some(Route::Cut) => Err(self.lost("its route is cut")),
+            None => Ok(self.registry.endpoint(self.target)),
+        }
+    }
+
+    /// The target's Raft this RPC goes to, routed as [`Self::target_endpoint`].
+    fn target_raft(
+        &self,
+    ) -> Result<Option<Raft<UrsulaRaftTypeConfig, SM>>, Unreachable<UrsulaRaftTypeConfig>> {
+        match self.route() {
+            Some(Route::To { raft, .. }) => Ok(raft),
+            Some(Route::Cut) => Err(self.lost("its route is cut")),
+            None => Ok(self.registry.get(self.target)),
+        }
     }
 
     fn lost(&self, why: impl std::fmt::Display) -> Unreachable<UrsulaRaftTypeConfig> {
@@ -1263,15 +1425,18 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         {
             sleep_in_process_raft_network(delay).await;
         }
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
-            self.policy
-                .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
-                    source: self.source,
-                    target: self.target,
-                    kind: InProcessRaftRpcKind::AppendEntries,
-                });
-            RPCError::Unreachable(self.missing_target_error())
-        })?;
+        let target = self
+            .target_endpoint()
+            .map_err(RPCError::Unreachable)?
+            .ok_or_else(|| {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                        source: self.source,
+                        target: self.target,
+                        kind: InProcessRaftRpcKind::AppendEntries,
+                    });
+                RPCError::Unreachable(self.missing_target_error())
+            })?;
         self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
             source: self.source,
             target: self.target,
@@ -1321,15 +1486,18 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         self.before_rpc(InProcessRaftRpcKind::Vote)
             .await
             .map_err(RPCError::Unreachable)?;
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
-            self.policy
-                .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
-                    source: self.source,
-                    target: self.target,
-                    kind: InProcessRaftRpcKind::Vote,
-                });
-            RPCError::Unreachable(self.missing_target_error())
-        })?;
+        let target = self
+            .target_endpoint()
+            .map_err(RPCError::Unreachable)?
+            .ok_or_else(|| {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                        source: self.source,
+                        target: self.target,
+                        kind: InProcessRaftRpcKind::Vote,
+                    });
+                RPCError::Unreachable(self.missing_target_error())
+            })?;
         self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
             source: self.source,
             target: self.target,
@@ -1361,15 +1529,18 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel.as_mut())
             .await?;
         self.registry.record_full_snapshot(self.target);
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
-            self.policy
-                .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
-                    source: self.source,
-                    target: self.target,
-                    kind: InProcessRaftRpcKind::FullSnapshot,
-                });
-            StreamingError::Unreachable(self.missing_target_error())
-        })?;
+        let target = self
+            .target_endpoint()
+            .map_err(StreamingError::Unreachable)?
+            .ok_or_else(|| {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                        source: self.source,
+                        target: self.target,
+                        kind: InProcessRaftRpcKind::FullSnapshot,
+                    });
+                StreamingError::Unreachable(self.missing_target_error())
+            })?;
         self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
             source: self.source,
             target: self.target,
@@ -1438,21 +1609,24 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         self.before_rpc(InProcessRaftRpcKind::TransferLeader)
             .await
             .map_err(RPCError::Unreachable)?;
-        let target = self.registry.get(self.target).ok_or_else(|| {
-            self.policy
-                .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
-                    source: self.source,
-                    target: self.target,
-                    kind: InProcessRaftRpcKind::TransferLeader,
-                });
-            RPCError::Unreachable(self.missing_target_error())
-        })?;
+        let target = self
+            .target_raft()
+            .map_err(RPCError::Unreachable)?
+            .ok_or_else(|| {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                        source: self.source,
+                        target: self.target,
+                        kind: InProcessRaftRpcKind::TransferLeader,
+                    });
+                RPCError::Unreachable(self.missing_target_error())
+            })?;
         self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
             source: self.source,
             target: self.target,
             kind: InProcessRaftRpcKind::TransferLeader,
         });
-        let endpoint = self.registry.endpoint(self.target);
+        let endpoint = self.target_endpoint().map_err(RPCError::Unreachable)?;
         self.deliver(endpoint.as_ref())
             .map_err(RPCError::Unreachable)?;
         if let Some(endpoint) = &endpoint

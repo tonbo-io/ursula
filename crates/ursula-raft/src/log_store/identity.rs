@@ -132,7 +132,7 @@ pub(super) fn advance(
     };
     let file = IdentityFile {
         run,
-        predecessor_wait: predecessor == Predecessor::MayLive,
+        predecessor_wait: predecessor == Predecessor::MayLive && records_owed_wait(),
         standing: stored.standing(),
     };
     write(root, &file)?;
@@ -141,6 +141,17 @@ pub(super) fn advance(
         run,
         nonce: rand::random(),
     }))
+}
+
+/// Whether the start records an owed wait. A negative control turns it off
+/// (`Defence::OwedWait`), and a restart during the wait then owes nothing.
+fn records_owed_wait() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::OwedWait) {
+        ursula_stream::sim_controls::note_fired(Defence::OwedWait);
+        return false;
+    }
+    true
 }
 
 /// Records `file`, `fsync`ed: the whole file, replacing the one before.

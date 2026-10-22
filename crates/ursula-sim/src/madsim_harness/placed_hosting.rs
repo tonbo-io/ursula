@@ -33,6 +33,7 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex as AsyncMutex;
 use openraft::Raft;
 use openraft::ServerState;
+use openraft::storage::RaftLogReader;
 use ursula_ctl::recovery::LoopState;
 use ursula_ctl::recovery::PlanError;
 use ursula_ctl::recovery::PlanMember;
@@ -136,6 +137,32 @@ struct Hosted {
     engine: Arc<AsyncMutex<RaftGroupEngine>>,
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     rejoin: Arc<GroupRejoin>,
+    /// What the replica showed once it opened, before its drivers ran,
+    /// with the vote its store held.
+    opened: ReplicaMarks,
+}
+
+/// What a replica's gate and vote show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplicaMarks {
+    /// Whether its vote gate is open.
+    pub(super) gate_open: bool,
+    /// Whether it holds a vote floor.
+    pub(super) floor: bool,
+    pub(super) vote: ursula_raft::UrsulaVote,
+}
+
+impl ReplicaMarks {
+    pub(super) fn of(
+        raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+        rejoin: &GroupRejoin,
+    ) -> Self {
+        Self {
+            gate_open: rejoin.vote_gate_open(),
+            floor: rejoin.holds_vote_floor(),
+            vote: openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).vote,
+        }
+    }
 }
 
 /// Why a [`SimHost`] did not open or close a replica.
@@ -171,6 +198,9 @@ pub(super) struct SimHost {
     inputs: MetaPlacement,
     replicas: Mutex<BTreeMap<u32, Hosted>>,
     started: StartedGates,
+    /// Whether the process no longer answers for its node
+    /// ([`MetaCluster::take_host`]).
+    detached: std::sync::atomic::AtomicBool,
 }
 
 impl SimHost {
@@ -198,6 +228,16 @@ impl SimHost {
             .await
             .map_err(|source| SimHostError::Gate { group, source })?,
         );
+        // The vote the replica opens with, for I16 of the identity-fence
+        // family, whose processes alone read it, so other families' runs
+        // keep their schedules.
+        let stored_vote = match self.parts.process {
+            Some(_) => {
+                let mut store = Arc::clone(&store);
+                store.read_vote().await.ok().flatten()
+            }
+            None => None,
+        };
         let registry = &self.parts.registry;
         let network = self.parts.registries[&group].clone();
         let mut config = (*self.parts.config).clone();
@@ -213,15 +253,19 @@ impl SimHost {
             ^ node_id.rotate_left(32)
             ^ u64::from(group).rotate_left(16)
             ^ self.started.len();
+        let mut factory = InProcessRaftNetworkFactory::new(network.clone())
+            .with_source(node_id)
+            .with_policy(self.parts.policy.clone());
+        if let Some(process) = self.parts.process {
+            factory = factory.with_process(process, (placement.raft_group_id, registry.clone()));
+        }
         let engine = MadsimOpenRaftRuntime::scope(
             seed,
             RaftGroupEngine::new_node(
                 placement,
                 node_id,
                 Arc::new(config),
-                InProcessRaftNetworkFactory::new(network.clone())
-                    .with_source(node_id)
-                    .with_policy(self.parts.policy.clone()),
+                factory,
                 store,
                 wal.recording_work(options),
             ),
@@ -240,10 +284,19 @@ impl SimHost {
             &self.inputs,
             registry,
         );
-        network.register(node_id, &engine);
+        match self.parts.process {
+            Some(_) => network.register_process(node_id, &engine, registry),
+            None => network.register(node_id, &engine),
+        }
         self.started.push(group, node_id, Arc::clone(&rejoin));
+        let raft = engine.raft_handle();
+        let mut opened = ReplicaMarks::of(&raft, &rejoin);
+        if let Some(vote) = stored_vote {
+            opened.vote = vote;
+        }
         let hosted = Hosted {
-            raft: engine.raft_handle(),
+            opened,
+            raft,
             engine: Arc::new(AsyncMutex::new(engine)),
             rejoin,
         };
@@ -252,11 +305,14 @@ impl SimHost {
     }
 
     /// Steps 2 and 3 of a close (design 7.3): the handle goes, then the
-    /// engine stops and releases its store.
+    /// engine stops and releases its store. A detached process leaves the in-process network as it is: its node
+    /// answers through its next process there.
     async fn stop(&self, group: u32) -> Result<(), SimHostError> {
         let hosted = self.lock().remove(&group);
         self.parts.registry.unregister_group(RaftGroupId(group));
-        self.parts.registries[&group].unregister(self.parts.node_id);
+        if !self.detached.load(std::sync::atomic::Ordering::Acquire) {
+            self.parts.registries[&group].unregister(self.parts.node_id);
+        }
         let Some(hosted) = hosted else {
             return Ok(());
         };
@@ -319,6 +375,19 @@ impl SimHost {
             .map(|hosted| Arc::clone(&hosted.engine))
     }
 
+    /// Each replica this host runs, by group.
+    fn replicas(&self) -> Vec<HostedReplica> {
+        self.lock()
+            .iter()
+            .map(|(group, hosted)| HostedReplica {
+                group: *group,
+                raft: hosted.raft.clone(),
+                rejoin: Arc::clone(&hosted.rejoin),
+                opened: hosted.opened,
+            })
+            .collect()
+    }
+
     fn gates_open(&self) -> bool {
         self.lock()
             .values()
@@ -347,6 +416,35 @@ impl GroupHost for SimHost {
 struct NodeHost {
     host: Arc<SimHost>,
     driver: HostingTask,
+}
+
+/// One placed replica as the checks read it.
+pub(super) struct HostedReplica {
+    pub(super) group: u32,
+    pub(super) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    pub(super) rejoin: Arc<GroupRejoin>,
+    /// What it showed once it opened.
+    pub(super) opened: ReplicaMarks,
+}
+
+/// The host and hosting driver of a node process that no longer answers
+/// for its node ([`MetaCluster::take_host`]), and runs on until it is
+/// killed.
+pub(super) struct DetachedHost(NodeHost);
+
+impl DetachedHost {
+    /// Kills the process's driver and replicas. Their disk may be gone, so
+    /// a stop that fails is only logged, as a killed process ends either
+    /// way.
+    pub(super) async fn kill(self) {
+        let NodeHost { host, driver } = self.0;
+        driver.shutdown().await;
+        for group in host.groups() {
+            if let Err(error) = host.stop(group).await {
+                tracing::info!(group, %error, "a detached process's replica stopped with an error");
+            }
+        }
+    }
 }
 
 /// The placed data plane of a [`MetaCluster`]: each running node's host.
@@ -386,7 +484,8 @@ impl MetaCluster {
         let hosting = HostingSet::default();
         let placed = self.placed_mut();
         let started = placed.started.clone();
-        let parts = self.data.replica_parts(node_id);
+        let mut parts = self.data.replica_parts(node_id);
+        parts.process = self.process(node_id);
         let inputs = MetaPlacement::new(
             ursula_proto::placement::NodeId::new(node_id),
             parts.registry.clone(),
@@ -398,11 +497,40 @@ impl MetaCluster {
             inputs,
             replicas: Mutex::new(BTreeMap::new()),
             started,
+            detached: std::sync::atomic::AtomicBool::new(false),
         });
         let driver = HostingDriver::start(Arc::clone(&host), wal, reader, hosting);
         self.placed_mut()
             .hosts
             .insert(node_id, NodeHost { host, driver });
+    }
+
+    /// Takes `node_id`'s running host and driver out of the cluster, which
+    /// keeps running them until [`DetachedHost::kill`].
+    pub(super) fn take_host(&mut self, node_id: u64) -> Option<DetachedHost> {
+        let node = self.placed_mut().hosts.remove(&node_id)?;
+        node.host
+            .detached
+            .store(true, std::sync::atomic::Ordering::Release);
+        Some(DetachedHost(node))
+    }
+
+    /// Each replica `node_id`'s current process runs.
+    pub(super) fn hosted_replicas(&self, node_id: u64) -> Vec<HostedReplica> {
+        self.placed()
+            .hosts
+            .get(&node_id)
+            .map(|node| node.host.replicas())
+            .unwrap_or_default()
+    }
+
+    /// `node_id`'s current replica of `group`, if it runs one.
+    pub(super) fn hosted_engine(
+        &self,
+        node_id: u64,
+        group: u32,
+    ) -> Option<Arc<AsyncMutex<RaftGroupEngine>>> {
+        self.placed().hosts.get(&node_id)?.host.engine(group)
     }
 
     /// Stops `node_id`'s hosting driver, then every replica it runs.

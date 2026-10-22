@@ -183,6 +183,30 @@ pub enum Defence {
     /// seed role answers `Initializer` for any view, so every seed voter
     /// races to initialize its group.
     InitializeOnlySeeded,
+    /// A run whose predecessor may still run owes the predecessor wait
+    /// before it grants a vote, takes a transfer, opens a gate or writes a
+    /// snapshot object (N12 of the identity fence). Off, it owes none, so a
+    /// successor on a moved volume votes beside its old process.
+    SuccessorWait,
+    /// A probe that does not sync ends the disk lease at once, and a lease
+    /// whose last success is older than its length has ended (N21). Off,
+    /// the lease never ends, so a process whose volume moved keeps taking
+    /// part in Raft.
+    DiskLease,
+    /// The identity file records an owed predecessor wait at the start, so
+    /// a restart during the wait owes it again (N22). Off, it records none,
+    /// and a successor that crashes during its wait restarts owing nothing.
+    OwedWait,
+    /// A run that did not end cleanly on another device of the same boot
+    /// reads as a moved volume (`Remounted`), which may still run and may
+    /// have lost what it did not sync (N20). Off, it reads as a process
+    /// crash on the same mount.
+    RemountedRun,
+    /// A recovery gate's barrier rounds, and the vote floor they write,
+    /// begin only once the fence no longer holds the replica out (N13). Off,
+    /// they run during the predecessor wait, so a floor may come from a
+    /// round the predecessor still took part in.
+    GateAfterWait,
 }
 
 #[cfg(madsim)]
@@ -192,8 +216,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 37]> = const { Cell::new([false; 37]) };
-        static FIRED: Cell<[u64; 37]> = const { Cell::new([0; 37]) };
+        static OFF: Cell<[bool; 42]> = const { Cell::new([false; 42]) };
+        static FIRED: Cell<[u64; 42]> = const { Cell::new([0; 42]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -235,6 +259,11 @@ mod switches {
             Defence::MetaOverDataHistory => 34,
             Defence::MetaAlwaysSync => 35,
             Defence::InitializeOnlySeeded => 36,
+            Defence::SuccessorWait => 37,
+            Defence::DiskLease => 38,
+            Defence::OwedWait => 39,
+            Defence::RemountedRun => 40,
+            Defence::GateAfterWait => 41,
         }
     }
 
@@ -257,7 +286,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 37]));
+        FIRED.with(|fired| fired.set([0; 42]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {
