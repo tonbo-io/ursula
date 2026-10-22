@@ -7,6 +7,7 @@ title: ursulactl
 - before a node goes down, transfer every Raft group it leads to a healthy successor (`drain`)
 - after it comes back, refuse to move on until `last_applied_index` has caught up to peers' `committed_index` (`wait`)
 - abort rather than corner a group with no leader
+- change placement only from a view the meta group confirmed (`placement`, `node`)
 
 A safe rolling restart wraps the platform's restart in these verbs, one node at a time. On Kubernetes:
 
@@ -28,7 +29,7 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 
 | Verb | Effect |
 |------|--------|
-| `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
+| `drain --node N` | Mark the node draining and transfer away every leadership it holds, the meta group's included. The mark lives in the process: the node attracts no leaderships until `undrain` or a restart clears it. `--dry-run` prints the transfer plan |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
 | `wait --node N` | Block until the node is a voter, within `--lag-tolerance` of peers, in every group the meta leader's placement view places it in and every group its own maintenance report counts it a voter of. Progress-gated: a node that keeps advancing is never timed out |
 | `status` | Per-node group counts and leadership distribution |
@@ -170,11 +171,17 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `wait` | `GET /__ursula/metrics` and `GET /__ursula/placement` |
 | `wait-ready` | `GET /__ursula/metrics`, `GET /__ursula/ready` and `GET /__ursula/placement` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
-| `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
+| `drain` (transfer step) | `POST /__ursula/raft/{target}/leader/transfer/{node_id}`, `target` a group ID or `meta` |
 | `backup-create` | `GET /__ursula/backup/info`, `GET /__ursula/backup/group/{raft_group_id}` |
 | `restore` | `GET /__ursula/backup/info`, `POST /__ursula/backup/group/{raft_group_id}/cold-check`, `POST /__ursula/backup/group/{raft_group_id}/import` |
+| `placement status` | `GET /__ursula/placement`, `GET /__ursula/placement/groups/{group}` |
+| `placement move`, `placement cancel` | `GET /__ursula/placement?confirmed=true`, `POST /__ursula/placement/groups/{group}/move` |
+| `placement set-move-limit` | `POST /__ursula/placement/move-limit` |
+| `node cordon`, `uncordon`, `decommission` | `GET /__ursula/placement?confirmed=true`, `POST /__ursula/placement/nodes/{node}/cordon`, `.../uncordon`, `.../decommission` |
+| `node replace-disk` | `GET /__ursula/placement?confirmed=true`, `POST /__ursula/placement/nodes/{node}/replace-disk` |
+| `recover-group` | `GET /__ursula/metrics`, `GET /__ursula/placement?confirmed=true`, `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` |
 
-The transfer endpoint returns a typed rejection: `409 Conflict` for a changed leader or a recovering target, `400` for an invalid target, `404` for an unregistered group, and `500` for a stopped Raft. Drain re-observes and re-plans the two `409` cases; other errors stop the operation.
+The transfer endpoint returns a typed rejection: `409 Conflict` for a changed leader or an unready target, `400` for an invalid target, `404` for an unregistered group, and `500` for a stopped Raft. Drain observes again and plans again after either `409`, and other errors stop the operation.
 
 ## Backup and restore
 

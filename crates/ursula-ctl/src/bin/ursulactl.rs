@@ -779,14 +779,14 @@ fn print_plan_explanation(
         });
     if plan.cut {
         println!(
-            "  cut: the longest voter log ends at {longest}, below the floor {}, the highest vote \
-             term a restricted replica holds, or its replica is no voter of its own membership; \
-             every replica keeps only what it knew was committed",
+            "  cut: the longest voter log ends at {longest}, below the term floor {}, the highest \
+             vote term a restricted replica holds, or its replica is no voter of its own \
+             membership; every replica keeps only what it knew was committed",
             plan.floor
         );
     } else {
         println!(
-            "  no cut: the longest voter log ends at {longest}, not below the floor {}",
+            "  no cut: the longest voter log ends at {longest}, not below the term floor {}",
             plan.floor
         );
     }

@@ -2,7 +2,7 @@
 title: Deploy a Cluster
 ---
 
-Production Ursula is a static-membership Raft cluster: three voting nodes across availability zones, a durable Raft log per node, and a shared S3 bucket for the cold tier.
+Production Ursula is a Raft cluster of three or more nodes across availability zones, each with a durable Raft log, and a shared S3 bucket for the cold tier. Its meta group places every data group on three of the nodes by default and moves groups between them on request ([Placement and the meta group](/docs/operations#placement-and-the-meta-group)).
 
 The recommended way to run it is **Kubernetes via the Helm chart**. Bring a Kubernetes cluster with a StorageClass for the voters' volumes and an S3 bucket for the cold tier. The chart installs Ursula into it. If you are not running Kubernetes, see [bare metal](#without-kubernetes-bare-metal--vms) at the end.
 
@@ -89,7 +89,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
 
 ## Without Kubernetes (bare metal / VMs)
 
-The same static-membership model works by hand. Every node runs the same config file, and only the node ID differs:
+The same cluster works by hand. Every node runs the same config file, and only the node ID differs:
 
 ```toml
 [server]
@@ -135,7 +135,7 @@ ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 
 Peers dial each other's `url` on the cluster port (`4439`), and a follower redirects clients to the leader's `client_url` on the client port (`4437`). Let only the voters reach port `4439`, with a security group or a firewall. Without `server.cluster_listen`, both planes share `server.listen` and each peer's `url` names that port (see [Network planes](/docs/security#network-planes)).
 
-`server.cluster_id` is required with `raft.peers`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. At bootstrap the meta group seeds each group on three consecutive nodes in node ID order (every node in a cluster of three), and the first of them initializes it on the first start of a fresh cluster, only when every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). The placement lives in the meta group from then on: a node added to `raft.peers` later registers and holds no group, and the nodes keep their IDs for the life of the cluster. Verify the cluster with a one-file manifest:
+`server.cluster_id` is required with `raft.wal.path`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. Start every node of a fresh cluster: the meta group forms once every `raft.peers` node answered, over the meta voters `raft.meta_voters`, by default nodes 1 to 3. At bootstrap the meta group seeds each group on three consecutive nodes in node ID order (every node in a cluster of three), and the first of them initializes it on the first start of a fresh cluster, only when every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). The placement lives in the meta group from then on: a node added to `raft.peers` later registers and holds no group until groups move onto it ([Adding a node](/docs/operations#adding-a-node)), and a node leaves only by `ursulactl node decommission`. A removed node ID never holds a group again. Verify the cluster with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'

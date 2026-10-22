@@ -77,16 +77,18 @@ core_count = 4
 # live_read_max_waiters_per_core = 65536
 
 # ------------------------------------------------------------------------------
-# [raft]  — Raft consensus and static-cluster networking
+# [raft]  — Raft consensus, the meta group and cluster networking
 # ------------------------------------------------------------------------------
 [raft]
-# Unique node ID within the static gRPC Raft cluster.  Must be present in
-# raft.peers and must be non-zero.  Can also be supplied via --node-id CLI.
+# Unique node ID within the cluster.  Must be present in raft.peers and must
+# be non-zero.  Can also be supplied via --node-id CLI.  A WAL root opens only
+# under the node ID that created it.
 node_id = 1
 
 # Number of Raft groups (shards).  Each stream hashes to exactly one group.
 # More groups = finer-grained parallelism but slightly more memory overhead.
-# Required once raft.peers lists another node, the same on every node.
+# Required once raft.peers lists another node, the same on every node.  At
+# most 4096.
 group_count = 16
 
 # Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
@@ -94,10 +96,11 @@ group_count = 16
 # Use a human-readable size.  Omit to disable the admission.
 # max_uncommitted_size_per_group = "64MiB"
 
-# Each data group runs on min(raft.placement.replication_factor, N)
-# consecutive peers in ascending node id, from index `group mod N`, and the
-# first of them initializes it.  Keep raft.peers fixed for the life of a
-# cluster: the peers' ids decide every group's voters.
+# The meta group's voters at genesis, as raft.peers node IDs.  Unset, the
+# smallest min(3, N) IDs.  Read once, when the meta group forms: meta voters
+# never change afterwards and are never decommissioned.  Every other node is
+# a meta learner.
+# meta_voters = [1, 2, 3]
 
 # A group's initializer that holds nothing of the group initializes it only
 # once every voter reports an empty group.  How often it logs that it is
@@ -139,6 +142,18 @@ group_count = 16
 # deleted_data_max_age = "1h"
 
 # ------------------------------------------------------------------------------
+# [raft.placement]  — How the meta group places the data groups
+# ------------------------------------------------------------------------------
+# At bootstrap each data group runs on min(replication_factor, N) consecutive
+# peers in ascending node ID, from index `group mod N`, and the first of them
+# initializes it.  The meta group records the placement, and groups change
+# nodes only by a move (ursulactl placement move).  A node added to raft.peers
+# later holds no group until groups move onto it.
+# [raft.placement]
+# replication_factor = 3      # voters per data group, read at genesis
+# max_concurrent_moves = 4    # groups that may move at once, 0 stops moves
+
+# ------------------------------------------------------------------------------
 # [raft.wal]  — Raft write-ahead log persistence
 # ------------------------------------------------------------------------------
 [raft.wal]
@@ -157,10 +172,17 @@ group_count = 16
 #             before it votes again.  A group whose majority lost it stops
 #             until an operator accepts the loss.
 #   always  — acknowledge after fsync.
+# Unset: "always" when groups have one or two voters, "never" otherwise.  The
+# meta group's journal in raft-log/meta/ always runs "always".
 # fsync = "never"
 
+# The disk lease.  The node syncs a probe of the WAL disk every second.  With
+# no synced probe for this long it stops all Raft traffic and object writes
+# and answers clients 503 until a probe syncs.  From 2s to 10s.
+# lease = "5s"
+
 # ------------------------------------------------------------------------------
-# [raft.peers]  — Static gRPC Raft peers (repeatable table)
+# [raft.peers]  — Raft peers, the only source of peer addresses (repeatable)
 # ------------------------------------------------------------------------------
 # Uncomment and repeat for every node in the cluster, this node included.  A
 # single node with raft.wal.path lists itself.  `url` is the address peers

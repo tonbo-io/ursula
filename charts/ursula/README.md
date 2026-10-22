@@ -263,6 +263,19 @@ ServiceAccount allowed only to `get` this release's StatefulSet, and reaches
 the pods' client plane, which the NetworkPolicy admits it to. Set
 `server.scaleCheck.enabled=false` to skip it.
 
+## Replacing A Lost Volume
+
+A pod whose `raft-data` PVC was lost or replaced starts on an empty WAL under
+its node id. The meta group still binds that id to the old volume's root, so
+the pod takes part in no group and reports readiness `root_refused`. Once the
+old volume is revoked (deleted, or detached with its pod gone), release it
+from a manifest that reaches the admin plane:
+`ursulactl node replace-disk --config manifest.json --node 3 --expect-root R`,
+where `R` is the old root the pod's `GET /__ursula/placement` names. The pod
+then binds its new volume with no restart, waits 12 seconds and catches up.
+A release cannot be undone. Replace one pod's volume at a time, and run
+`ursulactl wait --node N` before the next.
+
 ## S3 Object Storage
 
 Cold chunks and externalized Raft snapshots share one S3-compatible object
@@ -397,14 +410,21 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
-Ursula 0.9 (format epoch 5) cannot read the data of a 0.8 release. Install it
+Ursula 0.10 (format epoch 6) cannot read the data of a 0.9 release. Install it
 fresh, as a new release with new PVCs and a new `s3.prefix` (and, with cold
-storage off and S3 snapshots, a new `snapshotStore.prefix`). `helm upgrade`
-from 0.8 stops before a second voter is replaced, because the first new pod
-finds the 0.8 data on its volume and exits at startup. Recover with
-`helm rollback`. 0.9 does not restore 0.8 backups, and there is no backup
-migration. Move the data through your applications, and give the new release
-its own `server.clusterId`. See the operations guide's "Upgrading to 0.9".
+storage off and S3 snapshots, a new `snapshotStore.prefix`), with the 0.9
+release's `server.clusterId` and `raft.groupCount`. `helm upgrade` from 0.9
+stops before a second voter is replaced, because the first new pod finds the
+0.9 data on its volume and exits at startup. Recover with `helm rollback`. A
+values file that still sets a value 0.10 removed (`server.updateStrategy`,
+`server.podManagementPolicy`, `server.probes.readiness.enabled`,
+`server.onDeleteMigration`, `server.startupOwnership`,
+`server.gracefulRollout`, `raft.initMembership`, `raft.initMembershipPerGroup`)
+fails validation first. Backups keep format 5, so move the data with
+`ursulactl backup-create` of 0.9, a copy of the 0.9 cold objects into the new
+prefix and `ursulactl restore` of 0.10. Then delete the 0.9 release's
+`<StatefulSet>-rollout-state` and `<StatefulSet>-maintenance` ConfigMaps with
+its other resources. See the operations guide's "Upgrading to 0.10".
 
 The StatefulSet updates by `RollingUpdate` and never changes Raft membership.
 Each replaced voter hands off its leaderships on `SIGTERM`, and the controller
