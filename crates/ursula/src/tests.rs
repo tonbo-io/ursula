@@ -312,10 +312,13 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 fn leader_redirect_never_points_at_this_node() {
     let router = ClientWriteLeaderRouter::with_static_topology(
         Some(2),
-        crate::shared_peers([
-            (1, "http://node-1/".to_owned()),
-            (2, "http://node-2".to_owned()),
-        ]),
+        bound_peer_cluster(
+            2,
+            crate::shared_peers([
+                (1, "http://node-1/".to_owned()),
+                (2, "http://node-2".to_owned()),
+            ]),
+        ),
         BTreeMap::new(),
     );
     let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
@@ -357,10 +360,13 @@ fn leader_redirect_never_points_at_this_node() {
 fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
     let router = ClientWriteLeaderRouter::with_static_topology(
         Some(2),
-        crate::shared_peers([
-            (1, "http://node-1:4437".to_owned()),
-            (2, "http://node-2:4437".to_owned()),
-        ]),
+        bound_peer_cluster(
+            2,
+            crate::shared_peers([
+                (1, "http://node-1:4437".to_owned()),
+                (2, "http://node-2:4437".to_owned()),
+            ]),
+        ),
         BTreeMap::new(),
     );
     let unlisted = RuntimeError::GroupEngine {
@@ -627,11 +633,24 @@ fn static_test_cluster_id() -> ursula_headers::ClusterId {
     ursula_headers::ClusterId::new("static-grpc-test").expect("a valid cluster id")
 }
 
+/// The peer cluster of node `node_id` of the static gRPC test cluster, with
+/// `peers` bound as its `raft.peers`.
+pub(crate) fn bound_peer_cluster(
+    node_id: u64,
+    peers: ursula_raft::PeerDirectory,
+) -> ursula_raft::PeerCluster {
+    let cluster = ursula_raft::PeerCluster::default();
+    cluster.bind(
+        ursula_raft::PeerIdentity::new(node_id, static_test_cluster_id()),
+        peers,
+    );
+    cluster
+}
+
 async fn spawn_static_grpc_test_node(
     node_id: u64,
     listener: tokio::net::TcpListener,
-    factory_peers: Vec<(u64, String)>,
-    router_peers: Vec<(u64, String)>,
+    peers: Vec<(u64, String)>,
     raft_group_count: usize,
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
@@ -672,22 +691,22 @@ async fn spawn_static_grpc_test_node(
             )
         }
     };
-    // As the server binds its node before the runtime starts.
-    registry.peer_cluster().bind(
-        ursula_raft::PeerIdentity::new(node_id, log_stores.cluster_id().clone()),
-        crate::shared_peers(factory_peers.clone()),
-    );
-    // The seed rule over the factory's peers, as the server seeds its
-    // groups over `raft.peers`.
-    let factory_peers = crate::shared_peers(factory_peers);
+    // The seed rule over the peers, as the server seeds its groups over
+    // `raft.peers`, then the bind, as the server binds its node before the
+    // runtime starts.
+    let peers = crate::shared_peers(peers);
     let seeds = ursula_raft::ConfigSeeds::new(
-        &factory_peers,
+        &peers,
         raft_group_count,
         storage
             .replication_factor
             .unwrap_or(ursula_config::PlacementConfig::default().replication_factor),
     );
     let voter_table = seeds.voter_table();
+    registry.peer_cluster().bind(
+        ursula_raft::PeerIdentity::new(node_id, log_stores.cluster_id().clone()),
+        peers,
+    );
     let mut factory = PlacedRaftGroupEngineFactory::new(
         log_stores.clone(),
         registry.clone(),
@@ -712,7 +731,6 @@ async fn spawn_static_grpc_test_node(
             runtime.clone(),
             registry.clone(),
             Some(node_id),
-            crate::shared_peers(router_peers),
             voter_table,
         )
         .with_configured_cluster_id(Some(static_test_cluster_id())),
@@ -1985,11 +2003,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_static_raft_cluster(
-        runtime.clone(),
-        registry,
-        crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
-    );
+    let app = router_with_static_raft_cluster(runtime.clone(), registry);
 
     let response = http_put(
         &app,
@@ -2047,7 +2061,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .as_nanos()
     ));
     remove_test_path(&raft_root);
-    let peers = crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]);
 
     {
         let spawned = crate::bootstrap::spawn_runtime_with_placement(
@@ -2071,7 +2084,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "static durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for leader");
-        let app = router_with_static_raft_cluster(runtime, registry, peers.clone());
+        let app = router_with_static_raft_cluster(runtime, registry);
 
         let response = http_put(
             &app,
@@ -2143,7 +2156,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .await
             .expect("wait for restarted leader");
         let shutdown_runtime = runtime.clone();
-        let app = router_with_static_raft_cluster(runtime, registry, peers);
+        let app = router_with_static_raft_cluster(runtime, registry);
 
         let response = http_get(
             &app,
@@ -2290,7 +2303,6 @@ async fn static_grpc_seed_initializers_distribute_leaders() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 6,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -2431,7 +2443,6 @@ async fn static_grpc_seed_voters_create_distinct_initial_memberships() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 2,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -2513,7 +2524,6 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 2,
                 StaticGrpcTestNodeStorage::default(),
@@ -2701,7 +2711,6 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -2812,7 +2821,6 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             node.runtime.clone(),
             node.registry.clone(),
             Some(node_id),
-            crate::shared_peers(peers.clone()),
             BTreeMap::new(),
         )
         .with_wal_disk_monitor(monitor.clone());
@@ -2892,7 +2900,6 @@ async fn static_grpc_follower_redirects_writes_without_a_not_applied_marker() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage::default(),
@@ -3040,7 +3047,6 @@ async fn static_grpc_follower_redirects_inline_and_external_creates() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage {
                     cold_store: Some(cold_store.clone()),
@@ -3130,7 +3136,6 @@ async fn start_durable_cluster(
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 2,
                 StaticGrpcTestNodeStorage {
@@ -3386,7 +3391,6 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -3516,7 +3520,6 @@ async fn static_grpc_follower_answers_only_the_chunks_it_can_mark() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage::default(),
@@ -3670,7 +3673,6 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 6,
                 StaticGrpcTestNodeStorage::default(),
@@ -3875,7 +3877,6 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
         3,
         stale_listener,
         peers.clone(),
-        peers.clone(),
         6,
         StaticGrpcTestNodeStorage::default(),
     )
@@ -3907,7 +3908,6 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
     let restarted = spawn_static_grpc_test_node(
         3,
         restarted_listener,
-        peers.clone(),
         peers.clone(),
         6,
         StaticGrpcTestNodeStorage::default(),
@@ -4006,7 +4006,6 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 4,
                 StaticGrpcTestNodeStorage::default(),
@@ -4329,7 +4328,6 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 2,
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
@@ -4471,7 +4469,6 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage {
@@ -4678,31 +4675,17 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         std::num::NonZeroU8::new(2).expect("non-zero"),
     ));
     let mut nodes = vec![
-        spawn_static_grpc_test_node(
-            1,
-            listener1,
-            peers.clone(),
-            peers.clone(),
-            1,
-            StaticGrpcTestNodeStorage {
-                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-1")),
-                replication_factor: two_voters,
-                ..Default::default()
-            },
-        )
+        spawn_static_grpc_test_node(1, listener1, peers.clone(), 1, StaticGrpcTestNodeStorage {
+            raft_log_dir: raft_root.as_ref().map(|root| root.join("node-1")),
+            replication_factor: two_voters,
+            ..Default::default()
+        })
         .await,
-        spawn_static_grpc_test_node(
-            2,
-            listener2,
-            peers.clone(),
-            peers.clone(),
-            1,
-            StaticGrpcTestNodeStorage {
-                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-2")),
-                replication_factor: two_voters,
-                ..Default::default()
-            },
-        )
+        spawn_static_grpc_test_node(2, listener2, peers.clone(), 1, StaticGrpcTestNodeStorage {
+            raft_log_dir: raft_root.as_ref().map(|root| root.join("node-2")),
+            replication_factor: two_voters,
+            ..Default::default()
+        })
         .await,
     ];
 
@@ -4795,17 +4778,10 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("wait for leader purge");
 
     nodes.push(
-        spawn_static_grpc_test_node(
-            3,
-            listener3,
-            peers.clone(),
-            peers.clone(),
-            1,
-            StaticGrpcTestNodeStorage {
-                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-3")),
-                ..Default::default()
-            },
-        )
+        spawn_static_grpc_test_node(3, listener3, peers.clone(), 1, StaticGrpcTestNodeStorage {
+            raft_log_dir: raft_root.as_ref().map(|root| root.join("node-3")),
+            ..Default::default()
+        })
         .await,
     );
     nodes[2]
@@ -5965,7 +5941,6 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
                 u64::try_from(index + 1).expect("node id fits u64"),
                 listener,
                 peers.clone(),
-                peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage {
                     start_maintenance_drained: index == 2,
@@ -6075,7 +6050,6 @@ async fn drained_voters_of_a_three_voter_group_do_not_campaign() {
             spawn_static_grpc_test_node(
                 u64::try_from(index + 1).expect("node id fits u64"),
                 listener,
-                peers.clone(),
                 peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage {
@@ -6977,17 +6951,16 @@ async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_m
     let runtime = spawn_runtime(&test_config(1, 2), Topology::Development { group_count: 2 })
         .expect("runtime")
         .runtime;
-    let state = HttpState::with_static_raft_cluster_topology(
-        runtime,
-        RaftGroupHandleRegistry::default(),
-        1,
+    let registry = RaftGroupHandleRegistry::default();
+    registry.peer_cluster().bind(
+        ursula_raft::PeerIdentity::new(1, static_test_cluster_id()),
         crate::shared_peers([
             (1, "http://localhost:4437".to_owned()),
             (2, "http://localhost:4438".to_owned()),
             (3, "http://localhost:4439".to_owned()),
         ]),
-        BTreeMap::new(),
     );
+    let state = HttpState::with_static_raft_cluster_topology(runtime, registry, 1, BTreeMap::new());
     let app = client_router_with_admission(state, IngressAdmission::default());
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -8142,7 +8115,6 @@ mod snapshot_driver {
             1,
             listener,
             peers.clone(),
-            peers,
             group_count(),
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
@@ -8219,9 +8191,9 @@ mod snapshot_driver {
         cadence: SnapshotCadence,
         interval: Duration,
     ) {
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_addresses(
             1,
-            &ursula_raft::PeerDirectory::default(),
+            ursula_raft::PeerDirectory::default(),
             reqwest::Client::new(),
         );
         spawn_snapshot_driver(
@@ -8640,21 +8612,15 @@ mod snapshot_driver {
                 listener.local_addr().expect("addr").port()
             ),
         )];
-        let node = spawn_static_grpc_test_node(
-            1,
-            listener,
-            peers.clone(),
-            peers,
-            2,
-            StaticGrpcTestNodeStorage {
+        let node =
+            spawn_static_grpc_test_node(1, listener, peers.clone(), 2, StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
                     max_in_snapshot_log_to_keep: 8,
                     ..RaftEngineConfig::default()
                 }),
                 ..StaticGrpcTestNodeStorage::default()
-            },
-        )
-        .await;
+            })
+            .await;
         tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
             .await
             .expect("warm the groups in time")
@@ -8913,22 +8879,16 @@ mod snapshot_driver {
                 listener.local_addr().expect("addr").port()
             ),
         )];
-        let node = spawn_static_grpc_test_node(
-            1,
-            listener,
-            peers.clone(),
-            peers,
-            2,
-            StaticGrpcTestNodeStorage {
+        let node =
+            spawn_static_grpc_test_node(1, listener, peers.clone(), 2, StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
                     max_in_snapshot_log_to_keep: 8,
                     ..RaftEngineConfig::default()
                 }),
                 snapshot_store: Some(store.clone()),
                 ..StaticGrpcTestNodeStorage::default()
-            },
-        )
-        .await;
+            })
+            .await;
         tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
             .await
             .expect("warm the groups in time")
@@ -9067,18 +9027,12 @@ mod snapshot_driver {
                 listener.local_addr().expect("addr").port()
             ),
         )];
-        let node = spawn_static_grpc_test_node(
-            1,
-            listener,
-            peers.clone(),
-            peers,
-            2,
-            StaticGrpcTestNodeStorage {
+        let node =
+            spawn_static_grpc_test_node(1, listener, peers.clone(), 2, StaticGrpcTestNodeStorage {
                 snapshot_store: Some(store.clone()),
                 ..StaticGrpcTestNodeStorage::default()
-            },
-        )
-        .await;
+            })
+            .await;
         tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
             .await
             .expect("warm the groups in time")
@@ -9867,22 +9821,15 @@ mod snapshot_driver {
                 listener.local_addr().expect("addr").port()
             ),
         )];
-        spawn_static_grpc_test_node(
-            1,
-            listener,
-            peers.clone(),
-            peers,
-            1,
-            StaticGrpcTestNodeStorage {
-                raft_log_dir: Some(raft_log_dir.to_path_buf()),
-                engine_config: Some(RaftEngineConfig {
-                    max_in_snapshot_log_to_keep: 8,
-                    ..RaftEngineConfig::default()
-                }),
-                snapshot_store: Some(store.clone()),
-                ..StaticGrpcTestNodeStorage::default()
-            },
-        )
+        spawn_static_grpc_test_node(1, listener, peers.clone(), 1, StaticGrpcTestNodeStorage {
+            raft_log_dir: Some(raft_log_dir.to_path_buf()),
+            engine_config: Some(RaftEngineConfig {
+                max_in_snapshot_log_to_keep: 8,
+                ..RaftEngineConfig::default()
+            }),
+            snapshot_store: Some(store.clone()),
+            ..StaticGrpcTestNodeStorage::default()
+        })
         .await
     }
 
@@ -10479,7 +10426,6 @@ mod leadership_shed {
                         node_id,
                         listener,
                         peers.clone(),
-                        peers.clone(),
                         usize::try_from(GROUPS).unwrap(),
                         StaticGrpcTestNodeStorage {
                             cold_store: cold_store.clone(),
@@ -10614,7 +10560,7 @@ mod leadership_shed {
         }
 
         fn participation(&self) -> PeerParticipation {
-            PeerParticipation::new(1, &crate::shared_peers(self.peers.clone()), peer_client())
+            PeerParticipation::new(1, peer_client())
         }
 
         /// Node 1's participation when its leadership-shed requests to node
@@ -10625,9 +10571,9 @@ mod leadership_shed {
             &self,
         ) -> (PeerParticipation, tokio::net::TcpListener) {
             let (silent_2, listener) = silent_url().await;
-            let participation = PeerParticipation::new(
+            let participation = PeerParticipation::with_addresses(
                 1,
-                &crate::shared_peers([self.peers[0].clone(), (2, silent_2), self.peers[2].clone()]),
+                crate::shared_peers([self.peers[0].clone(), (2, silent_2), self.peers[2].clone()]),
                 reqwest::Client::builder()
                     .timeout(Duration::from_millis(500))
                     .build()
@@ -11116,9 +11062,9 @@ mod leadership_shed {
         let (url_2, _silent_2) = silent_url().await;
         let (url_3, _silent_3) = silent_url().await;
         let peers = crate::shared_peers([cluster.peers[0].clone(), (2, url_2), (3, url_3)]);
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_addresses(
             1,
-            &peers,
+            peers,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(500))
                 .build()
@@ -11128,7 +11074,6 @@ mod leadership_shed {
         crate::bootstrap::spawn_egress_gate(
             &node_1.registry,
             &participation,
-            &peers,
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(5),
                 unhealthy_ticks: 1,
@@ -11254,9 +11199,9 @@ mod leadership_shed {
             (2, stub_2.url.clone()),
             (3, stub_3.url.clone()),
         ]);
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_addresses(
             1,
-            &peers,
+            peers,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(500))
                 .build()
@@ -11280,7 +11225,6 @@ mod leadership_shed {
         crate::bootstrap::spawn_egress_gate(
             &node_1.registry,
             &participation,
-            &peers,
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(1),
                 unhealthy_ticks: 1,
@@ -12361,7 +12305,6 @@ async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
                 node_id,
                 listener,
                 peers.clone(),
-                peers.clone(),
                 6,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -13416,7 +13359,6 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
             spawn_static_grpc_test_node(
                 node_id,
                 listener,
-                peers.clone(),
                 peers.clone(),
                 1,
                 StaticGrpcTestNodeStorage::default(),

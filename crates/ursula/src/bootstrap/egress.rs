@@ -117,9 +117,11 @@ pub(crate) fn cluster_egress_probe_plan(
     ClusterEgressProbePlan { peer_urls, groups }
 }
 
-/// Cluster egress gate. Each tick it probes the peers of `probe_peers` that
-/// are voters of the groups whose replica on this node counts as a voter
-/// ([`cluster_egress_probe_plan`]) and, while it sheds, hands every leadership it held when it shed to its peers at once,
+/// Cluster egress gate. Each tick it probes the peers of `participation`
+/// ([`PeerParticipation::peers`], the bound `raft.peers` read at each tick)
+/// that are voters of the groups whose replica on this node counts as a
+/// voter ([`cluster_egress_probe_plan`]) and, while it sheds, hands every
+/// leadership it held when it shed to its peers at once,
 /// and plans again on every tick for the ones still pending. The peers'
 /// answers to `participation` travel the path the gate judges impaired, so
 /// a leadership's first handoff may also go to a peer that did not answer,
@@ -129,7 +131,6 @@ pub(crate) fn cluster_egress_probe_plan(
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
-    probe_peers: &PeerDirectory,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
     let node_id = participation.node_id();
@@ -137,16 +138,11 @@ pub fn spawn_egress_gate(
     if interval_ms == 0 {
         return;
     }
-    // A node with no peer has no egress to judge.
-    if probe_peers.node_ids().all(|peer| peer == node_id) {
-        return;
-    }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
     let probe_timeout_ms = cp_cfg.timeout.as_duration().as_millis() as usize;
     let unhealthy_ticks = cp_cfg.unhealthy_ticks;
     let heal_ticks = cp_cfg.heal_ticks;
     let registry = registry.clone();
-    let peers = probe_peers.clone();
     let participation = participation.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(
@@ -179,8 +175,11 @@ pub fn spawn_egress_gate(
         );
         loop {
             tokio::time::sleep(interval).await;
-            let plan =
-                cluster_egress_probe_plan(node_id, &peers, &registry.counting_voter_configs());
+            let plan = cluster_egress_probe_plan(
+                node_id,
+                &participation.peers(&registry),
+                &registry.counting_voter_configs(),
+            );
             if plan.is_empty() {
                 continue;
             }

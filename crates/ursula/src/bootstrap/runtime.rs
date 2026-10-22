@@ -229,7 +229,6 @@ fn spawn_raft_node(
     // Built before the runtime starts, so a failure leaves nothing running.
     let participation = PeerParticipation::new(
         node_id,
-        &peers,
         reqwest::Client::builder()
             .timeout(
                 config
@@ -260,7 +259,6 @@ fn spawn_raft_node(
         config.server.cluster_id.as_ref(),
         fence,
     )?;
-    let probe_peers = peers.clone();
     // Before the runtime starts, so `raft-log/meta/` exists before any data
     // group of the run opens and the peer identity is bound before any
     // group dials or answers a peer.
@@ -310,12 +308,7 @@ fn spawn_raft_node(
         &participation,
         &config.governance.leadership_balance,
     );
-    egress::spawn_egress_gate(
-        &registry,
-        &participation,
-        &probe_peers,
-        &config.governance.cluster_probe,
-    );
+    egress::spawn_egress_gate(&registry, &participation, &config.governance.cluster_probe);
     commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
     // Hot bytes are a cold-tier backlog signal only when a cold store can
     // drain them. Memory-only nodes intentionally retain all payloads hot,

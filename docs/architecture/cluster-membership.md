@@ -27,10 +27,14 @@ over the `raft.peers` ids at genesis, so the two agree only while `raft.peers`
 keeps those ids: do not add nodes to `raft.peers` of a running cluster.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
-electorate. Every reader of a peer address takes it from one `PeerDirectory`
-built from `raft.peers` (`crates/ursula-raft/src/peer_directory.rs`): the Raft
-network client, leader forwarding, recovery probes, the egress probe, the
-leadership-shed polls and leader redirects. Membership and recovery code deal in
+electorate. The server builds one `PeerDirectory` from `raft.peers` at config
+load (`crates/ursula-raft/src/peer_directory.rs`), lends it at startup (the
+format-epoch probe, meta's genesis node set and the interim seed table) and
+moves it into the node's one bind. Every other reader of a peer
+address reads the bound directory at each use (`PeerCluster::directory`): the
+Raft network client, leader forwarding, recovery probes, the egress probe, the
+leadership-shed polls, the shutdown handoff and leader redirects. The directory
+is not `Clone`, so no reader duplicates it, and a reader takes it per use. Membership and recovery code deal in
 node IDs only. A node that a group's membership names but `raft.peers` does not
 list is never dialed: its network client answers unreachable without dialing,
 followers neither forward to it nor redirect to it, and each node logs it once

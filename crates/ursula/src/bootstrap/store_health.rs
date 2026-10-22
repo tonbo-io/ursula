@@ -1097,9 +1097,9 @@ mod tests {
     }
 
     fn no_peers() -> PeerParticipation {
-        PeerParticipation::new(
+        PeerParticipation::with_addresses(
             1,
-            &ursula_raft::PeerDirectory::default(),
+            ursula_raft::PeerDirectory::default(),
             reqwest::Client::new(),
         )
     }

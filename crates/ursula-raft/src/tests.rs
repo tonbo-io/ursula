@@ -820,9 +820,11 @@ async fn build_three_node_cluster_gating(
     // Leave room for concurrent tests fsyncing votes on the same executor host.
     let config = raft_config(cluster_name, 500, 1_000);
     let nodes = BTreeSet::from([1, 2, 3]);
-    let peers = crate::PeerDirectory::new(
-        (1..=3).map(|node_id| (node_id, crate::PeerEndpoints::shared(address(node_id)))),
-    );
+    let peers = || {
+        crate::PeerDirectory::new(
+            (1..=3).map(|node_id| (node_id, crate::PeerEndpoints::shared(address(node_id)))),
+        )
+    };
 
     let mut engines = Vec::new();
     let mut wal_roots = Vec::new();
@@ -850,7 +852,7 @@ async fn build_three_node_cluster_gating(
             RaftGroupEngineOptions {
                 peer_cluster: Some(crate::peer_cluster::test_peer_cluster_with(
                     node_id,
-                    peers.clone(),
+                    peers(),
                 )),
                 ..RaftGroupEngineOptions::gated(node_gate.clone())
             },

@@ -672,7 +672,7 @@ impl Node {
         // Peer 2 is this node itself: a redirect to it is a redirect the
         // gateway can follow, and it answers each hop with a redirect again.
         state.fields_mut().client_write_router = Some(ClientWriteLeaderRouter::new(
-            crate::shared_peers([(2, url.clone())]),
+            crate::tests::bound_peer_cluster(2, crate::shared_peers([(2, url.clone())])),
         ));
         // A stream holds two staged, unused parts at most, so the third is
         // refused for the bound.

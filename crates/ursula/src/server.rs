@@ -142,19 +142,10 @@ async fn init_state(
     config: &ursula_config::UrsulaConfig,
     wal: Option<ClusterWal>,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
-    // The one source of every configured peer address.
+    // The one source of every configured peer address, built once here,
+    // lent to the format-epoch probe and moved into the node's one bind.
     let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
     let group_count = config.raft.effective_group_count();
-    let log_dir = wal.as_ref().map(ClusterWal::log_dir);
-    let topology = match wal {
-        None => Topology::Development { group_count },
-        Some(wal) => Topology::Cluster {
-            node_id: config.raft.node_id,
-            peers: raft_peers.clone(),
-            group_count,
-            wal,
-        },
-    };
     // Interim, removed in S2(h): the seed table decides what this node
     // warms, where it routes a group it does not host, and what its
     // maintenance inventory expects. It is the spawn path's seed rule.
@@ -166,7 +157,18 @@ async fn init_state(
 
     // Format epoch: refuse data and peers of another epoch before anything is
     // written.
+    let log_dir = wal.as_ref().map(ClusterWal::log_dir);
     crate::bootstrap::check_and_stamp_format_epoch(config, &raft_peers, log_dir.as_deref()).await?;
+
+    let topology = match wal {
+        None => Topology::Development { group_count },
+        Some(wal) => Topology::Cluster {
+            node_id: config.raft.node_id,
+            peers: raft_peers,
+            group_count,
+            wal,
+        },
+    };
 
     let spawned = spawn_runtime(config, topology)?;
     let runtime = spawned.runtime;
@@ -227,7 +229,6 @@ async fn init_state(
             runtime,
             registry,
             config.raft.node_id,
-            raft_peers,
             seeds.voter_table(),
         ),
     };
@@ -449,10 +450,9 @@ fn spawn_shutdown_signal_task(
         tokio::select! {
             () = async {
                 if let Some(registry) = raft_registry {
-                    let peers = registry.peer_cluster().directory();
                     let result = tokio::time::timeout(
                         SHUTDOWN_HANDOFF_GRACE,
-                        crate::bootstrap::handoff_shutdown_leadership(&registry, node_id, &peers),
+                        crate::bootstrap::handoff_shutdown_leadership(&registry, node_id),
                     ).await;
                     let remaining_leaders = registry.metrics_snapshot().iter()
                         .filter(|snapshot| snapshot.current_leader == Some(node_id)).count();

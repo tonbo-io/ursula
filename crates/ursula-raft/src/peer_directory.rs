@@ -2,14 +2,16 @@
 //!
 //! [`PeerDirectory`] maps a node id to its [`PeerEndpoints`]: the URL peers
 //! dial for its cluster plane and the URL clients reach its client plane at.
-//! Every reader of a configured peer address takes it from here: the engine
-//! factory and its [`crate::PeerCluster`], the leader router, the
-//! leadership-shed polls, the egress probe, the shutdown handoff and the
-//! format-epoch probe. URLs are normalized once, without a trailing `/`, so
-//! a caller appends a path to them as they are.
+//! The server builds it once at config load, lends it at startup (the
+//! format-epoch probe, meta's genesis node set and the interim seed table)
+//! and moves it into the one [`crate::PeerCluster::bind`]. Every other
+//! reader of a configured peer address, the engine factory, the leader
+//! router, the leadership-shed polls, the egress probe and the shutdown
+//! handoff, reads it there at each use ([`crate::PeerCluster::directory`]).
+//! It is not `Clone`, so no reader duplicates it. URLs are normalized once,
+//! without a trailing `/`, so a caller appends a path to them as they are.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// The URLs one peer listens at, without a trailing `/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +63,16 @@ fn normalize(mut url: String) -> String {
 }
 
 /// `raft.peers`: node id to the endpoints that node listens at. It lists
-/// this node too. Cloning shares one map.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PeerDirectory(Arc<BTreeMap<u64, PeerEndpoints>>);
+/// this node too.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PeerDirectory(BTreeMap<u64, PeerEndpoints>);
 
 impl PeerDirectory {
+    /// No peers: what a node reads before its bind.
+    pub const fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
     /// The directory of a node's `raft.peers`.
     pub fn from_config(peers: &[ursula_config::RaftPeerConfig]) -> Self {
         Self::new(
@@ -76,7 +83,7 @@ impl PeerDirectory {
     }
 
     pub fn new(peers: impl IntoIterator<Item = (u64, PeerEndpoints)>) -> Self {
-        Self(Arc::new(peers.into_iter().collect()))
+        Self(peers.into_iter().collect())
     }
 
     /// The URL peers dial for `node_id`'s cluster plane.

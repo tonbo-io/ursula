@@ -133,7 +133,6 @@ use ursula_proto::placement::ProcessIncarnation;
 use ursula_raft::IncomingTransferError;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
-use ursula_raft::PeerDirectory;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
 use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
@@ -435,7 +434,11 @@ impl HttpState {
         let node_id = topology
             .node_id
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
-        let all_voters = topology.peers.node_ids().collect::<BTreeSet<_>>();
+        let all_voters = topology
+            .peers
+            .directory()
+            .node_ids()
+            .collect::<BTreeSet<_>>();
         let expected = (0..self.runtime.raft_group_count())
             .filter_map(|id| {
                 let voters = topology
@@ -633,37 +636,31 @@ impl HttpState {
         .into()
     }
 
+    /// A node of a cluster whose peers `raft_registry`'s peer cluster
+    /// binds: its leader redirects read them there.
     pub fn with_static_raft_cluster(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
-        peers: PeerDirectory,
     ) -> Self {
-        Self::with_static_raft_cluster_topology(
-            runtime,
-            raft_registry,
-            None,
-            peers,
-            BTreeMap::new(),
-        )
+        Self::with_static_raft_cluster_topology(runtime, raft_registry, None, BTreeMap::new())
     }
 
     pub fn with_static_raft_cluster_topology(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
         node_id: impl Into<Option<u64>>,
-        peers: PeerDirectory,
         per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
         HttpStateFields {
-            runtime,
-            raft_registry: Some(raft_registry),
             client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
                 node_id,
-                peers,
+                raft_registry.peer_cluster().clone(),
                 per_group_voters,
             )),
+            runtime,
+            raft_registry: Some(raft_registry),
             process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
@@ -874,26 +871,27 @@ impl Drop for AbortOnDrop {
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` is the node's `raft.peers`, whose client URLs
-/// ([`PeerDirectory::client_url`]) are each node's `client_url`,
-/// or its Raft `url` when the node serves both planes on `server.listen`.
-/// Clients and gateways must be able to reach these URLs. A leader that
-/// `raft.peers` does not list is never a redirect target.
+/// redirect. `peers` is the node's peer cluster, whose bound `raft.peers`,
+/// read at each redirect, gives each node's client URL
+/// ([`ursula_raft::PeerDirectory::client_url`]): its `client_url`, or its
+/// Raft `url` when the node serves both planes on `server.listen`. Clients
+/// and gateways must be able to reach these URLs. A leader that `raft.peers`
+/// does not list is never a redirect target.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
-    peers: PeerDirectory,
+    peers: ursula_raft::PeerCluster,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
 }
 
 impl ClientWriteLeaderRouter {
-    pub fn new(peers: PeerDirectory) -> Self {
+    pub fn new(peers: ursula_raft::PeerCluster) -> Self {
         Self::with_static_topology(None, peers, BTreeMap::new())
     }
 
     pub fn with_static_topology(
         node_id: impl Into<Option<u64>>,
-        peers: PeerDirectory,
+        peers: ursula_raft::PeerCluster,
         per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     ) -> Self {
         Self {
@@ -906,11 +904,14 @@ impl ClientWriteLeaderRouter {
     /// The client URL `raft.peers` lists for `leader_id`. `None` for this
     /// node itself, and for a leader that `raft.peers` does not list, which
     /// the caller answers with a retryable `503`.
-    fn peer_base(&self, leader_id: u64) -> Option<&str> {
+    fn peer_base(&self, leader_id: u64) -> Option<String> {
         if Some(leader_id) == self.node_id {
             return None;
         }
-        self.peers.client_url(leader_id)
+        self.peers
+            .directory()
+            .client_url(leader_id)
+            .map(str::to_owned)
     }
 
     /// The URL of `request_target` on `leader_id`, the target of a routing
@@ -921,13 +922,14 @@ impl ClientWriteLeaderRouter {
     }
 
     /// A node that hosts a replica of `raft_group_id`, other than this one.
-    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<&str> {
+    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<String> {
         let voters = self.per_group_voters.get(&raft_group_id)?;
+        let peers = self.peers.directory();
         voters
             .iter()
             .copied()
             .filter(|node_id| Some(*node_id) != self.node_id)
-            .find_map(|node_id| self.peers.client_url(node_id))
+            .find_map(|node_id| peers.client_url(node_id).map(str::to_owned))
     }
 
     /// The redirect for `err`, typed through `ursula-headers`: to the
@@ -1213,9 +1215,8 @@ pub fn router_with_raft_registry(
 pub fn router_with_static_raft_cluster(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
-    peers: PeerDirectory,
 ) -> Router {
-    let state = HttpState::with_static_raft_cluster(runtime, raft_registry, peers);
+    let state = HttpState::with_static_raft_cluster(runtime, raft_registry);
     cluster_router_from_state(state.clone()).merge(client_router_with_admission(
         state,
         IngressAdmission::default(),
@@ -1226,14 +1227,12 @@ pub fn router_with_static_raft_cluster_topology(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
     node_id: u64,
-    peers: PeerDirectory,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 ) -> Router {
     let state = HttpState::with_static_raft_cluster_topology(
         runtime,
         raft_registry,
         Some(node_id),
-        peers,
         per_group_voters,
     );
     cluster_router_from_state(state.clone())
@@ -5728,8 +5727,10 @@ fn request_target(uri: &Uri) -> String {
 /// The directory of peers that each serve both planes at one URL, for
 /// tests.
 #[cfg(test)]
-pub(crate) fn shared_peers(peers: impl IntoIterator<Item = (u64, String)>) -> PeerDirectory {
-    PeerDirectory::new(
+pub(crate) fn shared_peers(
+    peers: impl IntoIterator<Item = (u64, String)>,
+) -> ursula_raft::PeerDirectory {
+    ursula_raft::PeerDirectory::new(
         peers
             .into_iter()
             .map(|(node_id, url)| (node_id, ursula_raft::PeerEndpoints::shared(url))),
