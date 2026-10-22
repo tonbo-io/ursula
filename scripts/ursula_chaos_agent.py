@@ -5,6 +5,13 @@ Run this on the client EC2 instance. It continuously appends deterministic
 payloads to one Ursula stream, verifies readable offsets, samples node metrics,
 randomly stops one EC2 node at a time, starts it again, and publishes a compact
 status JSON for the docs `/status` page.
+
+A node hosts only the groups its placement gives it, so the agent reads every
+group's target from `GET /__ursula/placement` and judges each node against it.
+The placement scenarios (`PLACEMENT_SCENARIOS`) change the placement over the
+admin plane under the workload, moves or a decommission, with an optional
+companion fault on one role of the change, and record the change's measures
+in its injection.
 """
 
 from __future__ import annotations
@@ -12,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -23,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -77,6 +86,13 @@ IMPAIRMENT_SCENARIOS = {
     "oneway_partition",
     "netem_reorder",
     "netem_duplicate",
+    "move_netem_delay",
+    "blackhole",
+    # The WAL disk throttled, or its filesystem frozen (a fence case: the node
+    # stops all Raft traffic once its disk lease ends and returns after the
+    # thaw). faultd's clear lifts both.
+    "slow_disk",
+    "fsfreeze",
 }
 # process_kill crashes a node, which must replay its Raft WAL and catch up from
 # its peers (possibly from an S3 snapshot) before it rejoins quorum: minutes,
@@ -102,8 +118,49 @@ FAULT_PROFILES = {
     # same single-voter crash/rejoin path without granting the agent node-level
     # privileges or coupling it to an EC2 instance lifecycle.
     "kubernetes": "pod_delete",
+    # 0.10 placement changes under load, with kills of each role of a move:
+    # every backend. `placement_host` adds the companions and the fence case
+    # that need faultd on the node hosts.
+    "placement": (
+        "move_third,move_kill_source,move_kill_target,move_kill_data_leader,"
+        "move_kill_meta_leader,move_fill_node"
+    ),
+    "placement_host": "move_netem,move_power_cycle,move_slow_disk,move_blackhole_voter,fsfreeze",
 }
-KUBERNETES_FAULT_SCENARIOS = {"pod_delete"}
+# Placement scenarios (0.10): the agent changes the placement itself over the
+# admin plane while its workload runs, and may run a companion fault on one
+# role of the change at the same time. Each maps to (action, companion,
+# role). `move_third` moves a third of the groups one voter each,
+# `move_fill_node` up to 64 groups onto the node holding the fewest replicas,
+# `decommission` decommissions the active node that is no meta voter and
+# holds the most replicas. A companion `kill` is `process_kill` on EC2 and
+# `pod_force_delete` on Kubernetes.
+PLACEMENT_SCENARIOS: dict[str, tuple[str, str | None, str | None]] = {
+    "move_third": ("move_third", None, None),
+    "move_fill_node": ("move_fill_node", None, None),
+    "move_netem": ("move_third", "move_netem_delay", "all"),
+    "move_kill_source": ("move_third", "kill", "source"),
+    "move_kill_target": ("move_third", "kill", "target"),
+    "move_kill_data_leader": ("move_third", "kill", "data_leader"),
+    "move_kill_meta_leader": ("move_third", "kill", "meta_leader"),
+    "move_power_cycle": ("move_third", "power_cycle", "target"),
+    "move_slow_disk": ("move_third", "slow_disk", "target"),
+    "move_blackhole_voter": ("move_third", "blackhole", "staying_voter"),
+    "decommission": ("decommission", None, None),
+}
+MOVE_FILL_NODE_GROUPS = 64
+# A placement change settles when every move converged and every retired
+# replica was torn down, which at the default move limit of 4 takes far longer
+# than a fault's recovery.
+PLACEMENT_RECOVERY_SLO_SECS = 1800
+# Client-observed append latencies kept for the placement measures: about an
+# hour at the default workload rate.
+APPEND_LATENCY_SAMPLES = 200_000
+KUBERNETES_FAULT_SCENARIOS = {"pod_delete", "pod_force_delete"} | {
+    scenario
+    for scenario, (_action, companion, _role) in PLACEMENT_SCENARIOS.items()
+    if companion in (None, "kill")
+}
 # Per-node raft endpoints used to scope netem to inter-node raft traffic.
 # Single-port deployment: raft replication shares the primary interface
 # (ens5) with the client API on :4491, so we target each peer's ens5 IP as a
@@ -205,7 +262,8 @@ class Node:
         # admin plane (server.admin_listen, :4438). The EC2 chaos nodes bind it
         # to the private interface and the security group restricts it to the
         # client, so the agent reaches it directly. The ursula chart binds it to
-        # loopback, so the Kubernetes profile cannot reach it.
+        # loopback by default: the Kubernetes placement scenarios need it
+        # opened to the pod network (`server.adminListen=0.0.0.0:4438`).
         parsed = urllib.parse.urlparse(self.base_url)
         host = parsed.hostname or self.base_url
         return f"http://{host}:4438"
@@ -227,11 +285,195 @@ class ProducerState:
     last_payload: bytes | None = None
 
 
-def node_id_from_name(name: str) -> int | None:
+def variant_name(value: Any) -> str | None:
+    """The variant of a serde enum in Ursula's admin JSON: a unit variant is a
+    string, a variant with fields an object of one key."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and len(value) == 1:
+        return next(iter(value))
+    return None
+
+
+@dataclass(frozen=True)
+class GroupTarget:
+    """One group's placement in a bootstrapped view: `current` are the voters
+    it is placed on now (a move's source), `target` those it ends on."""
+
+    group: int
+    since: Any
+    state: str  # "seeded", "stable" or "moving"
+    current: frozenset[int]
+    target: frozenset[int]
+
+    def placed_on(self, node_id: int) -> bool:
+        return node_id in self.current or node_id in self.target
+
+
+def group_targets(cluster: dict[str, Any]) -> dict[int, GroupTarget]:
+    """Every group's target from a bootstrapped `Cluster` of `GET /__ursula/placement`."""
+    targets: dict[int, GroupTarget] = {}
+    for raw_group, placement in (cluster.get("groups") or {}).items():
+        group = int(raw_group)
+        if variant_name(placement) == "seeded":
+            seeded = placement["seeded"]
+            voters = frozenset(seeded["voters"])
+            targets[group] = GroupTarget(group, seeded["since"], "seeded", voters, voters)
+            continue
+        live = placement["live"]
+        target = live["target"]
+        if variant_name(target) == "stable":
+            voters = frozenset(target["stable"]["voters"])
+            targets[group] = GroupTarget(group, live["since"], "stable", voters, voters)
+        else:
+            moving = target["moving"]
+            targets[group] = GroupTarget(
+                group, live["since"], "moving", frozenset(moving["from"]), frozenset(moving["to"])
+            )
+    return targets
+
+
+def cluster_retirements(cluster: dict[str, Any]) -> dict[int, set[int]]:
+    """The replicas a converged move retired and their nodes have not torn down yet."""
+    return {
+        int(group): {int(node) for node in records}
+        for group, records in (cluster.get("retirements") or {}).items()
+        if records
+    }
+
+
+def active_nodes(cluster: dict[str, Any]) -> list[int]:
+    """The registered nodes that take new replicas."""
+    return sorted(
+        int(node)
+        for node, record in (cluster.get("nodes") or {}).items()
+        if isinstance(record, dict) and record.get("lifecycle") == "active"
+    )
+
+
+def freshest_placement(statuses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The bootstrapped placement status that applied the most meta entries.
+
+    Each node answers from its own meta replica, so one that lags shows an
+    older view. `applied` is the view's last meta log id, compared in the
+    order its type documents: term, leader, index.
+    """
+    best: dict[str, Any] | None = None
+    best_key: tuple[int, int, int] | None = None
+    for status in statuses:
+        applied = status.get("applied")
+        if variant_name(status.get("view")) != "bootstrapped" or not isinstance(applied, dict):
+            continue
+        key = (int(applied.get("term", 0)), int(applied.get("leader", 0)), int(applied.get("index", 0)))
+        if best_key is None or key > best_key:
+            best, best_key = status, key
+    return best
+
+
+def node_matches_placement(node: dict[str, Any], targets: dict[int, GroupTarget]) -> bool:
+    """Whether a node hosts exactly what its placement gives it, each replica
+    with a leader and applied state, and a settled group's replica with the
+    placement's voters and no learner. A replica the placement no longer
+    gives the node (its teardown pending) leaves the node unsettled."""
+    node_id = node.get("node_id")
+    if node.get("metrics_state") != "ok" or not isinstance(node_id, int) or not targets:
+        return False
+    states = {state.get("raft_group_id"): state for state in node.get("raft_group_states", [])}
+    placed = {group for group, target in targets.items() if target.placed_on(node_id)}
+    if set(states) - placed:
+        return False
+    for group in placed:
+        state = states.get(group)
+        target = targets[group]
+        if (
+            state is None
+            or state.get("current_leader") is None
+            or state.get("committed_index") is None
+            or state.get("last_applied_index") is None
+        ):
+            return False
+        if target.state != "moving" and (
+            set(state.get("voter_ids", [])) != target.current or state.get("learner_ids")
+        ):
+            return False
+    return True
+
+
+def plan_moves(
+    targets: dict[int, GroupTarget],
+    active: list[int],
+    retirements: dict[int, set[int]],
+    count: int,
+    rng: random.Random,
+    *,
+    incoming: int | None = None,
+) -> list[dict[str, Any]]:
+    """Up to `count` one-voter moves of stable groups.
+
+    Each swaps the group's voter holding the most roles for the active node
+    outside it holding the fewest (`incoming` when given), never a node whose
+    retirement in the group is pending, which the kernel refuses
+    (`retirement_pending`). The replication factor stays.
+    """
+    roles: Counter[int] = Counter(node for target in targets.values() for node in target.target)
+    candidates = sorted(
+        (target for target in targets.values() if target.state == "stable"),
+        key=lambda target: target.group,
+    )
+    rng.shuffle(candidates)
+    plan: list[dict[str, Any]] = []
+    for target in candidates:
+        if len(plan) >= count:
+            break
+        blocked = target.current | retirements.get(target.group, set())
+        choices = [node for node in active if node not in blocked and incoming in (None, node)]
+        if not choices:
+            continue
+        new = min(choices, key=lambda node: (roles[node], node))
+        old = max(sorted(target.current), key=lambda node: roles[node])
+        roles[new] += 1
+        roles[old] -= 1
+        plan.append(
+            {
+                "group": target.group,
+                "from": sorted(target.current),
+                "to": sorted((target.current - {old}) | {new}),
+                "outgoing": old,
+                "incoming": new,
+            }
+        )
+    return plan
+
+
+def group_terms(topology: dict[str, Any]) -> dict[int, int]:
+    """Each group's highest term among its sampled replicas."""
+    terms: dict[int, int] = {}
+    for group in topology.get("raft_groups", []):
+        values = [replica.get("current_term") for replica in group.get("replicas", [])]
+        values = [value for value in values if isinstance(value, int)]
+        if values:
+            terms[group["raft_group_id"]] = max(values)
+    return terms
+
+
+def placement_refusal(body: bytes) -> str | None:
+    """The reason of a `PlacementApiError`: the kernel's own refusal when the
+    meta state machine refused (for example `move_limit`), else the reason."""
     try:
-        return int(name.rsplit("-", 1)[-1])
+        error = json.loads(body)
     except ValueError:
         return None
+    reason = variant_name(error.get("reason")) if isinstance(error, dict) else None
+    if reason == "refused":
+        return variant_name(error["reason"]["refused"])
+    return reason
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))]
 
 
 _STATUS_RANK = {
@@ -399,6 +641,8 @@ class WorkloadStream:
     pending_producer_appends: dict[str, bytes] | None = None
     recent_payloads: deque[PayloadSample] | None = None
     old_payloads: deque[PayloadSample] | None = None
+    # The stream's group, learned from the routing headers of a redirect.
+    raft_group: int | None = None
 
     def __post_init__(self) -> None:
         if self.recent_payloads is None:
@@ -447,7 +691,7 @@ class ChaosAgent:
             if unsupported:
                 raise SystemExit(
                     "unsupported Kubernetes fault scenarios: " + ",".join(unsupported)
-                    + "; use --fault-profile=kubernetes or --fault-scenarios=pod_delete"
+                    + "; Kubernetes runs pod deletes and the placement scenarios without a host companion"
                 )
         self.raft_ready_max_lag = max(0, args.raft_ready_max_lag)
         configured_unsupported = sorted(set(self.fault_scenarios) & UNSUPPORTED_QUORUM_LOSS_SCENARIOS)
@@ -576,6 +820,16 @@ class ChaosAgent:
         self.last_gc_churn_success = 0
         self.restored_workload_coverage: dict[str, Any] = {}
         self.restored_started_at: datetime | None = None
+        # Each node's id as its metrics report it, by node name.
+        self.node_ids: dict[str, int] = {}
+        # The placement change the current injection drives, see
+        # `start_placement_change`.
+        self.placement_change: dict[str, Any] | None = None
+        # (monotonic time, group, milliseconds) of each acknowledged append.
+        self.append_latencies: deque[tuple[float, int | None, float]] = deque(maxlen=APPEND_LATENCY_SAMPLES)
+        self.last_group_leaders: dict[int, int | None] = {}
+        self.last_group_terms: dict[int, int] = {}
+        self.steady_leader_changes = 0
         self.restore_published_state()
 
     def workload_run_id(self, generation: int) -> str:
@@ -833,7 +1087,9 @@ class ChaosAgent:
         # A write/read that lands on a non-leader is answered with a 307 to the
         # leader. urllib does NOT auto-follow 307/308 for non-GET/HEAD methods,
         # so follow it explicitly here, preserving method + body, up to a few
-        # hops (leadership can move mid-flight).
+        # hops (leadership can move mid-flight). A redirect names the stream's
+        # group (`x-ursula-raft-group`), which the final answer carries on.
+        routed_group: str | None = None
         for _hop in range(4):
             request = urllib.request.Request(
                 url, data=body, method=method, headers=headers or {}
@@ -858,13 +1114,23 @@ class ChaosAgent:
                 # killing the main loop (which would freeze status publishing
                 # and fault recovery — masking correct server behavior).
                 return 0, str(exc).encode(), {}
+            routed_group = resp_headers.get("x-ursula-raft-group", routed_group)
             if status in {307, 308} and resp_headers.get("location"):
                 url = urllib.parse.urljoin(url, resp_headers["location"])
                 continue
-            return status, data, resp_headers
+            break
+        if routed_group is not None:
+            resp_headers.setdefault("x-ursula-raft-group", routed_group)
         return status, data, resp_headers
 
-    def admin_request(self, node: Node, method: str, path: str) -> tuple[int, bytes, dict[str, str]]:
+    def admin_request(
+        self,
+        node: Node,
+        method: str,
+        path: str,
+        *,
+        json_body: Any = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
         """Bind one independent chaos operation before sending its mutation.
 
         Deployed <=0.6.2 chaos sources have no process field; their existing
@@ -882,11 +1148,15 @@ class ChaosAgent:
         if identity is not None:
             if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{32}", identity) is None:
                 raise RuntimeError("invalid admin process identity")
-            expected_node = node_id_from_name(node.name)
+            expected_node = self.node_ids.get(node.name)
             if expected_node is not None and metrics.get("process_node_id") != expected_node:
-                raise RuntimeError("admin observation reached a different voter")
+                raise RuntimeError("admin observation reached a different node")
             headers["x-ursula-process-incarnation"] = identity
-        return self.request(method, f"{node.admin_url}{path}", headers=headers)
+        body = None
+        if json_body is not None:
+            body = json.dumps(json_body).encode()
+            headers["Content-Type"] = "application/json"
+        return self.request(method, f"{node.admin_url}{path}", body=body, headers=headers)
 
     def kubernetes_request(self, method: str, path: str) -> tuple[int, bytes]:
         token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
@@ -1082,7 +1352,8 @@ class ChaosAgent:
         saw_hard_error = False
         saw_transient_failure = False
         producer_seq_conflict: tuple[int, int] | None = None
-        retry_deadline = time.monotonic() + APPEND_TRANSIENT_RETRY_SECS
+        append_started = time.monotonic()
+        retry_deadline = append_started + APPEND_TRANSIENT_RETRY_SECS
         while True:
             retryable_sweep = False
             for attempt in range(len(self.nodes)):
@@ -1132,7 +1403,14 @@ class ChaosAgent:
                         f"{next_offset_header!r}: {exc}"
                     ) from exc
                 end_offset = next_offset_value
+                routed_group = parse_int(headers.get("x-ursula-raft-group"))
+                acknowledged = time.monotonic()
                 with self.state_lock:
+                    if routed_group is not None:
+                        stream.raft_group = routed_group
+                    self.append_latencies.append(
+                        (acknowledged, stream.raft_group, (acknowledged - append_started) * 1000)
+                    )
                     # 204 is a producer dedup acknowledgement of an earlier
                     # append. It resolves the pending append, but the agent
                     # cannot prove `payload` is the committed bytes of that
@@ -1889,7 +2167,11 @@ class ChaosAgent:
                 sample["cold_store"] = metrics.get("cold_store")
                 sample["raft_groups"] = len(raft_groups)
                 sample["leader_groups"] = sum(1 for group in raft_groups if group.get("current_leader") is not None)
-                sample["node_id"] = raft_groups[0].get("node_id") if raft_groups else None
+                # A node may host no group at all, so its id comes from the
+                # process, not from a replica.
+                sample["node_id"] = metrics.get("process_node_id")
+                if isinstance(sample["node_id"], int):
+                    self.node_ids[node.name] = sample["node_id"]
                 sample["raft_group_states"] = [
                     {
                         "raft_group_id": group.get("raft_group_id"),
@@ -1897,6 +2179,7 @@ class ChaosAgent:
                         "current_leader": group.get("current_leader"),
                         "voter_ids": group.get("voter_ids", []),
                         "learner_ids": group.get("learner_ids", []),
+                        "current_term": group.get("current_term"),
                         "committed_index": group.get("committed_index"),
                         "last_applied_index": group.get("last_applied_index"),
                     }
@@ -1905,9 +2188,26 @@ class ChaosAgent:
         except Exception as exc:  # noqa: BLE001
             sample["metrics_state"] = "unavailable"
             sample["last_error"] = str(exc)
+        # The node's placement view (client plane, unconfirmed) and its
+        # readiness reason, which names a fence (`disk_lease_lost`,
+        # `superseded`, `predecessor_wait`, `root_refused`).
+        try:
+            status, body, _ = self.request("GET", f"{node.base_url}/__ursula/placement")
+            sample["placement"] = json.loads(body) if status == 200 else None
+            status, body, _ = self.request("GET", f"{node.base_url}/__ursula/ready")
+            readiness = json.loads(body) if body else {}
+            sample["ready"] = status == 200
+            sample["readiness_reason"] = readiness.get("reason") if isinstance(readiness, dict) else None
+        except ValueError as exc:
+            sample["last_error"] = f"placement or readiness: {exc}"
         return sample
 
-    def build_topology(self, nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    def build_topology(
+        self,
+        nodes: list[dict[str, Any]],
+        targets: dict[int, GroupTarget] | None = None,
+    ) -> dict[str, Any]:
+        targets = targets or {}
         node_names_by_id = {
             node["node_id"]: node["name"]
             for node in nodes
@@ -1934,6 +2234,13 @@ class ChaosAgent:
                         "replicas": [],
                     },
                 )
+                target = targets.get(group_id)
+                if target is not None and "placement" not in group:
+                    group["placement"] = {
+                        "state": target.state,
+                        "voters": sorted(target.current),
+                        "to": sorted(target.target),
+                    }
                 if group.get("leader_id") is None and state.get("current_leader") is not None:
                     group["leader_id"] = state.get("current_leader")
                     group["leader_name"] = node_names_by_id.get(state.get("current_leader"))
@@ -1941,7 +2248,14 @@ class ChaosAgent:
                     {
                         "node_id": state.get("node_id"),
                         "node_name": node.get("name"),
-                        "role": "leader" if state.get("node_id") == group.get("leader_id") else "voter",
+                        "role": (
+                            "leader"
+                            if state.get("node_id") == group.get("leader_id")
+                            else "voter"
+                            if state.get("node_id") in state.get("voter_ids", [])
+                            else "learner"
+                        ),
+                        "current_term": state.get("current_term"),
                         "committed_index": state.get("committed_index"),
                         "last_applied_index": state.get("last_applied_index"),
                     }
@@ -2093,7 +2407,10 @@ class ChaosAgent:
             self.event("warn", f"describe {node.name} failed during recovery check: {exc}")
             return "unknown"
 
-    def stop_instances(self, targets: list[Node], *, wait: bool) -> None:
+    def stop_instances(self, targets: list[Node], *, wait: bool, force: bool = False) -> None:
+        """Stops the targets. `force` kills them at once: a forced EC2 stop
+        (a power loss) or a pod deleted with no grace period (SIGKILL, the
+        pod recreated on its volume)."""
         if not targets:
             return
         if self.fault_backend == "kubernetes":
@@ -2101,6 +2418,7 @@ class ChaosAgent:
                 path = (
                     f"/api/v1/namespaces/{urllib.parse.quote(self.kubernetes_namespace, safe='')}"
                     f"/pods/{urllib.parse.quote(node.instance_id, safe='')}"
+                    + ("?gracePeriodSeconds=0" if force else "")
                 )
                 status, body = self.kubernetes_request("DELETE", path)
                 if status not in {200, 202, 404}:
@@ -2115,7 +2433,10 @@ class ChaosAgent:
                     time.sleep(1)
             return
         instance_ids = [node.instance_id for node in targets]
-        run(["aws", "ec2", "stop-instances", "--instance-ids", *instance_ids], check=False)
+        run(
+            ["aws", "ec2", "stop-instances", *(["--force"] if force else []), "--instance-ids", *instance_ids],
+            check=False,
+        )
         if wait:
             run(["aws", "ec2", "wait", "instance-stopped", "--instance-ids", *instance_ids], check=False)
 
@@ -2163,6 +2484,11 @@ class ChaosAgent:
         if self.disable_faults:
             return
         self.reconcile_active_fault_from_injection(now)
+        change = self.placement_change
+        # At most once a second: the single-lane loop calls this per append.
+        if change is not None and time.monotonic() - change.get("driven_at", 0.0) >= 1.0:
+            change["driven_at"] = time.monotonic()
+            self.drive_placement_change()
         # Self-heal scheduler: if we are completely idle (no in-flight fault,
         # no injection waiting to be resolved, no future tick scheduled), pick
         # the next firing time. This rescues the agent from a single race
@@ -2190,9 +2516,11 @@ class ChaosAgent:
             cleanup = self.active_fault.get("cleanup")
             if cleanup == "start_instances":
                 self.start_nodes(targets)
-            elif cleanup == "automatic_recreate":
-                # Kubernetes StatefulSet reconciliation already owns restart.
-                # Recording start_requested_at below starts the recovery SLO.
+            elif cleanup in {"automatic_recreate", "none"}:
+                # Kubernetes StatefulSet reconciliation already owns restart,
+                # and a placement change without a companion fault has
+                # nothing to undo. Recording start_requested_at below starts
+                # the recovery SLO.
                 pass
             else:
                 cleared = True
@@ -2253,16 +2581,40 @@ class ChaosAgent:
                 self.last_fault_postpone_log_at = now
             return
         scenario = self.choose_fault_scenario()
-        targets = self.choose_fault_targets(scenario)
         injection_id = (self.injections[-1]["id"] + 1) if self.injections else 1
+        fault: str | None = scenario
+        if scenario in PLACEMENT_SCENARIOS:
+            started = self.start_placement_change(scenario, injection_id)
+            if isinstance(started, str):
+                # Recorded and passed over, so the rotation moves on.
+                self.injections.append(
+                    {
+                        "id": injection_id,
+                        "scenario": scenario,
+                        "target_nodes": [],
+                        "status": "skipped",
+                        "stop_requested_at": iso(now),
+                        "recovered_at": iso(now),
+                        "timeline": [{"time": iso(now), "status": "skipped", "message": started}],
+                    }
+                )
+                self.next_fault_at = self.choose_next_fault()
+                self.event("warn", f"skipping {scenario}: {started}")
+                self.publish_status()
+                return
+            targets, fault = started
+        else:
+            targets = self.choose_fault_targets(scenario)
         self.active_injection_id = injection_id
-        if scenario == "pod_delete":
+        if fault is None:
+            cleanup = "none"
+        elif fault in {"pod_delete", "pod_force_delete"}:
             cleanup = "automatic_recreate"
-        elif scenario in IMPAIRMENT_SCENARIOS:
+        elif fault in IMPAIRMENT_SCENARIOS:
             cleanup = "clear_impairment"
         else:
             cleanup = "start_instances"
-        fault_duration_secs = 0 if cleanup == "automatic_recreate" else self.recovery_secs
+        fault_duration_secs = 0 if cleanup in {"automatic_recreate", "none"} else self.recovery_secs
         self.injections.append(
             {
                 "id": injection_id,
@@ -2287,6 +2639,14 @@ class ChaosAgent:
                 ],
             }
         )
+        if scenario in PLACEMENT_SCENARIOS:
+            change = self.placement_change or {}
+            self.injections[-1]["placement"] = {
+                "action": change.get("action"),
+                "moves_planned": len(change.get("queue", [])),
+                "decommission_node": (change.get("decommission") or {}).get("node"),
+                "companion": fault,
+            }
         self.active_fault = {
             "scenario": scenario,
             "targets": targets,
@@ -2295,7 +2655,11 @@ class ChaosAgent:
         }
         self.publish_status()
         self.event("warn", f"injecting {scenario} on {', '.join(node.name for node in targets)}")
-        self.apply_fault_scenario(scenario, targets)
+        if scenario in PLACEMENT_SCENARIOS:
+            # The companion fault lands while the first moves run.
+            self.drive_placement_change()
+        if fault is not None:
+            self.apply_fault_scenario(fault, targets)
         injection = self.current_injection()
         if injection is not None and cleanup == "clear_impairment":
             injected_at = iso(utc_now())
@@ -2394,6 +2758,16 @@ class ChaosAgent:
                     ),
                 }
             )
+        elif injection.get("cleanup") == "none":
+            # A placement change is not restarted: the moves stay queued in
+            # the meta group and their leaders keep reconciling.
+            injection["timeline"].append(
+                {
+                    "time": iso(now),
+                    "status": "repairing",
+                    "message": f"placement change has not settled; repair attempt {repair_count} only waits",
+                }
+            )
         else:
             self.stop_instances(targets, wait=True)
             injection["timeline"].append(
@@ -2414,6 +2788,291 @@ class ChaosAgent:
         self.publish_status()
         return True
 
+    def node_by_id(self, node_id: int | None) -> Node | None:
+        if node_id is None:
+            return None
+        for node in self.nodes:
+            if self.node_ids.get(node.name) == node_id:
+                return node
+        return None
+
+    def confirmed_cluster(self) -> tuple[Node, dict[str, Any]] | None:
+        """A bootstrapped view a meta read barrier confirmed current, and the
+        admin node that answered it, which then takes the writes."""
+        for node in self.nodes:
+            status, body, _ = self.request("GET", f"{node.admin_url}/__ursula/placement?confirmed=true")
+            if status != 200:
+                continue
+            try:
+                view = json.loads(body).get("view")
+            except ValueError:
+                continue
+            if variant_name(view) == "bootstrapped":
+                return node, view["bootstrapped"]
+        return None
+
+    def start_placement_change(self, scenario: str, injection_id: int) -> tuple[list[Node], str | None] | str:
+        """Plans the scenario's placement change and its companion fault.
+
+        Returns the companion's targets (the change's own nodes when it has
+        none) and the companion scenario, or why the change cannot run here.
+        The moves are submitted by `drive_placement_change`.
+        """
+        action, companion, role = PLACEMENT_SCENARIOS[scenario]
+        confirmed = self.confirmed_cluster()
+        if confirmed is None:
+            return "no admin node answered a confirmed bootstrapped placement view"
+        _admin, cluster = confirmed
+        nodes = [self.sample_node(node) for node in self.nodes]
+        placement = self.placement_health(nodes)
+        topology = self.build_topology(nodes, placement["targets"])
+        targets = group_targets(cluster)
+        active = active_nodes(cluster)
+        change: dict[str, Any] = {
+            "injection_id": injection_id,
+            "action": action,
+            "started_at": time.monotonic(),
+            "queue": [],
+            "moves": {},
+            "refused": {},
+            "decommission": None,
+        }
+        roles: Counter[int] = Counter(node for target in targets.values() for node in target.target)
+        if action == "decommission":
+            meta_voters = set((cluster.get("params") or {}).get("meta_voters") or [])
+            replication_factor = int((cluster.get("params") or {}).get("replication_factor") or 0)
+            candidates = [node for node in active if node not in meta_voters]
+            if not candidates or len(active) - 1 < replication_factor:
+                return "no active node outside the meta voters can leave without dropping below the replication factor"
+            leaving = max(candidates, key=lambda node: (roles[node], node))
+            change["decommission"] = {"node": leaving, "accepted_at": None, "removed_at": None, "refused": None}
+            plan_nodes = [leaving]
+        else:
+            if action == "move_fill_node":
+                incoming = min(active, key=lambda node: (roles[node], node)) if active else None
+                count = MOVE_FILL_NODE_GROUPS
+            else:
+                incoming = None
+                count = max(1, len(targets) // 3)
+            plan = plan_moves(
+                targets, active, cluster_retirements(cluster), count, random.Random(), incoming=incoming
+            )
+            if not plan:
+                return "no stable group has an active node outside its voters to move to"
+            change["queue"] = plan
+            plan_nodes = [move["incoming"] for move in plan]
+        leaders = {group["raft_group_id"]: group.get("leader_id") for group in topology["raft_groups"]}
+        if role == "all":
+            role_nodes = [self.node_ids.get(node.name) for node in self.nodes]
+        elif role == "source":
+            role_nodes = [Counter(move["outgoing"] for move in change["queue"]).most_common(1)[0][0]]
+        elif role == "target":
+            role_nodes = [Counter(plan_nodes).most_common(1)[0][0]]
+        elif role == "data_leader":
+            role_nodes = [leaders.get(change["queue"][0]["group"])]
+        elif role == "meta_leader":
+            role_nodes = [placement.get("meta_leader")]
+        elif role == "staying_voter":
+            staying = Counter(
+                node
+                for move in change["queue"]
+                for node in set(move["from"]) & set(move["to"])
+                if node != leaders.get(move["group"])
+            )
+            role_nodes = [staying.most_common(1)[0][0]] if staying else []
+        else:
+            role_nodes = list(dict.fromkeys(plan_nodes))
+        fault_targets = [node for node in (self.node_by_id(node_id) for node_id in role_nodes) if node is not None]
+        if not fault_targets:
+            return f"no node of role {role or 'change'} is known by id"
+        self.placement_change = change
+        fault = companion
+        if companion == "kill":
+            fault = "pod_force_delete" if self.fault_backend == "kubernetes" else "process_kill"
+        return fault_targets, fault
+
+    def drive_placement_change(self) -> None:
+        """Submits what the current placement change still owes, on a
+        confirmed view: each queued move names the placement key it read,
+        and a `move_limit` refusal or an answer that may have applied leaves
+        the rest queued for the next tick. A queued move the view already
+        shows was accepted by a submit whose answer was lost."""
+        change = self.placement_change
+        if change is None:
+            return
+        decommission = change["decommission"]
+        owes_decommission = (
+            decommission is not None
+            and decommission["accepted_at"] is None
+            and decommission["refused"] is None
+        )
+        if not change["queue"] and not owes_decommission:
+            return
+        confirmed = self.confirmed_cluster()
+        if confirmed is None:
+            return
+        admin, cluster = confirmed
+        try:
+            if owes_decommission:
+                node_id = decommission["node"]
+                record = (cluster.get("nodes") or {}).get(str(node_id)) or {}
+                if record.get("lifecycle") in {"decommissioning", "removed"}:
+                    decommission["accepted_at"] = time.monotonic()
+                else:
+                    status, body, _ = self.admin_request(
+                        admin, "POST", f"/__ursula/placement/nodes/{node_id}/decommission"
+                    )
+                    if status == 200:
+                        decommission["accepted_at"] = time.monotonic()
+                    elif status not in {0, 503, 504}:
+                        decommission["refused"] = placement_refusal(body) or f"http_{status}"
+            targets = group_targets(cluster)
+            queue = change["queue"]
+            while queue:
+                move = queue[0]
+                target = targets.get(move["group"])
+                if target is not None and target.state != "seeded" and target.target == frozenset(move["to"]):
+                    self.accept_move(change, queue.pop(0))
+                    continue
+                if target is None or target.state != "stable" or target.current != frozenset(move["from"]):
+                    self.refuse_move(change, queue.pop(0), "placement_changed")
+                    continue
+                status, body, _ = self.admin_request(
+                    admin,
+                    "POST",
+                    f"/__ursula/placement/groups/{move['group']}/move",
+                    json_body={"expected": target.since, "to": move["to"]},
+                )
+                if status == 200:
+                    self.accept_move(change, queue.pop(0))
+                    continue
+                reason = placement_refusal(body)
+                if reason == "move_limit" or status in {0, 503, 504}:
+                    break
+                self.refuse_move(change, queue.pop(0), reason or f"http_{status}")
+        except RuntimeError as exc:
+            self.event("warn", f"placement change submit: {exc}")
+
+    def accept_move(self, change: dict[str, Any], move: dict[str, Any]) -> None:
+        move["accepted_at"] = time.monotonic()
+        move["start_term"] = self.last_group_terms.get(move["group"])
+        change["moves"][move["group"]] = move
+
+    def refuse_move(self, change: dict[str, Any], move: dict[str, Any], reason: str) -> None:
+        change["refused"][reason] = change["refused"].get(reason, 0) + 1
+        self.event("warn", f"move of group {move['group']} to {move['to']} refused: {reason}")
+
+    def observe_placement_change(self, placement: dict[str, Any], topology: dict[str, Any]) -> None:
+        """Stamps each accepted move when its group is stable at its target and
+        when the outgoing replica's retirement is gone, and the decommission
+        when its node is removed. Once nothing is owed, the injection gets
+        the change's measures."""
+        change = self.placement_change
+        if change is None or placement["stage"] != "bootstrapped":
+            return
+        now = time.monotonic()
+        targets = placement["targets"]
+        retirements = placement["retirements"]
+        terms = group_terms(topology)
+        for group, move in change["moves"].items():
+            target = targets.get(group)
+            if (
+                move.get("stable_at") is None
+                and target is not None
+                and target.state == "stable"
+                and target.current == frozenset(move["to"])
+            ):
+                move["stable_at"] = now
+                move["end_term"] = terms.get(group)
+            if (
+                move.get("stable_at") is not None
+                and move.get("retired_at") is None
+                and move["outgoing"] not in retirements.get(group, set())
+            ):
+                move["retired_at"] = now
+        decommission = change["decommission"]
+        if decommission is not None and decommission["accepted_at"] is not None and decommission["removed_at"] is None:
+            record = (placement["cluster"].get("nodes") or {}).get(str(decommission["node"])) or {}
+            if record.get("lifecycle") == "removed":
+                decommission["removed_at"] = now
+        owes = bool(change["queue"]) or any(move.get("retired_at") is None for move in change["moves"].values())
+        if decommission is not None:
+            owes = owes or (decommission["refused"] is None and decommission["removed_at"] is None)
+        if owes:
+            return
+        self.placement_change = None
+        measures = self.placement_measures(change, now)
+        for injection in self.injections:
+            if injection.get("id") == change["injection_id"]:
+                injection.setdefault("placement", {}).update(measures)
+        self.event("info", f"placement change {change['action']} settled: {json.dumps(measures, sort_keys=True)}")
+
+    def placement_measures(self, change: dict[str, Any], now: float) -> dict[str, Any]:
+        """The measures of design 15.4 for one settled change. Write p99s are
+        client-observed append latencies (redirects included) during the
+        change, split by whether the stream's group moved, and over the
+        same length of time before it."""
+        started = change["started_at"]
+        moved = set(change["moves"])
+        with self.state_lock:
+            latencies = list(self.append_latencies)
+
+        def write_p99(low: float, high: float, moving: bool | None) -> float | None:
+            values = [
+                ms
+                for at, group, ms in latencies
+                if low <= at <= high and group is not None and (moving is None or (group in moved) == moving)
+            ]
+            value = percentile(values, 0.99)
+            return None if value is None else round(value, 1)
+
+        moves = list(change["moves"].values())
+        move_secs = [move["stable_at"] - move["accepted_at"] for move in moves]
+        teardown_secs = [move["retired_at"] - move["stable_at"] for move in moves]
+        elections = [
+            move["end_term"] - move["start_term"]
+            for move in moves
+            if isinstance(move.get("end_term"), int) and isinstance(move.get("start_term"), int)
+        ]
+        decommission = change["decommission"]
+
+        def rounded(value: float | None) -> float | None:
+            return None if value is None else round(value, 1)
+
+        return {
+            "moves_accepted": len(moves),
+            "moves_refused": dict(change["refused"]),
+            "change_secs": round(now - started, 1),
+            "move_secs_p50": rounded(percentile(move_secs, 0.5)),
+            "move_secs_max": rounded(max(move_secs, default=None)),
+            "teardown_secs_max": rounded(max(teardown_secs, default=None)),
+            "elections_total": sum(elections),
+            "elections_per_move": round(sum(elections) / len(elections), 2) if elections else None,
+            "write_p99_ms_not_moving": write_p99(started, now, False),
+            "write_p99_ms_moving": write_p99(started, now, True),
+            "write_p99_ms_before": write_p99(2 * started - now, started, None),
+            "decommission_secs": (
+                rounded(decommission["removed_at"] - decommission["accepted_at"])
+                if decommission is not None and decommission["removed_at"] is not None
+                else None
+            ),
+            "decommission_refused": None if decommission is None else decommission["refused"],
+        }
+
+    def count_steady_leader_changes(self, topology: dict[str, Any]) -> None:
+        """Counts leader changes between samples while no fault, injection or
+        placement change runs: a settled cluster makes none."""
+        leaders = {group["raft_group_id"]: group.get("leader_id") for group in topology.get("raft_groups", [])}
+        quiet = self.active_fault is None and self.current_injection() is None and self.placement_change is None
+        if quiet:
+            self.steady_leader_changes += sum(
+                1
+                for group, leader in leaders.items()
+                if leader is not None and self.last_group_leaders.get(group) not in (None, leader)
+            )
+        self.last_group_leaders = leaders
+        self.last_group_terms = group_terms(topology)
+
     def choose_fault_scenario(self) -> str:
         scenario = self.fault_scenarios[(self.injections[-1]["id"] if self.injections else 0) % len(self.fault_scenarios)]
         if scenario == "mixed_stop":
@@ -2428,6 +3087,36 @@ class ChaosAgent:
             # Kubernetes recreates a deleted pod at once, so there is no
             # stopped state to wait for.
             self.stop_instances(targets, wait=scenario != "pod_delete")
+            return
+        if scenario in {"pod_force_delete", "power_cycle"}:
+            self.stop_instances(targets, wait=scenario == "power_cycle", force=True)
+            return
+        if scenario in {"move_netem_delay", "blackhole", "slow_disk", "fsfreeze"}:
+            # Every node's own host stands for its Raft traffic, which shares
+            # the client interface: a cluster grown past the three fixed
+            # chaos hosts is covered too.
+            hosts = [urllib.parse.urlparse(node.base_url).hostname for node in self.nodes]
+            payloads = {
+                "move_netem_delay": {
+                    "kind": "netem",
+                    "scope": "cluster",
+                    "delay_ms": 250,
+                    "jitter_ms": 75,
+                    "loss_percent": 0,
+                    "cluster_subnets": [f"{host}/32" for host in hosts if host],
+                },
+                "slow_disk": {"kind": "disk", "write_iops": 50, "write_bytes_per_sec": 4 * 1024 * 1024},
+                "fsfreeze": {"kind": "fsfreeze"},
+            }
+            applied = True
+            for node in targets:
+                own = urllib.parse.urlparse(node.base_url).hostname
+                payload = payloads.get(scenario) or {
+                    "kind": "partition",
+                    "peer_hosts": [host for host in hosts if host and host != own],
+                }
+                applied = self.apply_node_impairment(node, payload) and applied
+            self.mark_current_injection_apply_result(applied)
             return
         if scenario == "netem_delay":
             applied = True
@@ -2853,56 +3542,84 @@ class ChaosAgent:
             )
             coverage["configured_verify_mode_count"] = len(verify_modes)
 
-    def raft_node_has_full_view(
-        self,
-        node: dict[str, Any],
-        *,
-        expected_groups: int,
-        expected_voters: set[int],
-    ) -> bool:
-        if (
-            expected_groups <= 0
-            or node.get("metrics_state") != "ok"
-            or node.get("raft_groups") != expected_groups
-        ):
-            return False
-        states = node.get("raft_group_states", [])
-        if len(states) != expected_groups:
-            return False
-        for state in states:
-            if state.get("current_leader") is None:
-                return False
-            if set(state.get("voter_ids", [])) != expected_voters:
-                return False
-            if state.get("committed_index") is None or state.get("last_applied_index") is None:
-                return False
-        return True
+    def placement_health(self, nodes: list[dict[str, Any]]) -> dict[str, Any]:
+        """How the sampled nodes stand against the placement.
+
+        Placement decides what each node hosts, so a node is complete when
+        it hosts exactly what the freshest bootstrapped view gives it
+        (`node_matches_placement`). The placement is settled when no group
+        moves and no retired replica waits for its teardown.
+        """
+        placement = freshest_placement(
+            [node["placement"] for node in nodes if isinstance(node.get("placement"), dict)]
+        )
+        if placement is None:
+            stages = sorted(
+                {
+                    str(variant_name(node["placement"].get("view")))
+                    for node in nodes
+                    if isinstance(node.get("placement"), dict)
+                }
+            )
+            return {
+                "stage": ",".join(stages) or "unavailable",
+                "targets": {},
+                "full_raft_nodes": 0,
+                "settled": False,
+            }
+        cluster = placement["view"]["bootstrapped"]
+        targets = group_targets(cluster)
+        retirements = cluster_retirements(cluster)
+        params = cluster.get("params") or {}
+        meta = placement.get("meta")
+        running = meta.get("running") if isinstance(meta, dict) else None
+        moving = sum(1 for target in targets.values() if target.state == "moving")
+        retired = sum(len(nodes_) for nodes_ in retirements.values())
+        return {
+            "stage": "bootstrapped",
+            "applied": placement.get("applied"),
+            "cluster": cluster,
+            "targets": targets,
+            "retirements": retirements,
+            "group_count": params.get("group_count"),
+            "replication_factor": params.get("replication_factor"),
+            "meta_voters": params.get("meta_voters"),
+            "max_concurrent_moves": params.get("max_concurrent_moves"),
+            "meta_leader": running.get("leader") if isinstance(running, dict) else None,
+            "seeded": sum(1 for target in targets.values() if target.state == "seeded"),
+            "moving": moving,
+            "retirements_pending": retired,
+            "full_raft_nodes": sum(1 for node in nodes if node_matches_placement(node, targets)),
+            "settled": moving == 0 and retired == 0,
+        }
+
+    @staticmethod
+    def placement_reasons(placement: dict[str, Any]) -> list[str]:
+        if placement["stage"] != "bootstrapped":
+            return [f"placement view is {placement['stage']}, not bootstrapped"]
+        reasons = []
+        if placement["moving"]:
+            reasons.append(f"{placement['moving']} groups moving")
+        if placement["retirements_pending"]:
+            reasons.append(f"{placement['retirements_pending']} retired replicas not torn down")
+        return reasons
+
+    @staticmethod
+    def published_placement(placement: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in placement.items()
+            if key not in {"cluster", "targets", "retirements"}
+        }
 
     def fault_injection_readiness(self) -> tuple[bool, list[str]]:
         nodes = [self.sample_node(node) for node in self.nodes]
-        topology = self.build_topology(nodes)
+        placement = self.placement_health(nodes)
+        topology = self.build_topology(nodes, placement["targets"])
         expected_nodes = len(self.nodes)
-        expected_voters = {
-            node_id
-            for node_id in (node.get("node_id") for node in nodes)
-            if isinstance(node_id, int)
-        }
-        expected_groups = max(
-            (node.get("raft_groups") for node in nodes if isinstance(node.get("raft_groups"), int)),
-            default=0,
-        )
         running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
         metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
-        full_raft_nodes = sum(
-            1
-            for node in nodes
-            if len(expected_voters) == expected_nodes
-            and self.raft_node_has_full_view(
-                node,
-                expected_groups=expected_groups,
-                expected_voters=expected_voters,
-            )
-        )
+        full_raft_nodes = placement["full_raft_nodes"]
         lag_status = self.raft_replica_lag_status(topology)
         reasons = []
         if running_nodes < expected_nodes:
@@ -2911,8 +3628,11 @@ class ChaosAgent:
             reasons.append(f"{metrics_ok}/{expected_nodes} metrics endpoints healthy")
         if full_raft_nodes < expected_nodes:
             reasons.append(
-                f"{full_raft_nodes}/{expected_nodes} nodes have complete Raft membership and applied state"
+                f"{full_raft_nodes}/{expected_nodes} nodes host what the placement gives them, with applied state"
             )
+        reasons.extend(self.placement_reasons(placement))
+        if self.placement_change is not None:
+            reasons.append("a placement change is in progress")
         if not lag_status["ok"]:
             reasons.append(self.raft_lag_reason(lag_status))
         if self.last_integrity_error is not None:
@@ -2986,33 +3706,26 @@ class ChaosAgent:
         # which takes far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
         if scenario in CATCH_UP_SCENARIOS:
             return max(self.recovery_slo_secs, CATCH_UP_RECOVERY_SLO_SECS)
+        if scenario in PLACEMENT_SCENARIOS:
+            return max(self.recovery_slo_secs, PLACEMENT_RECOVERY_SLO_SECS)
         return self.recovery_slo_secs
 
     def build_status(self) -> dict[str, Any]:
         self.reconcile_active_fault_from_injection(utc_now())
         nodes = [self.sample_node(node) for node in self.nodes]
-        topology = self.build_topology(nodes)
+        placement = self.placement_health(nodes)
+        topology = self.build_topology(nodes, placement["targets"])
+        self.observe_placement_change(placement, topology)
+        self.count_steady_leader_changes(topology)
         expected_nodes = len(self.nodes)
-        expected_voters = {node_id for node_id in (node.get("node_id") for node in nodes) if isinstance(node_id, int)}
-        expected_groups = max(
-            (node.get("raft_groups") for node in nodes if isinstance(node.get("raft_groups"), int)),
-            default=0,
-        )
+        expected_groups = placement.get("group_count") or 0
         running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
         metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
         storage = self.storage_status(nodes)
         raft_lag_status = self.raft_replica_lag_status(topology)
         raft_replicas_caught_up = raft_lag_status["ok"]
-        full_raft_nodes = sum(
-            1
-            for node in nodes
-            if len(expected_voters) == expected_nodes
-            and self.raft_node_has_full_view(
-                node,
-                expected_groups=expected_groups,
-                expected_voters=expected_voters,
-            )
-        )
+        full_raft_nodes = placement["full_raft_nodes"]
+        placement_settled = placement["settled"] and self.placement_change is None
         append_success_delta = (
             None
             if self.last_status_append_success is None
@@ -3063,7 +3776,8 @@ class ChaosAgent:
         if metrics_ok < expected_nodes:
             reasons.append(f"{metrics_ok}/{expected_nodes} metrics endpoints healthy")
         if full_raft_nodes < expected_nodes:
-            reasons.append(f"{full_raft_nodes}/{expected_nodes} nodes have complete Raft membership and applied state")
+            reasons.append(f"{full_raft_nodes}/{expected_nodes} nodes host what the placement gives them, with applied state")
+        reasons.extend(self.placement_reasons(placement))
         if not raft_replicas_caught_up:
             reasons.append(self.raft_lag_reason(raft_lag_status))
         if not workload_progressing:
@@ -3092,6 +3806,7 @@ class ChaosAgent:
             running_nodes == expected_nodes
             and metrics_ok == expected_nodes
             and full_raft_nodes == expected_nodes
+            and placement_settled
             and raft_replicas_caught_up
             and workload_progressing
             and workload_clean
@@ -3112,6 +3827,7 @@ class ChaosAgent:
         # doing useful work.
         recovered_healthy = (
             quorum_healthy
+            and placement_settled
             and raft_replicas_caught_up
             and workload_progressing
             and integrity_status == "operational"
@@ -3155,6 +3871,9 @@ class ChaosAgent:
             "raft_replica_max_allowed_lag": raft_lag_status["max_allowed_lag"],
             "raft_replica_lagging_count": raft_lag_status["lagging_count"],
             "raft_replica_lagging": raft_lag_status["lagging"],
+            "placement": self.published_placement(placement),
+            "placement_settled": placement_settled,
+            "steady_leader_changes_total": self.steady_leader_changes,
             "reasons": reasons,
         }
         injection = self.current_injection()
@@ -3167,6 +3886,21 @@ class ChaosAgent:
                 target.get("instance_state") != "running" or target.get("metrics_state") != "ok"
                 for target in targets
             )
+            # A fence shows as the target's readiness reason: record each
+            # change, so a frozen disk reads as `disk_lease_lost` and then
+            # ready again after the thaw.
+            readiness = injection.setdefault("readiness", {})
+            for target in targets:
+                reason = target.get("readiness_reason")
+                if "ready" in target and readiness.get(target["name"]) != reason:
+                    readiness[target["name"]] = reason
+                    injection["timeline"].append(
+                        {
+                            "time": updated_at,
+                            "status": "readiness",
+                            "message": f"{target['name']} readiness reason {reason or 'none (ready)'}",
+                        }
+                    )
             if injection.get("stopped_at") is None and target_down:
                 injection["status"] = "stopped"
                 injection["stopped_at"] = updated_at
@@ -3627,7 +4361,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fault-profile",
-        choices=["network", "orthogonal", "kubernetes", "custom"],
+        choices=["network", "orthogonal", "kubernetes", "placement", "placement_host", "custom"],
         default="network",
         help="Preset fault scenario set. Use custom with --fault-scenarios.",
     )

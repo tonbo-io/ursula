@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import random
 import subprocess
 import tempfile
 import threading
@@ -21,6 +22,13 @@ from ursula_chaos_agent import (
     _downsample_history,
     _prune_history,
     _published_started_at,
+    active_nodes,
+    cluster_retirements,
+    freshest_placement,
+    group_targets,
+    node_matches_placement,
+    placement_refusal,
+    plan_moves,
 )
 
 
@@ -479,6 +487,7 @@ class ChaosAgentStateTest(unittest.TestCase):
         agent.cold_flush_noop = 0
         agent.cold_flush_errors = 0
         agent.fault_backend = "ec2"
+        agent.node_ids = {}
         return agent
 
     def test_verifier_reads_back_bytes_and_separates_corruption_from_availability(self) -> None:
@@ -709,6 +718,223 @@ class ChaosAgentStateTest(unittest.TestCase):
             agent.append_once(3)
 
         self.assertEqual(agent.active_append_count, 0)
+
+
+
+def placement_cluster(groups, *, nodes=(1, 2, 3, 4, 5), retirements=None, lifecycles=None):
+    """A bootstrapped `Cluster` as `GET /__ursula/placement` encodes it."""
+    lifecycles = lifecycles or {}
+    encoded = {}
+    for group, (state, *voters) in groups.items():
+        since = {"term": 2, "leader": 1, "index": 10 + group}
+        if state == "seeded":
+            encoded[str(group)] = {"seeded": {"since": since, "voters": voters[0], "initializer": voters[0][0]}}
+        elif state == "stable":
+            encoded[str(group)] = {
+                "live": {"since": since, "converged_at": since, "target": {"stable": {"voters": voters[0]}}}
+            }
+        else:
+            encoded[str(group)] = {
+                "live": {
+                    "since": since,
+                    "converged_at": since,
+                    "target": {"moving": {"from": voters[0], "to": voters[1], "abandoned": [], "since_ms": 1}},
+                }
+            }
+    return {
+        "params": {"group_count": len(groups), "replication_factor": 3, "meta_voters": [1, 2, 3],
+                   "max_concurrent_moves": 4},
+        "nodes": {str(node): {"lifecycle": lifecycles.get(node, "active"), "since_ms": 1, "root": None}
+                  for node in nodes},
+        "groups": encoded,
+        "retirements": {
+            str(group): {str(node): {"created_at": {"term": 2, "leader": 1, "index": 99}} for node in owed}
+            for group, owed in (retirements or {}).items()
+        },
+    }
+
+
+def replica(group, voters, *, learners=(), leader=1, term=3):
+    return {
+        "raft_group_id": group,
+        "current_leader": leader,
+        "voter_ids": list(voters),
+        "learner_ids": list(learners),
+        "current_term": term,
+        "committed_index": 5,
+        "last_applied_index": 5,
+    }
+
+
+class PlacementTest(unittest.TestCase):
+    def test_a_node_is_complete_when_it_hosts_exactly_what_its_placement_gives_it(self) -> None:
+        # The bug this catches: judging every node against "every node votes
+        # in every group", which reads every node of a placed cluster as
+        # incomplete, or counting a replica its placement dropped as settled.
+        targets = group_targets(
+            placement_cluster(
+                {0: ("stable", [1, 2, 3]), 1: ("moving", [1, 2, 3], [2, 3, 4]), 2: ("seeded", [2, 3, 4])}
+            )
+        )
+        node = lambda node_id, *states: {  # noqa: E731
+            "node_id": node_id, "metrics_state": "ok", "raft_group_states": list(states)
+        }
+        self.assertTrue(
+            node_matches_placement(node(1, replica(0, [1, 2, 3]), replica(1, [1, 2, 3], learners=[4])), targets)
+        )
+        self.assertTrue(node_matches_placement(node(4, replica(1, [1, 2, 3], learners=[4]), replica(2, [2, 3, 4])), targets))
+        self.assertTrue(node_matches_placement(node(5), targets))
+        # A node missing a placed replica, a replica its placement dropped, a
+        # settled group with other voters or a learner, and a replica with no
+        # leader are not complete.
+        self.assertFalse(node_matches_placement(node(1, replica(0, [1, 2, 3])), targets))
+        self.assertFalse(node_matches_placement(node(5, replica(0, [1, 2, 3])), targets))
+        self.assertFalse(
+            node_matches_placement(node(4, replica(1, [1, 2, 3]), replica(2, [2, 3, 4], learners=[5])), targets)
+        )
+        self.assertFalse(
+            node_matches_placement(node(4, replica(1, [1, 2, 3]), replica(2, [1, 2, 3, 4])), targets)
+        )
+        self.assertFalse(
+            node_matches_placement(node(4, replica(1, [1, 2, 3], leader=None), replica(2, [2, 3, 4])), targets)
+        )
+
+    def test_the_freshest_view_is_the_one_that_applied_most(self) -> None:
+        older = {"view": {"bootstrapped": {"tag": "older"}}, "applied": {"term": 3, "leader": 2, "index": 90}}
+        newer = {"view": {"bootstrapped": {"tag": "newer"}}, "applied": {"term": 4, "leader": 1, "index": 7}}
+        forming = {"view": "meta_catching_up", "applied": None}
+        self.assertIs(freshest_placement([older, forming, newer]), newer)
+        self.assertIsNone(freshest_placement([forming]))
+
+    def test_planned_moves_keep_the_factor_and_never_place_a_retired_replica_again(self) -> None:
+        cluster = placement_cluster(
+            {
+                0: ("stable", [1, 2, 3]),
+                1: ("stable", [1, 2, 3]),
+                2: ("stable", [2, 3, 4]),
+                3: ("moving", [1, 2, 3], [1, 2, 5]),
+                4: ("seeded", [3, 4, 5]),
+            },
+            retirements={0: [4], 1: [4]},
+            lifecycles={5: "cordoned"},
+        )
+        targets = group_targets(cluster)
+        active = active_nodes(cluster)
+        self.assertEqual(active, [1, 2, 3, 4])
+        plan = plan_moves(targets, active, cluster_retirements(cluster), 10, random.Random(7))
+        # Groups 0 and 1 would only move to node 4, whose retirement there is
+        # pending, and node 5 takes no new replica: only group 2 moves.
+        self.assertEqual([move["group"] for move in plan], [2])
+        (move,) = plan
+        self.assertEqual(len(move["to"]), 3)
+        self.assertNotIn(move["incoming"], move["from"])
+        self.assertEqual(set(move["to"]), set(move["from"]) - {move["outgoing"]} | {move["incoming"]})
+        self.assertEqual(move["incoming"], 1)
+        # A fill names its incoming node, and a count bounds the plan.
+        fill = plan_moves(
+            group_targets(placement_cluster({group: ("stable", [1, 2, 3]) for group in range(6)})),
+            [1, 2, 3, 4, 5],
+            {},
+            4,
+            random.Random(3),
+            incoming=5,
+        )
+        self.assertEqual(len(fill), 4)
+        self.assertTrue(all(move["incoming"] == 5 for move in fill))
+
+    def test_a_refusal_reads_the_kernels_own_variant(self) -> None:
+        refused = {"reason": {"refused": {"move_limit": {"limit": 4, "moving": 4}}}, "write_effect": "not_applied"}
+        self.assertEqual(placement_refusal(json.dumps(refused).encode()), "move_limit")
+        unit = {"reason": {"refused": "not_bootstrapped"}, "write_effect": "not_applied"}
+        self.assertEqual(placement_refusal(json.dumps(unit).encode()), "not_bootstrapped")
+        self.assertEqual(placement_refusal(json.dumps({"reason": "no_leader"}).encode()), "no_leader")
+        self.assertIsNone(placement_refusal(b"Not Found"))
+
+    def placement_agent(self) -> ChaosAgent:
+        agent = object.__new__(ChaosAgent)
+        agent.nodes = [Node("ursula-0", "ursula-0", "http://ursula-0:4437")]
+        agent.events = deque()
+        agent.state_lock = threading.Lock()
+        agent.append_latencies = deque()
+        agent.last_group_terms = {0: 3, 1: 3, 2: 3}
+        agent.injections = deque([{"id": 1, "placement": {"action": "move_third"}}])
+        agent.event = lambda level, message: agent.events.append((level, message))
+        return agent
+
+    def test_moves_requeue_on_the_move_limit_and_a_lost_answer_resolves_from_the_view(self) -> None:
+        agent = self.placement_agent()
+        moves = [
+            {"group": group, "from": [1, 2, 3], "to": [2, 3, 4], "outgoing": 1, "incoming": 4} for group in range(3)
+        ]
+        agent.placement_change = {
+            "injection_id": 1, "action": "move_third", "started_at": 0.0, "queue": list(moves),
+            "moves": {}, "refused": {}, "decommission": None,
+        }
+        view = placement_cluster({group: ("stable", [1, 2, 3]) for group in range(3)})
+        agent.confirmed_cluster = lambda: (agent.nodes[0], view)
+        answers = [
+            (200, b'{"since": {"term": 2, "leader": 1, "index": 40}}', {}),
+            (409, json.dumps({"reason": {"refused": {"move_limit": {"limit": 1, "moving": 1}}}}).encode(), {}),
+        ]
+        submitted: list[tuple[str, dict]] = []
+
+        def admin_request(node, method, path, *, json_body=None):
+            submitted.append((path, json_body))
+            return answers.pop(0)
+
+        agent.admin_request = admin_request
+        agent.drive_placement_change()
+        self.assertEqual(list(agent.placement_change["moves"]), [0])
+        self.assertEqual([move["group"] for move in agent.placement_change["queue"]], [1, 2])
+        self.assertEqual(submitted[0][1]["expected"], {"term": 2, "leader": 1, "index": 10})
+        # The second submit's answer was lost: the view shows group 1 moving
+        # to its target, so it is accepted without a resubmit. Group 2's
+        # placement moved on, so the move is refused, never sent stale.
+        view = placement_cluster(
+            {0: ("moving", [1, 2, 3], [2, 3, 4]), 1: ("moving", [1, 2, 3], [2, 3, 4]), 2: ("stable", [1, 2, 5])}
+        )
+        agent.drive_placement_change()
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(sorted(agent.placement_change["moves"]), [0, 1])
+        self.assertEqual(agent.placement_change["queue"], [])
+        self.assertEqual(agent.placement_change["refused"], {"placement_changed": 1})
+
+    def test_a_change_settles_once_every_retired_replica_is_torn_down_and_records_its_measures(self) -> None:
+        agent = self.placement_agent()
+        move = {"group": 0, "from": [1, 2, 3], "to": [2, 3, 4], "outgoing": 1, "incoming": 4,
+                "accepted_at": 100.0, "start_term": 3}
+        agent.placement_change = {
+            "injection_id": 1, "action": "move_third", "started_at": 100.0, "queue": [],
+            "moves": {0: move}, "refused": {"stale_placement": 1}, "decommission": None,
+        }
+        # Group 0 moves, group 1 does not: before the change both write
+        # fast, during it the moving group's writes are slow.
+        agent.append_latencies.extend(
+            [(95.0, 0, 5.0), (96.0, 1, 6.0), (101.0, 0, 80.0), (102.0, 1, 9.0), (103.0, None, 500.0)]
+        )
+        topology = {"raft_groups": [{"raft_group_id": 0, "replicas": [{"current_term": 5}, {"current_term": 4}]}]}
+
+        def observe(retirements):
+            cluster = placement_cluster({0: ("stable", [2, 3, 4]), 1: ("stable", [1, 2, 3])}, retirements=retirements)
+            placement = {"stage": "bootstrapped", "cluster": cluster, "targets": group_targets(cluster),
+                         "retirements": cluster_retirements(cluster)}
+            agent.observe_placement_change(placement, topology)
+
+        with patch("ursula_chaos_agent.time.monotonic", return_value=110.0):
+            observe({0: [1]})
+        self.assertIsNotNone(agent.placement_change)
+        self.assertEqual(move["stable_at"], 110.0)
+        with patch("ursula_chaos_agent.time.monotonic", return_value=115.0):
+            observe({})
+        self.assertIsNone(agent.placement_change)
+        measures = agent.injections[0]["placement"]
+        self.assertEqual(measures["move_secs_max"], 10.0)
+        self.assertEqual(measures["teardown_secs_max"], 5.0)
+        self.assertEqual(measures["elections_total"], 2)
+        self.assertEqual(measures["write_p99_ms_moving"], 80.0)
+        self.assertEqual(measures["write_p99_ms_not_moving"], 9.0)
+        self.assertEqual(measures["write_p99_ms_before"], 6.0)
+        self.assertEqual(measures["moves_refused"], {"stale_placement": 1})
 
 
 if __name__ == "__main__":

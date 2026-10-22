@@ -6,7 +6,8 @@ S3 traffic (and vice versa). Each `apply` call replaces all previously
 applied state.
 
 Fault payload schema:
-  kind            One of "netem" | "partition" | "s3_unavailable" | "process" | "clear"
+  kind            One of "netem" | "partition" | "s3_unavailable" | "process" | "disk" |
+                  "fsfreeze" | "clear"
   scope           Used by "netem": "cluster" | "all" (default "all")
   delay_ms/jitter_ms/loss_percent  netem parameters
   reorder_percent/duplicate_percent/corrupt_percent  extra netem parameters
@@ -14,7 +15,11 @@ Fault payload schema:
   direction       partition: "both" | "inbound" | "outbound" (default "both")
   cluster_subnets netem scope=cluster: list of CIDRs to selectively delay
   action          process: "kill" | "freeze" | "thaw"
-  units           process: systemd units to target (default ursula-chaos.service)
+  units           process, disk: systemd units to target (default ursula-chaos.service)
+  write_iops/write_bytes_per_sec  disk: the write limits of the units on the WAL disk
+                  (cgroup io.max through systemd), a slow disk
+  fsfreeze        freezes the WAL filesystem (`--wal-path`): every write and sync
+                  on it blocks until the thaw, a hung disk
 """
 
 from __future__ import annotations
@@ -76,8 +81,12 @@ def default_dev() -> str:
 
 
 class FaultState:
-    def __init__(self, dev: str) -> None:
+    def __init__(self, dev: str, wal_path: str) -> None:
         self.dev = default_dev() if dev == "auto" else dev
+        self.wal_path = wal_path
+        self.fsfreeze = command_path("fsfreeze")
+        self.throttled_units: list[str] = []
+        self.frozen_fs = False
         self.tc = command_path("tc")
         self.iptables = command_path("iptables")
         self.systemctl = command_path("systemctl")
@@ -135,6 +144,13 @@ class FaultState:
         for unit in unique([*self.frozen_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
             run([self.systemctl, "thaw", unit])
         self.frozen_units = []
+        # Stateless too: a thaw of a filesystem that is not frozen fails
+        # harmlessly, and an empty limit resets the unit's runtime limit.
+        run([self.fsfreeze, "--unfreeze", self.wal_path])
+        self.frozen_fs = False
+        for unit in unique([*self.throttled_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
+            run([self.systemctl, "set-property", "--runtime", unit, "IOWriteIOPSMax=", "IOWriteBandwidthMax="])
+        self.throttled_units = []
 
     def status(
         self,
@@ -171,6 +187,14 @@ class FaultState:
             if res.returncode == 0 and "FreezerState=frozen" in res.stdout:
                 frozen_units.append(unit)
 
+        throttled_units: list[str] = []
+        for unit in unique([*self.throttled_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
+            res = run([self.systemctl, "show", unit, "-p", "IOWriteIOPSMax", "-p", "IOWriteBandwidthMax"])
+            if res.returncode == 0 and any(
+                line.split("=", 1)[-1].strip() for line in res.stdout.splitlines()
+            ):
+                throttled_units.append(unit)
+
         qdisc_error = ""
         if qdisc.returncode != 0:
             qdisc_error = qdisc.stderr.strip() or qdisc.stdout.strip()
@@ -179,6 +203,8 @@ class FaultState:
             and not partition_rules
             and not s3_rules
             and not frozen_units
+            and not throttled_units
+            and not self.frozen_fs
             and not qdisc_error
         )
         return {
@@ -188,6 +214,8 @@ class FaultState:
             "partition_rules": partition_rules,
             "s3_rules": s3_rules,
             "frozen_units": frozen_units,
+            "throttled_units": throttled_units,
+            "frozen_fs": self.frozen_fs,
             "qdisc_error": qdisc_error,
         }
 
@@ -205,6 +233,12 @@ class FaultState:
             return self._apply_s3_unavailable(payload)
         if kind == "process":
             return self._apply_process(payload)
+        if kind == "disk":
+            return self._apply_disk(payload)
+        if kind == "fsfreeze":
+            self._must_run([self.fsfreeze, "--freeze", self.wal_path])
+            self.frozen_fs = True
+            return {"ok": True, "kind": "fsfreeze", "path": self.wal_path}
         raise ValueError(f"unsupported fault kind: {kind}")
 
     def _apply_netem(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -322,6 +356,20 @@ class FaultState:
             return {"ok": True, "kind": "process", "action": "thaw", "units": units}
         raise ValueError(f"unsupported process action: {action}")
 
+    def _apply_disk(self, payload: dict[str, Any]) -> dict[str, Any]:
+        units = [str(unit) for unit in payload.get("units", DEFAULT_PROCESS_UNITS) if unit]
+        iops = max(1, int(payload.get("write_iops", 50)))
+        bandwidth = max(1, int(payload.get("write_bytes_per_sec", 4 * 1024 * 1024)))
+        for unit in units:
+            self._must_run([
+                self.systemctl, "set-property", "--runtime", unit,
+                f"IOWriteIOPSMax={self.wal_path} {iops}",
+                f"IOWriteBandwidthMax={self.wal_path} {bandwidth}",
+            ])
+        self.throttled_units = units
+        return {"ok": True, "kind": "disk", "units": units, "write_iops": iops,
+                "write_bytes_per_sec": bandwidth}
+
     def _must_run(self, argv: list[str]) -> None:
         result = run(argv)
         if result.returncode != 0:
@@ -386,8 +434,10 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=4492)
     parser.add_argument("--dev", default="auto")
+    parser.add_argument("--wal-path", default="/var/lib/ursula",
+                        help="mount point of the node's Raft WAL, for the disk and fsfreeze faults")
     args = parser.parse_args()
-    Handler.state = FaultState(args.dev)
+    Handler.state = FaultState(args.dev, args.wal_path)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
     return 0
 

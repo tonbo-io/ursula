@@ -45,7 +45,7 @@
     "appendPerSecond": { "type": "integer", "minimum": 1 },
     "appendWorkers": { "type": "integer", "minimum": 1 },
     "payloadSizes": { "type": "string", "minLength": 1 },
-    "faultProfile": { "type": "string", "enum": ["kubernetes"] },
+    "faultProfile": { "type": "string", "enum": ["kubernetes", "placement"] },
     "faultMinSeconds": { "type": "integer", "minimum": 1 },
     "faultMaxSeconds": { "type": "integer", "minimum": 1 },
     "recoverySeconds": { "type": "integer", "minimum": 1 },
