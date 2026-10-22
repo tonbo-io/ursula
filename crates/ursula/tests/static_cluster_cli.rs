@@ -5578,20 +5578,24 @@ async fn read_until_holding(client: &reqwest::Client, url: &str, writes: &[Strin
     );
 }
 
-/// IT-1 (#768 addendum, section 7): a process that is not its node's own
-/// never counts for it, over real gRPC with pooled channels and AppendStream
-/// sessions. Nodes 1 and 2 reach node 3 through a relay. Pointed at node 2,
-/// an address that serves another node, the relay costs nobody its fence
-/// and writes go on. Then node 3's process is stopped with SIGSTOP, its
-/// root released by `ursulactl node replace-disk` and a replacement started
-/// on an empty WAL, which the relay's new connections reach while its open
-/// ones stay on the old process, under write load, and the old process is
-/// continued. That breaks the release rule while every peer reaches meta.
-/// The old process reports `superseded`, the replacement serves after its
-/// wait, and with node 1 killed every acknowledged write is on node 2 and on
-/// the replacement.
+/// IT-1 (#768 addendum, section 7): a replaced process behind a relay, over
+/// real gRPC with pooled channels and AppendStream sessions. Nodes 1 and 2
+/// reach node 3 through a relay. Pointed at node 2, an address that serves
+/// another node, the relay fences nobody and writes go on. Then node 3's
+/// process is stopped with SIGSTOP, its root released by `ursulactl node
+/// replace-disk` and a replacement started on an empty WAL, which the
+/// relay's new connections reach while its open ones stay on the old
+/// process, under write load, and the old process is continued. That breaks
+/// the release rule while every peer reaches meta. The continued old
+/// process reports `superseded`, the replacement becomes ready after its
+/// wait, and with node 1 killed no acknowledged write is lost.
+///
+/// It does not show that no leader counts the old process's answers. Node 2
+/// acknowledges throughout, so every write commits on a leader and node 2
+/// whether or not the old process's answers count, and node 1 is killed
+/// whether or not it leads the stream's group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_a_replaced_process_behind_a_relay_never_counts_for_its_node() {
+async fn cli_a_replaced_process_behind_a_relay_is_superseded_and_loses_no_write() {
     use ursula_proto::admin::ServingReadinessReason;
 
     let _guard = static_cluster_cli_test_guard().await;
@@ -5691,7 +5695,7 @@ async fn cli_a_replaced_process_behind_a_relay_never_counts_for_its_node() {
     let load = WriteLoad::start(&client, &stream, "replaced");
     signal(&old, "-CONT");
 
-    // 3. The old process never counts for node 3 again, and the
+    // 3. The continued old process reports `superseded`, and the
     // replacement serves once it waited out its predecessor.
     // A fenced process answers every client request `503`, so its
     // readiness is read on its admin listener.
@@ -5723,8 +5727,8 @@ async fn cli_a_replaced_process_behind_a_relay_never_counts_for_its_node() {
     assert!(!replaced.is_empty(), "writes go on around the replacement");
     acknowledged.extend(replaced);
 
-    // 4. Node 1 is killed: every acknowledged write is on node 2 and on the
-    // replacement.
+    // 4. Node 1 is killed: no acknowledged write is lost, on node 2 or on
+    // the replacement.
     procs.kill(1);
     read_until_holding(&client, &read(&nodes[1]), &acknowledged).await;
     read_until_holding(&client, &read(&nodes[2]), &acknowledged).await;
