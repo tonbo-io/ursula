@@ -204,7 +204,7 @@
         "replicaCount": {
           "type": "integer",
           "minimum": 1,
-          "description": "Ursula server pod count: 1, or 3 and more (2 is refused). Raising it from 3 or more adds nodes that register and hold no group. Lowering it, or growing a single node, is not supported."
+          "description": "Ursula server pod count: 1, or 3 and more (2 is refused). Raising it from 3 or more adds nodes that register and hold no group. Lowering it is permanent and needs every dropped id decommissioned first, which the scale-check hook verifies. A single pod never grows."
         },
         "terminationGracePeriodSeconds": {
           "type": "integer",

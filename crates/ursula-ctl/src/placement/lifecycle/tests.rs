@@ -30,7 +30,9 @@ use super::check_removal;
 use super::pending_changes;
 use super::plan_decommission;
 
-/// Six nodes, meta voters 1 to 3, four groups at three voters, all seeded.
+/// Six nodes, meta voters 1 to 3, four groups at three voters, all seeded,
+/// so each of nodes 4 to 6 holds a role. Node 7 registers after Bootstrap,
+/// as a scale-up node does, and holds nothing.
 struct Meta {
     state: ControlPlaneState,
     index: u64,
@@ -51,6 +53,7 @@ impl Meta {
             nodes: node_set(&nodes),
             now_ms: 20,
         });
+        meta.apply(register(7, 25));
         meta
     }
 
@@ -81,9 +84,9 @@ impl Meta {
     /// A node that is no meta voter, with a role in some group or none.
     fn other(&self, with_role: bool) -> u64 {
         let cluster = self.state.cluster().unwrap();
-        (4..=6)
+        (4..=7)
             .find(|id| cluster.has_any_role(node(*id)) == with_role)
-            .expect("the seeds leave such a node")
+            .expect("the seeds and node 7 leave such a node")
     }
 }
 
