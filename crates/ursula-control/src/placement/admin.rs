@@ -92,8 +92,9 @@ pub struct MetaLeaderReport {
     /// The decommissioning nodes' groups the last decommission pass could
     /// not move.
     pub decommission_blocked: Vec<BlockedMove>,
-    /// The groups whose snapshot objects the removed-node sweep has not
-    /// deleted yet, by removed node.
+    /// The groups whose snapshot objects the removed-node sweep's last
+    /// pass left, by removed node. A node removed after that pass is absent
+    /// until the next pass.
     pub sweep_pending: BTreeMap<NodeId, BTreeSet<RaftGroupId>>,
     /// Why the meta leader's last `Bootstrap` was refused, if it was.
     #[serde(deserialize_with = "required_option")]

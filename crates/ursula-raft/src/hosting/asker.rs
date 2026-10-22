@@ -223,9 +223,9 @@ pub(super) async fn ask(
 /// `leader`'s answer to a fresh quorum barrier of `group`, asked over the
 /// one barrier seam ([`MetaStatusReader::barrier`]) within
 /// [`crate::rejoin::RECOVERY_BARRIER_TIMEOUT`]: `None` when it answered
-/// nothing as a live leader. Every asker of a group's memberships, this
-/// one, the teardown's and the removed-node sweep (`meta::sweep`), asks
-/// through it.
+/// nothing as a live leader. This asker, the teardown's asks and the
+/// removed-node sweep (`meta::sweep`) ask through it. The rejoin barrier
+/// loop (`rejoin::barrier`) still asks a group's memberships on its own.
 pub(crate) async fn live_barrier(
     meta: &MetaStatusReader,
     group: RaftGroupId,

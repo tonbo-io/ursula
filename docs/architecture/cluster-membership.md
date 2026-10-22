@@ -164,7 +164,7 @@ nothing. For each node that view shows removed it lists the groups the
 node's snapshot directory holds objects of, and per group lists the node's
 objects of it, then asks the group for a fresh quorum barrier, its own
 replica first and then the group's leader candidates, until a live leader
-answers. When that leader's memberships list the node in neither config,
+answers. When that leader's memberships list the node in neither membership,
 the sweep deletes exactly the objects it listed
 (`sweep_removed_group` in `crates/ursula-raft/src/snapshot_holds.rs`). An
 object written after the listing waits for the next pass. A group without
