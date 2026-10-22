@@ -1,9 +1,9 @@
-//! What every leader-side membership driver shares: its wake-ups, its rate
-//! limit and the follower log reversion observer.
+//! The membership reconcile shell's wake-ups, its rate limit and the
+//! follower log reversion observer.
 //!
-//! The heal driver and the membership reconcile shell both run on a
-//! [`LeaderTick`], so a follower that lost entries is counted once, by one
-//! observer, whichever driver a replica runs.
+//! Every replica of either plane runs its shell on a [`LeaderTick`], so a
+//! follower that lost entries is counted once, by one observer, also on a
+//! replica whose shell has no target and only observes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

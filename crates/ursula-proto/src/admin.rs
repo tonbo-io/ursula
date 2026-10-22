@@ -1064,6 +1064,12 @@ pub struct RaftGroupMetrics {
     /// last 3 seconds. A leader that lost its quorum stays a leader in its
     /// own metrics; this says it is not live (m2, #581 review).
     pub leads_live: bool,
+    /// What the replica's membership reconcile shell does: on a leader, the
+    /// step it takes toward the group's placement, or why it waits. `null`
+    /// for a replica that runs no shell, such as one stopped by an apply
+    /// failure.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reconcile: Option<crate::placement::ReconcileStatus>,
 }
 
 /// The history event a replica applied last.
@@ -1152,6 +1158,7 @@ mod metrics_contract_tests {
                 recovery: None,
                 recovery_gate: RecoveryGateStatus::Open,
                 leads_live: false,
+                reconcile: None,
             }],
         }
     }

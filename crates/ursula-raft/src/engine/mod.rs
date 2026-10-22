@@ -297,6 +297,11 @@ pub struct RaftGroupEngine {
     /// the registry copies incoming snapshots and runs GC passes with
     /// (#687).
     pub(crate) snapshots: crate::registry::GroupSnapshots,
+    /// The status the replica's reconcile shell publishes, which the
+    /// registry serves in the group's metrics. `None` only for a forwarded
+    /// read's engine, which runs no shell.
+    pub(crate) reconcile:
+        Option<crate::rt::sync::watch::Sender<ursula_proto::placement::ReconcileStatus>>,
     /// The work OpenRaft runs for this engine on tasks of its own, which
     /// [`Self::shutdown`] waits for (#709).
     pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
@@ -448,6 +453,7 @@ impl ForwardedReadEngine {
             peer_cluster: self.peer_cluster,
             log_gauge: self.log_gauge,
             snapshots: self.snapshots,
+            reconcile: None,
             openraft_work: crate::openraft_work::OpenRaftWork::none(),
             drop_stop: std::sync::Mutex::new(DropStop::Nothing),
             work_stop_timeout: crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT,
@@ -791,10 +797,36 @@ impl RaftGroupEngine {
             peer_cluster,
             log_gauge,
             snapshots,
+            reconcile: Some(
+                crate::rt::sync::watch::channel(crate::rejoin::initial_status(
+                    ursula_runtime::unix_time_ms(),
+                ))
+                .0,
+            ),
             openraft_work,
             drop_stop: std::sync::Mutex::new(drop_stop),
             work_stop_timeout,
         })
+    }
+
+    /// The replica's barrier, recovery gate, history, apply health and
+    /// reconcile status, which every plane's replica has: what the registry
+    /// publishes and the reconcile shell runs on.
+    pub(crate) fn replica_core(&self) -> crate::replica::ReplicaCore {
+        crate::replica::ReplicaCore {
+            barrier: self.read_barrier.clone(),
+            recovery: self
+                .rejoin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            history: self.history.clone(),
+            apply_health: self.apply_health.clone(),
+            reconcile: self
+                .reconcile
+                .as_ref()
+                .map(crate::rt::sync::watch::Sender::subscribe),
+        }
     }
 
     /// The voter configs of the membership this replica keeps when a

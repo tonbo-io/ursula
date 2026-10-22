@@ -1,5 +1,5 @@
 //! Recovery gates of simulated nodes over the in-process network: the
-//! production gate, barrier driver and heal driver, wired the way the
+//! production gate, barrier driver and reconcile shell, wired the way the
 //! placed engine factory wires them, over a [`FixedPlacement`] or, in the
 //! placement family, a node's `MetaPlacement`.
 
@@ -118,7 +118,7 @@ pub(super) async fn in_process_probe(
 /// Binds `rejoin` to `node_id`'s replica of `placement`, puts it in front of
 /// the votes and appends the network delivers to that replica, and spawns
 /// the node's recovery drivers over `inputs`, as the engine factory does:
-/// the barrier driver, the heal driver, the vote floor task and, on the
+/// the barrier driver, the reconcile shell, the vote floor task and, on the
 /// initializer, the bootstrap driver. The drivers belong to the node's
 /// process and must be aborted with it.
 pub(super) fn wire_recovery(

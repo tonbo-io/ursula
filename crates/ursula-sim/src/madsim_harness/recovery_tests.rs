@@ -6,7 +6,7 @@
 //!
 //! Every scenario runs three nodes with two raft groups sharing each node's
 //! core journal (`JournalCluster`), with the production gate, barrier
-//! driver, heal driver and bootstrap on every node. The simulated network
+//! driver, reconcile shell and bootstrap on every node. The simulated network
 //! records every vote answer with the target's gate at that moment.
 //! Schedules that once broke the gate or the run state live in
 //! `regression`.
@@ -1010,13 +1010,13 @@ fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
                 "{context}: no follower answered a conflict below its matched index"
             );
             assert_no_vote_while_gated(&cluster, &context);
-            // The survivor's heal driver saw the rewinds the network saw.
+            // The survivor's reconcile shell saw the rewinds the network saw.
             let observed = cluster.recovery_registries[&survivor].follower_log_reversions();
             assert!(
                 followers
                     .iter()
                     .any(|node_id| observed.get(node_id).is_some_and(|count| *count > 0)),
-                "{context}: the survivor's heal driver observed no reversion: {observed:?}"
+                "{context}: the survivor's reconcile shell observed no reversion: {observed:?}"
             );
             for group in JOURNAL_GROUPS {
                 wait_writable(&mut cluster, group, &context).await;

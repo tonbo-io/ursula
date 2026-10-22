@@ -12,8 +12,11 @@
 //!
 //! - I2 ([`I2`]): no group is initialized twice, and no two replicas lead
 //!   one group in one term.
-//! - I3 ([`I3`]), in its S2 form: every membership a running replica holds
-//!   is its group's seed voters, with no learner.
+//! - I3 ([`I3`]), while no group moves: every membership a running replica
+//!   holds is its group's seed voters, with no learner. Its live half is a
+//!   wait: once the faults are over, every running node's view shows every
+//!   group `Live` and stable on its seed voters, as each group's leader
+//!   reported them.
 //! - The hosting check ([`HOSTED`]): a node runs only the groups it is a
 //!   seed voter of, and no node runs one before the view of some running
 //!   node bootstrapped. It does not see whether the placement that created
@@ -783,6 +786,55 @@ impl MetaCluster {
                 );
             }
             madsim::time::sleep(STEP).await;
+        }
+    }
+
+    /// I3's live half: each group's leader reports the voters it formed on
+    /// (design 5.7), so within the bound every running node's view shows
+    /// every group `Live` and stable on its seed voters.
+    pub(super) async fn groups_live(&self, trace: &mut SimTrace, after_event: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        for group in JOURNAL_GROUPS {
+            let seeds = self.seeds(group);
+            loop {
+                let behind: Vec<(u64, Option<ursula_control::GroupPlacement>)> = self
+                    .running()
+                    .into_iter()
+                    .filter_map(|node_id| {
+                        let placement = self
+                            .view(node_id)
+                            .cluster()
+                            .and_then(|cluster| cluster.group(RaftGroupId(group)))
+                            .cloned();
+                        let live = placement.as_ref().is_some_and(|placement| {
+                            matches!(placement, ursula_control::GroupPlacement::Live { .. })
+                                && placement.moving().is_none()
+                                && placement
+                                    .current_voters()
+                                    .iter()
+                                    .map(ursula_proto::placement::NodeId::get)
+                                    .collect::<BTreeSet<u64>>()
+                                    == seeds
+                        });
+                        (!live).then_some((node_id, placement))
+                    })
+                    .collect();
+                if behind.is_empty() {
+                    break;
+                }
+                if madsim::time::Instant::now() >= deadline {
+                    fail(
+                        trace,
+                        I3,
+                        after_event,
+                        format!(
+                            "group {group} is not live on its seed voters {seeds:?} in every \
+                             view: {behind:?}"
+                        ),
+                    );
+                }
+                madsim::time::sleep(STEP).await;
+            }
         }
     }
 

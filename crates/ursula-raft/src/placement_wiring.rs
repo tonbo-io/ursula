@@ -10,15 +10,18 @@
 //!   or waits for the initializer. The bootstrap driver confirms it right
 //!   before it opens its gate for a fresh group, the vote floor task right
 //!   before it writes the floor.
-//! - **node sets** ([`GroupNodes`]): whom the gate drivers ask, whom an
-//!   initializer initializes and which voters the heal driver restores,
-//!   each read at its use, so a placement that changes reaches a running
-//!   replica.
+//! - **node sets** ([`GroupNodes`]): whom the gate drivers ask and whom an
+//!   initializer initializes, each read at its use, so a placement that
+//!   changes reaches a running replica.
+//! - **membership target** ([`MembershipTargetSource`]): what the replica's
+//!   reconcile shell takes the group's membership toward when it leads, and
+//!   where it reports each convergence.
 //!
 //! [`MetaPlacement`] answers from meta: admission from the hosting driver's
-//! [`HostingSet`], the seed role and the node sets from this node's
-//! placement views. Every Raft node of a server runs it. [`FixedPlacement`]
-//! gives tests and the simulation one fixed voter set. The meta group keeps
+//! [`HostingSet`], the seed role, the node sets and the target from this
+//! node's placement views. Every Raft node of a server runs it.
+//! [`FixedPlacement`] gives tests and the simulation one fixed voter set and
+//! no target, so their memberships change only by hand. The meta group keeps
 //! its genesis driver and passes its claim through [`FixedNodes`] and
 //! [`FixedRole`].
 
@@ -28,6 +31,9 @@ use std::sync::OnceLock;
 
 use futures_util::future::BoxFuture;
 use ursula_control::Admission;
+use ursula_control::ConfirmedStamp;
+use ursula_control::ControlApplied;
+use ursula_control::MembershipTarget;
 use ursula_control::SeedRoleOf;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ReplicaRole;
@@ -36,8 +42,12 @@ use ursula_shard::RaftGroupId;
 use crate::RaftGroupHandleRegistry;
 use crate::hosting::HostingSet;
 use crate::meta::confirm::MetaBarrierError;
+use crate::meta::handle::MetaWriteError;
 use crate::meta::status::MetaStatusReader;
 use crate::meta::watch::GroupPlacementWatch;
+use crate::rejoin::Convergence;
+use crate::rejoin::MembershipTargetSource;
+use crate::rejoin::TargetRead;
 
 /// Every placement input of a data replica's open, by group.
 pub trait PlacementInputs: std::fmt::Debug + Send + Sync + 'static {
@@ -47,6 +57,9 @@ pub trait PlacementInputs: std::fmt::Debug + Send + Sync + 'static {
     fn seed_role(&self, group: RaftGroupId) -> Arc<dyn SeedRole>;
     /// The node sets of `group` the replica's drivers read.
     fn nodes(&self, group: RaftGroupId) -> Arc<dyn GroupNodes>;
+    /// The membership target of `group` that the replica's reconcile shell
+    /// pursues and reports to.
+    fn target_source(&self, group: RaftGroupId) -> Arc<dyn MembershipTargetSource>;
 }
 
 /// A replica's seed role in its group.
@@ -76,8 +89,7 @@ pub trait GroupNodes: Send + Sync + 'static {
     /// The nodes the barrier driver asks for a leader's barrier, and the
     /// vote floor task and the bootstrap driver probe.
     fn candidates(&self) -> BTreeSet<u64>;
-    /// The voters an initializer initializes, which the heal driver also
-    /// restores.
+    /// The voters an initializer initializes.
     fn voters(&self) -> BTreeSet<u64>;
 
     /// Whether `node` is the group's only voter, so no other node could
@@ -150,9 +162,13 @@ impl GroupNodes for FixedNodes {
 /// - the node sets from the group's placement in the latest view
 ///   ([`GroupPlacementWatch`]): every voter of its current and target
 ///   voters as candidates, and the target voters as the voters an
-///   initializer initializes and the heal driver restores. A group without
-///   a placement has neither, so its replica asks only the members of its
-///   own membership and heals nothing.
+///   initializer initializes. A group without a placement has neither, so
+///   its replica asks only the members of its own membership;
+/// - the target from the group's placement in the latest view
+///   ([`MembershipTarget::of_placement`]), confirmed by a meta read barrier
+///   and reported through the meta leader
+///   ([`MetaStatusReader::report_converged`]). A group without a placement
+///   has no target.
 ///
 /// The engine factory takes the inputs before the meta runtime starts, so
 /// the meta read barrier binds later ([`Self::bind_meta`]). Until then the
@@ -205,6 +221,48 @@ impl PlacementInputs for MetaPlacement {
             self.registry.placement_watch(),
             group,
         )))
+    }
+
+    fn target_source(&self, group: RaftGroupId) -> Arc<dyn MembershipTargetSource> {
+        Arc::new(PlacedTarget {
+            watch: GroupPlacementWatch::new(self.registry.placement_watch(), group),
+            meta: Arc::clone(&self.meta),
+        })
+    }
+}
+
+/// One group's membership target from its placement in the latest view.
+struct PlacedTarget {
+    watch: GroupPlacementWatch,
+    meta: Arc<OnceLock<MetaStatusReader>>,
+}
+
+impl MembershipTargetSource for PlacedTarget {
+    /// The target and the stage of one view, read once.
+    fn target(&self) -> Option<TargetRead> {
+        let view = self.watch.view();
+        let placement = view.cluster()?.group(self.watch.group())?;
+        Some(TargetRead {
+            target: MembershipTarget::of_placement(placement),
+            view: view.stage,
+        })
+    }
+
+    fn confirm(&self) -> BoxFuture<'_, Result<ConfirmedStamp, MetaBarrierError>> {
+        Box::pin(async move {
+            let meta = self.meta.get().ok_or(MetaBarrierError::Stopped)?;
+            Ok(meta.confirm_view().await?.stamp())
+        })
+    }
+
+    fn report(
+        &self,
+        convergence: Convergence,
+    ) -> BoxFuture<'_, Result<ControlApplied, MetaWriteError>> {
+        Box::pin(async move {
+            let meta = self.meta.get().ok_or(MetaWriteError::Stopped)?;
+            meta.report_converged(self.watch.group(), convergence).await
+        })
     }
 }
 
@@ -346,5 +404,35 @@ impl PlacementInputs for FixedPlacement {
 
     fn nodes(&self, _group: RaftGroupId) -> Arc<dyn GroupNodes> {
         Arc::new(FixedNodes::from_voters(self.voters.clone()))
+    }
+
+    /// No target (design 4.6): the membership changes only by hand, and
+    /// the reconcile shell only observes.
+    fn target_source(&self, _group: RaftGroupId) -> Arc<dyn MembershipTargetSource> {
+        Arc::new(NoTarget)
+    }
+}
+
+/// The target source of a membership managed by hand: no target, so the
+/// reconcile shell plans nothing, confirms nothing and reports nothing.
+#[cfg(any(test, madsim, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTarget;
+
+#[cfg(any(test, madsim, feature = "test-support"))]
+impl MembershipTargetSource for NoTarget {
+    fn target(&self) -> Option<TargetRead> {
+        None
+    }
+
+    fn confirm(&self) -> BoxFuture<'_, Result<ConfirmedStamp, MetaBarrierError>> {
+        Box::pin(std::future::ready(Err(MetaBarrierError::Stopped)))
+    }
+
+    fn report(
+        &self,
+        _convergence: Convergence,
+    ) -> BoxFuture<'_, Result<ControlApplied, MetaWriteError>> {
+        Box::pin(std::future::ready(Err(MetaWriteError::Stopped)))
     }
 }

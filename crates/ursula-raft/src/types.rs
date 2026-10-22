@@ -218,6 +218,9 @@ pub struct RaftGroupMetricsSnapshot {
     pub recovery_gate: ursula_proto::admin::RecoveryGateStatus,
     /// The replica leads with a quorum that acknowledged it lately.
     pub leads_live: bool,
+    /// What the replica's membership reconcile shell does, `None` for a
+    /// replica that runs none.
+    pub reconcile: Option<ursula_proto::placement::ReconcileStatus>,
 }
 
 impl RaftGroupMetricsSnapshot {
@@ -254,6 +257,7 @@ impl RaftGroupMetricsSnapshot {
             recovery: self.recovery,
             recovery_gate: self.recovery_gate,
             leads_live: self.leads_live,
+            reconcile: self.reconcile.clone(),
         }
     }
 }

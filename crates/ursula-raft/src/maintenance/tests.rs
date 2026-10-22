@@ -89,6 +89,7 @@ fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
         recovery: None,
         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         leads_live: false,
+        reconcile: None,
     }
 }
 

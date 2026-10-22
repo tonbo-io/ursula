@@ -45,13 +45,14 @@
 //!   and the conflict still counts as its acknowledgement of the leader, so
 //!   the leader keeps its quorum. That is safe because the leader holds
 //!   every committed entry and the follower votes for no one until its gate
-//!   opens. Every leader-side membership driver runs on one leader tick
-//!   (`leader_tick`), which observes each reversion in the replication
-//!   metrics, counts it per follower and logs it. The heal driver
-//!   (`run_rejoin_heal`) brings the membership back to the configured
-//!   voters, which it reads from the group's placement inputs on each tick
-//!   ([`crate::GroupNodes`]), when an operator or a recovery plan left one
-//!   out.
+//!   opens. Every replica runs the membership reconcile shell
+//!   (`reconcile`) on one leader tick (`leader_tick`), which observes each
+//!   reversion in the replication metrics, counts it per follower and logs
+//!   it. On a leader the shell takes the group's membership toward the
+//!   target of its placement ([`crate::PlacementInputs::target_source`])
+//!   and reports each convergence to the meta group. A replica whose
+//!   membership is managed externally has no target, and its shell only
+//!   observes.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   placed voter answers a probe `Vote` with an empty log and no
@@ -129,8 +130,9 @@ use crate::types::UrsulaVoteResponse;
 
 type MetricsReceiver = WatchReceiverOf<UrsulaRaftTypeConfig, RaftMetrics<UrsulaRaftTypeConfig>>;
 
-/// How often the leader-side heal driver re-reads its group.
-pub const REJOIN_HEAL_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a replica's recovery drivers and its reconcile shell re-read
+/// their group.
+pub const RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long a gated replica goes without a leader barrier and without
 /// applying anything before it reports its group stalled: a majority of the
@@ -208,10 +210,8 @@ pub(crate) enum Incoming<'a> {
     },
 }
 
-/// How long one membership step of the heal driver may take.
+/// How long the barrier driver waits for one leader's barrier.
 pub(crate) const RECOVERY_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
-
-const REJOIN_HEAL_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn log_index(log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>) -> Option<u64> {
     log_id.map(|log_id| log_id.index())
@@ -2644,7 +2644,6 @@ mod tests {
         );
     }
     use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
 
     use openraft::alias::LogIdOf;
     use openraft::vote::RaftLeaderId;
@@ -2652,8 +2651,6 @@ mod tests {
     use super::BootstrapDecision;
     use super::GateRecovery;
     use super::GroupEvidence;
-    use super::HealStep;
-    use super::HealView;
     use super::LocalReplica;
     use super::LogReversion;
     use super::PeerGroupLog;
@@ -2662,7 +2659,6 @@ mod tests {
     use super::VoteGate;
     use super::VoteScreen;
     use super::bootstrap_decision;
-    use super::plan_heal_step;
     use crate::types::UrsulaRaftTypeConfig;
     use crate::types::UrsulaVote;
     use crate::types::UrsulaVoteResponse;
@@ -2958,83 +2954,6 @@ mod tests {
         assert_eq!(
             PeerGroupLog::from_vote_response(&holding),
             PeerGroupLog::Initialized
-        );
-    }
-
-    fn view(voters: &[u64], learners: &[u64]) -> HealView {
-        HealView {
-            is_leader: true,
-            uniform: true,
-            stale_joint: false,
-            voters: voters.iter().copied().collect(),
-            learners: learners.iter().copied().collect(),
-            matched: BTreeMap::new(),
-            committed: Some(10),
-            configured: BTreeSet::from([1, 2, 3]),
-        }
-    }
-
-    #[test]
-    fn the_heal_driver_adds_back_a_missing_voter_and_promotes_it_once_caught_up() {
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2], &[])),
-            Some(HealStep::AddLearner { target: 3 })
-        );
-        let mut catching_up = view(&[1, 2], &[3]);
-        catching_up.matched.insert(3, Some(9));
-        assert_eq!(plan_heal_step(&catching_up), None);
-        catching_up.matched.insert(3, Some(10));
-        assert_eq!(
-            plan_heal_step(&catching_up),
-            Some(HealStep::Promote {
-                target: 3,
-                voters: BTreeSet::from([1, 2, 3]),
-            })
-        );
-        // The placed voters, all present: nothing to do. A follower that
-        // lost entries stays a voter, and OpenRaft rewinds it in place.
-        assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[])), None);
-        let mut follower_view = view(&[1, 2], &[]);
-        follower_view.is_leader = false;
-        assert_eq!(plan_heal_step(&follower_view), None);
-        // A voter outside the static config: not a restart repair, leave it
-        // to the operator.
-        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[])), None);
-    }
-
-    #[test]
-    fn the_heal_driver_restores_two_missing_voters_in_a_group_of_five() {
-        let five = |voters: &[u64], learners: &[u64]| HealView {
-            configured: BTreeSet::from([1, 2, 3, 4, 5]),
-            ..view(voters, learners)
-        };
-        assert_eq!(
-            plan_heal_step(&five(&[1, 2, 3], &[])),
-            Some(HealStep::AddLearner { target: 4 })
-        );
-        // 4 caught up while 5 is not back yet: promote 4 alone.
-        let mut partly = five(&[1, 2, 3], &[4]);
-        partly.matched.insert(4, Some(10));
-        assert_eq!(
-            plan_heal_step(&partly),
-            Some(HealStep::Promote {
-                target: 4,
-                voters: BTreeSet::from([1, 2, 3, 4]),
-            })
-        );
-        partly.matched.insert(4, Some(9));
-        assert_eq!(
-            plan_heal_step(&partly),
-            Some(HealStep::AddLearner { target: 5 })
-        );
-        let mut last = five(&[1, 2, 3, 4], &[5]);
-        last.matched.insert(5, Some(10));
-        assert_eq!(
-            plan_heal_step(&last),
-            Some(HealStep::Promote {
-                target: 5,
-                voters: BTreeSet::from([1, 2, 3, 4, 5]),
-            })
         );
     }
 
@@ -3550,24 +3469,11 @@ mod tests {
         drop((gate, store));
         wal.shutdown().await.expect("clean shutdown");
     }
-
-    #[test]
-    fn the_heal_driver_flattens_only_a_joint_config_nothing_else_finishes() {
-        let mut joint = view(&[1, 2, 3], &[]);
-        joint.uniform = false;
-        // Just entered: OpenRaft's own second step is still on its way.
-        assert_eq!(plan_heal_step(&joint), None);
-        joint.stale_joint = true;
-        assert_eq!(plan_heal_step(&joint), Some(HealStep::FinishJoint));
-        joint.is_leader = false;
-        assert_eq!(plan_heal_step(&joint), None);
-    }
 }
 
 mod attach;
 mod barrier;
 mod bootstrap;
-mod heal;
 mod leader_tick;
 mod reconcile;
 pub(crate) use attach::GateProbe;
@@ -3583,18 +3489,12 @@ pub use bootstrap::PeerGroupLog;
 use bootstrap::bootstrap_decision;
 pub use bootstrap::bootstrap_probe_vote;
 pub use bootstrap::run_group_bootstrap;
-#[cfg(test)]
-use heal::HealStep;
-#[cfg(test)]
-use heal::HealView;
-#[cfg(test)]
-use heal::plan_heal_step;
-pub(crate) use heal::run_rejoin_heal;
 pub(crate) use leader_tick::FollowerLogReversions;
 #[cfg(test)]
 use leader_tick::LogReversion;
 #[cfg(test)]
 use leader_tick::ReversionWatch;
+pub use reconcile::Convergence;
 pub use reconcile::MembershipTargetSource;
 pub use reconcile::NoPeerGates;
 pub use reconcile::PeerGates;

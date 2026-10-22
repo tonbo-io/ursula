@@ -238,6 +238,7 @@ where
                 return runtime;
             }
         };
+        let shell_status = reconcile.subscribe();
         let tasks = MetaReplicaTasks {
             snapshots: config.snapshots,
             drivers: Some(Arc::new(ReplicaDrivers {
@@ -250,6 +251,7 @@ where
                 reconcile,
             })),
             damage: Some(damage),
+            reconcile: Some(shell_status),
             pauses: pauses.clone(),
         };
         let registrant = Registrant {
@@ -466,7 +468,7 @@ impl GrpcMetaRuntime {
 /// groups.
 fn recovery_config(engine: &RaftEngineConfig) -> RecoveryConfig {
     RecoveryConfig {
-        interval: crate::rejoin::REJOIN_HEAL_INTERVAL,
+        interval: crate::rejoin::RECOVERY_INTERVAL,
         barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
         stall_after: crate::rejoin::RECOVERY_STALL_AFTER,
         bootstrap_interval: engine.bootstrap_peer_probe_interval,
