@@ -1137,7 +1137,7 @@ pub(crate) fn refuse_unless_leader<
         return Ok(());
     }
     Err(leadership_refusal(
-        LeadershipReason::Follower,
+        leadership.refusal_reason(),
         Proposal::NotProposed,
         metrics.current_leader,
         &leadership,

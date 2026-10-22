@@ -23,6 +23,7 @@ use openraft::rt::Instant as _;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::WatchReceiverOf;
 use ursula_runtime::CommittedLeader;
+use ursula_runtime::LeadershipReason;
 use ursula_runtime::NodeFence;
 use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
@@ -125,6 +126,18 @@ impl GroupLeadership {
                 term: self.term,
             },
             LeaderRole::Unknown | LeaderRole::Lapsed => WriteRoute::NoLeader,
+        }
+    }
+
+    /// Why this view refuses what only a leader may do: a lapsed leader
+    /// could not confirm its leadership with a quorum, and any other replica
+    /// does not lead.
+    pub fn refusal_reason(&self) -> LeadershipReason {
+        match self.role {
+            LeaderRole::Lapsed => LeadershipReason::QuorumUnconfirmed,
+            LeaderRole::Leads | LeaderRole::Follows { .. } | LeaderRole::Unknown => {
+                LeadershipReason::Follower
+            }
         }
     }
 

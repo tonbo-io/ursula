@@ -2129,7 +2129,9 @@ impl WriteToOpenRaft {
 /// leadership check. The leader appends the
 /// write's entries but cannot commit them. The followers
 /// elect a new leader, and once the partition heals, the new leader's log
-/// replaces the entries and OpenRaft answers the write with a forward to it.
+/// replaces the entries and OpenRaft answers the write with a forward to it,
+/// unless the leader's lease ended first and the engine answered that its
+/// leadership lapsed. Either answer says the write may have committed.
 /// Had a follower stored an entry first, the new leader could have committed
 /// it instead, and the deposed node cannot tell the two apart. That node's
 /// own leadership check now refuses before proposal, so running the check
@@ -2231,9 +2233,14 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
                 .not_leader()
                 .unwrap_or_else(|| panic!("{write:?}: expected a leadership refusal: {error:?}"));
             assert_eq!(refusal.proposal, Proposal::MayHaveCommitted, "{write:?}");
-            assert_eq!(
-                refusal.reason,
-                LeadershipReason::SteppedDown,
+            // OpenRaft's forward once the new leader's log replaced the
+            // entries, or the engine's own answer once the cut-off leader's
+            // lease ended first.
+            assert!(
+                matches!(
+                    refusal.reason,
+                    LeadershipReason::SteppedDown | LeadershipReason::QuorumUnconfirmed
+                ),
                 "{write:?}: {error:?}"
             );
             // OpenRaft names the new leader; the refusal carries it, with the
