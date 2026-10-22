@@ -42,7 +42,9 @@ Rollouts and scaling:
   Lowering it removes the highest node ids for good. First run
   `ursulactl node decommission --node <id> ... --wait` for every id above
   the new count, which must keep the meta voters (ids 1 to 3), then lower
-  the count and delete the dropped pods' PVCs. A single node never grows.
+  the count and delete the dropped pods' PVCs. A single pod never grows
+  under this chart, which sets neither raft.meta_voters nor
+  raft.placement.replication_factor.
 {{- if .Values.server.scaleCheck.enabled }}
   A pre-upgrade and pre-rollback hook refuses a change of the count that
   breaks these rules.

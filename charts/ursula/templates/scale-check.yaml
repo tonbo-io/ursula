@@ -9,8 +9,10 @@ and a higher count starts ids again. The hook reads the live StatefulSet's
 replicas with kubectl, since Helm's lookup is empty under Argo CD, and
 passes when there is none (a fresh install, Argo CD's first PreSync) or the
 count is unchanged, so an image-only upgrade of an unhealthy cluster passes.
-A raise from 1 is refused: a single node keeps one meta voter and RF 1 as
-its Bootstrap fixed them. Otherwise it runs `ursulactl node verify-removed`
+A raise from 1 is refused: the chart sets neither raft.meta_voters nor
+raft.placement.replication_factor, which a growing single node needs, so the
+pods of a raised count would claim the defaults and report
+replication_factor_mismatch. Otherwise it runs `ursulactl node verify-removed`
 for every id a lower count drops, which passes once `ursulactl node
 decommission --wait` removed them, and `verify-not-removed` for every id a
 higher count starts, since a removed id never holds a group again. ursulactl
@@ -98,7 +100,7 @@ data:
       exit 0
     fi
     if [ "${live}" -eq 1 ]; then
-      echo "scale check: refused, server.replicaCount ${live} to ${desired}: a single node keeps one meta voter and replication factor 1, so it never grows. Install a new release and restore a backup into it" >&2
+      echo "scale check: refused, server.replicaCount ${live} to ${desired}: a single pod never grows under this chart, which sets neither raft.meta_voters nor raft.placement.replication_factor. Install a new release and restore a backup into it" >&2
       exit 1
     fi
     if [ "${desired}" -lt "${live}" ]; then

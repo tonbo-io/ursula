@@ -249,9 +249,12 @@ meta voters (ids 1 to 3) are never decommissioned. To lower the count:
 2. Lower `server.replicaCount` with `helm upgrade`.
 3. Delete the PVCs of the dropped pods.
 
-A single pod never grows: its replication factor of 1 and its one meta voter
-stay as its bootstrap fixed them. Grow it by installing a new release and
-restoring a backup into it.
+A single pod never grows under the chart. A single node grows only with
+`raft.meta_voters` and `raft.placement.replication_factor` set on every node
+([Adding a node](https://ursula.tonbo.io/docs/operations#adding-a-node)), and
+the chart sets neither, so the pods of a raised count would claim the
+defaults and report `replication_factor_mismatch`. To run more pods, install
+a new release and restore a backup into it.
 
 Before every upgrade and rollback the `scale-check` hook compares the live
 StatefulSet's replicas with the new count. No StatefulSet and an unchanged
