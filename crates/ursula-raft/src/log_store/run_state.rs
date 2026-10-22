@@ -1326,14 +1326,21 @@ fn held_data_history(data_history: JournalHistory) -> bool {
     held
 }
 
-/// A run-state file with distinct values in the fields of one type, for the
-/// persisted-envelopes fixture. It decodes to the run state it was encoded
-/// from and re-encodes to the same bytes.
+/// A run-state file of `status` with distinct values in the fields of one
+/// type, by its persisted-envelopes fixture name. The name comes from an
+/// exhaustive match, so a new status fails to compile here until it has a
+/// sample. It decodes to the run state it was encoded from and re-encodes to
+/// the same bytes.
 #[cfg(test)]
-pub(crate) fn sample_file() -> Vec<u8> {
+pub(crate) fn sample_file(status: RunStatus) -> (&'static str, Vec<u8>) {
+    let name = match status {
+        RunStatus::Running => "run_state_file_running",
+        RunStatus::Clean => "run_state_file_clean",
+        RunStatus::Poisoned => "run_state_file",
+    };
     let state = RunState {
         boot_id: Some(BootId::new("0b3f5c1e-9d2a-4e7b-8c61-a1b2c3d4e5f6")),
-        status: RunStatus::Poisoned,
+        status,
         data: JournalRun {
             fsync: WalFsync::Never,
             recovery_epoch: 4,
@@ -1350,7 +1357,16 @@ pub(crate) fn sample_file() -> Vec<u8> {
             .expect("the sample decodes");
     assert_eq!(decoded, state);
     assert_eq!(state_file::encode(StateFileKind::RunState, &decoded), bytes);
-    bytes
+    (name, bytes)
+}
+
+/// One run-state file of each [`RunStatus`] ([`sample_file`]).
+#[cfg(test)]
+pub(crate) fn sample_files() -> Vec<(&'static str, Vec<u8>)> {
+    [RunStatus::Running, RunStatus::Clean, RunStatus::Poisoned]
+        .into_iter()
+        .map(sample_file)
+        .collect()
 }
 
 /// The core directories under the WAL `root`, in name order.
@@ -1622,7 +1638,10 @@ mod tests {
         super::RunStateFile::new(path.clone(), current.clone())
             .record(RunStatus::Poisoned, "sample")
             .expect("record");
-        assert_eq!(std::fs::read(&path).expect("read"), super::sample_file());
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            super::sample_file(RunStatus::Poisoned).1
+        );
         let read = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
             .expect("read")
             .expect("a run state");

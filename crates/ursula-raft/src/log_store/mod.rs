@@ -172,14 +172,15 @@ pub(crate) enum RaftGroupLogRecord {
     Purge(LogIdOf<UrsulaRaftTypeConfig>),
 }
 
-/// One sample of each WAL state file, and of the identity file one of each
-/// standing, by name, as the persisted-envelopes fixture holds it: the whole
-/// file, its header and checksum included.
+/// One sample of each WAL state file, of the identity file one of each
+/// standing and of the run-state file one of each run status, by name, as
+/// the persisted-envelopes fixture holds it: the whole file, its header and
+/// checksum included.
 #[cfg(test)]
 pub(crate) fn state_file_samples() -> Vec<(&'static str, Vec<u8>)> {
     let mut samples = vec![("core_metadata_file", core_meta::sample_file())];
     samples.extend(identity::sample_files());
-    samples.push(("run_state_file", run_state::sample_file()));
+    samples.extend(run_state::sample_files());
     samples.push(("topology_file", topology::sample_file()));
     samples
 }

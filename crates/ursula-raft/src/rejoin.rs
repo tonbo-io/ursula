@@ -1811,8 +1811,10 @@ impl GroupRejoin {
     /// genesis. `applied` is the newest event it applied, through
     /// `applied_index`; committed entries above that are read from its log.
     /// An event counts as apply would count it: only when it names the
-    /// history before it. `None` when the log could not be read, or holds
-    /// an import there, whose outcome only its apply knows.
+    /// history before it, and on the meta plane its entry's leader
+    /// ([`crate::meta::state_machine::history_applies`]). `None` when the
+    /// log could not be read, or holds an import there, whose outcome only
+    /// its apply knows.
     pub(crate) async fn history_at_marker(
         &self,
         applied: Option<ursula_runtime::HistoryEvent>,
@@ -1848,9 +1850,20 @@ impl GroupRejoin {
                 )) => return None,
                 openraft::EntryPayload::Normal(crate::types::RaftCommand::Meta(
                     crate::meta::MetaCommand::NewHistory {
-                        history, previous, ..
+                        history,
+                        previous,
+                        leader,
+                        ..
                     },
-                )) if previous == current => current = history.get(),
+                )) if crate::meta::state_machine::history_applies(
+                    current,
+                    entry.log_id,
+                    previous,
+                    leader,
+                ) =>
+                {
+                    current = history.get()
+                }
                 _ => {}
             }
         }
