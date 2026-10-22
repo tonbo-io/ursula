@@ -5,16 +5,20 @@
 //! since the leader stops replicating to it, so only its group can tell it.
 //! The hosting driver therefore asks, for each held replica that is closed,
 //! or whose bootstrapped view gives its node the role `Outgoing`,
-//! `Abandoned` or none, the group's leader for a fresh quorum barrier
-//! ([`MetaStatusReader::barrier`]), along the group's leader candidates
-//! ([`ursula_control::leader_candidates`]). It asks after each change of the
-//! replica's vote, and again each [`ASK_INTERVAL`] unless an append with a
-//! vote of at least its last answer's arrived since the previous check.
-//! Each check after the interval, asked or skipped, moves that baseline to
-//! now, so a replica its leader stops replicating to asks again within one
-//! interval: a voter dropped after a `Voter` answer, whose vote no
-//! membership change moves, learns it too. Each ask is one driver action
-//! under the per-core budget, begun after the pass's opens and closes.
+//! `Abandoned` or none (none on a node that knows itself removed,
+//! [`ursula_control::Standing::placed_role`]), the group's leader for a
+//! fresh quorum barrier ([`MetaStatusReader::barrier`]), along the group's
+//! leader candidates ([`ursula_control::leader_candidates`]). It asks after
+//! each change of the replica's vote, and again each [`ASK_INTERVAL`]
+//! unless an append with a vote of at least its last answer's arrived since
+//! the previous check. Each check after the interval, asked or skipped,
+//! moves that baseline to now, so a replica its leader stops replicating to
+//! asks again within one interval: a voter dropped after a `Voter` answer,
+//! whose vote no membership change moves, learns it too. Each ask is one
+//! driver action under the per-core budget, begun after the pass's opens
+//! and closes. The back-off after a failed open does not hold an ask back,
+//! since the pass after it begins the open again before it asks: a closed
+//! replica whose open keeps failing asks in that back-off.
 //!
 //! Only a leader that just proved its quorum answers, so a group without
 //! one answers nothing and its replicas keep counting. Every answer is

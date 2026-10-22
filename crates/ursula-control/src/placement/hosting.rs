@@ -68,6 +68,26 @@ impl Standing {
                 .and_then(|cluster| cluster.node(me))
                 .is_some_and(|record| record.lifecycle == NodeLifecycle::Removed)
     }
+
+    /// Node `me`'s role in `group` by `cluster`, read with this standing:
+    /// none once the node knows itself removed ([`Self::knows_removed`]),
+    /// whatever role a view that predates the removal still shows. A
+    /// removed node hears no more meta entries, so restarted with its disk
+    /// it keeps a view that places it. The one reading of a node's own
+    /// placed role for the voter predicate ([`counts_as_voter`]), the
+    /// membership asker and the readiness inventory (design 8.1).
+    pub fn placed_role(
+        self,
+        cluster: &Cluster,
+        group: RaftGroupId,
+        me: NodeId,
+    ) -> Option<ReplicaRole> {
+        if self.knows_removed(Some(cluster), me) {
+            None
+        } else {
+            cluster.role(group, me)
+        }
+    }
 }
 
 /// What the node's journal holds of a group. A group the journal does not

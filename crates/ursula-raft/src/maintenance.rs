@@ -23,6 +23,7 @@ use ursula_control::GroupPlacement;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::PlacementStatus;
 use ursula_control::RegistrationStatus;
+use ursula_control::Standing;
 use ursula_proto::admin::NodePlacementReport;
 pub use ursula_proto::admin::RaftMaintenanceIssue;
 pub use ursula_proto::admin::RaftMaintenanceReport;
@@ -63,6 +64,9 @@ pub struct NodePlacement<'a> {
     pub leaderless_for: Option<Duration>,
     /// The hosting driver's last status.
     pub hosting: &'a HostingStatus,
+    /// The node's standing in this run, its registration's answers
+    /// included ([`RaftGroupHandleRegistry::learn_standing`]).
+    pub standing: Standing,
 }
 
 /// The inputs of [`check_raft_maintenance`].
@@ -85,13 +89,16 @@ pub struct MaintenanceInputs<'a, C> {
 ///
 /// Node issues: a node without a meta runtime reports `placement_unknown`.
 /// A damaged meta replica reports `meta_damaged` and replaces every issue
-/// the view gives, the inventory included. A node whose view or
-/// registration says it is removed reports `node_removed` alone among its
-/// node issues, and its replicas keep their group checks. Otherwise the bootstrapped view
-/// gives the inventory and the mismatches with the node's genesis claim. A
-/// view that has not bootstrapped gives `placement_not_bootstrapped` when
-/// the node holds or runs replicas, and `placement_unknown` when it holds
-/// none, confirmed no view in this run, and was not answered `forming` or
+/// the view gives, the inventory included. A node that knows itself
+/// removed, by its standing or its view, reports `node_removed` alone among
+/// its node issues. No group places it ([`Standing::placed_role`]), even in
+/// a view from before its removal, so its inventory is empty, each replica
+/// it runs or its plan keeps open is `unplaced_replica`, and its running
+/// replicas keep their voter checks. Otherwise the bootstrapped view gives
+/// the inventory and the mismatches with the node's genesis claim. A view
+/// that has not bootstrapped gives `placement_not_bootstrapped` when the
+/// node holds or runs replicas, and `placement_unknown` when it holds none,
+/// confirmed no view in this run, and was not answered `forming` or
 /// `unreferenced`. `meta_unavailable` comes after
 /// [`META_UNAVAILABLE_AFTER`] without a meta leader, unless the node holds
 /// nothing and is placed nowhere.
@@ -137,7 +144,11 @@ pub fn check_raft_maintenance(
     let cluster = match placement {
         Some(placement) => {
             let cluster = read_placement(&mut report, placement, &running, &counts);
-            if knows_removed(placement.status) {
+            let status = placement.status;
+            if placement
+                .standing
+                .knows_removed(shown_cluster(&status.view), status.node)
+            {
                 report.node_issues = vec![Issue::NodeRemoved];
             }
             cluster
@@ -210,20 +221,15 @@ pub fn check_raft_maintenance(
     report
 }
 
-/// Whether the node's status says it is removed, by its view or its
-/// registration's answers ([`ursula_control::Standing::knows_removed`]).
-fn knows_removed(status: &PlacementStatus) -> bool {
-    let cluster = match &status.view {
+/// The cluster of a bootstrapped view, `None` before Bootstrap.
+fn shown_cluster(view: &ClusterView) -> Option<&Cluster> {
+    match view {
         ClusterView::Bootstrapped(cluster) => Some(cluster),
         ClusterView::MetaGenesis { .. }
         | ClusterView::MetaCatchingUp
         | ClusterView::Registering { .. }
         | ClusterView::FormationCut => None,
-    };
-    status
-        .registration
-        .standing()
-        .knows_removed(cluster, status.node)
+    }
 }
 
 /// Fills the report's placement, inventory and node issues from
@@ -251,13 +257,7 @@ fn read_placement<'a>(
         | RegistrationStatus::Refused(_)
         | RegistrationStatus::Removed => None,
     };
-    let cluster = match &status.view {
-        ClusterView::Bootstrapped(cluster) => Some(cluster),
-        ClusterView::MetaGenesis { .. }
-        | ClusterView::MetaCatchingUp
-        | ClusterView::Registering { .. }
-        | ClusterView::FormationCut => None,
-    };
+    let cluster = shown_cluster(&status.view);
     report.placement = Some(NodePlacementReport {
         view: status.view.stage(),
         applied: status.applied,
@@ -284,7 +284,7 @@ fn read_placement<'a>(
                 report.node_issues.push(Issue::ReplicationFactorMismatch);
             }
             for (group, placed) in cluster.groups().iter() {
-                if let Some(role) = placed.role(me) {
+                if let Some(role) = placement.standing.placed_role(cluster, group, me) {
                     report.expected_groups.insert(group.0, ExpectedReplica {
                         role,
                         since: placed.since(),
@@ -460,6 +460,11 @@ pub fn raft_maintenance_report(
             claim: reader.claim(),
             leaderless_for: reader.meta_leaderless_for(),
             hosting: hosting.unwrap_or(&before_first_pass),
+            standing: registry.learn_standing(
+                status.registration.standing(),
+                shown_cluster(&status.view),
+                status.node,
+            ),
         });
     check_raft_maintenance(MaintenanceInputs {
         node_id,
