@@ -129,10 +129,6 @@ impl GroupLeadership {
     }
 }
 
-/// Whether the node fence takes part in the leader predicate, read only
-/// where it decides the role. A negative control turns it off
-/// (`Defence::FencedLeadership`), and the predicate then reads OpenRaft's
-/// server state alone.
 /// Whether the replica whose metrics are `metrics` is the only voter of its
 /// effective membership, joint configs included, and so its own quorum.
 /// OpenRaft's leader then has no follower to acknowledge it: its
@@ -146,6 +142,10 @@ pub(crate) fn own_quorum(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
         .all(|voter| voter == metrics.id)
 }
 
+/// Whether the node fence takes part in the leader predicate, read only
+/// where it decides the role. A negative control turns it off
+/// (`Defence::FencedLeadership`), and the predicate then reads OpenRaft's
+/// server state alone.
 fn fence_rules_leadership() -> bool {
     use ursula_stream::sim_controls::Defence;
     if ursula_stream::sim_controls::off(Defence::FencedLeadership) {
