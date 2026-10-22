@@ -138,14 +138,6 @@ pub fn spawn_egress_gate(
     if interval_ms == 0 {
         return;
     }
-    // A node with no peer has no egress to judge.
-    if participation
-        .peers(registry)
-        .node_ids()
-        .all(|peer| peer == node_id)
-    {
-        return;
-    }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
     let probe_timeout_ms = cp_cfg.timeout.as_duration().as_millis() as usize;
     let unhealthy_ticks = cp_cfg.unhealthy_ticks;

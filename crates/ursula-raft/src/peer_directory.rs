@@ -2,12 +2,13 @@
 //!
 //! [`PeerDirectory`] maps a node id to its [`PeerEndpoints`]: the URL peers
 //! dial for its cluster plane and the URL clients reach its client plane at.
-//! The server builds it once at config load, lends it to the format-epoch
-//! probe and moves it into the one [`crate::PeerCluster::bind`]. Every other
+//! The server builds it once at config load, lends it at startup (the
+//! format-epoch probe, meta's genesis node set and the interim seed table)
+//! and moves it into the one [`crate::PeerCluster::bind`]. Every other
 //! reader of a configured peer address, the engine factory, the leader
 //! router, the leadership-shed polls, the egress probe and the shutdown
 //! handoff, reads it there at each use ([`crate::PeerCluster::directory`]).
-//! It is not `Clone`, so no reader holds a copy. URLs are normalized once,
+//! It is not `Clone`, so no reader duplicates it. URLs are normalized once,
 //! without a trailing `/`, so a caller appends a path to them as they are.
 
 use std::collections::BTreeMap;

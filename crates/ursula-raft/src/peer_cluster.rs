@@ -404,8 +404,8 @@ struct Bound {
 }
 
 /// The configured peers last bound ([`PeerCluster::directory`]), as a
-/// [`PeerDirectory`]. It is not `Clone`: a reader takes it at each use and
-/// keeps no copy.
+/// [`PeerDirectory`]. It is not `Clone`: a reader takes it at each use, and
+/// one held longer pins that bind.
 #[derive(Debug)]
 pub struct BoundPeers(Option<Arc<Bound>>);
 
