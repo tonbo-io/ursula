@@ -315,7 +315,9 @@ mod tests {
             let mut node = node(1);
             node.http_url = Some(format!("http://{address}").parse().unwrap());
             node.admin_url = format!("http://{address}").parse().unwrap();
-            let unavailable = if mode >= 7 {
+            // Modes 7 and 8 point one plane at a refusing port. Mode 9 reads
+            // every plane from the mock, so only its placement status fails.
+            let unavailable = if matches!(mode, 7 | 8) {
                 Some(RefusingPort::hold().await)
             } else {
                 None
@@ -330,7 +332,7 @@ mod tests {
             }
             let timeout = match mode {
                 7 | 8 => Duration::from_millis(40),
-                9 => Duration::from_secs(30),
+                9 => Duration::from_secs(5),
                 _ => Duration::ZERO,
             };
             let started = Instant::now();
