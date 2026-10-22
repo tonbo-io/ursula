@@ -357,14 +357,17 @@ impl CoreMetadata {
 }
 
 /// Which generation of each group's log a replay of a core journal keeps:
-/// the one the core's metadata names, or, without a metadata file, the
-/// highest among the group's frames and its snapshot record, since nothing
-/// then says which life of the group is current.
+/// the one the core's metadata names, none of a log it names retired, or,
+/// without a metadata file, the highest among the group's frames and its
+/// snapshot record, since nothing then says which life of the group is
+/// current.
 #[derive(Debug)]
 pub(crate) enum ReplayGenerations {
     /// The metadata file names each group's generation; a group it does not
-    /// list is at [`LogGeneration::FIRST`].
-    Named(BTreeMap<u32, LogGeneration>),
+    /// list is at [`LogGeneration::FIRST`]. A retired log (`None`) keeps no
+    /// frame: a frame of its generation can only be one the writer wrote
+    /// before a crash and never acknowledged.
+    Named(BTreeMap<u32, Option<LogGeneration>>),
     /// No metadata file: the highest generation found so far per group.
     Highest(BTreeMap<u32, LogGeneration>),
 }
@@ -391,7 +394,15 @@ impl ReplayGenerations {
             Self::Named(
                 metadata
                     .groups()
-                    .map(|(group_id, group)| (group_id, group.generation))
+                    .map(|(group_id, group)| {
+                        let kept = match group.log {
+                            GroupLogState::Retired => None,
+                            GroupLogState::Empty
+                            | GroupLogState::Initialized
+                            | GroupLogState::Recovering => Some(group.generation),
+                        };
+                        (group_id, kept)
+                    })
                     .collect(),
             )
         }
@@ -414,7 +425,11 @@ impl ReplayGenerations {
     pub(crate) fn admit(&mut self, group_id: u32, generation: LogGeneration) -> ReplayRecord {
         match self {
             Self::Named(named) => {
-                if named.get(&group_id).copied().unwrap_or_default() == generation {
+                let kept = named
+                    .get(&group_id)
+                    .copied()
+                    .unwrap_or(Some(LogGeneration::FIRST));
+                if kept == Some(generation) {
                     ReplayRecord::Keep
                 } else {
                     ReplayRecord::Skip
@@ -756,6 +771,25 @@ mod tests {
             ReplayRecord::Skip,
             ReplayRecord::Keep,
             ReplayRecord::Skip,
+        ]);
+        assert_eq!(generations.adopted().count(), 0);
+    }
+
+    /// A retired log keeps no frame, not even one of the generation its
+    /// retirement named, which only a reopen whose metadata never became
+    /// durable can have written.
+    #[test]
+    fn replay_keeps_no_frame_of_a_retired_log() {
+        let mut metadata = CoreMetadata::default();
+        assert!(metadata.retire(1, LogGeneration::new(3)));
+        let mut generations = ReplayGenerations::of(&metadata, false);
+        let admitted = [(1, 2), (1, 3), (1, 0), (2, 0)]
+            .map(|(group, generation)| generations.admit(group, LogGeneration::new(generation)));
+        assert_eq!(admitted, [
+            ReplayRecord::Skip,
+            ReplayRecord::Skip,
+            ReplayRecord::Skip,
+            ReplayRecord::Keep,
         ]);
         assert_eq!(generations.adopted().count(), 0);
     }

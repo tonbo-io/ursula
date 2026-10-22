@@ -478,6 +478,94 @@ async fn retired_frames_leave_every_segment(name: &str) {
     assert_eq!(log_ids(&quiet).await, [1, 2, 3]);
 }
 
+/// A retirement keeps its group's log pinned until the metadata that
+/// retires it is durable (7.2 of #768). A maintenance pass that runs after
+/// the retirement was sent, and before its batch, deletes none of the
+/// group's segments, an open of the group meanwhile is refused, and when
+/// the metadata store then fails the restart finds the whole log. Catches a
+/// log that leaves the core's groups when the retirement is sent: that pass
+/// would delete its segments while the metadata still names it initialized,
+/// and the restart would then open a log that lost its entries.
+#[cfg(madsim)]
+async fn a_retirement_in_flight_keeps_its_segments(name: &str) {
+    use super::SimDisk;
+    use super::SimDiskFault;
+    use super::core_meta::core_metadata_path;
+    use super::writer::CoreJournalError;
+
+    let journal = Journal::new(name, WalFsync::Never);
+    let writer = journal.writer();
+    let start = Instant::now();
+    let mut retired = journal.store(&writer, REMOVED);
+    let mut last = 0;
+    for index in 1..=40 {
+        append(&mut retired, [entry(index, &marked(500))]).await;
+        last = index;
+        if journal.segments().len() >= 3 {
+            break;
+        }
+    }
+    assert!(
+        journal.segments().len() >= 3,
+        "the log spans sealed segments"
+    );
+    drop(retired);
+    let group = RaftGroupId(REMOVED);
+
+    // The writer holds a maintenance pass's batch while the retirement is
+    // sent, so the pass runs after the send and before the retirement.
+    writer.pause_simulated(true);
+    let pass = crate::rt::spawn({
+        let writer = writer.clone();
+        async move { writer.maintain(start, MAX_AGE).await }
+    });
+    crate::rt::time::sleep(Duration::from_millis(1)).await;
+    let retirement = crate::rt::spawn({
+        let writer = writer.clone();
+        async move { writer.retire_group(group).await }
+    });
+    crate::rt::time::sleep(Duration::from_millis(1)).await;
+    assert!(matches!(
+        writer.open_group(group, ursula_control::Admission::Create),
+        Err(CoreJournalError::Retiring { .. })
+    ));
+    assert_eq!(
+        writer.local_logs().expect("local logs").get(&group),
+        Some(&ursula_control::LocalLog::Holding)
+    );
+    SimDisk::inject_fault(&core_metadata_path(&journal.dir), SimDiskFault::Rename)
+        .expect("arm the fault");
+    writer.pause_simulated(false);
+    pass.await.expect("join the pass").expect("the pass runs");
+    let failed = retirement
+        .await
+        .expect("join the retirement")
+        .expect_err("the metadata store fails");
+    assert!(
+        matches!(failed, CoreJournalError::WriterPoisoned { .. }),
+        "{failed}"
+    );
+    assert!(
+        matches!(
+            writer.open_group(group, ursula_control::Admission::Create),
+            Err(CoreJournalError::Retiring { .. })
+        ),
+        "a failed retirement stays in doubt until a restart"
+    );
+    drop(writer);
+    SimDisk::clear_faults(&journal.dir).expect("clear the faults");
+
+    let writer = journal.writer();
+    let store = RaftGroupFileLogStore::open(
+        placement(REMOVED),
+        journal.metrics.group_engine_metrics(),
+        writer.clone(),
+        ursula_control::Admission::Open,
+    )
+    .expect("the group the retirement left is still held");
+    assert_eq!(log_ids(&store).await, (1..=last).collect::<Vec<_>>());
+}
+
 /// Makes every file of the journal `by` older than now: on the operating
 /// system's disk its modification time moves back, on the simulated disk
 /// time moves on.
@@ -520,6 +608,18 @@ fn a_retired_groups_frames_leave_every_simulated_segment() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(
             674,
             retired_frames_leave_every_segment("retired-frames"),
+        )
+        .await;
+    });
+}
+
+#[cfg(madsim)]
+#[test]
+fn a_simulated_retirement_in_flight_keeps_its_segments() {
+    crate::tests::check_madsim_determinism(675, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            675,
+            a_retirement_in_flight_keeps_its_segments("retirement-in-flight"),
         )
         .await;
     });

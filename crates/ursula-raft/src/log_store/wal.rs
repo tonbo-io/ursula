@@ -149,8 +149,11 @@ pub enum MetaOpenError {
     LockPoisoned,
 }
 
-/// Failure to tear down a group's log ([`RaftWal::retire_group`]). Nothing
-/// was retired.
+/// Failure to tear down a group's log ([`RaftWal::retire_group`]). A
+/// refusal retires nothing. A writer that fails the retirement
+/// ([`CoreJournalError::WriterPoisoned`]) leaves it in doubt until a restart
+/// reads the core's metadata back, and the group's log keeps its segments
+/// until then.
 #[derive(Debug, thiserror::Error)]
 pub enum RetireGroupError {
     /// The root's shard map places no such group.
@@ -161,7 +164,8 @@ pub enum RetireGroupError {
     #[error("the journal of core {} is not open", .core.0)]
     CoreNotOpen { core: CoreId },
     /// The journal refused or failed the retirement: a store holds the
-    /// group, or the writer stopped.
+    /// group, an earlier retirement of it is not durable yet, or the writer
+    /// stopped or failed.
     #[error("retire raft group {} on core {}: {source}", .placement.raft_group_id.0, .placement.core_id.0)]
     Journal {
         placement: ShardPlacement,

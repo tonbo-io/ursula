@@ -164,11 +164,16 @@ archives go only once reclaim deletes the segments that refer to them.
 the group. One synced replacement of `journal.meta` records it `retired` in
 the next generation, with no vote, no log and no recovery plan, and writes no
 frame. The vote goes because a removed replica campaigns and would depose a
-leader once the group is placed on it again. Every segment that held the log
-now holds dead frames, and once `journal.meta` is durable the group's
-snapshot record is deleted. While `journal.meta` survives, a torn-down log
-never revives. Without it, the retired frames that remain open as a gated
-replica.
+leader once the group is placed on it again. Until `journal.meta` is durable
+the log keeps pinning its segments, and no open or second retirement of the
+group is admitted, so a reclaim pass in between deletes nothing the old
+`journal.meta` still names. Once it is durable, every segment that held the
+log holds dead frames and the group's snapshot record is deleted. A writer
+that fails the retirement leaves it in doubt until a restart reads
+`journal.meta` back. While `journal.meta` survives, a torn-down log never
+revives: replay keeps no frame of a `retired` log, not even one of the
+generation its retirement named. Without it, the retired frames that remain
+open as a gated replica.
 
 A core's open deletes every snapshot record of another generation than
 `journal.meta` names, and the record of a `retired` log, which a crash
@@ -182,8 +187,9 @@ A group's store opens with an admission. `Open` opens only a log
 `journal.meta` names, other than a `retired` one. `Create` also opens a group
 it does not name, with a fresh log, and reopens a `retired` log: one synced
 replacement of `journal.meta` records it `recovering`, empty and with no vote,
-in the generation the retirement named, before any write of the new store, so
-its recovery gate starts closed. Every other open is refused before anything
+in the generation the retirement named, so its recovery gate starts closed.
+The reopen ends its writer batch, so it is durable before the new store's
+first frame is written. Every other open is refused before anything
 is written for the group. An `Open` never creates a core's journal: on a core
 that holds nothing it is refused before the core opens. The engine factories
 open with `Create` until placement decides what a node hosts.

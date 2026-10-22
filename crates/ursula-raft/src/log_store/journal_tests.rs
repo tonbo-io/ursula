@@ -3863,8 +3863,9 @@ async fn held_cores_open_and_a_core_that_fails_stays_unknown() {
 /// core's writer, so with no store open the group stays listed `Retired`,
 /// an `Open` of it is refused and a second retirement writes nothing. A
 /// `Create` reopens it (7.3) recovering, empty and with no vote in the new
-/// generation, behind a closed gate, durably before the new store's first
-/// write, and a restart replays none of the retired frames. Catches a
+/// generation, behind a closed gate, and a restart replays none of the
+/// retired frames (`a_reopen_ends_its_batch` in `writer.rs` pins that the
+/// reopen is durable before the new store's first frame). Catches a
 /// retirement that keeps the vote (a removed replica campaigns and deposes
 /// a leader at a re-placement), keeps the log or its record, revives on
 /// restart, or a reopen that opens the gate.
@@ -4090,6 +4091,53 @@ async fn a_reopened_log_ignores_the_markers_of_its_retired_life() {
         None
     );
     assert_eq!(store.log_state(), GroupLogState::Recovering);
+}
+
+/// A retired log keeps no frame, not even one of the generation its
+/// retirement named. Only a reopen whose metadata never became durable
+/// could have written one, before a crash, and no batch replies before its
+/// metadata is durable, so the frame was never acknowledged. The group
+/// opens retired with no log, the segment holding those frames counts as
+/// dead beside the one holding its retired life, and a reopen hands out an
+/// empty log. Catches a replay that keeps them: the group would come back
+/// retired holding a log that pins its segments for good, since a
+/// retirement of a retired log writes nothing, and a reopen would hand the
+/// new store a log it never wrote.
+#[tokio::test]
+async fn a_retired_log_replays_no_frame_of_its_named_generation() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_generations(&core, 1, &[(7, 0, vec![1, 2]), (5, 0, vec![1])]);
+    write_generations(&core, 2, &[(7, 1, vec![1, 2, 3])]);
+    let mut metadata = CoreMetadata::default();
+    assert!(metadata.retire(7, LogGeneration::new(1)));
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    assert_eq!(
+        writer.local_logs().unwrap().get(&RaftGroupId(7)),
+        Some(&LocalLog::Retired)
+    );
+    assert_eq!(
+        core.metrics.snapshot().wal_dirty_segments,
+        2,
+        "both segments of group 7 hold dead frames"
+    );
+    assert!(matches!(
+        RaftGroupFileLogStore::open(
+            placement(7),
+            core.metrics.group_engine_metrics(),
+            writer.clone(),
+            Admission::Open,
+        ),
+        Err(CoreJournalError::NotHeld { .. })
+    ));
+    let reopened = core.store(&writer, 7);
+    assert_eq!(reopened.log_state(), GroupLogState::Recovering);
+    assert!(log_ids(&reopened).await.is_empty());
+    assert_eq!(log_ids(&core.store(&writer, 5)).await, [1]);
 }
 
 /// A retired generation's frozen archives stay as long as a segment refers
