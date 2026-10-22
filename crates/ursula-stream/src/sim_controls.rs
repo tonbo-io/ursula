@@ -218,6 +218,22 @@ pub enum Defence {
     /// run, so a root refused for longer than the wait takes part at once
     /// when it binds.
     WaitFromBinding,
+    /// A reconcile shell's membership step runs under a CAS on the committed
+    /// leader id it was planned under and the membership it was planned
+    /// from (N1 of design 15.2). Off, a step planned in an earlier
+    /// leadership changes the membership as it is when its leader leads
+    /// again.
+    MembershipCas,
+    /// A voter change from a uniform config waits for a view confirmed by a
+    /// meta read barrier within the leader's leadership (N5). Off, every
+    /// view counts as confirmed, so a leader whose meta replica lags
+    /// promotes a node the placement has retired.
+    PlacementBarrier,
+    /// A leader proves its leadership with a fresh quorum barrier, and
+    /// reads its vote and membership again, before it reports a
+    /// convergence (N9). Off, a deposed leader reports the membership it
+    /// last committed after a later leader changed it.
+    ConvergeLeadershipProof,
 }
 
 #[cfg(madsim)]
@@ -227,8 +243,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 44]> = const { Cell::new([false; 44]) };
-        static FIRED: Cell<[u64; 44]> = const { Cell::new([0; 44]) };
+        static OFF: Cell<[bool; 47]> = const { Cell::new([false; 47]) };
+        static FIRED: Cell<[u64; 47]> = const { Cell::new([0; 47]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -277,6 +293,9 @@ mod switches {
             Defence::GateAfterWait => 41,
             Defence::ResponderBinding => 42,
             Defence::WaitFromBinding => 43,
+            Defence::MembershipCas => 44,
+            Defence::PlacementBarrier => 45,
+            Defence::ConvergeLeadershipProof => 46,
         }
     }
 
@@ -299,7 +318,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 44]));
+        FIRED.with(|fired| fired.set([0; 47]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -79,6 +79,7 @@ use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WaitReason;
 use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
+use ursula_stream::sim_controls::Defence;
 
 use super::leader_tick::FollowerLogReversions;
 use super::leader_tick::LeaderTick;
@@ -92,6 +93,8 @@ use crate::memberships::MembershipKind;
 use crate::memberships::membership_config;
 use crate::meta::confirm::MetaBarrierError;
 use crate::meta::handle::MetaWriteError;
+use crate::meta::pause::MetaPausePoint;
+use crate::meta::pause::MetaPauses;
 use crate::peer_cluster::PeerCluster;
 use crate::registry::QuorumProofError;
 use crate::replica::ReplicaCore;
@@ -552,6 +555,9 @@ where SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static
     pub(crate) status: watch::Sender<ReconcileStatus>,
     /// The node's step counts, which each finished step counts into.
     pub(crate) steps: ReconcileSteps,
+    /// The node's pause points: each step waits at its
+    /// [`MetaPausePoint::ShellStep`] before it runs.
+    pub(crate) pauses: MetaPauses,
 }
 
 /// A fresh status: waiting as no leader.
@@ -904,7 +910,7 @@ where
             .filter(|node| *node != self.me && !voters.contains(&node.get()))
             .filter(|node| self.peers.cluster_url(node.get()).is_none())
             .collect();
-        let freshness = if state.confirmed.is_some() {
+        let freshness = if state.confirmed.is_some() || unconfirmed_counts() {
             ViewFreshness::Confirmed
         } else {
             ViewFreshness::Unconfirmed
@@ -917,7 +923,8 @@ where
     }
 
     /// Spawns `step`'s future, a report of the `Converged` step when
-    /// `report` names one. Its handle is kept until it answers.
+    /// `report` names one, behind its pause point. Its handle is kept until
+    /// it answers.
     fn start(
         &self,
         step: MembershipStep,
@@ -926,7 +933,7 @@ where
         report: Option<ReportKey>,
     ) -> Option<Pending> {
         let vote = metrics.vote;
-        let handle = match (&step, report) {
+        let future: BoxFuture<'static, StepOutcome> = match (&step, report) {
             (MembershipStep::Converged { voters }, Some(report)) => {
                 self.report(voters.clone(), report, vote)
             }
@@ -958,7 +965,7 @@ where
                 let election = self.election.clone();
                 let group = RaftGroupId(self.replica.wire_group_id());
                 let to = to.get();
-                crate::rt::spawn(async move {
+                Box::pin(async move {
                     match core.transfer_leader(&election, group, to).await {
                         Ok(()) => StepOutcome::Done,
                         Err(error) => StepOutcome::TransferRefused(error),
@@ -967,7 +974,7 @@ where
             }
             (MembershipStep::ConfirmView, _) => {
                 let source = self.source.clone();
-                crate::rt::spawn(async move {
+                Box::pin(async move {
                     match source.confirm().await {
                         Ok(stamp) => StepOutcome::Confirmed(stamp),
                         Err(error) => StepOutcome::ConfirmFailed(error),
@@ -976,6 +983,15 @@ where
             }
             (MembershipStep::Converged { .. }, None) | (MembershipStep::Wait(_), _) => return None,
         };
+        let pauses = self.pauses.clone();
+        let point = MetaPausePoint::ShellStep {
+            target: self.replica,
+            step: kind,
+        };
+        let handle = crate::rt::spawn(async move {
+            pauses.at(point).await;
+            future.await
+        });
         tracing::info!(
             target: "ursula::placement",
             plane = self.replica.plane().as_str_name(),
@@ -997,26 +1013,30 @@ where
         })
     }
 
-    /// Spawns a membership change guarded by the committed leader id of
-    /// `vote` and the membership log id `expected`.
+    /// A membership change guarded by the committed leader id of `vote`
+    /// and the membership log id `expected`.
     fn change(
         &self,
         expected: MembershipLogId,
         vote: UrsulaVote,
         members: ChangeMembers<u64, EmptyNode>,
         retain: bool,
-    ) -> crate::rt::task::JoinHandle<StepOutcome> {
+    ) -> BoxFuture<'static, StepOutcome> {
         let owner = self.core.owner().clone();
         let expected = openraft_log_id(expected);
-        let preconditions = vec![
-            Precondition::CommittedLeaderId {
-                committed_leader_id: vote.leader_id().to_committed(),
-            },
-            Precondition::LastMembershipLogId {
-                last_membership_log_id: Some(expected),
-            },
-        ];
-        crate::rt::spawn(async move {
+        let preconditions = if unguarded_changes() {
+            Vec::new()
+        } else {
+            vec![
+                Precondition::CommittedLeaderId {
+                    committed_leader_id: vote.leader_id().to_committed(),
+                },
+                Precondition::LastMembershipLogId {
+                    last_membership_log_id: Some(expected),
+                },
+            ]
+        };
+        Box::pin(async move {
             let result = owner
                 .change_membership_if(members, retain, preconditions)
                 .await;
@@ -1024,7 +1044,7 @@ where
         })
     }
 
-    /// Spawns the report of `voters`, the committed uniform membership at
+    /// The report of `voters`, the committed uniform membership at
     /// `report.membership`, for the placement at `report.since`, planned
     /// under `vote` (design 5.7). A fresh quorum barrier proves the
     /// leadership first, which a deposed leader fails. The vote and the
@@ -1035,13 +1055,21 @@ where
         voters: VoterSet,
         report: ReportKey,
         vote: UrsulaVote,
-    ) -> crate::rt::task::JoinHandle<StepOutcome> {
+    ) -> BoxFuture<'static, StepOutcome> {
         let ReportKey { since, membership } = report;
         let core = self.core.clone();
         let source = self.source.clone();
         let group = RaftGroupId(self.replica.wire_group_id());
         let expected = openraft_log_id(membership);
-        crate::rt::spawn(async move {
+        Box::pin(async move {
+            let convergence = Convergence {
+                since,
+                voters,
+                membership,
+            };
+            if unproven_reports() {
+                return report_outcome(source.report(convergence).await, since);
+            }
             let proof = match core.confirm_barrier(group).await {
                 Ok(proof) => proof,
                 Err(error) => return StepOutcome::ProofFailed(Box::new(error)),
@@ -1061,11 +1089,6 @@ where
             if committed != Some(expected) || effective != Some(expected) {
                 return StepOutcome::MembershipMoved;
             }
-            let convergence = Convergence {
-                since,
-                voters,
-                membership,
-            };
             report_outcome(source.report(convergence).await, since)
         })
     }
@@ -1216,6 +1239,37 @@ where
             *status != before
         });
     }
+}
+
+/// Whether a negative control turned off `defence` here, noting that it
+/// decided the outcome when it did.
+fn defence_off(defence: Defence) -> bool {
+    let off = ursula_stream::sim_controls::off(defence);
+    if off {
+        ursula_stream::sim_controls::note_fired(defence);
+    }
+    off
+}
+
+/// Whether membership steps run without their CAS (`Defence::MembershipCas`
+/// off): a step planned in an earlier leadership or from an older
+/// membership then changes the membership as it is.
+fn unguarded_changes() -> bool {
+    defence_off(Defence::MembershipCas)
+}
+
+/// Whether a view counts as confirmed without a meta read barrier
+/// (`Defence::PlacementBarrier` off): a leader whose meta replica lags then
+/// adds the voters of a placement meta has moved past.
+fn unconfirmed_counts() -> bool {
+    defence_off(Defence::PlacementBarrier)
+}
+
+/// Whether reports go without the leadership proof
+/// (`Defence::ConvergeLeadershipProof` off): a deposed leader then reports
+/// a membership a later leader has changed.
+fn unproven_reports() -> bool {
+    defence_off(Defence::ConvergeLeadershipProof)
 }
 
 enum Event {

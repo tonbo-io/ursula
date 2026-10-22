@@ -232,6 +232,7 @@ impl RecoveryGate {
                 election: registry.election_policy(),
                 status,
                 steps: registry.reconcile_step_counter(),
+                pauses: registry.pauses().clone(),
             };
             self.push(crate::rt::spawn(
                 shell.run(config.interval, registry.follower_log_reversion_counter()),

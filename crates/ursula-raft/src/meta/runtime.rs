@@ -198,7 +198,7 @@ where
         );
         let handle = MetaHandle::new(me, registry.clone(), transport.clone(), &config.claim)
             .with_root_guard(guard.clone());
-        let pauses = MetaPauses::default();
+        let pauses = registry.pauses().clone();
         let mut runtime = Self {
             reader: MetaStatusReader::new(
                 me,
@@ -340,7 +340,8 @@ where
         &self.reader
     }
 
-    /// The pause points tests stop this runtime at.
+    /// The pause points tests stop this runtime at: its node's pause
+    /// registry ([`RaftGroupHandleRegistry::pauses`]).
     pub fn pauses(&self) -> &MetaPauses {
         &self.pauses
     }
@@ -602,6 +603,7 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
             election: replica.election.clone(),
             status: self.reconcile.clone(),
             steps: replica.registry.reconcile_step_counter(),
+            pauses: replica.registry.pauses().clone(),
         };
         replica.tasks.push(crate::rt::spawn(shell.run(
             self.recovery.interval,

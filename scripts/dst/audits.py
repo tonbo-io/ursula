@@ -677,6 +677,7 @@ EXPECTED_FAMILIES = {
     "snapshot-objects-stay-owned",
     "snapshot-objects-stay-owned-extended",
     "placement-move",
+    "placement-move-extended",
     "identity-fence",
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}

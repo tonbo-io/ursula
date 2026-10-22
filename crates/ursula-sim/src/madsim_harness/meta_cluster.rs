@@ -5,8 +5,10 @@
 //!
 //! A node opens its meta journal before its data replicas, as the server's
 //! spawn path does, so a lost meta journal over data history is told apart
-//! from a new one. The data and meta planes share the cluster's one network
-//! policy, so a partition cuts both. The data replicas are static, every
+//! from a new one. A fenced cluster's data and meta planes share one
+//! network policy, so a partition cuts both. Every other cluster's meta
+//! plane has a policy of its own ([`MetaCluster::meta_policy`]), so a
+//! partition of one plane leaves the other. The data replicas are static, every
 //! node a voter of every data group, or placed, opened by each node's
 //! hosting driver ([`Hosting`]). The meta voters are the claim's.
 
@@ -110,6 +112,11 @@ const SNAPSHOTS: MetaSnapshotTrigger = MetaSnapshotTrigger {
 /// The claim of a cluster of `nodes` nodes, `1..=nodes`, with `meta_voters`,
 /// over the cluster's data groups at replication factor 3.
 pub(super) fn claim(nodes: u64, meta_voters: &[u64]) -> GenesisClaim {
+    claim_with_factor(nodes, meta_voters, 3)
+}
+
+/// [`claim`] at replication factor `factor`.
+pub(super) fn claim_with_factor(nodes: u64, meta_voters: &[u64], factor: u8) -> GenesisClaim {
     let ids = |ids: &mut dyn Iterator<Item = u64>| ids.map(NodeId::new).collect::<BTreeSet<_>>();
     GenesisClaim {
         meta_voters: VoterSet::new(ids(&mut meta_voters.iter().copied())).expect("meta voters"),
@@ -118,22 +125,25 @@ pub(super) fn claim(nodes: u64, meta_voters: &[u64]) -> GenesisClaim {
             NonZeroU32::new(u32::try_from(JOURNAL_GROUPS.len()).expect("group count"))
                 .expect("groups"),
         ),
-        replication_factor: ReplicationFactor::new(NonZeroU8::new(3).expect("factor")),
+        replication_factor: ReplicationFactor::new(NonZeroU8::new(factor).expect("factor")),
     }
 }
 
 /// The meta recovery transport of one node process: the genesis probe,
 /// meta barriers and forwarded control commands over the meta plane's
 /// in-process registry, and the data barriers its hosting driver's
-/// membership asker sends over each data group's, cut off by the network
-/// policy. A fenced cluster's process makes every call as itself
-/// ([`InProcessCaller`]).
+/// membership asker sends over each data group's, each cut off by its own
+/// plane's network policy. A fenced cluster's process makes every call as
+/// itself ([`InProcessCaller`]).
 #[derive(Clone)]
 pub(super) struct MetaTransport {
     registry: InProcessMetaRegistry,
     /// The in-process network of each data group.
     data: BTreeMap<u32, InProcessRaftRegistry>,
-    policy: InProcessRaftNetworkPolicy,
+    /// The data plane's policy, which judges the data barriers.
+    data_policy: InProcessRaftNetworkPolicy,
+    /// The meta plane's policy, which judges every other call.
+    meta_policy: InProcessRaftNetworkPolicy,
     caller: InProcessCaller,
 }
 
@@ -147,14 +157,14 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
     type Error = RecoveryProbeError;
 
     async fn probe(&self, peer: u64) -> Option<PeerGroupLog> {
-        if self.policy.partitioned(self.node_id(), peer) {
+        if self.meta_policy.partitioned(self.node_id(), peer) {
             return None;
         }
         self.registry.probe(&self.caller, peer).await
     }
 
     async fn genesis_probe(&self, peer: u64, probe: &GenesisProbe) -> Option<PeerGroupLog> {
-        if self.policy.partitioned(self.node_id(), peer) {
+        if self.meta_policy.partitioned(self.node_id(), peer) {
             return None;
         }
         self.registry
@@ -169,9 +179,10 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
                 .data
                 .get(&group.0)
                 .ok_or(RecoveryProbeError::Partitioned)?;
-            return in_process_barrier(registry, &self.policy, &self.caller, leader, target).await;
+            return in_process_barrier(registry, &self.data_policy, &self.caller, leader, target)
+                .await;
         }
-        if self.policy.partitioned(self.node_id(), leader) {
+        if self.meta_policy.partitioned(self.node_id(), leader) {
             return Err(RecoveryProbeError::Partitioned);
         }
         self.registry
@@ -185,7 +196,7 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
         leader: u64,
         command: ControlCommand,
     ) -> Result<ControlResponse, MetaForwardError> {
-        if self.policy.partitioned(self.node_id(), leader) {
+        if self.meta_policy.partitioned(self.node_id(), leader) {
             return Err(MetaForwardError::leader_unreachable());
         }
         self.registry
@@ -231,6 +242,9 @@ pub(super) struct MetaCluster {
     /// The meta pause point the next meta runtime started closes at once
     /// ([`Self::pause_next_start`]).
     pause_next: Option<MetaPausePoint>,
+    /// The meta plane's network policy: the data plane's for a fenced
+    /// cluster, else one of its own.
+    pub(super) meta_policy: InProcessRaftNetworkPolicy,
 }
 
 /// The processes of a fenced cluster: each node's runs start behind a disk
@@ -310,6 +324,7 @@ impl MetaCluster {
             placed: (hosting == Hosting::Placed).then(Placed::default),
             fenced: None,
             pause_next: None,
+            meta_policy: InProcessRaftNetworkPolicy::default(),
         };
         cluster.start_nodes(nodes, hosting).await;
         cluster
@@ -337,6 +352,7 @@ impl MetaCluster {
                 lease,
             });
         }
+        let meta_policy = data.policy.clone();
         let mut cluster = Self {
             data,
             meta: InProcessMetaRegistry::default(),
@@ -349,6 +365,7 @@ impl MetaCluster {
                 started: BTreeMap::new(),
             }),
             pause_next: None,
+            meta_policy,
         };
         cluster.start_nodes(nodes, Hosting::Placed).await;
         cluster
@@ -627,7 +644,7 @@ impl MetaCluster {
         }
         let mut network = InProcessMetaNetworkFactory::new(self.meta.clone())
             .with_source(node_id)
-            .with_policy(self.data.policy.clone());
+            .with_policy(self.meta_policy.clone());
         if let Some(process) = process {
             network = network.with_process(process, registry.clone());
         }
@@ -765,13 +782,14 @@ impl MetaCluster {
                 process,
                 self.registry(node_id).peer_cluster().clone(),
             )
-            .with_policy(self.data.policy.clone()),
+            .with_policy(self.meta_policy.clone()),
             None => InProcessCaller::node(node_id),
         };
         MetaTransport {
             registry: self.meta.clone(),
             data: self.data.group_registry_map(),
-            policy: self.data.policy.clone(),
+            data_policy: self.data.policy.clone(),
+            meta_policy: self.meta_policy.clone(),
             caller,
         }
     }

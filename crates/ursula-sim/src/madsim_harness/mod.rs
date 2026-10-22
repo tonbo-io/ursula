@@ -303,7 +303,7 @@ impl SimSchedule {
         if SNAPSHOT_OBJECTS_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned);
         }
-        if PLACEMENT_MOVE_SEEDS.contains(&seed) {
+        if PLACEMENT_MOVE_SEEDS.contains(&seed) || PLACEMENT_MOVE_EXTENDED_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::PlacementMove);
         }
         if IDENTITY_FENCE_SEEDS.contains(&seed) {
@@ -371,6 +371,7 @@ pub const HTTP_PROTOCOL_SURFACE_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> 
 pub const ROUTING_BEFORE_BODY_SEEDS: std::ops::RangeInclusive<u64> = 500..=504;
 pub const SNAPSHOT_OBJECTS_SEEDS: std::ops::RangeInclusive<u64> = 546..=549;
 pub const PLACEMENT_MOVE_SEEDS: std::ops::RangeInclusive<u64> = 1100..=1109;
+pub const PLACEMENT_MOVE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1120..=1159;
 pub const IDENTITY_FENCE_SEEDS: std::ops::RangeInclusive<u64> = 1110..=1119;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
@@ -589,6 +590,7 @@ mod membership_rollback;
 mod meta_checks;
 mod meta_cluster;
 mod placed_hosting;
+mod placed_moves;
 mod placement_move;
 mod recovery_wiring;
 mod routing;

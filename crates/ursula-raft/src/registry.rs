@@ -240,6 +240,8 @@ pub struct RaftGroupHandleRegistry {
     meta_changes: Arc<crate::rt::sync::watch::Sender<()>>,
     /// Each data group's left mark, for the run (`crate::voter`).
     left_marks: crate::LeftMarks,
+    /// This node process's one pause registry ([`crate::meta::pause`]).
+    pauses: crate::meta::pause::MetaPauses,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -270,6 +272,7 @@ impl Default for RaftGroupHandleRegistry {
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             meta_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             left_marks: crate::LeftMarks::default(),
+            pauses: crate::meta::pause::MetaPauses::default(),
         }
     }
 }
@@ -1373,6 +1376,13 @@ impl RaftGroupHandleRegistry {
     /// This node's left marks, which its data replicas bind at attach.
     pub(crate) fn left_marks(&self) -> &crate::LeftMarks {
         &self.left_marks
+    }
+
+    /// This node process's pause points, which its meta runtime and the
+    /// reconcile shells of its replicas wait at
+    /// ([`crate::meta::pause::MetaPauses`]).
+    pub fn pauses(&self) -> &crate::meta::pause::MetaPauses {
+        &self.pauses
     }
 
     /// This node's latest placement view, while the stamp of its last meta

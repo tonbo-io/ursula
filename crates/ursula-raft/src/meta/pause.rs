@@ -1,13 +1,15 @@
-//! Pause points of the meta runtime, for tests and simulations that stop
-//! it at a step and act while it waits there, as a data group's
-//! `pause_plans_after_the_fence` does for plans.
+//! A node's one pause registry, for tests and simulations that stop the
+//! node at a step and act while it waits there, as a data group's
+//! `pause_plans_after_the_fence` does for plans: the meta runtime's steps
+//! and the step of every replica's membership reconcile shell. The node's
+//! registry holds it ([`crate::RaftGroupHandleRegistry::pauses`]), so its
+//! meta runtime and every replica it opens share it, and a new process
+//! starts with none closed.
 //!
 //! [`MetaPauses::pause`] (tests, simulations and the `fault-injection`
 //! feature only) closes a point: every later pass waits there until the
 //! returned semaphore has a permit. Elsewhere a pass never waits.
 
-#[cfg(any(test, madsim, feature = "fault-injection"))]
-use std::collections::BTreeMap;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
 use std::sync::Arc;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
@@ -15,11 +17,14 @@ use std::sync::Mutex;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
 use std::sync::PoisonError;
 
+use ursula_proto::placement::StepKind;
+use ursula_shard::RaftTarget;
+
 #[cfg(any(test, madsim, feature = "fault-injection"))]
 use crate::rt::sync::Semaphore;
 
-/// A step of the meta runtime a test can hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A step of the node a test can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetaPausePoint {
     /// Before the node submits its registration.
     Registration,
@@ -33,13 +38,21 @@ pub enum MetaPausePoint {
     RestartStopped,
     /// In a recovery plan's restart, once the new replica opened.
     RestartReopened,
+    /// In the reconcile shell of `target`'s replica, once it planned a step
+    /// of kind `step` and published it, before the step runs: a held step
+    /// runs as it was planned, whatever changed while it waited.
+    ShellStep { target: RaftTarget, step: StepKind },
 }
 
-/// The meta runtime's pause points (see the module docs).
+/// Each closed point with the semaphore its passes wait on.
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+type Points = Vec<(MetaPausePoint, Arc<Semaphore>)>;
+
+/// The node's pause points (see the module docs).
 #[derive(Debug, Clone, Default)]
 pub struct MetaPauses {
     #[cfg(any(test, madsim, feature = "fault-injection"))]
-    points: Arc<Mutex<BTreeMap<MetaPausePoint, Arc<Semaphore>>>>,
+    points: Arc<Mutex<Points>>,
 }
 
 impl MetaPauses {
@@ -48,11 +61,19 @@ impl MetaPauses {
     #[cfg(any(test, madsim, feature = "fault-injection"))]
     pub fn pause(&self, point: MetaPausePoint) -> Arc<Semaphore> {
         let pause = Arc::new(Semaphore::new(0));
-        self.points
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(point, Arc::clone(&pause));
+        let mut points = self.points.lock().unwrap_or_else(PoisonError::into_inner);
+        points.retain(|(held, _)| *held != point);
+        points.push((point, Arc::clone(&pause)));
         pause
+    }
+
+    /// Opens `point` for every pass, those waiting there included.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub fn release(&self, point: MetaPausePoint) {
+        let points = self.points.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, pause)) = points.iter().find(|(held, _)| *held == point) {
+            pause.add_permits(1);
+        }
     }
 
     /// Waits at `point` while it is closed.
@@ -63,8 +84,9 @@ impl MetaPauses {
                 .points
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .get(&point)
-                .cloned();
+                .iter()
+                .find(|(held, _)| *held == point)
+                .map(|(_, pause)| Arc::clone(pause));
             if let Some(pause) = pause {
                 drop(pause.acquire().await);
             }
