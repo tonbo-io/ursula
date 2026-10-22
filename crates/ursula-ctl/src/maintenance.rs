@@ -30,13 +30,13 @@ use crate::view::read_view;
 /// A timeout measured from its start. Comparing elapsed time cannot overflow
 /// the way `Instant::now() + timeout` does for an operator-supplied timeout.
 #[derive(Debug, Clone, Copy)]
-struct Deadline {
+pub(crate) struct Deadline {
     started: Instant,
     timeout: Duration,
 }
 
 impl Deadline {
-    fn after(timeout: Duration) -> Self {
+    pub(crate) fn after(timeout: Duration) -> Self {
         Self {
             started: Instant::now(),
             timeout,
@@ -47,7 +47,7 @@ impl Deadline {
         now.saturating_duration_since(self.started) >= self.timeout
     }
 
-    fn is_reached(&self) -> bool {
+    pub(crate) fn is_reached(&self) -> bool {
         self.reached_at(Instant::now())
     }
 }

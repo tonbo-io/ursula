@@ -348,7 +348,7 @@ pub(crate) fn is_transport_failure(error: &reqwest::Error) -> bool {
 /// `metrics_url`, else `client_url`, else `admin_url`. The client and admin
 /// planes serve them, so the rollout's Pod-bound admin tunnel suffices. The
 /// Raft `http_url` is never used: a node's cluster listener serves neither.
-fn metrics_base_url(node: &NodeInfo) -> &url::Url {
+pub(crate) fn metrics_base_url(node: &NodeInfo) -> &url::Url {
     node.metrics_url
         .as_ref()
         .or(node.client_url.as_ref())
