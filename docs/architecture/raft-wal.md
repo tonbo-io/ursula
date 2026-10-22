@@ -97,9 +97,7 @@ one, and so does a counter at its last value. An empty disk is the way back.
 A new root is `unbound`. The first answer of the meta group to its
 registration records it `bound` in `identity.bin`, synced, before the run acts
 on that answer, and it stays bound across restarts (see Roots in meta and disk
-replacement in cluster-membership.md). An `identity.bin` written by a 0.10
-development build before this field existed does not decode, and the start
-refuses with the file's read error. An empty disk is the way back there too.
+replacement in cluster-membership.md).
 
 Every segment starts with a 32-byte header, and every record is a frame:
 

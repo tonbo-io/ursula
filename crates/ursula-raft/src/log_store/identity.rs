@@ -159,23 +159,48 @@ pub(super) fn write(root: &Path, file: &IdentityFile) -> Result<(), RaftWalError
     .map_err(RaftWalError::RecordIdentity)
 }
 
-/// An identity file with distinct values in its fields, for the
-/// persisted-envelopes fixture. It decodes to the file it was encoded from
+/// One identity file of each [`RootStanding`], by its persisted-envelopes
+/// fixture name, each with its own run and wait. A new standing fails to
+/// compile here until it has a sample.
+#[cfg(test)]
+fn sample_identities() -> [(&'static str, IdentityFile); 2] {
+    let samples = [
+        ("identity_file", IdentityFile {
+            run: 7,
+            predecessor_wait: true,
+            standing: RootStanding::Bound,
+        }),
+        ("identity_file_unbound", IdentityFile {
+            run: 8,
+            predecessor_wait: false,
+            standing: RootStanding::Unbound,
+        }),
+    ];
+    for (_, file) in &samples {
+        match file.standing {
+            RootStanding::Unbound | RootStanding::Bound => {}
+        }
+    }
+    samples
+}
+
+/// The identity files of [`sample_identities`], encoded, for the
+/// persisted-envelopes fixture. Each decodes to the file it was encoded from
 /// and re-encodes to the same bytes.
 #[cfg(test)]
-pub(crate) fn sample_file() -> Vec<u8> {
-    let file = IdentityFile {
-        run: 7,
-        predecessor_wait: true,
-        standing: RootStanding::Bound,
-    };
-    let bytes = state_file::encode(StateFileKind::Identity, &file);
-    let decoded: IdentityFile =
-        state_file::decode(StateFileKind::Identity, Path::new(IDENTITY_FILE), &bytes)
-            .expect("the sample decodes");
-    assert_eq!(decoded, file);
-    assert_eq!(state_file::encode(StateFileKind::Identity, &decoded), bytes);
-    bytes
+pub(crate) fn sample_files() -> Vec<(&'static str, Vec<u8>)> {
+    sample_identities()
+        .into_iter()
+        .map(|(name, file)| {
+            let bytes = state_file::encode(StateFileKind::Identity, &file);
+            let decoded: IdentityFile =
+                state_file::decode(StateFileKind::Identity, Path::new(IDENTITY_FILE), &bytes)
+                    .expect("the sample decodes");
+            assert_eq!(decoded, file);
+            assert_eq!(state_file::encode(StateFileKind::Identity, &decoded), bytes);
+            (name, bytes)
+        })
+        .collect()
 }
 
 #[cfg(all(test, not(madsim)))]
@@ -190,7 +215,8 @@ mod tests {
     use super::IDENTITY_FILE;
     use super::IdentityFile;
     use super::RootStanding;
-    use super::sample_file;
+    use super::sample_files;
+    use super::sample_identities;
     use super::state_file;
     use super::state_file::StateFileKind;
     use crate::JournalTuning;
@@ -422,19 +448,20 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"URSWIDNT");
     }
 
-    /// A WAL root records its identity file as the persisted-envelopes
-    /// fixture's sample holds it ([`sample_file`]).
+    /// A WAL root records its identity file of each standing as the
+    /// persisted-envelopes fixture's sample holds it ([`sample_files`]).
     #[test]
     fn a_recorded_identity_file_is_the_fixture_sample() {
-        let dir = tempfile::tempdir().unwrap();
-        record(dir.path(), &IdentityFile {
-            run: 7,
-            predecessor_wait: true,
-            standing: RootStanding::Bound,
-        });
-        assert_eq!(
-            std::fs::read(dir.path().join(IDENTITY_FILE)).unwrap(),
-            sample_file()
-        );
+        let encoded = sample_files();
+        for ((name, file), (encoded_name, bytes)) in sample_identities().iter().zip(&encoded) {
+            assert_eq!(name, encoded_name);
+            let dir = tempfile::tempdir().unwrap();
+            record(dir.path(), file);
+            assert_eq!(
+                &std::fs::read(dir.path().join(IDENTITY_FILE)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
     }
 }
