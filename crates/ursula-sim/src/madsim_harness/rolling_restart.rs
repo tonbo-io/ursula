@@ -252,6 +252,10 @@ impl RollingRestartValidator {
                             recovery: None,
                             leads_live: false,
                             reconcile: None,
+                            needs_vote_floor: self
+                                .registry
+                                .rejoin(node_id)
+                                .is_some_and(|rejoin| rejoin.needs_vote_floor()),
                             recovery_gate: self
                                 .registry
                                 .rejoin(node_id)

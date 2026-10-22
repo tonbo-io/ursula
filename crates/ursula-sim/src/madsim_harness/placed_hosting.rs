@@ -37,6 +37,8 @@ use futures_util::lock::Mutex as AsyncMutex;
 use openraft::Raft;
 use openraft::ServerState;
 use openraft::storage::RaftLogReader;
+use ursula_ctl::recovery::Floor;
+use ursula_ctl::recovery::FloorError;
 use ursula_ctl::recovery::LoopState;
 use ursula_ctl::recovery::PlanError;
 use ursula_ctl::recovery::PlanMember;
@@ -44,7 +46,6 @@ use ursula_ctl::recovery::PlanTransport;
 use ursula_ctl::recovery::RecoverError;
 use ursula_ctl::recovery::RecoverOutcome;
 use ursula_ctl::recovery::SendError;
-use ursula_proto::admin::PlanFloor;
 use ursula_proto::admin::RecoveryPlanRefused;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
@@ -954,12 +955,36 @@ impl MetaCluster {
             .collect()
     }
 
+    /// The floor `ursulactl recover-group` plans data group `group` with
+    /// (`group_floor`), from the view of the first running node that
+    /// confirms one, as the tool asks the manifest's nodes in turn.
+    async fn data_floor(&self, group: u32) -> Result<Floor, FloorError> {
+        let mut confirmed = None;
+        for runtime in self.runtimes.values() {
+            if let Ok(status) = runtime.status_reader().confirmed_placement_status().await {
+                confirmed = Some(status.view);
+                break;
+            }
+        }
+        ursula_ctl::recovery::group_floor(group, confirmed.as_ref())
+    }
+
     /// `ursulactl recover-group --accept-loss` for each data group after a
-    /// meta plan, as the operations order has it (meta first): over the
-    /// group's running seed voters, the tool's rounds until its plan is
-    /// satisfied, or until it finds the group healthy.
+    /// meta plan, as the operations order has it (meta first): the floor
+    /// the tool reads from a confirmed view, then over the group's running
+    /// seed voters, the tool's rounds until its plan is satisfied, or until
+    /// it finds the group healthy.
     pub(super) async fn recover_data(&mut self, trace: &mut SimTrace, after_event: &str) {
         for group in JOURNAL_GROUPS {
+            let floor = match self.data_floor(group).await {
+                Ok(floor) => floor,
+                Err(error) => fail(
+                    trace,
+                    DATA_PLAN,
+                    after_event,
+                    format!("group {group} has no plan floor after the meta plan: {error}"),
+                ),
+            };
             let nodes: Vec<u64> = self
                 .seeds(group)
                 .into_iter()
@@ -974,7 +999,7 @@ impl MetaCluster {
                     cluster: self,
                     group,
                 };
-                match recover_round(&mut state, &members, &mut transport, PlanFloor::Seeded).await {
+                match recover_round(&mut state, &members, &mut transport, &floor).await {
                     Ok(Some(_))
                     | Err(MetaRecoverFailed::NoPlan {
                         outcome: RecoverOutcome::Healthy,

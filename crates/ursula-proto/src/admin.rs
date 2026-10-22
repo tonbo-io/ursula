@@ -119,9 +119,12 @@ pub struct RecoveryPlanRequest {
     pub floor: PlanFloor,
     /// With a cut whose `point` is above the plan leader's own commit
     /// marker: the id of the entry at `point`, which another replica reported
-    /// committed (#613). The leader keeps its log up to `point` only if it
-    /// holds exactly that entry; every other member cuts to its own commit
-    /// marker as always.
+    /// committed (#613), or under a `certified` floor the certified entry.
+    /// The leader keeps its log up to `point` only if it holds exactly that
+    /// entry. Every other member cuts to its own commit marker, except that
+    /// under a `certified` floor a member whose marker lies below the
+    /// certified entry and that holds it at or below `point` keeps its log
+    /// up to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub point_entry: Option<EntryId>,
     /// This replica's log as the tool read it.
@@ -136,11 +139,28 @@ pub struct RecoveryPlanRequest {
 /// - `seeded`: a plan of a data group that a confirmed meta view shows
 ///   seeded, so no membership change of the group was ever certified and
 ///   nothing above the plan's own cut needs keeping.
+/// - `certified`: a plan of a data group that a confirmed meta view shows
+///   live, with the membership entry its last convergence certified
+///   committed (`converged_at`). The plan keeps it: its leader must hold
+///   it at or below the plan's point
+///   ([`RecoveryPlanRefusal::FloorNotHeld`]), and every member that holds
+///   it keeps it through a cut as if its commit marker reached it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanFloor {
     Meta,
     Seeded,
+    Certified(crate::placement::MembershipLogId),
+}
+
+impl PlanFloor {
+    /// The membership entry the plan keeps, for a `certified` floor.
+    pub fn certified(self) -> Option<crate::placement::MembershipLogId> {
+        match self {
+            Self::Certified(entry) => Some(entry),
+            Self::Meta | Self::Seeded => None,
+        }
+    }
 }
 
 /// The id of one log entry: its leader's term and node, and its index is
@@ -238,8 +258,14 @@ pub enum RecoveryPlanRefusal {
     /// this replica: the term did not come from the plan's leader.
     PlanTermBelowVote,
     /// The plan's `floor` is of the other plane: `meta` sent to a data
-    /// group, or `seeded` sent to the meta group. It changed nothing.
+    /// group, or `seeded` or `certified` sent to the meta group. It changed
+    /// nothing.
     FloorOtherPlane,
+    /// The plan's floor is `certified` and this replica, the plan's leader,
+    /// does not hold that membership entry at or below the plan's point. It
+    /// changed nothing. Another replica may hold it: the tool leaves this
+    /// one out and plans again.
+    FloorNotHeld,
 }
 
 /// Whether a replica's voter sets, of its effective membership and of the
@@ -260,7 +286,8 @@ impl RecoveryPlanRefusal {
     /// needs a quorum's proof first, and a step that is not the replica's
     /// is a bug in the tool, as is a floor of the other plane.
     /// `leader_not_voter` is not one: a plan read from the current
-    /// membership names another leader (#613).
+    /// membership names another leader (#613). Nor is `floor_not_held`:
+    /// another replica may hold the certified entry and lead.
     pub fn no_plan_fixes(&self) -> bool {
         matches!(
             self,
@@ -389,7 +416,23 @@ mod tests {
             serde_json::to_string(&lead).unwrap(),
             r#"{"leader":2,"point":12,"cut":true,"step":{"lead":{"highest_term":8}},"floor":"meta","expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
-        for request in [plan, lead] {
+        // A live group's floor names the membership entry its last
+        // convergence certified, as the placement view writes it.
+        let certified = RecoveryPlanRequest {
+            floor: super::PlanFloor::Certified(crate::placement::MembershipLogId::new(
+                crate::placement::RaftLogId {
+                    term: 6,
+                    leader: crate::placement::NodeId::new(4),
+                    index: 11,
+                },
+            )),
+            ..plan
+        };
+        assert_eq!(
+            serde_json::to_string(&certified).unwrap(),
+            r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"floor":{"certified":{"term":6,"leader":4,"index":11}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        for request in [plan, lead, certified] {
             assert_eq!(
                 serde_json::from_str::<RecoveryPlanRequest>(
                     &serde_json::to_string(&request).unwrap()
@@ -415,6 +458,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&super::RecoveryPlanRefusal::FloorOtherPlane).unwrap(),
             r#"{"reason":"floor_other_plane"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RecoveryPlanRefusal::FloorNotHeld).unwrap(),
+            r#"{"reason":"floor_not_held"}"#
         );
         let report = RecoveryPlanReport {
             raft_group_id: 4,
@@ -1072,6 +1119,10 @@ pub struct RaftGroupMetrics {
     /// failure.
     #[serde(deserialize_with = "Option::deserialize")]
     pub reconcile: Option<crate::placement::ReconcileStatus>,
+    /// The replica lost its vote and holds no vote floor yet: it refuses
+    /// every recovery plan (`missing_vote_floor`) until a live leader's
+    /// barrier proves a vote, so a plan never counts it.
+    pub needs_vote_floor: bool,
 }
 
 /// The history event a replica applied last.
@@ -1161,6 +1212,7 @@ mod metrics_contract_tests {
                 recovery_gate: RecoveryGateStatus::Open,
                 leads_live: false,
                 reconcile: None,
+                needs_vote_floor: false,
             }],
         }
     }

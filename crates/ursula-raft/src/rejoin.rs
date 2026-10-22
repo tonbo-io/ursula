@@ -187,6 +187,26 @@ pub(crate) fn kept_membership_of(
     }
 }
 
+/// The membership entry a plan under a `certified` floor keeps, when this
+/// replica holds it at or below the plan's point (design 7.4). A member
+/// that holds it keeps it through a cut as if its commit marker reached it,
+/// and the plan's leader refuses a plan it cannot keep it under
+/// ([`RecoveryGateError::FloorNotHeld`]).
+fn certified_held(
+    plan: &RecoveryPlanRequest,
+    store: &RaftGroupFileLogStore,
+) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+    let certified = reconcile::openraft_log_id(plan.floor.certified()?);
+    (certified.index() <= plan.point
+        && store
+            .last_held_index()
+            .is_some_and(|last| last >= certified.index())
+        && store
+            .committed_conflict(certified.index(), [certified], false)
+            .is_none())
+    .then_some(certified)
+}
+
 /// The log id a cutting plan's leader keeps when the plan names the entry
 /// at its point ([`RecoveryPlanRequest::point_entry`]).
 fn point_log_id(plan: &RecoveryPlanRequest) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
@@ -765,11 +785,21 @@ pub enum RecoveryGateError {
     },
     #[error(
         "{group}'s recovery plan carries the floor {floor:?} of the other plane: a data \
-         group takes `seeded`, the meta group `meta`"
+         group takes `seeded` or `certified`, the meta group `meta`"
     )]
     FloorOtherPlane {
         group: RaftTarget,
         floor: ursula_proto::admin::PlanFloor,
+    },
+    #[error(
+        "{group}'s recovery plan elects this replica with point {point}, but it does not \
+         hold the membership entry {certified} the group's last convergence certified at or \
+         below that point: another replica must lead"
+    )]
+    FloorNotHeld {
+        group: RaftTarget,
+        certified: ursula_proto::placement::MembershipLogId,
+        point: u64,
     },
     #[error("restart {group}'s replica to run its recovery cut: {source}")]
     Restart {
@@ -862,6 +892,7 @@ impl RecoveryGateError {
             Self::SingleVoterCut { .. } => RecoveryPlanRefusal::SingleVoterCut,
             Self::PlanTermBelowVote { .. } => RecoveryPlanRefusal::PlanTermBelowVote,
             Self::FloorOtherPlane { .. } => RecoveryPlanRefusal::FloorOtherPlane,
+            Self::FloorNotHeld { .. } => RecoveryPlanRefusal::FloorNotHeld,
             Self::NotRegistered { .. } => return PlanAnswer::NotRegistered,
             // A restart that failed for a reason that passes is retryable,
             // as one refused while the group's previous engine still stops
@@ -1381,7 +1412,10 @@ impl GroupRejoin {
             .is_some_and(|store| store.log_state().is_initialized())
     }
 
-    pub(crate) fn needs_vote_floor(&self) -> bool {
+    /// Whether this replica lost its vote and holds no vote floor yet: it
+    /// refuses every recovery plan until a live leader's barrier proves a
+    /// vote, and its metrics say so (`needs_vote_floor`).
+    pub fn needs_vote_floor(&self) -> bool {
         self.vote_floor
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2060,6 +2094,20 @@ impl GroupRejoin {
                 applied,
             });
         }
+        // Design 7.4: under a certified floor the plan's leader holds the
+        // membership entry the group's last convergence certified, so no
+        // plan drops a membership that teardowns may have followed.
+        let certified = certified_held(plan, &store);
+        if leads
+            && let Some(entry) = plan.floor.certified()
+            && certified.is_none()
+        {
+            return Err(RecoveryGateError::FloorNotHeld {
+                group,
+                certified: entry,
+                point: plan.point,
+            });
+        }
         // The plan's leader continues from the point: its last entry, or
         // with a cut its committed one, or with a cut to a later entry
         // another replica reported committed (#613), exactly that entry.
@@ -2135,7 +2183,10 @@ impl GroupRejoin {
                 drop(pause.acquire().await);
             }
         }
-        match self.take_plan(plan, &store, core, leads, cut_restart).await {
+        match self
+            .take_plan(plan, &store, core, leads, cut_restart, certified)
+            .await
+        {
             Ok((record, restart)) => {
                 drop(store);
                 if !restart {
@@ -2163,7 +2214,8 @@ impl GroupRejoin {
     /// through the core, takes the plan term on the plan's leader, and
     /// records the plan. Returns the record and whether the group restarts
     /// before the answer: to run the cut, or to demote a replica that leads
-    /// or campaigns (M2, #581 review).
+    /// or campaigns (M2, #581 review). `certified` is the certified
+    /// membership entry this replica holds ([`certified_held`]).
     async fn take_plan(
         &self,
         plan: &RecoveryPlanRequest,
@@ -2171,6 +2223,7 @@ impl GroupRejoin {
         core: &dyn PlanCore,
         leads: bool,
         cut_restart: bool,
+        certified: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     ) -> Result<(RecoveryRecord, bool), RecoveryGateError> {
         let group = self.group;
         // B1 (#581 review): the committed entry the cut keeps is read
@@ -2206,9 +2259,16 @@ impl GroupRejoin {
             // The plan's leader keeps up to a later entry another replica
             // reported committed, when it holds exactly that entry (#613):
             // the cut then never lands below a reached replica's commit.
-            let keep = match raised {
-                Some(keep) => keep,
-                None => state
+            // A replica holding the certified membership entry above its
+            // commit marker keeps that entry as committed (design 7.4).
+            let keep = match (raised, certified) {
+                (Some(keep), _) => keep,
+                (None, Some(certified))
+                    if committed.is_none_or(|index| index < certified.index()) =>
+                {
+                    certified
+                }
+                (None, _) => state
                     .committed
                     .ok_or(RecoveryGateError::NothingCommitted { group })?,
             };

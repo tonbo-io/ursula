@@ -1277,6 +1277,7 @@ pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u
             .clone(),
         committed_voter_configs: cluster.engines[&(group, node_id)].kept_voter_configs(),
         running: true,
+        needs_vote_floor: cluster.rejoins[&(group, node_id)].needs_vote_floor(),
         learner_ids: replica
             .membership_config
             .membership()

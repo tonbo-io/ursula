@@ -443,6 +443,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                     cut_pending: matches!(record.cut, crate::log_store::PlanCut::Pending { .. }),
                 }),
             leads_live: crate::rejoin::leads_live(&metrics),
+            needs_vote_floor: recovery.is_some_and(GroupRejoin::needs_vote_floor),
             recovery_gate: recovery.map_or(
                 ursula_proto::admin::RecoveryGateStatus::Open,
                 GroupRejoin::status,

@@ -814,6 +814,7 @@ mod tests {
             recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
             leads_live: false,
             reconcile: None,
+            needs_vote_floor: false,
         }
     }
 

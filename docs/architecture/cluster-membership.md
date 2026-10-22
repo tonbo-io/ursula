@@ -238,7 +238,7 @@ and answer `400` for `meta`:
 | `POST /__ursula/raft/{target}/leader/transfer/{node}` | Transfer leadership. |
 | `GET /__ursula/raft/{target}/quorum` | Confirm a fresh quorum prefix for this group. |
 | `POST /__ursula/raft/{target}/self-election` | Start an election on this replica while its term is unchanged. |
-| `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` | Take a recovery plan for a stalled group. Its `floor` names the plane (`meta` or `seeded`), and a floor of the other plane is refused with `floor_other_plane` before the plan runs. |
+| `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` | Take a recovery plan for a stalled group. Its `floor` names the plane (`meta`, or `seeded` or `certified` for a data group), and a floor of the other plane is refused with `floor_other_plane` before the plan runs. A `certified` floor names the membership entry the group's last convergence certified: the plan's leader refuses unless it holds it (`floor_not_held`), and every replica that holds it keeps it through a cut. |
 | `POST /__ursula/raft/{target}/snapshot`, `.../purge` | Build a snapshot or purge the log. |
 | `POST`/`DELETE /__ursula/leadership-shed/maintenance` | Set or clear the maintenance-drain mark. |
 | `POST /__ursula/placement/nodes/{node}/replace-disk` | Release the root the node id is bound to, given as `{"expect_root": R}` (section 2). |

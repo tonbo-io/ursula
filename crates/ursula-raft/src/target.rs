@@ -85,9 +85,10 @@ pub(crate) trait WireTarget: Sized {
     fn admits(self, command: &RaftCommand) -> bool;
 
     /// Whether a recovery plan of this target may carry `floor`: a data
-    /// group's plan takes `seeded`, the meta group's `meta`. The only plane
-    /// predicate of a plan floor: a plan of the other plane is refused
-    /// before its job runs ([`crate::RecoveryGateError::FloorOtherPlane`]).
+    /// group's plan takes `seeded` or `certified`, the meta group's `meta`.
+    /// The only plane predicate of a plan floor: a plan of the other plane
+    /// is refused before its job runs
+    /// ([`crate::RecoveryGateError::FloorOtherPlane`]).
     fn takes_floor(self, floor: ursula_proto::admin::PlanFloor) -> bool;
 
     /// Writes this target and `target_node` into `request`: the one encoder
@@ -133,8 +134,10 @@ impl WireTarget for RaftTarget {
     fn takes_floor(self, floor: ursula_proto::admin::PlanFloor) -> bool {
         use ursula_proto::admin::PlanFloor;
         match (self, floor) {
-            (Self::Data(_), PlanFloor::Seeded) | (Self::Meta, PlanFloor::Meta) => true,
-            (Self::Data(_), PlanFloor::Meta) | (Self::Meta, PlanFloor::Seeded) => false,
+            (Self::Data(_), PlanFloor::Seeded | PlanFloor::Certified(_))
+            | (Self::Meta, PlanFloor::Meta) => true,
+            (Self::Data(_), PlanFloor::Meta)
+            | (Self::Meta, PlanFloor::Seeded | PlanFloor::Certified(_)) => false,
         }
     }
 

@@ -21,6 +21,7 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
 use ursula_control::MoveLimit;
 use ursula_control::PlacementView;
+use ursula_ctl::recovery::Floor;
 use ursula_ctl::recovery::GroupPlan;
 use ursula_ctl::recovery::LoopState;
 use ursula_ctl::recovery::PlanMember;
@@ -34,7 +35,6 @@ use ursula_ctl::recovery::next_step;
 use ursula_ctl::recovery::plan_sent;
 use ursula_ctl::recovery::send_follows;
 use ursula_ctl::recovery::send_plan;
-use ursula_proto::admin::PlanFloor;
 use ursula_proto::admin::RecoveryPlanRefused;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
@@ -562,7 +562,7 @@ impl MetaCluster {
     ) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
         let members = self.plan_members(nodes);
         let mut transport = MetaPlanTransport { cluster: self };
-        recover_round(state, &members, &mut transport, PlanFloor::Meta).await
+        recover_round(state, &members, &mut transport, &Floor::Meta).await
     }
 }
 
@@ -574,21 +574,22 @@ pub(super) async fn recover_round<T: PlanTransport>(
     state: &mut LoopState,
     members: &[PlanMember],
     transport: &mut T,
-    floor: PlanFloor,
+    floor: &Floor,
 ) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
-    match next_step(state, members, MAX_META_PLANS)? {
+    match next_step(state, members, floor, MAX_META_PLANS)? {
         Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
         Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
         Step::Wait => Ok(None),
         Step::Plan(plan) => {
             state.plans_sent = state.plans_sent.saturating_add(1);
-            let sent = send_plan(transport, plan, floor, members).await;
-            plan_sent(state, plan, sent, &electorate(&plan, members))?;
+            let sent = send_plan(transport, plan, floor.plan_floor(), members).await;
+            plan_sent(state, plan, sent, &electorate(&plan, members, floor))?;
             Ok(None)
         }
         Step::Resume { plan, leader_term } => {
-            let sent = send_follows(transport, plan, floor, leader_term, members).await;
-            plan_sent(state, plan, Ok(sent), &electorate(&plan, members))?;
+            let sent =
+                send_follows(transport, plan, floor.plan_floor(), leader_term, members).await;
+            plan_sent(state, plan, Ok(sent), &electorate(&plan, members, floor))?;
             Ok(None)
         }
     }
