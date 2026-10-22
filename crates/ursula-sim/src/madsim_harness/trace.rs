@@ -820,11 +820,39 @@ pub enum SimEvent {
         linearizable_reads: u64,
         defences_fired: u64,
     },
+    /// In the identity fence's zombie GC, the snapshot object keys the new
+    /// process of `node_id` restored from its records: every other key its
+    /// records name later is one it wrote.
+    SnapshotKeysRestored {
+        node_id: u64,
+        keys: Vec<String>,
+    },
+    /// In the identity fence's zombie cold jobs, what the old process's
+    /// cold-index repair step did once its lease ended.
+    ZombieColdRepair {
+        outcome: ColdRepairOutcome,
+    },
     InvariantFailed {
         invariant: String,
         after_event: String,
         message: String,
     },
+}
+
+/// What one cold-index repair step of a process did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdRepairOutcome {
+    /// It ran as a follower's, repairing nothing: the leader predicate said
+    /// the replica does not lead.
+    NotLeading,
+    /// It ran as a leader's, and a cold store call failed, a refused PUT
+    /// included.
+    Failed,
+    /// It ran as a leader's and rewrote `pages_rewritten` pages.
+    Repaired { pages_rewritten: u64 },
+    /// It did not answer within its timeout.
+    TimedOut,
 }
 
 impl SimEvent {

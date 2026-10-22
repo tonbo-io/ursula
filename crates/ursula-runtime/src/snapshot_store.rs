@@ -981,7 +981,8 @@ pub struct FencedSnapshotStore {
     /// Whether the fence admitted a write of each group when its last LIST
     /// began, noted only while a negative control turns off
     /// `Defence::ObjectWriteCheck`, whose DELETEs read it instead of the
-    /// fence.
+    /// fence. Simulation builds only.
+    #[cfg(madsim)]
     listed: std::sync::Mutex<std::collections::BTreeMap<RaftGroupId, bool>>,
 }
 
@@ -990,6 +991,7 @@ impl FencedSnapshotStore {
         Arc::new(Self {
             inner,
             fence,
+            #[cfg(madsim)]
             listed: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
@@ -1000,27 +1002,60 @@ impl FencedSnapshotStore {
             .check_write(crate::node_fence::FencedObject::Snapshot, operation, path)?)
     }
 
-    fn listed(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<RaftGroupId, bool>> {
-        self.listed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// The check before a DELETE of `object`. A negative control turns it
-    /// off (`Defence::ObjectWriteCheck`), and the DELETE then follows what
-    /// the fence said when its pass's LIST began.
+    /// The check before a DELETE of `object`.
     fn check_delete(&self, object: &OwnedObject) -> Result<(), SnapshotStoreError> {
-        use ursula_stream::sim_controls::Defence;
         let checked = self.check("DELETE", object.path());
-        if checked.is_err() && ursula_stream::sim_controls::off(Defence::ObjectWriteCheck) {
-            let group = object.key().owner().raft_group_id();
-            if self.listed().get(&group).copied().unwrap_or(false) {
-                ursula_stream::sim_controls::note_fired(Defence::ObjectWriteCheck);
-                return Ok(());
-            }
+        if checked.is_err() && self.deletes_by_listing(object) {
+            return Ok(());
         }
         checked
     }
+
+    /// Whether a refused DELETE of `object` follows what the fence said
+    /// when its pass's LIST began: only while a negative control turns off
+    /// `Defence::ObjectWriteCheck`.
+    #[cfg(madsim)]
+    fn deletes_by_listing(&self, object: &OwnedObject) -> bool {
+        use ursula_stream::sim_controls::Defence;
+        if !ursula_stream::sim_controls::off(Defence::ObjectWriteCheck) {
+            return false;
+        }
+        let group = object.key().owner().raft_group_id();
+        let admitted = self
+            .listed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&group)
+            .copied()
+            .unwrap_or(false);
+        if admitted {
+            ursula_stream::sim_controls::note_fired(Defence::ObjectWriteCheck);
+        }
+        admitted
+    }
+
+    #[cfg(not(madsim))]
+    fn deletes_by_listing(&self, _object: &OwnedObject) -> bool {
+        false
+    }
+
+    /// Notes whether the fence admits a write of `raft_group_id` as its
+    /// LIST begins, while a negative control turns off
+    /// `Defence::ObjectWriteCheck`.
+    #[cfg(madsim)]
+    fn note_listing(&self, raft_group_id: RaftGroupId) {
+        if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::ObjectWriteCheck)
+        {
+            let admitted = self.check("LIST", "").is_ok();
+            self.listed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(raft_group_id, admitted);
+        }
+    }
+
+    #[cfg(not(madsim))]
+    fn note_listing(&self, _raft_group_id: RaftGroupId) {}
 }
 
 impl SnapshotStore for FencedSnapshotStore {
@@ -1059,11 +1094,7 @@ impl SnapshotStore for FencedSnapshotStore {
     }
 
     fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing> {
-        if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::ObjectWriteCheck)
-        {
-            let admitted = self.check("LIST", "").is_ok();
-            self.listed().insert(raft_group_id, admitted);
-        }
+        self.note_listing(raft_group_id);
         self.inner.list_own(raft_group_id)
     }
 

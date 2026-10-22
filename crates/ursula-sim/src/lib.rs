@@ -14,6 +14,8 @@ mod madsim_harness;
 pub mod artifact;
 
 #[cfg(madsim)]
+pub use madsim_harness::ColdRepairOutcome;
+#[cfg(madsim)]
 pub use madsim_harness::HttpProtocolSurfacePlan;
 #[cfg(madsim)]
 pub use madsim_harness::LEADER_FAILOVER_SEEDS;

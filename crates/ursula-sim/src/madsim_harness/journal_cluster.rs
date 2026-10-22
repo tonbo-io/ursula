@@ -50,6 +50,8 @@ use ursula_raft::apply_failure::ApplyFault;
 #[cfg(test)]
 use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::ColdStore;
+use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FollowerRead;
@@ -135,6 +137,20 @@ pub(super) fn set_snapshot_store(plan: Option<SnapshotStorePlan>) {
     SNAPSHOT_STORE.with(|store| *store.borrow_mut() = plan);
 }
 
+std::thread_local! {
+    /// Whether the next [`JournalCluster`] on this simulation's thread runs
+    /// a cold store ([`set_cold_store`]).
+    static COLD_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the [`JournalCluster`]s this simulation's thread starts give
+/// their placed replicas one in-memory cold store, each process's handle
+/// behind its node fence as a server's runtime wires it, or none with
+/// `false`.
+pub(super) fn set_cold_store(on: bool) {
+    COLD_STORE.with(|cold| cold.set(on));
+}
+
 /// What a [`JournalCluster`] keeps of its snapshot store.
 pub(super) struct SnapshotObjects {
     pub(super) bucket: MemorySnapshotBucket,
@@ -191,6 +207,9 @@ pub(super) struct ReplicaParts {
     /// The process's snapshot store, behind its node fence, when the
     /// cluster runs one ([`JournalCluster::host_snapshot_objects`]).
     pub(super) snapshot_store: Option<SharedSnapshotStore>,
+    /// The process's cold store, behind its node fence, when the cluster
+    /// runs one ([`JournalCluster::cold_store`]).
+    pub(super) cold_store: Option<ColdStoreHandle>,
 }
 
 /// A replica that did not start: its engine refused to open.
@@ -351,6 +370,9 @@ pub(super) struct JournalCluster {
     /// The snapshot store every node writes its objects to, if any
     /// ([`set_snapshot_store`]).
     pub(super) snapshot_objects: Option<SnapshotObjects>,
+    /// The in-memory cold store every placed replica writes its cold
+    /// objects to, if any ([`set_cold_store`]).
+    cold_objects: Option<ColdStore>,
 }
 
 impl JournalCluster {
@@ -514,6 +536,13 @@ impl JournalCluster {
                 .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
                 .collect(),
             snapshot_objects,
+            cold_objects: COLD_STORE.with(std::cell::Cell::get).then(|| {
+                let store = ColdStore::memory()
+                    .expect("an in-memory cold store")
+                    .without_read_cache();
+                store.set_delay_fn(madsim::time::sleep);
+                store
+            }),
         }
     }
 
@@ -814,7 +843,17 @@ impl JournalCluster {
             process: None,
             snapshots: self.drivers.is_some(),
             snapshot_store: None,
+            cold_store: None,
         }
+    }
+
+    /// The cold store of `node_id`'s current process, behind its node
+    /// fence, if the cluster runs one: every process writes the one
+    /// in-memory store.
+    pub(super) fn cold_store(&self, node_id: u64) -> Option<ColdStoreHandle> {
+        let store = self.cold_objects.as_ref()?;
+        let fence = self.wals[&node_id].raft_wal().fence();
+        Some(Arc::new(store.clone().with_fence(fence)))
     }
 
     /// Readies the snapshot objects of `node_id`'s current process, a

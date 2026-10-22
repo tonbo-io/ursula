@@ -239,7 +239,9 @@ struct FenceState {
     /// A root that the meta group has not bound yet.
     awaits_binding: AtomicBool,
     /// When a bootstrapped cluster's meta group bound this run's unbound
-    /// root, in nanoseconds after `origin`, plus one. 0 for none.
+    /// root, in nanoseconds after `origin`, plus one. 0 for none. Only the
+    /// simulation's checks read it ([`NodeFence::bound_at`]).
+    #[cfg(madsim)]
     bound: AtomicU64,
     /// Wakes the waiters of [`NodeFence::waited`] and
     /// [`NodeFence::bound_and_waited`].
@@ -261,6 +263,7 @@ impl NodeFence {
             superseded: AtomicBool::new(false),
             owes_wait: AtomicBool::new(false),
             awaits_binding: AtomicBool::new(false),
+            #[cfg(madsim)]
             bound: AtomicU64::new(0),
             waited: crate::rt::sync::Notify::new(),
         }))
@@ -457,6 +460,7 @@ impl NodeFence {
     /// ends, so a data replica is never free in between.
     pub fn bind(&self, owes_wait: bool) {
         if owes_wait {
+            #[cfg(madsim)]
             self.0
                 .bound
                 .store(self.nanos(fence_now()).saturating_add(1), Ordering::Release);
@@ -469,6 +473,8 @@ impl NodeFence {
     /// When [`Self::bind`] bound this run's unbound root in a bootstrapped
     /// cluster, the instant the run owes its predecessor wait from. `None`
     /// for a root bound before this run, or by an answer before Bootstrap.
+    /// Simulation introspection only: the fence itself reads the wait.
+    #[cfg(madsim)]
     pub fn bound_at(&self) -> Option<FenceInstant> {
         let bound = self.0.bound.load(Ordering::Acquire).checked_sub(1)?;
         self.0.origin.checked_add(Duration::from_nanos(bound))
