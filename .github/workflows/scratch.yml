@@ -1,0 +1,32 @@
+name: Scratch
+
+on:
+  push:
+    branches:
+      - scratch/**
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scratch:
+    name: Scratch
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
+    timeout-minutes: 300
+    steps:
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Run scratch script
+        run: bash scripts/scratch.sh
