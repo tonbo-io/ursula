@@ -32,8 +32,10 @@ use futures_util::lock::Mutex as AsyncMutex;
 use openraft::Raft;
 use openraft::ServerState;
 use ursula_ctl::recovery::LoopState;
+use ursula_ctl::recovery::PlanError;
 use ursula_ctl::recovery::PlanMember;
 use ursula_ctl::recovery::PlanTransport;
+use ursula_ctl::recovery::RecoverError;
 use ursula_ctl::recovery::RecoverOutcome;
 use ursula_ctl::recovery::SendError;
 use ursula_proto::admin::PlanFloor;
@@ -788,6 +790,11 @@ impl MetaCluster {
                     | Err(MetaRecoverFailed::NoPlan {
                         outcome: RecoverOutcome::Healthy,
                     }) => break,
+                    // A group whose leader outlived the loss needs no plan:
+                    // its gated replicas open through its barrier.
+                    Err(MetaRecoverFailed::Recover(RecoverError::Plan(PlanError::HasLeader {
+                        ..
+                    }))) if state.sent.is_none() => break,
                     Ok(None) if madsim::time::Instant::now() < deadline => {
                         madsim::time::sleep(STEP).await;
                     }
