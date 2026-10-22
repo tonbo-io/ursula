@@ -184,6 +184,13 @@ pub(super) struct ReplicaParts {
     /// process's fence and incarnation and follow its routes
     /// ([`InProcessRaftRegistry::pin_route`]). `None` sends as the node.
     pub(super) process: Option<u64>,
+    /// Whether the node runs the snapshot drivers, so its replicas build
+    /// through its registry's coordinator and keep snapshot records, and,
+    /// with a snapshot store, write their objects to its registry's store.
+    pub(super) snapshots: bool,
+    /// The process's snapshot store, behind its node fence, when the
+    /// cluster runs one ([`JournalCluster::host_snapshot_objects`]).
+    pub(super) snapshot_store: Option<SharedSnapshotStore>,
 }
 
 /// A replica that did not start: its engine refused to open.
@@ -555,9 +562,21 @@ impl JournalCluster {
     /// Starts `node_id`'s snapshot driver, if the nodes run drivers and its
     /// own does not run yet.
     fn start_driver(&mut self, node_id: u64) {
-        if let Some(drivers) = self.drivers
-            && !self.driver_tasks.contains_key(&node_id)
+        if !self.driver_tasks.contains_key(&node_id)
+            && let Some(driver) = self.spawn_snapshot_driver(node_id)
         {
+            self.driver_tasks.insert(node_id, driver);
+        }
+    }
+
+    /// The production snapshot driver of `node_id`'s current process over
+    /// its registry, spawned, if the nodes run drivers. The caller keeps
+    /// its handle and aborts it when the process stops.
+    pub(super) fn spawn_snapshot_driver(
+        &self,
+        node_id: u64,
+    ) -> Option<madsim::task::JoinHandle<()>> {
+        self.drivers.map(|drivers| {
             let max_age = drivers.max_age;
             let driver = ursula::SnapshotDriver::new(
                 &self.node_registries[&node_id],
@@ -574,9 +593,8 @@ impl JournalCluster {
                     max_groups_per_tick: 16,
                 },
             );
-            self.driver_tasks
-                .insert(node_id, madsim::task::spawn(driver.run()));
-        }
+            madsim::task::spawn(driver.run())
+        })
     }
 
     /// How many full snapshots `group`'s leaders sent `node_id`.
@@ -778,12 +796,12 @@ impl JournalCluster {
 
     /// What starting `node_id`'s replicas reads of the cluster, for a node
     /// whose hosting driver starts them (the placement family). A cluster
-    /// with snapshot drivers, a snapshot store or faulty code starts its
-    /// replicas itself.
+    /// with faulty code starts its replicas itself. A hosted process's
+    /// snapshot store is set by [`Self::host_snapshot_objects`].
     pub(super) fn replica_parts(&self, node_id: u64) -> ReplicaParts {
         assert!(
-            self.drivers.is_none() && self.snapshot_objects.is_none() && self.faulty.is_none(),
-            "a hosted replica runs without snapshot drivers, a snapshot store or faulty code"
+            self.faulty.is_none(),
+            "a hosted replica runs without faulty code"
         );
         ReplicaParts {
             node_id,
@@ -794,7 +812,32 @@ impl JournalCluster {
             metrics: self.metrics[&node_id].clone(),
             registry: self.node_registries[&node_id].clone(),
             process: None,
+            snapshots: self.drivers.is_some(),
+            snapshot_store: None,
         }
+    }
+
+    /// Readies the snapshot objects of `node_id`'s current process, a
+    /// hosted one, if the cluster runs a snapshot store: its registry's
+    /// store is the process's, behind its node fence as the engine factory
+    /// wires it, and the records of its groups in its current run are the
+    /// ones the checks read. Answers that store.
+    pub(super) fn host_snapshot_objects(&mut self, node_id: u64) -> Option<SharedSnapshotStore> {
+        let wal = self.wals[&node_id].clone();
+        let registry = self.node_registries[&node_id].clone();
+        let objects = self.snapshot_objects.as_mut()?;
+        let store = ursula_runtime::FencedSnapshotStore::wrap(
+            Arc::new(objects.process(node_id)),
+            wal.raft_wal().fence(),
+        );
+        registry.set_snapshot_store(Some(Arc::clone(&store)));
+        for group in JOURNAL_GROUPS {
+            objects.records.insert(
+                (group, node_id),
+                wal.snapshot_metadata_path(group_placement(group)),
+            );
+        }
+        Some(store)
     }
 
     /// The in-process network of `group`.

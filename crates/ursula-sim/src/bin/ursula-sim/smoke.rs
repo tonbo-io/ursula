@@ -535,7 +535,7 @@ const SEED_FAMILIES: &[SeedFamily] = &[
     SeedFamily {
         name: "identity-fence-extended",
         start: 1160,
-        end: 1161,
+        end: 1162,
         kind: "identity-fence",
         generate: generate_identity_fence,
     },

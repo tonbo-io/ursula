@@ -950,17 +950,48 @@ pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
 pub struct FencedSnapshotStore {
     inner: SharedSnapshotStore,
     fence: crate::NodeFence,
+    /// Whether the fence admitted a write of each group when its last LIST
+    /// began, noted only while a negative control turns off
+    /// `Defence::ObjectWriteCheck`, whose DELETEs read it instead of the
+    /// fence.
+    listed: std::sync::Mutex<std::collections::BTreeMap<RaftGroupId, bool>>,
 }
 
 impl FencedSnapshotStore {
     pub fn wrap(inner: SharedSnapshotStore, fence: crate::NodeFence) -> SharedSnapshotStore {
-        Arc::new(Self { inner, fence })
+        Arc::new(Self {
+            inner,
+            fence,
+            listed: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
     }
 
     fn check(&self, operation: &'static str, path: &str) -> Result<(), SnapshotStoreError> {
         Ok(self
             .fence
             .check_write(crate::node_fence::FencedObject::Snapshot, operation, path)?)
+    }
+
+    fn listed(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<RaftGroupId, bool>> {
+        self.listed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The check before a DELETE of `object`. A negative control turns it
+    /// off (`Defence::ObjectWriteCheck`), and the DELETE then follows what
+    /// the fence said when its pass's LIST began.
+    fn check_delete(&self, object: &OwnedObject) -> Result<(), SnapshotStoreError> {
+        use ursula_stream::sim_controls::Defence;
+        let checked = self.check("DELETE", object.path());
+        if checked.is_err() && ursula_stream::sim_controls::off(Defence::ObjectWriteCheck) {
+            let group = object.key().owner().raft_group_id();
+            if self.listed().get(&group).copied().unwrap_or(false) {
+                ursula_stream::sim_controls::note_fired(Defence::ObjectWriteCheck);
+                return Ok(());
+            }
+        }
+        checked
     }
 }
 
@@ -1000,12 +1031,17 @@ impl SnapshotStore for FencedSnapshotStore {
     }
 
     fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing> {
+        if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::ObjectWriteCheck)
+        {
+            let admitted = self.check("LIST", "").is_ok();
+            self.listed().insert(raft_group_id, admitted);
+        }
         self.inner.list_own(raft_group_id)
     }
 
     fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
         Box::pin(async move {
-            self.check("DELETE", object.path())?;
+            self.check_delete(&object)?;
             self.inner.delete_own(object).await
         })
     }

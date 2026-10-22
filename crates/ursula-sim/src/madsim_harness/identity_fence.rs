@@ -64,6 +64,13 @@
 //!   process, keeps acknowledging the old process. The old process answers
 //!   linearizable reads while the new process waits out its predecessor and
 //!   then elects a leader with the third node, which takes writes.
+//! - **zombie GC** (D13): under `always`, every node runs the production
+//!   snapshot driver over the in-memory snapshot store (#687), each process
+//!   behind its node fence. A follower snapshots a group twice, so a GC pass
+//!   of its own directory is owed, and the pass begins inside its lease,
+//!   its LIST held at the store's gate. Then its volume moves while the old
+//!   process runs on, and the gate holds the LIST until the new process
+//!   wrote and named a snapshot object of the group.
 //!
 //! Its checks:
 //!
@@ -96,6 +103,10 @@
 //!   earlier one led.
 //! - Liveness ([`RESUME`]): after the faults heal, every group takes a write
 //!   within a predecessor wait and a bound.
+//! - In **zombie GC** also the snapshot object checks at every step
+//!   (`snapshot_checks`): every key a node's records name exists
+//!   (`snapshot_named_keys_exist`), no node deletes outside its directory,
+//!   and no restore reads a missing object (`snapshot_reads_found`).
 //! - In **replacements** also the meta invariants of `placement-move` (I12
 //!   and the hosting checks at every step, I10 at the end), that the node's
 //!   healthy process is never refused while a new disk under its id is,
@@ -113,6 +124,7 @@
 //! keeps its reads current.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -137,6 +149,9 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::node_fence::FenceStatus;
 use ursula_runtime::node_fence::fence_now;
+use ursula_runtime::snapshot_harness::Gate;
+use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+use ursula_runtime::snapshot_harness::StoreOp;
 use ursula_shard::RaftGroupId;
 use ursula_stream::sim_controls::Defence;
 use ursula_stream::sim_controls::fired;
@@ -150,7 +165,9 @@ use super::SimTrace;
 use super::SplitMix64;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
+use super::journal_cluster::DriverPlan;
 use super::journal_cluster::JOURNAL_GROUPS;
+use super::journal_cluster::SnapshotStorePlan;
 use super::journal_cluster::group_placement;
 use super::journal_cluster::group_stream;
 use super::meta_checks::BOUND;
@@ -162,6 +179,7 @@ use super::meta_cluster::Zombie;
 use super::meta_cluster::claim;
 use super::placed_hosting::I2;
 use super::placed_hosting::ReplicaMarks;
+use super::snapshot_checks::SnapshotChecks;
 
 pub(super) const I1: &str = "acknowledged_writes_read_back";
 pub(super) const I16: &str = "held_replicas_take_no_part";
@@ -186,6 +204,15 @@ const APPEND_TIMEOUT: Duration = Duration::from_secs(1);
 const READ_ON: Duration = Duration::from_secs(2);
 /// Mixed into the seed of a run's draws.
 const SALT: u64 = 0x6964_656e_7469_7479;
+/// The snapshot drivers of a zombie GC run: a pass every 100 ms, four
+/// entries kept below a snapshot, and no removal due on its age.
+const DRIVERS: DriverPlan = DriverPlan {
+    max_age: Duration::from_secs(600),
+    keep: 4,
+    interval: Duration::from_millis(100),
+};
+/// `raft.install_snapshot_timeout` of every node in a zombie GC run.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Which run a scenario makes, and which defence it turns off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -225,12 +252,18 @@ pub(super) enum Controls {
         send_lease: bool,
         fenced_leadership: bool,
     },
+    /// Zombie GC, with a held process's snapshot objects refused (`true`)
+    /// or left to the lease (N15).
+    WaitCoversObjects { defended: bool },
+    /// Zombie GC, with the fence checked before each DELETE (`true`) or
+    /// read when the pass's LIST began (N25).
+    ObjectWriteCheck { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
 struct Switched;
 
-const SWITCHED: [Defence; 10] = [
+const SWITCHED: [Defence; 12] = [
     Defence::SuccessorWait,
     Defence::DiskLease,
     Defence::OwedWait,
@@ -241,6 +274,8 @@ const SWITCHED: [Defence; 10] = [
     Defence::CrashedLeaderDemotion,
     Defence::SendLease,
     Defence::FencedLeadership,
+    Defence::WaitCoversObjects,
+    Defence::ObjectWriteCheck,
 ];
 
 impl Switched {
@@ -299,6 +334,14 @@ impl Switched {
                         fenced_leadership: false,
                     }
             }),
+        );
+        set_off(
+            Defence::WaitCoversObjects,
+            controls == Controls::WaitCoversObjects { defended: false },
+        );
+        set_off(
+            Defence::ObjectWriteCheck,
+            controls == Controls::ObjectWriteCheck { defended: false },
         );
         reset_fired();
         Self
@@ -635,10 +678,26 @@ struct Run {
     appended: BTreeMap<u32, u64>,
     /// Whether every step also runs the meta checks ([`MetaChecks::observe`]).
     meta_checked: bool,
+    /// The snapshot object checks, when the nodes run the snapshot store.
+    snapshots: Option<SnapshotChecks>,
 }
 
 impl Run {
     async fn start(seed: u64, fsync: WalFsync) -> Self {
+        Self::start_with(seed, fsync, false).await
+    }
+
+    /// [`Self::start`], every node running the production snapshot driver
+    /// over the in-memory snapshot store when `snapshots` is set.
+    async fn start_with(seed: u64, fsync: WalFsync, snapshots: bool) -> Self {
+        if snapshots {
+            super::journal_cluster::set_snapshot_drivers(Some(DRIVERS));
+            super::journal_cluster::set_snapshot_store(Some(SnapshotStorePlan {
+                seed: seed ^ SALT,
+                faults: SnapshotStoreFaults::none(),
+                install_timeout: INSTALL_TIMEOUT,
+            }));
+        }
         let mut trace = SimTrace::default();
         trace.push(SimEvent::ClusterBuilt { seed });
         let claims = (1..=NODES)
@@ -652,6 +711,9 @@ impl Run {
             LEASE,
         )
         .await;
+        // The cluster read them when it was provisioned.
+        super::journal_cluster::set_snapshot_drivers(None);
+        super::journal_cluster::set_snapshot_store(None);
         let mut run = Self {
             cluster,
             trace,
@@ -661,6 +723,7 @@ impl Run {
             seed,
             appended: BTreeMap::new(),
             meta_checked: false,
+            snapshots: snapshots.then(SnapshotChecks::default),
         };
         run.step("cluster_started");
         run.cluster.groups_form(&mut run.trace, "formed").await;
@@ -689,6 +752,9 @@ impl Run {
         self.fence.observe(&self.cluster, &mut self.trace, phase);
         if self.meta_checked {
             self.meta.observe(&self.cluster, &mut self.trace, phase);
+        }
+        if let Some(snapshots) = self.snapshots.as_mut() {
+            snapshots.step(&self.cluster.data, &mut self.trace, phase);
         }
     }
 
@@ -1922,6 +1988,117 @@ impl Run {
         self.reads_back("zombie_leads_reads").await;
     }
 
+    /// The snapshot object keys `node_id`'s records name now.
+    fn named_by(&self, node_id: u64) -> BTreeSet<String> {
+        self.cluster
+            .data
+            .snapshot_names()
+            .into_iter()
+            .find(|names| names.node_id == node_id)
+            .map(|names| names.named)
+            .unwrap_or_default()
+    }
+
+    /// An operator's snapshot of `group` on `node_id` within the bound.
+    async fn snapshot_on(&mut self, group: u32, node_id: u64, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            match self
+                .cluster
+                .placed_snapshot(group, node_id, STEP * 20)
+                .await
+            {
+                Ok(_) => break,
+                Err(error) if madsim::time::Instant::now() >= deadline => fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!("node {node_id} built no snapshot of group {group}: {error}"),
+                ),
+                Err(_retried) => madsim::time::sleep(STEP).await,
+            }
+        }
+        self.step(phase);
+    }
+
+    /// Zombie GC (D13): see the module docs. The new process writes its
+    /// first object once its wait ended, by when the old process's lease
+    /// had ended too, so the old pass's DELETEs are refused, however early
+    /// the pass began.
+    async fn zombie_gc(&mut self) {
+        const PHASE: &str = "zombie_gc";
+        let roles = self.roles(PHASE).await;
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!("{PHASE}: {roles:?}"),
+        });
+        let Roles {
+            group,
+            leader,
+            moved,
+            ..
+        } = roles;
+        self.led_by(group, leader, PHASE).await;
+        self.snapshot_on(group, moved, PHASE).await;
+        self.led_by(group, leader, PHASE).await;
+        // The second snapshot replaces the first, whose key leaves the
+        // holds, so a pass is owed at once. It begins now, and its LIST
+        // waits at the gate.
+        let gates = self.cluster.data.snapshot_gates(moved);
+        let list = Gate::before(moved, StoreOp::ListOwn);
+        gates.hold(list);
+        let arrived = gates.arrived(list);
+        self.snapshot_on(group, moved, PHASE).await;
+        let deadline = madsim::time::Instant::now() + BOUND;
+        while gates.arrived(list) <= arrived {
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    PHASE,
+                    format!("node {moved} began no GC pass of group {group}"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        self.after_probe(moved, SCRIPTED_OFFSET).await;
+        self.step(PHASE);
+        let zombie = self.cluster.move_volume(
+            moved,
+            &format!("identity-fence-{}-moved-{moved}", self.seed),
+            &[],
+        );
+        self.cluster.start_node(moved).await;
+        self.step(PHASE);
+        // The new process restored what its records named, and snapshots
+        // the group as soon as its fence lets it write the object.
+        let restored = self.named_by(moved);
+        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
+        while self.named_by(moved).is_subset(&restored) {
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    PHASE,
+                    format!("node {moved}'s new process named no object of its own"),
+                );
+            }
+            if let Err(error) = self.cluster.placed_snapshot(group, moved, STEP * 4).await {
+                tracing::info!(error, group, moved, "the new process built no snapshot yet");
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        // The old pass's LIST runs now and shows the new object.
+        gates.open(list);
+        self.watch(PHASE, PROBE * 2).await;
+        self.heal(vec![zombie]).await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "zombie_gc_healed").await;
+        }
+        self.reads_back("zombie_gc_reads").await;
+    }
+
     /// Ends the run: I17 over the whole run, and I16 fails when no step
     /// saw a held replica, so that every run's I16 judged something.
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
@@ -2008,11 +2185,16 @@ pub(super) async fn run_identity_fence_inner(
             run.zombie_leads(SCRIPTED_OFFSET).await;
             run.finish()
         }
+        Controls::WaitCoversObjects { .. } | Controls::ObjectWriteCheck { .. } => {
+            let mut run = Run::start_with(seed, WalFsync::Always, true).await;
+            run.zombie_gc().await;
+            run.finish()
+        }
     }
 }
 
 /// How many scripts the family runs, one per seed in turn.
-const SCRIPTS: u64 = 12;
+const SCRIPTS: u64 = 13;
 
 /// The script of `seed`: the family's scripts are numbered over
 /// [`IDENTITY_FENCE_SEEDS`] and then [`IDENTITY_FENCE_EXTENDED_SEEDS`],
@@ -2042,7 +2224,7 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         2 | 3 => WalFsync::Never,
         _ => WalFsync::Always,
     };
-    let mut run = Run::start(seed, fsync).await;
+    let mut run = Run::start_with(seed, fsync, script == 12).await;
     match script {
         0 => run.split(offset, false).await,
         1 => run.split(offset, true).await,
@@ -2055,7 +2237,8 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         8 => run.registration_crash().await,
         9 => run.two_moved(offset).await,
         10 => run.resumed_leader().await,
-        _ => run.zombie_leads(offset).await,
+        11 => run.zombie_leads(offset).await,
+        _ => run.zombie_gc().await,
     }
     run.finish()
 }
@@ -2074,6 +2257,7 @@ mod tests {
     use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
     use crate::madsim_harness::ThreeNodeRaftSimConfig;
+    use crate::madsim_harness::snapshot_checks::NAMED_KEYS_EXIST;
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::IdentityFence;
@@ -2311,6 +2495,35 @@ mod tests {
             "zombie_leads",
         );
         assert!(message.contains("missed the write"), "{message}");
+    }
+
+    /// A successor that writes snapshot objects during its wait writes one
+    /// while its predecessor's lease holds, and the predecessor's pass,
+    /// which listed it, deletes it (N15).
+    #[test]
+    fn negative_control_wait_covers_objects() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::WaitCoversObjects { defended: true },
+            Controls::WaitCoversObjects { defended: false },
+            NAMED_KEYS_EXIST,
+            "zombie_gc",
+        );
+        assert!(!message.is_empty(), "{message}");
+    }
+
+    /// A pass that reads the fence when its LIST began, inside the lease,
+    /// deletes the successor's object long after the lease ended (N25).
+    #[test]
+    fn negative_control_object_write_check() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ObjectWriteCheck { defended: true },
+            Controls::ObjectWriteCheck { defended: false },
+            NAMED_KEYS_EXIST,
+            "zombie_gc",
+        );
+        assert!(!message.is_empty(), "{message}");
     }
 
     /// Either defence of a zombie leader alone keeps its reads current, and

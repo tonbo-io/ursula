@@ -483,6 +483,14 @@ impl SimHost {
         options.metrics = Some(self.parts.metrics.group_engine_metrics());
         options.peer_cluster = Some(registry.peer_cluster().clone());
         options.fence = Some(wal.raft_wal().fence());
+        if self.parts.snapshots {
+            // As the engine factory wires a node with a snapshot driver:
+            // its registry's coordinators and store, and the store's record.
+            options.snapshot_build = Some(registry.snapshot_build_coordinator());
+            options.snapshot_install = Some(registry.snapshot_install_coordinator());
+            options.snapshot_store = self.parts.snapshot_store.clone();
+            options.snapshot_record = Some(store.snapshot_record());
+        }
         // The driver's tasks run outside the simulation's OpenRaft seed
         // scope, so each start gets a seed of its own, as the runtime
         // scenarios' engine factory gives each create.
@@ -664,10 +672,12 @@ impl GroupHost for SimHost {
     }
 }
 
-/// A running node's host and hosting driver.
+/// A running node's host and hosting driver, and its process's snapshot
+/// driver when the cluster runs them.
 struct NodeHost {
     host: Arc<SimHost>,
     driver: HostingTask,
+    snapshots: Option<madsim::task::JoinHandle<()>>,
 }
 
 /// One placed replica as the checks read it.
@@ -689,7 +699,14 @@ impl DetachedHost {
     /// a stop that fails is only logged, as a killed process ends either
     /// way.
     pub(super) async fn kill(self) {
-        let NodeHost { host, driver } = self.0;
+        let NodeHost {
+            host,
+            driver,
+            snapshots,
+        } = self.0;
+        if let Some(snapshots) = snapshots {
+            snapshots.abort();
+        }
         driver.shutdown().await;
         for group in host.groups() {
             if let Err(error) = host.stop(group).await {
@@ -740,9 +757,12 @@ impl MetaCluster {
             panic!("node {node_id}: the held cores do not open: {error}");
         }
         let reader = self.runtimes[&node_id].status_reader().clone();
+        let snapshot_store = self.data.host_snapshot_objects(node_id);
+        let snapshots = self.data.spawn_snapshot_driver(node_id);
         let hosting = HostingSet::default();
         let mut parts = self.data.replica_parts(node_id);
         parts.process = self.process(node_id);
+        parts.snapshot_store = snapshot_store;
         let placed = self.placed_mut();
         let started = placed.started.clone();
         let memberships = placed.memberships.clone();
@@ -771,9 +791,11 @@ impl MetaCluster {
             detached: std::sync::atomic::AtomicBool::new(false),
         });
         let driver = HostingDriver::start(Arc::clone(&host), wal, reader, hosting);
-        self.placed_mut()
-            .hosts
-            .insert(node_id, NodeHost { host, driver });
+        self.placed_mut().hosts.insert(node_id, NodeHost {
+            host,
+            driver,
+            snapshots,
+        });
     }
 
     /// Puts `host`, taken out by [`Self::take_host`], back as `node_id`'s
@@ -820,12 +842,63 @@ impl MetaCluster {
         self.placed().hosts.get(&node_id)?.host.engine(group)
     }
 
+    /// An operator's snapshot of `group` on `node_id`'s current replica,
+    /// through its process's build coordinator, as `POST /snapshot` asks
+    /// it of a node with a snapshot driver. Answers the index of the
+    /// snapshot published within `wait`.
+    pub(super) async fn placed_snapshot(
+        &self,
+        group: u32,
+        node_id: u64,
+        wait: std::time::Duration,
+    ) -> Result<u64, &'static str> {
+        let raft = self
+            .placed()
+            .hosts
+            .get(&node_id)
+            .and_then(|node| node.host.raft(group))
+            .ok_or("no replica of the group runs")?;
+        let wanted = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).last_applied;
+        let applied = wanted.map_or(0, |log_id| log_id.index);
+        let published = |metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>| {
+            metrics
+                .snapshot
+                .is_some_and(|snapshot| snapshot.index >= applied)
+        };
+        self.registry(node_id)
+            .snapshot_build_coordinator()
+            .start_snapshot(
+                group,
+                wanted,
+                wait,
+                || {
+                    published(&openraft::rt::WatchReceiver::borrow_watched(
+                        &raft.metrics(),
+                    ))
+                },
+                std::future::pending(),
+                || async { raft.trigger().snapshot().await },
+            )
+            .await
+            .map_err(|_not_started| "start a snapshot")?;
+        raft.wait(Some(wait))
+            .metrics(published, "snapshot built")
+            .await
+            .map_err(|_timeout| "wait for the snapshot")?
+            .snapshot
+            .map(|snapshot| snapshot.index)
+            .ok_or("snapshot log id")
+    }
+
     /// Stops `node_id`'s hosting driver, then every replica it runs.
     pub(super) async fn stop_host(&mut self, node_id: u64) {
         self.placed_mut().registries.lock().remove(&node_id);
         let Some(node) = self.placed_mut().hosts.remove(&node_id) else {
             return;
         };
+        if let Some(snapshots) = &node.snapshots {
+            snapshots.abort();
+        }
         node.driver.shutdown().await;
         for group in node.host.groups() {
             if let Err(error) = node.host.stop(group).await {
