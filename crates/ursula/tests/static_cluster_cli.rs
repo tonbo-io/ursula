@@ -5849,6 +5849,13 @@ const JOURNAL_RECLAIM_WAIT: Duration = Duration::from_secs(220);
 /// they are 40 s old (`raft.deleted_data_max_age` of 160 s), segments are
 /// 64 KiB so that a few writes seal them, and a follower's install copy
 /// fits inside a 20 s `raft.install_snapshot_timeout`.
+///
+/// The test applies it to the torn-down source only. With 64 KiB segments
+/// the journal reports a group lagging as soon as its live log keeps a
+/// sealed segment, and the snapshot cadence then builds that group's
+/// snapshot unasked, which stores the node's own object of it. On every
+/// node that would leave the dead-node phase without a group whose objects
+/// the dead node never owned.
 fn bound_dead_journal_data(node: &MetaNode) {
     let text = std::fs::read_to_string(&node.config).expect("read node config");
     assert!(
@@ -5863,6 +5870,52 @@ fn bound_dead_journal_data(node: &MetaNode) {
         .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n")
         + "\n[storage.snapshot]\ns3_timeout = \"1500ms\"\ns3_max_retries = 1\n";
     std::fs::write(&node.config, text).expect("write node config");
+}
+
+/// How long phase 4 of the teardown and decommission test gives one meta
+/// leadership's first sweep pass before it starts another leadership. A
+/// pass asks each listed group at most a few seconds per peer.
+const SWEEP_PASS_WAIT: Duration = Duration::from_secs(60);
+
+/// Asks meta leader `from` to hand the meta leadership alone to the next
+/// meta voter, so a new meta leadership begins while data leaderships stay
+/// where they are.
+async fn try_hand_meta_on(
+    client: &reqwest::Client,
+    nodes: &[MetaNode],
+    from: u64,
+) -> Result<(), String> {
+    use ursula_proto::admin::TransferLeaderResponse;
+
+    if !META_VOTERS.contains(&from) {
+        return Err(format!("meta leader {from} is no meta voter"));
+    }
+    let to = META_VOTERS
+        .iter()
+        .cycle()
+        .skip_while(|voter| **voter != from)
+        .nth(1)
+        .copied()
+        .expect("another meta voter");
+    let leader = nodes
+        .iter()
+        .find(|node| node.id == from)
+        .ok_or_else(|| format!("no node {from}"))?;
+    let url = format!("{}/__ursula/raft/meta/leader/transfer/{to}", leader.admin());
+    let response = try_admin_test_post(client, url.clone())
+        .await?
+        .send()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))?;
+    match serde_json::from_str::<TransferLeaderResponse>(&body) {
+        Ok(answer) if status.is_success() && answer.transferred => Ok(()),
+        _ => Err(format!("POST {url}: {status} {body}")),
+    }
 }
 
 /// The snapshot objects node `node` owns of group `group`, under
@@ -6145,7 +6198,7 @@ async fn assert_move_refused_as_removed(
     }
 }
 
-/// S4(b) and S5 (#768), integrations 1's teardown half and 5 (design 15.3),
+/// S4(b) and S5 (#768), integration 1's teardown half and 5 (design 15.3),
 /// in phases on one cluster of five nodes at replication factor 3 with meta
 /// voters 1 to 3, on S3. Every move and lifecycle change goes through
 /// `ursula_ctl` library calls over the admin plane. Runs on real S3 in CI.
@@ -6168,16 +6221,25 @@ async fn assert_move_refused_as_removed(
 ///    `placement-unavailable`. A move naming it answers `409 node_removed`
 ///    and applies nothing, and `verify-removed` passes. A removed node that
 ///    keeps a replica open fails it.
-/// 3. Node 5 snapshots group 1, so it owns an object of the group, and owns
-///    none of its other groups. It is killed and decommissioned: it is
-///    removed once its last group converged without it, and every group
-///    ends on nodes 1 to 3 and takes writes.
-/// 4. The meta leader is drained, so another node leads meta and its sweep
-///    runs at once (a pass runs when a leadership begins). Both removed
-///    nodes' snapshot directories end empty and the leader reports no group
-///    left by its sweep. Node 5 is dead and node 4 deletes no object of a
-///    group whose log it holds, so the sweep is what deletes them. A sweep
-///    that keeps a removed node's objects fails it.
+/// 3. Node 5 snapshots group 1, so it owns an object of the group, and it
+///    holds a group it owns no object of (only node 4 runs the small
+///    journal segments that make the snapshot cadence build unasked). The
+///    test fails if node 5 owns objects of every group it holds. Node 5 is
+///    killed and decommissioned: it is removed once its last group
+///    converged without it, and every group ends on nodes 1 to 3 and takes
+///    writes.
+/// 4. The meta leader hands the meta leadership alone to another meta
+///    voter, so data leaderships stay put, and the new leader's sweep runs
+///    at once (a pass runs when a leadership begins). A pass that leaves a
+///    group or confirms no view passes again only after the sweep
+///    interval, so while objects remain the test hands meta on again after
+///    a pass left a group, or after a minute. Both removed nodes' snapshot
+///    directories end empty and the leader reports no group left by its
+///    sweep. Node 5 is dead, so only the sweep deletes its object of group
+///    1, and a sweep that keeps it fails the test. Node 4's directory ends
+///    empty too, but node 4 was decommissioning, not removed, while its
+///    groups moved away, so its own teardowns may have deleted its objects
+///    before the sweep ran: node 4's half proves nothing of the sweep.
 /// 5. Node 5 restarts with its old disk. It ends running no data replica,
 ///    keeping none open, reporting `node_removed`, ready, and shedding
 ///    `placement-unavailable`, and stays so for longer than its asker's
@@ -6232,8 +6294,8 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
     };
     for node in &nodes {
         node.write(&peers, meta);
-        bound_dead_journal_data(node);
     }
+    bound_dead_journal_data(&nodes[3]);
     let config = ursula_config::load_config(Some(&nodes[0].config), None, None)
         .unwrap_or_else(|err| panic!("load config for the cold store: {err}"));
     config
@@ -6509,8 +6571,8 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
     .await
     .expect("verify-removed passes for node 4");
 
-    // 3. Node 5 owns an object of group 1 only, is killed and is
-    // decommissioned.
+    // 3. Node 5 owns an object of group 1 and none of another group it
+    // holds, is killed and is decommissioned.
     let dead = &nodes[4];
     let held = placed_on(&cluster, 5);
     assert!(held.contains(&1), "{cluster:?}");
@@ -6569,56 +6631,16 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
         .await;
     }
 
-    // 4. Another node leads meta, and its sweep takes both removed nodes'
-    // objects.
+    // 4. Another meta voter leads meta, and its sweep takes both removed
+    // nodes' objects.
     let members = manifest(&[4, 5]);
-    let metrics = ctl().fetch_cluster(&members).await.expect("metrics");
-    let leader = metrics
-        .per_node
-        .iter()
-        .find(|view| view.leads_meta())
-        .expect("a node leads meta")
-        .node
-        .clone();
-    let drain = ursula_ctl::drain_node(&members, &leader, &ctl(), &ursula_ctl::DrainOptions {
-        drain_timeout: Duration::from_secs(120),
-        ready_timeout: Duration::from_secs(120),
-        poll_interval: Duration::from_millis(200),
-        lag_tolerance: 16,
-        dry_run: false,
-    })
-    .await
-    .expect("drain the meta leader");
-    assert!(
-        matches!(drain, ursula_ctl::DrainOutcome::Drained),
-        "{drain:?}"
-    );
-    let other = nodes
-        .iter()
-        .find(|node| node.id != leader.id && META_VOTERS.contains(&node.id))
-        .expect("another meta voter");
-    wait_placement(
-        &client,
-        &mut procs,
-        other,
-        "names another meta leader",
-        |status| meta_leader(status).is_some_and(|new| new != leader.id),
-    )
-    .await;
-    ursula_ctl::undrain_node(&ctl(), &leader)
-        .await
-        .expect("undrain the old meta leader");
+    // The leader the test last handed meta away from, and when.
+    let mut handed: Option<(NodeId, std::time::Instant)> = None;
     eventually_for(
         &mut procs,
         "the sweep takes the removed nodes' snapshot objects",
         LIFECYCLE_WAIT,
         async || {
-            for node in [4, 5] {
-                let left = groups_with_objects(&cold_store, &prefix, node).await?;
-                if !left.is_empty() {
-                    return Err(format!("node {node} owns objects of groups {left:?}"));
-                }
-            }
             let status = ursula_ctl::view::leader_status(&ctl(), &members)
                 .await
                 .map_err(|err| format!("{err:?}"))?
@@ -6626,11 +6648,32 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
             let report = status
                 .leader_report
                 .ok_or_else(|| "no leader report".to_owned())?;
-            if report.sweep_pending.is_empty() {
-                Ok(())
-            } else {
-                Err(format!("sweep pending {:?}", report.sweep_pending))
+            let mut left = BTreeMap::new();
+            for node in [4, 5] {
+                let groups = groups_with_objects(&cold_store, &prefix, node).await?;
+                if !groups.is_empty() {
+                    left.insert(node, groups);
+                }
             }
+            if left.is_empty() && report.sweep_pending.is_empty() {
+                return Ok(());
+            }
+            // A new leadership passes at once. Its pass left a group, or
+            // it has had a minute, so the next pass would wait out the
+            // sweep interval: start another leadership.
+            let pass_again = handed.is_none_or(|(from, at)| {
+                at.elapsed() >= SWEEP_PASS_WAIT
+                    || (report.leader != from && !report.sweep_pending.is_empty())
+            });
+            if pass_again {
+                try_hand_meta_on(&client, &nodes, report.leader.get()).await?;
+                handed = Some((report.leader, std::time::Instant::now()));
+            }
+            Err(format!(
+                "objects of groups {left:?}, sweep pending {:?} on meta leader {}",
+                report.sweep_pending,
+                report.leader.get()
+            ))
         },
     )
     .await;
@@ -8430,21 +8473,36 @@ async fn flush_stream_until_cold_hot_bytes_zero(
 }
 
 async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
-    let mut metrics_url = reqwest::Url::parse(&url).expect("admin URL");
+    try_admin_test_post(client, url)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// [`admin_test_post`], with a node that does not answer its metrics as an
+/// `Err`, for a polled probe.
+async fn try_admin_test_post(
+    client: &reqwest::Client,
+    url: String,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut metrics_url =
+        reqwest::Url::parse(&url).map_err(|err| format!("admin URL {url}: {err}"))?;
     metrics_url.set_path("/__ursula/metrics");
     metrics_url.set_query(None);
     let metrics: serde_json::Value = client
-        .get(metrics_url)
+        .get(metrics_url.clone())
         .send()
         .await
-        .expect("metrics")
+        .map_err(|err| format!("GET {metrics_url}: {err}"))?
         .json()
         .await
-        .expect("JSON");
-    client.post(url).header(
-        ursula_proto::admin::PROCESS_INCARNATION_HEADER,
-        metrics["process_incarnation"].as_str().expect("identity"),
-    )
+        .map_err(|err| format!("GET {metrics_url}: {err}"))?;
+    let incarnation = metrics["process_incarnation"]
+        .as_str()
+        .ok_or_else(|| format!("GET {metrics_url}: no process incarnation"))?
+        .to_owned();
+    Ok(client
+        .post(url)
+        .header(ursula_proto::admin::PROCESS_INCARNATION_HEADER, incarnation))
 }
 
 /// Asks for an admin purge, again while the group's snapshot work is not
