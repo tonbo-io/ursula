@@ -243,7 +243,10 @@ which its bootstrapped view gives the node a role, each with its role, its
 target voters and whether the replica counts as a voter by the one voter
 predicate. The voter checks come from each replica's effective membership. A
 replica that does not count as a voter, such as an incoming learner, is
-checked only for being stopped, and that blocks nothing. Node issues come
+checked only for being stopped. That blocks nothing while the report lists
+the replica in `expected_groups` or `unplaced`. Before a bootstrapped view
+and while meta is damaged the report lists no replica, so a stopped replica
+blocks as a voter's would. Node issues come
 from the view, the meta replica's status and the hosting driver's: a node
 that does not know its groups (`placement_unknown`, a wiped voter before meta
 answers), a view that has not bootstrapped, a genesis mismatch, a meta group

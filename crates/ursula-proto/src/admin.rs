@@ -659,7 +659,8 @@ impl RaftMaintenanceIssue {
 
     /// Whether the issue is one a replica that does not count as a voter
     /// reports: such a replica is checked only for being stopped, and
-    /// those checks block nothing.
+    /// those checks block nothing while the report lists the replica as
+    /// not counting (`RaftMaintenanceReport::replica`).
     fn of_a_non_voter(&self) -> bool {
         matches!(self, Self::RaftStopped | Self::ApplyStopped)
     }
@@ -738,7 +739,9 @@ impl RaftMaintenanceReport {
     }
 
     /// The node's role in `group` and whether its replica counts as a
-    /// voter. A replica in neither map counts, so its issues block.
+    /// voter. A replica in neither map counts, so its issues block: before
+    /// a bootstrapped view and while meta is damaged the maps list no
+    /// replica, and a stopped replica blocks as a voter's would.
     fn replica(&self, group: u32) -> (Option<crate::placement::ReplicaRole>, bool) {
         match (self.expected_groups.get(&group), self.unplaced.get(&group)) {
             (Some(expected), _) => (Some(expected.role), expected.counts_as_voter),

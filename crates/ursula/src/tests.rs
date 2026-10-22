@@ -2412,83 +2412,10 @@ async fn static_grpc_seed_initializers_distribute_leaders() {
         }
     }
 
-    let manifest = peers
-        .iter()
-        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
-            id: *id,
-            admin_url: endpoint.parse().unwrap(),
-            http_url: Some(endpoint.parse().unwrap()),
-            metrics_url: Some(endpoint.parse().unwrap()),
-            client_url: None,
-            host: endpoint.clone(),
-        })
-        .collect::<Vec<_>>();
-    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    ursula_ctl::wait_cluster_ready(
-        "fresh quorum fixture startup",
-        &manifest,
-        &client,
-        Duration::from_secs(5),
-        Duration::from_millis(10),
-        16,
-    )
-    .await
-    .unwrap();
-    let mut options = ursula_ctl::quorum::QuorumVerificationOptions {
-        group_count: 6,
-        timeout: Duration::from_secs(5),
-        poll_interval: Duration::from_millis(10),
-    };
-    let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .unwrap();
-    assert_eq!(proof.process_incarnations.len(), 3);
-    assert_eq!(proof.prefixes.len(), 6);
-    assert_eq!(proof.applied.len(), 3);
-    for (id, prefix) in proof.prefixes {
-        assert_eq!(prefix.leader_id, u64::from(id % 3) + 1);
-        assert!(
-            proof
-                .applied
-                .values()
-                .all(|groups| groups[&id] >= prefix.required_applied_index)
-        );
-    }
-    options.group_count = 7;
-    let missing = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .unwrap_err();
-    assert!(
-        missing.to_string().contains("inventory differs"),
-        "{missing}"
-    );
-
-    options.group_count = 6;
-    nodes.pop().unwrap().shutdown().await;
-    ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .expect_err("quorum verification must fail while a voter is down");
-    let survivor = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options).await
-            {
-                Ok(proof) => break proof,
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(survivor.configured_voter_ids, BTreeSet::from([1, 2, 3]));
-    assert_eq!(survivor.surviving_voter_ids, BTreeSet::from([1, 2]));
-    assert!(!survivor.full_redundancy_restored);
-    assert_eq!(survivor.verification.prefixes.len(), 6);
-    assert_eq!(survivor.verification.applied.len(), 2);
-    nodes.pop().unwrap().shutdown().await;
-    ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options)
-        .await
-        .expect_err("surviving-quorum verification must fail with one voter left");
-
+    // `ursulactl`'s quorum proofs need ready maintenance reports, which
+    // these nodes never give: they run no meta runtime, so they report
+    // `placement_unknown`. The proofs run on real processes in
+    // `static_cluster_cli.rs`.
     for node in nodes {
         node.shutdown().await;
     }
@@ -3236,6 +3163,25 @@ async fn start_durable_cluster(
     nodes
 }
 
+/// Waits until every node knows a leader of each of its first `groups`
+/// groups.
+async fn wait_group_leaders(nodes: &[StaticGrpcTestNode], groups: u32) {
+    for node in nodes {
+        for group in 0..groups {
+            node.registry
+                .get(RaftGroupId(group))
+                .expect("registered group")
+                .wait(Some(Duration::from_secs(20)))
+                .metrics(
+                    |metrics| metrics.current_leader.is_some(),
+                    "the group has a leader",
+                )
+                .await
+                .expect("a leader of the group");
+        }
+    }
+}
+
 /// Polls a stream's read through `base` until it holds `expected`.
 async fn poll_payload(
     client: &reqwest::Client,
@@ -3266,10 +3212,11 @@ async fn poll_payload(
 }
 
 /// A deterministic poison record stops its group on every voter: a buggy
-/// binary replays the committed record at startup on each replica. Every
-/// node stays serving-ready and serves its other group, while maintenance
-/// readiness refuses disruption. Corrected code replays the record on every
-/// voter without skipping it.
+/// binary replays the committed record at startup on each replica. On every
+/// node the stop is the group's only issue, which serving ignores, and the
+/// node serves its other group, while maintenance readiness refuses
+/// disruption. Corrected code replays the record on every voter without
+/// skipping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_replay() {
     let root = TestWalRoot::new();
@@ -3310,15 +3257,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
     };
     let poisoned = stream_of(0, "poisoned");
     let healthy = stream_of(1, "healthy");
-    ursula_ctl::observe::wait_ready(
-        &ctl,
-        &manifest,
-        2,
-        Duration::from_secs(20),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("a fresh cluster becomes ready");
+    wait_group_leaders(&nodes, 2).await;
     for (stream, body) in [(&poisoned, "poison"), (&healthy, "healthy")] {
         let created = client
             .put(format!("{}/{stream}", bases[0]))
@@ -3444,15 +3383,23 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
 
     // Corrected code replays the retained record on every voter.
     let nodes = start_durable_cluster(root.path(), &addresses, None).await;
-    ursula_ctl::observe::wait_ready(
-        &ctl,
-        &manifest,
-        2,
-        Duration::from_secs(20),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("corrected code recovers the group");
+    wait_group_leaders(&nodes, 2).await;
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("group 0")
+            .wait(Some(Duration::from_secs(20)))
+            .applied_index_at_least(Some(poison), "corrected code applies the record")
+            .await
+            .expect("replay the record");
+        assert!(
+            node.registry
+                .metrics_snapshot()
+                .iter()
+                .all(|group| group.apply_failure.is_none()),
+            "corrected code stops no group"
+        );
+    }
     for base in &bases {
         poll_payload(&client, base, &poisoned, "poison").await;
         poll_payload(&client, base, &healthy, "healthy-1-2-3").await;
@@ -13497,6 +13444,28 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }
 
+/// Waits until every recovery gate on `registry` is open, so each of its
+/// replicas may vote and campaign.
+async fn wait_recovery_gates_open(registry: &RaftGroupHandleRegistry) {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .expect("deadline");
+    loop {
+        let gates = registry.recovery_gates();
+        if gates
+            .values()
+            .all(|gate| *gate == ursula_proto::admin::RecoveryGateStatus::Open)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovery gates stay closed: {gates:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A follower's self-election is held to the policy of every leadership
 /// transfer it receives: refused with 409 while it may not campaign (here a
 /// maintenance drain), and once it may, taken with 204, after which it leads.
@@ -13544,28 +13513,9 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
     }
     // The followers' recovery gates open once they caught up: until then
     // they may not campaign either.
-    let manifest = peers
-        .iter()
-        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
-            id: *id,
-            admin_url: endpoint.parse().unwrap(),
-            http_url: Some(endpoint.parse().unwrap()),
-            metrics_url: Some(endpoint.parse().unwrap()),
-            client_url: None,
-            host: endpoint.clone(),
-        })
-        .collect::<Vec<_>>();
-    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    ursula_ctl::wait_cluster_ready(
-        "self-election fixture startup",
-        &manifest,
-        &client,
-        Duration::from_secs(5),
-        Duration::from_millis(10),
-        1,
-    )
-    .await
-    .unwrap();
+    for node in &nodes {
+        wait_recovery_gates_open(&node.registry).await;
+    }
     let follower = &nodes[1];
     let raft = follower.registry.get(group).expect("registered group");
     let admin = admin_router(HttpState::with_raft_cluster(
