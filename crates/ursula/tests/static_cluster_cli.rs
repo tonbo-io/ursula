@@ -5082,8 +5082,11 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
 }
 
 /// One stream name of each data group, as `bucket`'s streams hash to the
-/// groups of a meta test cluster.
+/// groups of a meta test cluster. `bucket` must be a valid bucket ID, or
+/// every create in it answers `400`.
 fn stream_per_group(bucket: &str) -> Vec<String> {
+    ursula_runtime::validate_bucket_id(bucket)
+        .unwrap_or_else(|err| panic!("bucket {bucket:?}: {err}"));
     let map = ursula_shard::StaticShardMap::new(1, META_TEST_GROUPS).expect("shard map");
     let mut streams: BTreeMap<u32, String> = BTreeMap::new();
     for candidate in 0_u32.. {
@@ -5498,7 +5501,13 @@ async fn create_stream(client: &reqwest::Client, procs: &mut Processes, url: &st
             .map_err(|err| format!("PUT {url}: {err}"))?;
         match response.status() {
             reqwest::StatusCode::CREATED | reqwest::StatusCode::OK => Ok(()),
-            status => Err(format!("PUT {url}: {status}")),
+            status => {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+                Err(format!("PUT {url}: {status}: {body}"))
+            }
         }
     })
     .await;
@@ -6506,9 +6515,9 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
     wait_leaders_settle(&client, &mut procs, &nodes).await;
     let kept = *to.first().expect("three voters");
     let cut_stream = format!(
-        "{}/cut/{}",
+        "{}/cutover/{}",
         node_of(&nodes, kept).url(),
-        stream_per_group("cut")[usize::try_from(group.0).unwrap()]
+        stream_per_group("cutover")[usize::try_from(group.0).unwrap()]
     );
     create_stream(&client, &mut procs, &cut_stream).await;
     post_until_no_content(&client, &cut_stream, "before-the-cut;").await;
