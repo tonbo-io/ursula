@@ -11,7 +11,6 @@ use ursula_control::ControlResponse;
 use ursula_control::SeedRoleOf;
 
 use super::GroupRejoin;
-use super::NoPeerGates;
 use super::PeerGroupLog;
 use super::ReconcileShell;
 use super::run_group_bootstrap;
@@ -205,8 +204,9 @@ impl RecoveryGate {
     /// source `inputs` gives the group ([`PlacementInputs::target_source`])
     /// and its gate drivers (`spawn_gate_drivers`) with the transport's
     /// bootstrap probe vote, over that seed role and the node sets `inputs`
-    /// gives the group. The shell asks no learner's gate yet, so it
-    /// promotes none ([`NoPeerGates`]).
+    /// gives the group. The shell asks the gates of the learners it would
+    /// promote through the peer gates `inputs` gives the group
+    /// ([`PlacementInputs::peer_gates`]).
     pub fn attach<T: RecoveryTransport>(
         &self,
         engine: &crate::RaftGroupEngine,
@@ -227,7 +227,7 @@ impl RecoveryGate {
                 replica: RaftTarget::Data(group),
                 me: ursula_proto::placement::NodeId::new(rejoin.node_id),
                 source: inputs.target_source(group),
-                gates: Arc::new(NoPeerGates),
+                gates: inputs.peer_gates(group),
                 peers: registry.peer_cluster().clone(),
                 election: registry.election_policy(),
                 status,

@@ -661,6 +661,19 @@ pub enum ReplicaRole {
     Abandoned,
 }
 
+impl ReplicaRole {
+    /// Whether a replica of this role may take over its group's leadership:
+    /// a voter's or an incoming replica's may, an outgoing or abandoned one
+    /// is about to leave the group (design 5.9). Every leadership handoff
+    /// planner asks this one rule.
+    pub fn takes_leadership(self) -> bool {
+        match self {
+            Self::Voter | Self::Incoming => true,
+            Self::Outgoing | Self::Abandoned => false,
+        }
+    }
+}
+
 /// A node's role in meta's effective membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -883,7 +896,14 @@ pub enum ReconcileState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReconcileStatus {
     pub state: ReconcileState,
+    /// When `state` last changed.
     pub since_ms: u64,
+    /// When the reconciler last made progress: `since_ms`, or later while
+    /// a `catching_up` learner's gap shrinks below its smallest since then
+    /// or a snapshot is being sent to one of those learners (design 11.4).
+    /// A moving group's leader whose progress is older than five minutes
+    /// reports `move_stalled`.
+    pub progress_ms: u64,
     #[serde(deserialize_with = "crate::admin::required_option")]
     pub last_failure: Option<StepFailure>,
     pub attempts: u32,
@@ -1098,12 +1118,13 @@ mod tests {
             ReconcileState::Waiting(WaitReason::Unknown)
         );
         let status: ReconcileStatus = serde_json::from_str(
-            r#"{"state":{"state":"throttled","limit":3},"since_ms":5,"last_failure":{"step":"rebalance","kind":"throttled","at_ms":4},"attempts":2,"target_since":null,"view_applied":null}"#,
+            r#"{"state":{"state":"throttled","limit":3},"since_ms":5,"progress_ms":6,"last_failure":{"step":"rebalance","kind":"throttled","at_ms":4},"attempts":2,"target_since":null,"view_applied":null}"#,
         )
         .unwrap();
         assert_eq!(status, ReconcileStatus {
             state: ReconcileState::Unknown,
             since_ms: 5,
+            progress_ms: 6,
             last_failure: Some(StepFailure {
                 step: StepKind::Unknown,
                 kind: StepFailureKind::Unknown,
@@ -1211,7 +1232,7 @@ mod tests {
 
     #[test]
     fn an_admin_option_field_is_required_also_when_null() {
-        let missing = r#"{"state":{"state":"converged"},"since_ms":5,"last_failure":null,"attempts":2,"target_since":null}"#;
+        let missing = r#"{"state":{"state":"converged"},"since_ms":5,"progress_ms":5,"last_failure":null,"attempts":2,"target_since":null}"#;
         serde_json::from_str::<ReconcileStatus>(missing)
             .expect_err("a missing `view_applied` does not decode");
         serde_json::from_str::<LearnerLag>(r#"{"node":4}"#)

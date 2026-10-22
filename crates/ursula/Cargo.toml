@@ -71,6 +71,8 @@ madsim = { workspace = true }
 # `group_engine_error_samples`, for the wire fixture and classification
 # tables of `GroupEngineError`.
 ursula-runtime = { workspace = true, features = ["test-support"] }
+# `samples`, the placement views of the leadership balancer's tests.
+ursula-control = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 ursula-headers = { workspace = true, features = ["test-support"] }
 criterion = { workspace = true }

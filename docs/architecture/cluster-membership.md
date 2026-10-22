@@ -160,9 +160,33 @@ its view before it plans again. Each group's metrics on `GET
 /__ursula/metrics` carry the shell's status under `reconcile`: its state
 (`stepping`, `waiting` with its reason, `reporting`, `stale_view` or
 `converged`), its last failed step, and the placement and meta entry it
-read. The shell asks no learner's recovery gate yet, so it promotes no
-learner. A group placed by hand in tests and the simulation
-(`FixedPlacement`) has no target, and its shell only observes.
+read. The status also carries `progress_ms`, when the shell last made
+progress: a new state, or in a `catching_up` wait a learner gap that shrinks
+below its smallest since then or a snapshot being sent to one of its
+learners. The leader of a moving group whose progress is five minutes old
+reports `move_stalled`. A caught-up learner is promoted only once its gate is
+open, since a promoted learner whose gate is closed refuses the votes a new
+leader would need. Right before it decides, the shell asks each such
+learner's node for its participation answer (`GET
+/__ursula/leadership-shed`), which lists the recovery gate of every replica
+the node runs. A learner whose answer shows a gated state waits as
+`gate_closed`, and one that does not answer, answers for another cluster or
+lists no gate of the group waits as `gate_unknown`. A group placed by hand in
+tests and the simulation (`FixedPlacement`) has no target, and its shell only
+observes.
+
+Each node's leadership balancer moves leaderships off a node that leads more
+than its fair share (`crates/ursula/src/bootstrap/leadership.rs`). The share
+is every data group of the bootstrapped view divided among the nodes that may
+campaign and have a voter or incoming role somewhere, rounded up. Each peer's
+participation answer says how many data groups it leads (`leader_count`). A
+node hands one of its groups to a voter `t` only while it leads more than
+its share, `t` leads fewer than its share and `t` would still lead fewer
+than this node, so every transfer lowers the spread and the balancer
+settles. The balancer, the shutdown handoff, the shedding gates and
+`ursulactl drain` pick their targets through one rule: a voter that may
+campaign, and under a bootstrapped view one whose role in the group is
+`voter` or `incoming`, never an outgoing or abandoned replica.
 
 A replica that lost its vote history, such as one on a wiped disk, answers
 errors until a quorum without it proves a vote. Two such replicas of three
@@ -281,8 +305,8 @@ write may have applied, and for a stale placement the placement as
 `current`. It answers `404` for an unknown group or node, `409` for another
 refusal of the meta state machine, `503` while the meta group cannot answer,
 and `504` when the write may have applied. A move's leader adds its learners
-and waits for their recovery gates, which it does not ask other nodes for
-yet, so a move waits as `gate_unknown`. The shells count their steps in
+and promotes each once it caught up and its node's participation answer
+shows its recovery gate open (section 2). The shells count their steps in
 `ursula.placement.reconcile_steps_total{step, outcome}`, and
 `ursula.placement.reconcile_waiting{reason}` and
 `ursula.placement.oldest_move_age_seconds` show why replicas wait and how
@@ -329,13 +353,14 @@ group is seeded or its voters equal the target, and such a voter only by a
 move or by leaving a joint configuration; nothing restores a missing voter),
 a move of the group in the view (`move_in_progress`, for every role, a
 replica that does not count as a voter included), `joint_membership`,
-`apply_lag` or `apply_stopped`. A node with no group is ready.
-`GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete voter
-sets, members and replicas without a role, moves, joint membership and
-stopped apply, so healthy survivors keep serving while a peer catches up.
-Maintenance tooling uses `ready()`, which ignores only a meta group without a
-leader and a damaged meta replica, so a second disruption waits for full
-redundancy. The readiness body includes the full report.
+`apply_lag`, `apply_stopped` or `move_stalled` on the leader of a stalled
+move. A node with no group is ready. `GET /__ursula/ready` uses
+`serving_ready()`, which ignores incomplete voter sets, members and replicas
+without a role, moves, joint membership, stopped apply and a stalled move, so
+healthy survivors keep serving while a peer catches up. Maintenance tooling
+uses `ready()`, which ignores only a meta group without a leader and a damaged
+meta replica, so a second disruption waits for full redundancy. The readiness
+body includes the full report.
 
 ## 4. Kubernetes integration
 

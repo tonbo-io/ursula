@@ -31,6 +31,7 @@ use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::StepFailureKind;
 use ursula_shard::RaftGroupId;
 
+use super::CatchUpGaps;
 use super::PendingStep;
 use super::ShellInputs;
 use super::StepOutcome;
@@ -330,4 +331,86 @@ fn a_report_answer_classifies_by_what_the_meta_group_did() {
     assert!(matches!(no_leader, StepOutcome::ReportFailed(_)));
     assert!(!no_leader.rereads());
     assert_eq!(no_leader.failure(), Some(StepFailureKind::MetaUnavailable));
+}
+
+/// A `catching_up` wait over learners `behind`, each `(node, matched)`, at
+/// `committed`.
+fn catching_up(
+    committed: u64,
+    behind: &[(u64, Option<u64>)],
+) -> ursula_proto::placement::ReconcileState {
+    ursula_proto::placement::ReconcileState::Waiting(
+        ursula_proto::placement::WaitReason::CatchingUp {
+            committed,
+            behind: behind
+                .iter()
+                .map(|(node, matched)| ursula_proto::placement::LearnerLag {
+                    node: NodeId::new(*node),
+                    matched: *matched,
+                })
+                .collect(),
+        },
+    )
+}
+
+/// Design 11.4's progress of a move. The bugs it catches: a wait whose
+/// committed index moves under writes read as progress while its learner
+/// gains nothing, a gap that shrinks back to an earlier low read as
+/// progress, and a snapshot send to the learner not counted.
+#[test]
+fn a_catching_up_wait_progresses_only_while_a_gap_shrinks_or_a_snapshot_is_sent() {
+    let nobody = |_node: NodeId| false;
+    let mut gaps = CatchUpGaps::default();
+    let gated = ursula_proto::placement::ReconcileState::Waiting(
+        ursula_proto::placement::WaitReason::GateUnknown {
+            nodes: samples::ids(&[4]),
+        },
+    );
+    // A new state is progress, the same one is not.
+    assert!(gaps.progressed(&gated, &catching_up(100, &[(4, Some(40))]), nobody));
+    assert!(!gaps.progressed(
+        &catching_up(100, &[(4, Some(40))]),
+        &catching_up(100, &[(4, Some(40))]),
+        nobody
+    ));
+    // Writes move both indexes at once: the gap stays 60.
+    assert!(!gaps.progressed(
+        &catching_up(100, &[(4, Some(40))]),
+        &catching_up(130, &[(4, Some(70))]),
+        nobody
+    ));
+    // The gap shrinks to 50, grows back to 55, and only a gap below 50
+    // progresses again.
+    assert!(gaps.progressed(
+        &catching_up(130, &[(4, Some(70))]),
+        &catching_up(150, &[(4, Some(100))]),
+        nobody
+    ));
+    assert!(!gaps.progressed(
+        &catching_up(150, &[(4, Some(100))]),
+        &catching_up(160, &[(4, Some(105))]),
+        nobody
+    ));
+    assert!(gaps.progressed(
+        &catching_up(160, &[(4, Some(105))]),
+        &catching_up(160, &[(4, Some(120))]),
+        nobody
+    ));
+    // A learner that falls back to matching nothing has a growing gap, no
+    // progress. It progresses while it is sent a snapshot, and only then.
+    let stuck = catching_up(200, &[(4, None)]);
+    assert!(!gaps.progressed(&catching_up(160, &[(4, Some(120))]), &stuck, nobody));
+    assert!(!gaps.progressed(&stuck, &stuck, nobody));
+    assert!(gaps.progressed(&stuck, &stuck, |node| node == NodeId::new(4)));
+    assert!(!gaps.progressed(&stuck, &stuck, |node| node == NodeId::new(5)));
+    // Another learner set is a new state.
+    assert!(gaps.progressed(
+        &stuck,
+        &catching_up(200, &[(4, None), (5, Some(150))]),
+        nobody
+    ));
+    // Leaving the wait is a state change, coming back starts over.
+    assert!(gaps.progressed(&stuck, &gated, nobody));
+    assert!(!gaps.progressed(&gated, &gated, nobody));
+    assert!(gaps.progressed(&gated, &stuck, nobody));
 }

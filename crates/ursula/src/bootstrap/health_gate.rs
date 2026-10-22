@@ -14,11 +14,13 @@ use std::time::Duration;
 // `tokio::time::Instant` so the drain's deadlines follow tokio's clock, which
 // tests pause and madsim simulates.
 use tokio::time::Instant;
+use ursula_control::Cluster;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
 
+use crate::bootstrap::util::handoff_targets;
 use crate::bootstrap::util::leader_counts;
 
 /// Most handoffs one gate submits per tick at [`ShedPace::Gradual`]. A node
@@ -253,9 +255,10 @@ pub(crate) struct ShedPlan {
 }
 
 /// Plans at most `limit` handoffs of `candidates`, the groups `node_id`
-/// leads that it may hand off, in the order given. A target must be another
-/// voter of the group that `targets` admits for the candidate and that
-/// `can_take_over` accepts (the registry's handoff check). Of those, each
+/// leads that it may hand off, in the order given. A target must be one of
+/// the group's [`handoff_targets`] under the bootstrapped view `cluster`
+/// that `targets` admits for the candidate and that `can_take_over` accepts
+/// (the registry's handoff check). Of those, each
 /// handoff goes to the one that leads the fewest groups, counting the
 /// `in_flight` handoffs (submitted, with the leadership not moved yet) and
 /// the ones planned before it, so the handoffs spread over the peers. A
@@ -265,6 +268,7 @@ pub(crate) struct ShedPlan {
 pub(crate) fn plan_shed_handoffs(
     snaps: &[RaftGroupMetricsSnapshot],
     node_id: u64,
+    cluster: Option<&Cluster>,
     candidates: impl IntoIterator<Item = ShedCandidate>,
     in_flight: &[ShedHandoff],
     limit: usize,
@@ -292,16 +296,9 @@ pub(crate) fn plan_shed_handoffs(
             continue;
         };
         let group = RaftGroupId(snap.raft_group_id);
-        let qualifying: Vec<u64> = snap
-            .voter_ids
-            .iter()
-            .copied()
-            .filter(|voter| {
-                *voter != node_id
-                    && targets.admit(&candidate, *voter)
-                    && can_take_over(group, *voter)
-            })
-            .collect();
+        let qualifying = handoff_targets(snap, node_id, cluster, |voter| {
+            targets.admit(&candidate, voter) && can_take_over(group, voter)
+        });
         let preferred = qualifying
             .iter()
             .copied()
@@ -410,6 +407,7 @@ impl ShedDrain {
         &mut self,
         snaps: &[RaftGroupMetricsSnapshot],
         node_id: u64,
+        cluster: Option<&Cluster>,
         now: Instant,
         limit: usize,
         heat: &[u64],
@@ -481,6 +479,7 @@ impl ShedDrain {
         let plan = plan_shed_handoffs(
             snaps,
             node_id,
+            cluster,
             candidates,
             &in_flight,
             limit,
@@ -627,9 +626,11 @@ impl LeadershipShed {
         let now = Instant::now();
         let snaps = self.registry.metrics_snapshot();
         let registry = &self.registry;
+        let view = registry.placement_watch().current();
         let tick = self.drain.tick(
             &snaps,
             self.node_id,
+            view.cluster(),
             now,
             self.pace.handoffs_per_step(),
             heat,
@@ -847,6 +848,7 @@ mod tests {
         drain.tick(
             snaps,
             ME,
+            None,
             now,
             SHED_HANDOFFS_PER_TICK,
             heat,
@@ -1025,7 +1027,16 @@ mod tests {
             group_id,
             avoid: None,
         });
-        let plan = plan_shed_handoffs(&snaps, ME, candidates, &[], 3, &every_node(), |_, _| true);
+        let plan = plan_shed_handoffs(
+            &snaps,
+            ME,
+            None,
+            candidates,
+            &[],
+            3,
+            &every_node(),
+            |_, _| true,
+        );
         assert_eq!(plan.handoffs, vec![
             handoff(5, 2),
             handoff(0, 3),
@@ -1040,6 +1051,7 @@ mod tests {
         let plan = plan_shed_handoffs(
             &snaps,
             ME,
+            None,
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             SHED_HANDOFFS_PER_TICK,
@@ -1064,6 +1076,7 @@ mod tests {
         let plan = plan_shed_handoffs(
             &snaps,
             ME,
+            None,
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             usize::MAX,
@@ -1080,6 +1093,7 @@ mod tests {
         let plan = plan_shed_handoffs(
             &snaps,
             ME,
+            None,
             ShedCandidate::every_group_led_by(&snaps, ME),
             &[],
             usize::MAX,
@@ -1096,6 +1110,7 @@ mod tests {
         let plan = plan_shed_handoffs(
             &snaps,
             ME,
+            None,
             [2, 3].map(|group_id| ShedCandidate {
                 group_id,
                 avoid: None,
@@ -1202,6 +1217,7 @@ mod tests {
         let only_three = drain.tick(
             &snaps,
             ME,
+            None,
             at(start, 16),
             SHED_HANDOFFS_PER_TICK,
             &[],
@@ -1224,6 +1240,7 @@ mod tests {
             drain.tick(
                 &snaps,
                 ME,
+                None,
                 now,
                 SHED_HANDOFFS_PER_TICK,
                 &[],
@@ -1321,6 +1338,7 @@ mod tests {
         let first = drain.tick(
             &snaps,
             ME,
+            None,
             start,
             SHED_HANDOFFS_PER_TICK,
             &[],

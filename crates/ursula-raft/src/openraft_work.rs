@@ -504,17 +504,69 @@ impl Debug for EngineWorkLedger {
 #[error("the group engine shut down")]
 pub(crate) struct EngineStopped;
 
+/// The full snapshot sends of one engine's network clients that run, by
+/// target node. A leader's reconcile shell reads them: a learner it waits
+/// for that is being sent a snapshot makes progress (design 11.4).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SnapshotSends(Arc<std::sync::Mutex<HashMap<u64, usize>>>);
+
+impl SnapshotSends {
+    /// Whether a snapshot send to `target` runs.
+    pub(crate) fn running(&self, target: u64) -> bool {
+        self.sends().contains_key(&target)
+    }
+
+    /// Counts a send to `target` until the guard drops.
+    fn start(&self, target: u64) -> SnapshotSend {
+        let mut sends = self.sends();
+        let count = sends.entry(target).or_insert(0);
+        *count = count.saturating_add(1);
+        SnapshotSend {
+            sends: self.clone(),
+            target,
+        }
+    }
+
+    fn sends(&self) -> std::sync::MutexGuard<'_, HashMap<u64, usize>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One running snapshot send, counted while it lives.
+struct SnapshotSend {
+    sends: SnapshotSends,
+    target: u64,
+}
+
+impl Drop for SnapshotSend {
+    fn drop(&mut self) {
+        let mut sends = self.sends.sends();
+        if let Some(count) = sends.get_mut(&self.target) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sends.remove(&self.target);
+            }
+        }
+    }
+}
+
 /// A network factory whose clients hold the engine's [`WorkToken`]:
 /// OpenRaft hands them to heartbeat, vote, replication and snapshot-sending
-/// tasks that `Raft::shutdown` does not join.
+/// tasks that `Raft::shutdown` does not join. Its clients count their
+/// snapshot sends in `sends`.
 pub(crate) struct TrackedNetworkFactory<NF> {
     factory: NF,
     work: WorkToken,
+    sends: SnapshotSends,
 }
 
 impl<NF> TrackedNetworkFactory<NF> {
-    pub(crate) fn new(factory: NF, work: WorkToken) -> Self {
-        Self { factory, work }
+    pub(crate) fn new(factory: NF, work: WorkToken, sends: SnapshotSends) -> Self {
+        Self {
+            factory,
+            work,
+            sends,
+        }
     }
 }
 
@@ -524,6 +576,9 @@ pub(crate) struct TrackedNetwork<N> {
     /// Declared before the token, so the client drops first.
     network: N,
     work: WorkToken,
+    /// The node the client sends to.
+    target: u64,
+    sends: SnapshotSends,
 }
 
 impl<NF> RaftNetworkFactory<UrsulaRaftTypeConfig> for TrackedNetworkFactory<NF>
@@ -537,6 +592,8 @@ where
         TrackedNetwork {
             network: self.factory.new_client(target, node).await,
             work: self.work.clone(),
+            target,
+            sends: self.sends.clone(),
         }
     }
 
@@ -546,6 +603,8 @@ where
         TrackedNetwork {
             network: self.factory.new_heartbeat_client(target, node).await,
             work: self.work.clone(),
+            target,
+            sends: self.sends.clone(),
         }
     }
 
@@ -553,6 +612,8 @@ where
         TrackedNetwork {
             network: self.factory.new_snapshot_client(target, node).await,
             work: self.work.clone(),
+            target,
+            sends: self.sends.clone(),
         }
     }
 }
@@ -571,7 +632,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let Self { network, work } = self;
+        let Self { network, work, .. } = self;
         work.until_stopping(RaftNetworkV2::append_entries(network, rpc, option))
             .await
             .unwrap_or_else(|| Err(engine_stopped()))
@@ -611,7 +672,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let Self { network, work } = self;
+        let Self { network, work, .. } = self;
         work.until_stopping(RaftNetworkV2::vote(network, rpc, option))
             .await
             .unwrap_or_else(|| Err(engine_stopped()))
@@ -622,7 +683,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let Self { network, work } = self;
+        let Self { network, work, .. } = self;
         work.until_stopping(RaftNetworkV2::pre_vote(network, rpc, option))
             .await
             .unwrap_or_else(|| Err(engine_stopped()))
@@ -635,7 +696,13 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
-        let Self { network, work } = self;
+        let Self {
+            network,
+            work,
+            target,
+            sends,
+        } = self;
+        let _send = sends.start(*target);
         work.until_stopping(RaftNetworkV2::full_snapshot(
             network, vote, snapshot, cancel, option,
         ))
@@ -652,7 +719,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<TransferLeaderResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let Self { network, work } = self;
+        let Self { network, work, .. } = self;
         work.until_stopping(RaftNetworkV2::transfer_leader(network, req, option))
             .await
             .unwrap_or_else(|| Err(engine_stopped()))

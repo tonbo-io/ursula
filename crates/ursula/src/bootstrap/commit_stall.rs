@@ -105,13 +105,15 @@ impl CommitStallTracker {
             if stalled_for < threshold {
                 continue;
             }
-            let mut targets: Vec<u64> = snap
-                .voter_ids
-                .iter()
-                .copied()
-                .filter(|v| *v != my_id)
-                .collect();
-            targets.sort_by_key(|v| (leader_count.get(v).copied().unwrap_or(0), *v));
+            // Escaping a stalled leader takes any other voter, a leaving
+            // one included.
+            let targets = crate::bootstrap::util::prioritized_transfer_targets(
+                snap,
+                my_id,
+                None,
+                |_voter| true,
+                &leader_count,
+            );
             if targets.is_empty() {
                 continue;
             }

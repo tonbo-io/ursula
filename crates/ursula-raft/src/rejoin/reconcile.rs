@@ -539,7 +539,7 @@ struct Pending {
 }
 
 /// The membership reconcile shell of one replica.
-pub(crate) struct ReconcileShell<SM, S: ?Sized, G>
+pub(crate) struct ReconcileShell<SM, S: ?Sized, G: ?Sized>
 where SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static
 {
     pub(crate) core: ReplicaCore<SM>,
@@ -559,6 +559,7 @@ pub(crate) fn initial_status(now_ms: u64) -> ReconcileStatus {
     ReconcileStatus {
         state: ReconcileState::Waiting(WaitReason::NotLeader),
         since_ms: now_ms,
+        progress_ms: now_ms,
         last_failure: None,
         attempts: 0,
         target_since: None,
@@ -582,6 +583,63 @@ struct ShellState {
     reported: Option<PlacementEpoch>,
     /// Confirm the view before the next plan.
     reread: bool,
+    /// The learners' smallest gaps since the shell last made progress.
+    gaps: CatchUpGaps,
+}
+
+/// The smallest gap of each learner a `catching_up` wait has shown since
+/// the shell last made progress (design 11.4).
+#[derive(Debug, Default)]
+pub(crate) struct CatchUpGaps(BTreeMap<NodeId, u64>);
+
+impl CatchUpGaps {
+    /// Whether publishing `after` over `before` is progress, remembering
+    /// the gaps `after` shows. A new state is progress, apart from one
+    /// `catching_up` wait over the same learners, whose committed and
+    /// matched indexes move under writes: that wait progresses while a
+    /// learner's gap shrinks below its smallest since the last progress, or
+    /// while one of its learners is being sent a snapshot (`sending`).
+    pub(crate) fn progressed(
+        &mut self,
+        before: &ReconcileState,
+        after: &ReconcileState,
+        sending: impl Fn(NodeId) -> bool,
+    ) -> bool {
+        let gaps = catch_up_gaps(after);
+        let one_wait = catch_up_gaps(before)
+            .zip(gaps.as_ref())
+            .is_some_and(|(before, after)| before.keys().eq(after.keys()));
+        let Some(gaps) = gaps.filter(|_| one_wait) else {
+            let changed = before != after;
+            if changed {
+                self.0 = catch_up_gaps(after).unwrap_or_default();
+            }
+            return changed;
+        };
+        let shrank = gaps
+            .iter()
+            .any(|(node, gap)| self.0.get(node).is_none_or(|smallest| gap < smallest));
+        let progressed = shrank || gaps.keys().any(|node| sending(*node));
+        for (node, gap) in gaps {
+            let smallest = self.0.entry(node).or_insert(gap);
+            *smallest = (*smallest).min(gap);
+        }
+        progressed
+    }
+}
+
+/// Each learner's gap behind the committed index in a `catching_up` wait:
+/// all of it for a learner that matches nothing.
+fn catch_up_gaps(state: &ReconcileState) -> Option<BTreeMap<NodeId, u64>> {
+    match state {
+        ReconcileState::Waiting(WaitReason::CatchingUp { committed, behind }) => Some(
+            behind
+                .iter()
+                .map(|lag| (lag.node, committed.saturating_sub(lag.matched.unwrap_or(0))))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// What a report names beside the `Converged` step's voters: the placement
@@ -596,7 +654,7 @@ impl<SM, S, G> ReconcileShell<SM, S, G>
 where
     SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static,
     S: MembershipTargetSource + ?Sized,
-    G: PeerGates,
+    G: PeerGates + ?Sized,
 {
     /// Runs the shell until its Raft stops. A step still pending then keeps
     /// running on its own task.
@@ -756,6 +814,7 @@ where
         let (step, report, reconcile) = match step {
             MembershipStep::Wait(reason) => {
                 self.publish(
+                    &mut state.gaps,
                     ReconcileState::Waiting(reason),
                     target_since,
                     view_applied,
@@ -767,7 +826,13 @@ where
                 let (Some(since), Leadership::Leading(leader)) = (target_since, &view.leadership)
                 else {
                     state.reported = None;
-                    self.publish(ReconcileState::Converged, target_since, view_applied, false);
+                    self.publish(
+                        &mut state.gaps,
+                        ReconcileState::Converged,
+                        target_since,
+                        view_applied,
+                        false,
+                    );
                     return;
                 };
                 let EffectiveMembership::Committed {
@@ -778,7 +843,13 @@ where
                 };
                 if state.reported == Some(since) {
                     // Applied: the view has not caught up with the report.
-                    self.publish(ReconcileState::Reporting, target_since, view_applied, false);
+                    self.publish(
+                        &mut state.gaps,
+                        ReconcileState::Reporting,
+                        target_since,
+                        view_applied,
+                        false,
+                    );
                     return;
                 }
                 let report = ReportKey { since, membership };
@@ -800,7 +871,7 @@ where
         if !state.retry.admit(&step, interval) {
             return;
         }
-        self.publish(reconcile, target_since, view_applied, true);
+        self.publish(&mut state.gaps, reconcile, target_since, view_applied, true);
         state.pending = self.start(step, kind, metrics, report);
     }
 
@@ -1045,6 +1116,7 @@ where
                 state.confirmed = None;
                 let view_applied = self.status.borrow().view_applied;
                 self.publish(
+                    &mut state.gaps,
                     ReconcileState::StaleView {
                         reported: *reported,
                         current: *current,
@@ -1114,19 +1186,26 @@ where
     }
 
     /// Publishes `reconcile`: a new state restarts `since_ms` and the
-    /// attempts, which count the steps started in one state.
+    /// attempts, which count the steps started in one state, and progress
+    /// ([`CatchUpGaps::progressed`]) moves `progress_ms`.
     fn publish(
         &self,
+        gaps: &mut CatchUpGaps,
         reconcile: ReconcileState,
         target_since: Option<PlacementEpoch>,
         view_applied: Option<ursula_proto::placement::MetaLogId>,
         attempt: bool,
     ) {
+        let sends = &self.core.snapshot_sends;
         self.status.send_if_modified(|status| {
             let before = status.clone();
+            let now_ms = ursula_runtime::unix_time_ms();
+            if gaps.progressed(&status.state, &reconcile, |node| sends.running(node.get())) {
+                status.progress_ms = now_ms;
+            }
             if status.state != reconcile {
                 status.state = reconcile;
-                status.since_ms = ursula_runtime::unix_time_ms();
+                status.since_ms = now_ms;
                 status.attempts = 0;
             }
             if attempt {

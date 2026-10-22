@@ -30,6 +30,7 @@ use crate::bootstrap::hosting::SpawnedHosting;
 use crate::bootstrap::leadership;
 use crate::bootstrap::meta;
 use crate::bootstrap::meta::SpawnedMeta;
+use crate::bootstrap::participation::ParticipationGates;
 use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::snapshot;
 use crate::bootstrap::snapshot::StoreGateInputs;
@@ -95,13 +96,20 @@ pub fn spawn_runtime(
     config: &ursula_config::UrsulaConfig,
     topology: Topology,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
-    spawn_with_inputs(config, topology, |node_id, registry| {
+    spawn_with_inputs(config, topology, |node_id, registry, participation| {
         let hosting = HostingSet::default();
+        // A leader promotes a learner only once the learner's participation
+        // answer shows its gate open.
+        let gates = ParticipationGates {
+            participation: participation.clone(),
+            registry: registry.clone(),
+        };
         let placement = MetaPlacement::new(
             ursula_proto::placement::NodeId::new(node_id),
             registry.clone(),
             hosting.clone(),
-        );
+        )
+        .with_peer_gates(Arc::new(gates));
         (
             Arc::new(placement.clone()),
             Some(SpawnedHosting { placement, hosting }),
@@ -117,9 +125,11 @@ pub(crate) fn spawn_runtime_with_placement(
     topology: Topology,
     placement: ursula_raft::FixedPlacement,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
-    spawn_with_inputs(config, topology, move |_node_id, _registry| {
-        (Arc::new(placement), None)
-    })
+    spawn_with_inputs(
+        config,
+        topology,
+        move |_node_id, _registry, _participation| (Arc::new(placement), None),
+    )
 }
 
 /// The placement inputs of a node's groups, by its node id and registry,
@@ -127,12 +137,12 @@ pub(crate) fn spawn_runtime_with_placement(
 type NodeInputs = (Arc<dyn PlacementInputs>, Option<SpawnedHosting>);
 
 /// The one spawn path. A Raft node's groups open behind their recovery
-/// gates with the placement inputs `inputs` gives for the node and its
-/// registry.
+/// gates with the placement inputs `inputs` gives for the node, its
+/// registry and the client that reads its peers' participation answers.
 fn spawn_with_inputs(
     config: &ursula_config::UrsulaConfig,
     topology: Topology,
-    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry) -> NodeInputs,
+    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry, &PeerParticipation) -> NodeInputs,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let mut runtime_config =
         RuntimeConfig::from_ursula_config(&config.runtime, topology.group_count());
@@ -210,7 +220,7 @@ fn spawn_raft_node(
     node_id: u64,
     peers: PeerDirectory,
     wal: &ClusterWal,
-    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry) -> NodeInputs,
+    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry, &PeerParticipation) -> NodeInputs,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let group_count = runtime_config.raft_group_count;
     let snapshot_store =
@@ -292,7 +302,7 @@ fn spawn_raft_node(
         participation.clone(),
     )
     .map_err(RuntimeError::from)?;
-    let (placement, hosting) = inputs(node_id, &registry);
+    let (placement, hosting) = inputs(node_id, &registry, &participation);
     let factory = ursula_raft::PlacedRaftGroupEngineFactory::new(
         raft_wal.clone(),
         registry.clone(),

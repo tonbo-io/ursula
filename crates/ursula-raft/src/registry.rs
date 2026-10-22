@@ -1265,7 +1265,11 @@ impl RaftGroupHandleRegistry {
     /// This node's leadership-shed state, as a node of `cluster_id` answers
     /// it. A node cannot receive a planned leadership handoff until the
     /// recovery gate of every data replica that counts as a voter is open
-    /// ([`Self::recovery_barriers_ready`]).
+    /// ([`Self::recovery_barriers_ready`]). The answer carries every
+    /// recovery gate ([`Self::recovery_gates`]), which a group's leader
+    /// reads before it promotes this node's learner, and how many data
+    /// groups the node leads ([`Self::leader_count`]), which the peers'
+    /// leadership balancers read.
     pub fn participation_status(
         &self,
         cluster_id: ursula_headers::ClusterId,
@@ -1279,7 +1283,22 @@ impl RaftGroupHandleRegistry {
             should_campaign: self.should_campaign(),
             recovery_barriers_ready: self.recovery_barriers_ready(),
             should_shed_current_leaders: state.should_shed_current_leaders(),
+            recovery_gates: self.recovery_gates(),
+            leader_count: self.leader_count(),
         }
+    }
+
+    /// How many data groups this node leads, each by its replica's
+    /// leadership view ([`crate::GroupLeadership::leads`]).
+    pub fn leader_count(&self) -> u32 {
+        let led = self
+            .groups
+            .load()
+            .values()
+            .filter_map(|entry| entry.active())
+            .filter(|active| active.raft().leadership().leads())
+            .count();
+        u32::try_from(led).unwrap_or(u32::MAX)
     }
 
     /// Every recovery gate of a data replica that counts as a voter is open

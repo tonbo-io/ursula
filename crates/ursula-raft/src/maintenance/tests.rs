@@ -26,6 +26,7 @@ use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
 use super::META_UNAVAILABLE_AFTER;
+use super::MOVE_STALLED_AFTER;
 use super::MaintenanceInputs;
 use super::NodePlacement;
 use super::RaftMaintenanceIssue as Issue;
@@ -106,6 +107,7 @@ struct Node {
     hosting: HostingStatus,
     groups: Vec<RaftGroupMetricsSnapshot>,
     not_voters: BTreeSet<u32>,
+    now_ms: u64,
 }
 
 impl Node {
@@ -151,6 +153,7 @@ impl Node {
             },
             groups: placed.iter().map(|group| healthy(group.0)).collect(),
             not_voters: BTreeSet::new(),
+            now_ms: 1_000_000_000,
         }
     }
 
@@ -174,6 +177,7 @@ impl Node {
         check_raft_maintenance(MaintenanceInputs {
             node_id: self.me,
             lag_tolerance: 16,
+            now_ms: self.now_ms,
             groups: &self.groups,
             counts: |group: RaftGroupId| {
                 if self.not_voters.contains(&group.0) {
@@ -601,6 +605,7 @@ fn a_node_without_a_meta_runtime_knows_no_placement() {
     let report = check_raft_maintenance(MaintenanceInputs {
         node_id: 1,
         lag_tolerance: 16,
+        now_ms: 0,
         groups: &groups,
         counts: |_group| Counts::Voter,
         placement: None,
@@ -609,6 +614,54 @@ fn a_node_without_a_meta_runtime_knows_no_placement() {
     assert_eq!(report.node_issues, vec![Issue::PlacementUnknown]);
     assert!(report.group_issues.is_empty());
     assert!(!report.serving_ready());
+}
+
+/// Only the leader of a moving group reports `move_stalled`, once its
+/// reconciler made no progress for [`MOVE_STALLED_AFTER`]. The bugs it
+/// catches: the stall raised for a stable or seeded group, by a follower,
+/// or before the five minutes passed.
+#[test]
+fn only_the_leader_of_a_moving_group_without_progress_reports_move_stalled() {
+    // Group 0 is seeded, group 1 stable and group 2 moving, each with a
+    // role for node 1.
+    let cluster = samples::sample_state().cluster().unwrap().clone();
+    let mut node = Node::placed(cluster, 1);
+    let stalled_after = u64::try_from(MOVE_STALLED_AFTER.as_millis()).unwrap();
+    let status = |progress_ms| ursula_proto::placement::ReconcileStatus {
+        state: ursula_proto::placement::ReconcileState::Waiting(
+            ursula_proto::placement::WaitReason::GateUnknown {
+                nodes: samples::ids(&[2]),
+            },
+        ),
+        since_ms: 7,
+        progress_ms,
+        last_failure: None,
+        attempts: 3,
+        target_since: None,
+        view_applied: None,
+    };
+    let stalled_at = node.now_ms - stalled_after;
+    for group in &mut node.groups {
+        group.current_leader = Some(1);
+        group.reconcile = Some(status(stalled_at));
+    }
+    let stalled = |node: &Node| {
+        node.report()
+            .group_issues
+            .into_iter()
+            .filter(|(_, issues)| issues.contains(&Issue::MoveStalled))
+            .map(|(group, _)| group)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stalled(&node), vec![2]);
+    assert!(!node.report().ready());
+
+    node.groups[2].reconcile = Some(status(stalled_at + 1));
+    assert_eq!(stalled(&node), Vec::<u32>::new());
+
+    node.groups[2].reconcile = Some(status(stalled_at));
+    node.groups[2].current_leader = Some(3);
+    assert_eq!(stalled(&node), Vec::<u32>::new());
 }
 
 #[test]
