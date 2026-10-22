@@ -5519,10 +5519,11 @@ async fn cli_a_wal_root_started_under_another_node_id_is_refused() {
 /// IT-2 (#768 addendum, section 7): restarts on the same boot owe no
 /// predecessor wait. A SIGKILL of every node is a crash of each process on
 /// its own mount: each next run reads `process_crash`, finds its
-/// predecessor gone and serves with every write kept. A follower stopped
-/// with SIGTERM and started again under write load, whose leaders' pooled
-/// AppendStream sessions name its old process (D25), catches up within a
-/// bound.
+/// predecessor gone and serves with every write kept. Node 3, stopped with
+/// SIGTERM and started again under write load, catches up within a bound.
+/// It may lead some groups when it stops: the leaders of the others, and of
+/// those once they move, hold pooled AppendStream sessions that name its old
+/// process (D25).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_restarts_on_the_same_boot_owe_no_predecessor_wait() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -5590,8 +5591,22 @@ async fn cli_restarts_on_the_same_boot_owe_no_predecessor_wait() {
     assert!(!loaded.is_empty(), "the write load was acknowledged");
     expected.extend(loaded);
     // What node 3 applies reaches each group's committed index within the
-    // bound, through the leaders that streamed to its old process.
-    let committed = leaders_committed(&client, &nodes[..2]).await;
+    // bound, through the leaders that streamed to its old process. A node
+    // whose metrics fail reports nothing, so the check waits until some
+    // leader reported, rather than pass with nothing to compare.
+    let committed = eventually(
+        &mut procs,
+        "a leader reports its committed index",
+        async || {
+            let committed = leaders_committed(&client, &nodes).await;
+            if committed.is_empty() {
+                Err("no leader reported a committed index".to_owned())
+            } else {
+                Ok(committed)
+            }
+        },
+    )
+    .await;
     eventually(
         &mut procs,
         "node 3 caught up after its restart",
@@ -5638,8 +5653,10 @@ async fn read_until_holding(client: &reqwest::Client, url: &str, writes: &[Strin
             None => false,
         })
     };
+    // 15 s: after a leader is killed, an election and a read on a loaded
+    // runner.
     let mut last = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..300 {
         if let Ok(response) = client.get(url).send().await
             && response.status().is_success()
         {
@@ -6647,8 +6664,10 @@ async fn read_until_replicated(client: &reqwest::Client, url: &str) -> Vec<u8> {
 }
 
 async fn read_until_matches(client: &reqwest::Client, url: &str, expected: &[u8]) -> Vec<u8> {
+    // 15 s: after a leader is killed, an election and a read on a loaded
+    // runner.
     let mut last = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..300 {
         if let Ok(response) = client.get(url).send().await
             && response.status().is_success()
         {

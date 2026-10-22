@@ -28,8 +28,10 @@
 //! records, owes its wait from the binding the meta group answers, and
 //! until that binding its data replicas take part in nothing
 //! ([`NodeFence::awaits_binding`]): no vote, no gate, no floor and no
-//! snapshot object. Its meta replica is not held by it, so a forming
-//! cluster's meta group still elects.
+//! snapshot object. Its meta replica's votes are not held by it, so a
+//! forming cluster's meta group still elects, but its meta barrier rounds
+//! are: a meta leader's barrier would let it take a meta floor beside the
+//! old process before meta answered its registration.
 //!
 //! A process without a WAL root, or a test, runs [`NodeFence::unleased`]:
 //! no lease and no wait, only the shutdown's close.
@@ -328,6 +330,20 @@ impl NodeFence {
             return FenceStatus::DiskLeaseLost;
         }
         FenceStatus::Admits
+    }
+
+    /// The start of the probe success the lease now runs from, if it holds
+    /// one: the lease holds until that start plus its length.
+    pub fn last_success_start(&self) -> Option<FenceInstant> {
+        let length = self.lease_length()?;
+        let until = self.0.until.load(Ordering::Acquire);
+        if until == 0 {
+            return None;
+        }
+        self.0
+            .origin
+            .checked_add(Duration::from_nanos(until))?
+            .checked_sub(length)
     }
 
     /// When the fence last lifted after a lost lease, if it did.

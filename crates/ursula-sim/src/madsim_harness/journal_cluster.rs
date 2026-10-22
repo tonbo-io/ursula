@@ -73,6 +73,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use super::recovery_wiring;
+use super::recovery_wiring::AnswerLog;
 use super::recovery_wiring::ReversionLog;
 use super::recovery_wiring::VoteLog;
 use super::sim_wal::SimNodeWal;
@@ -310,6 +311,8 @@ pub(super) struct JournalCluster {
     pub(super) votes: VoteLog,
     /// Every conflict below a matched index the network delivered.
     pub(super) reversions: ReversionLog,
+    /// Every answer a process with an incarnation counted.
+    pub(super) answers: AnswerLog,
     pub(super) wals: BTreeMap<u64, SimNodeWal>,
     registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
@@ -465,7 +468,7 @@ impl JournalCluster {
         let install_timeout = snapshot_objects
             .as_ref()
             .map(|objects| objects.install_timeout);
-        let (policy, votes, reversions) = recovery_wiring::vote_recording_network_policy(
+        let (policy, records) = recovery_wiring::vote_recording_network_policy(
             snapshot_objects
                 .as_ref()
                 .map(|objects| objects.bucket.clone()),
@@ -473,8 +476,9 @@ impl JournalCluster {
         Self {
             config,
             policy,
-            votes,
-            reversions,
+            votes: records.votes,
+            reversions: records.reversions,
+            answers: records.answers,
             wals: (1..=nodes)
                 .map(|node_id| {
                     (
@@ -685,7 +689,7 @@ impl JournalCluster {
             }
         };
         recovery_wiring::wire_recovery(
-            node_id,
+            ursula_raft::InProcessCaller::node(node_id),
             placement,
             &engine,
             &rejoin,
@@ -796,6 +800,11 @@ impl JournalCluster {
             registry: self.node_registries[&node_id].clone(),
             process: None,
         }
+    }
+
+    /// The in-process network of `group`.
+    pub(super) fn group_registry(&self, group: u32) -> &InProcessRaftRegistry {
+        &self.registries[&group]
     }
 
     /// The in-process network of each data group.

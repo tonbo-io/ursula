@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
-use ursula_proto::placement::NodeId;
 use ursula_raft::BarrierAnswer;
 use ursula_raft::FixedPlacement;
 use ursula_raft::GroupRejoin;
+use ursula_raft::InProcessCaller;
 use ursula_raft::InProcessRaftNetworkEvent;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
@@ -79,50 +79,49 @@ impl std::fmt::Display for RecoveryProbeError {
 /// confirmed the way the barrier RPC confirms one: a new ReadIndex round
 /// with a quorum, applied by the leader, while it still leads, and its
 /// answer checked as every seam checks one
-/// ([`ursula_raft::BarrierAnswer::accept`]). `policy` cuts the RPC off as
-/// it cuts off the Raft RPCs between `node_id` and the leader.
+/// ([`ursula_raft::BarrierAnswer::accept`]). `caller`'s process fence and
+/// routes apply to it as to the gRPC barrier, and `policy` cuts it off as it
+/// cuts off the Raft RPCs between the caller's node and the leader.
 pub(super) async fn in_process_barrier(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
-    node_id: u64,
+    caller: &InProcessCaller,
     leader_id: u64,
     target: RaftTarget,
 ) -> Result<BarrierAnswer, RecoveryProbeError> {
-    if policy.partitioned(node_id, leader_id) {
+    if policy.partitioned(caller.node_id(), leader_id) {
         return Err(RecoveryProbeError::Partitioned);
     }
     registry
-        .barrier(leader_id, target)
+        .barrier(caller, leader_id, target)
         .await
         .map_err(RecoveryProbeError::Proof)
 }
 
-/// The bootstrap probe vote of `node_id` to `peer_id`, screened by the
-/// peer's gate and cut off by `policy` as the network would.
+/// The bootstrap probe vote of `caller` to `peer_id`, screened by the
+/// peer's gate, fenced as the barrier is and cut off by `policy` as the
+/// network would.
 pub(super) async fn in_process_probe(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
-    node_id: u64,
+    caller: &InProcessCaller,
     peer_id: u64,
 ) -> Option<PeerGroupLog> {
-    if policy.partitioned(node_id, peer_id) {
+    if policy.partitioned(caller.node_id(), peer_id) {
         return None;
     }
-    registry
-        .vote(peer_id, ursula_raft::bootstrap_probe_vote())
-        .await
-        .ok()
-        .map(|response| PeerGroupLog::from_vote_response(&response))
+    registry.probe(caller, peer_id).await
 }
 
-/// Binds `rejoin` to `node_id`'s replica of `placement`, puts it in front of
+/// Binds `rejoin` to `caller`'s replica of `placement`, puts it in front of
 /// the votes and appends the network delivers to that replica, and spawns
 /// the node's recovery drivers over `inputs`, as the engine factory does:
 /// the barrier driver, the reconcile shell, the vote floor task and, on the
 /// initializer, the bootstrap driver. The drivers belong to the node's
-/// process and must be aborted with it.
+/// process, whose recovery calls `caller` makes, and must be aborted with
+/// it.
 pub(super) fn wire_recovery(
-    node_id: u64,
+    caller: InProcessCaller,
     _placement: ShardPlacement,
     engine: &RaftGroupEngine,
     rejoin: &Arc<GroupRejoin>,
@@ -139,7 +138,7 @@ pub(super) fn wire_recovery(
             InProcessRecoveryTransport {
                 registry: registry.clone(),
                 policy: policy.clone(),
-                node_id,
+                caller,
             },
             ursula_raft::RecoveryConfig {
                 interval: RECOVERY_DRIVER_INTERVAL,
@@ -198,7 +197,7 @@ pub(super) async fn start_gated_replica(
     )
     .await?;
     wire_recovery(
-        node_id,
+        InProcessCaller::node(node_id),
         placement,
         &engine,
         &rejoin,
@@ -237,37 +236,47 @@ pub(super) async fn wait_gates_open(
     }
 }
 
+/// The recovery transport of one replica's process over its group's
+/// in-process registry: every call is the process's ([`InProcessCaller`]).
 #[derive(Clone)]
 struct InProcessRecoveryTransport {
     registry: InProcessRaftRegistry,
     policy: InProcessRaftNetworkPolicy,
-    node_id: u64,
+    caller: InProcessCaller,
+}
+
+impl InProcessRecoveryTransport {
+    fn node_id(&self) -> u64 {
+        self.caller.node_id()
+    }
 }
 
 impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
     type Error = RecoveryProbeError;
     async fn probe(&self, peer: u64) -> Option<PeerGroupLog> {
-        in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
+        in_process_probe(&self.registry, &self.policy, &self.caller, peer).await
     }
     async fn genesis_probe(&self, peer: u64, probe: &GenesisProbe) -> Option<PeerGroupLog> {
-        if self.policy.partitioned(self.node_id, peer) {
+        if self.policy.partitioned(self.node_id(), peer) {
             return None;
         }
-        self.registry.genesis_probe(peer, probe.clone()).await
+        self.registry
+            .genesis_probe(&self.caller, peer, probe.clone())
+            .await
     }
     async fn barrier(&self, leader: u64, target: RaftTarget) -> Result<BarrierAnswer, Self::Error> {
-        in_process_barrier(&self.registry, &self.policy, self.node_id, leader, target).await
+        in_process_barrier(&self.registry, &self.policy, &self.caller, leader, target).await
     }
     async fn forward_control(
         &self,
         leader: u64,
         command: ControlCommand,
     ) -> Result<ControlResponse, MetaForwardError> {
-        if self.policy.partitioned(self.node_id, leader) {
+        if self.policy.partitioned(self.node_id(), leader) {
             return Err(MetaForwardError::leader_unreachable());
         }
         self.registry
-            .write_meta(leader, command, NodeId::new(self.node_id))
+            .write_meta(&self.caller, leader, command)
             .await
     }
 }
@@ -404,20 +413,83 @@ impl ReversionLog {
     }
 }
 
+/// One answer a sender with a process incarnation counted
+/// ([`InProcessRaftNetworkEvent::AnswerAccepted`]), when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AcceptedAnswer {
+    pub(super) at: madsim::time::Instant,
+    pub(super) source: Option<u64>,
+    pub(super) target: u64,
+    pub(super) responder: ursula_proto::placement::ProcessIncarnation,
+    pub(super) promise: bool,
+}
+
+/// Every answer a simulated network's senders with a process incarnation
+/// counted, for I17 of the identity-fence family.
+#[derive(Debug, Clone, Default)]
+pub(super) struct AnswerLog(Arc<Mutex<Vec<AcceptedAnswer>>>);
+
+impl AnswerLog {
+    fn push(&self, answer: AcceptedAnswer) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(answer);
+    }
+
+    /// Every answer counted so far.
+    pub(super) fn answers(&self) -> Vec<AcceptedAnswer> {
+        self.since(0)
+    }
+
+    /// The answers counted after the first `from`.
+    pub(super) fn since(&self, from: usize) -> Vec<AcceptedAnswer> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(from..)
+            .map(<[AcceptedAnswer]>::to_vec)
+            .unwrap_or_default()
+    }
+}
+
+/// What a recording network keeps: every vote answer, every conflict below
+/// a matched index and every answer a process counted.
+pub(super) struct NetworkRecords {
+    pub(super) votes: VoteLog,
+    pub(super) reversions: ReversionLog,
+    pub(super) answers: AnswerLog,
+}
+
 /// A simulated network that traces as `sim_network_policy` does and also
-/// records every vote answer and every conflict below a matched index. With
-/// `sends`, it opens a window in that bucket for each full snapshot it
-/// delivers, while its sender holds the object it names (I3 of #687).
+/// records every vote answer, every conflict below a matched index and
+/// every answer a process with an incarnation counted. With `sends`, it
+/// opens a window in that bucket for each full snapshot it delivers, while
+/// its sender holds the object it names (I3 of #687).
 pub(super) fn vote_recording_network_policy(
     sends: Option<MemorySnapshotBucket>,
-) -> (InProcessRaftNetworkPolicy, VoteLog, ReversionLog) {
+) -> (InProcessRaftNetworkPolicy, NetworkRecords) {
     let policy = InProcessRaftNetworkPolicy::default();
     let votes = VoteLog::default();
     let reversions = ReversionLog::default();
+    let answers = AnswerLog::default();
     let recorded = votes.clone();
     let reverted = reversions.clone();
+    let counted = answers.clone();
     policy.set_observer(move |event| {
         match &event {
+            InProcessRaftNetworkEvent::AnswerAccepted {
+                source,
+                target,
+                responder,
+                promise,
+            } => counted.push(AcceptedAnswer {
+                at: madsim::time::Instant::now(),
+                source: *source,
+                target: *target,
+                responder: *responder,
+                promise: *promise,
+            }),
             InProcessRaftNetworkEvent::VoteAnswered {
                 source,
                 target,
@@ -467,5 +539,9 @@ pub(super) fn vote_recording_network_policy(
             SimTrace::record(event);
         }
     });
-    (policy, votes, reversions)
+    (policy, NetworkRecords {
+        votes,
+        reversions,
+        answers,
+    })
 }

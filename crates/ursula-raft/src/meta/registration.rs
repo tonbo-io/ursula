@@ -137,6 +137,7 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
         };
         match judge_answer(standing, handle.submit(command).await) {
             Verdict::Registered(registered) => {
+                pauses.at(MetaPausePoint::RegistrationAnswered).await;
                 // Durable before the answer releases the data replicas.
                 match guard.bind().await {
                     Ok(()) => {}

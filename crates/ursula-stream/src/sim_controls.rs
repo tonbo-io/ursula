@@ -208,6 +208,16 @@ pub enum Defence {
     /// they run during the predecessor wait, so a floor may come from a
     /// round the predecessor still took part in.
     GateAfterWait,
+    /// A sender counts an answer only when its stamp names the target and
+    /// the table accepts the responder's process (N10 of the identity
+    /// fence). Off, every answer counts unchecked, so a leader keeps
+    /// counting a process whose root the meta group released.
+    ResponderBinding,
+    /// An unbound root owes its predecessor wait from the meta group's
+    /// answer that bound it (N23). Off, the wait runs from the start of the
+    /// run, so a root refused for longer than the wait takes part at once
+    /// when it binds.
+    WaitFromBinding,
 }
 
 #[cfg(madsim)]
@@ -217,8 +227,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 42]> = const { Cell::new([false; 42]) };
-        static FIRED: Cell<[u64; 42]> = const { Cell::new([0; 42]) };
+        static OFF: Cell<[bool; 44]> = const { Cell::new([false; 44]) };
+        static FIRED: Cell<[u64; 44]> = const { Cell::new([0; 44]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -265,6 +275,8 @@ mod switches {
             Defence::OwedWait => 39,
             Defence::RemountedRun => 40,
             Defence::GateAfterWait => 41,
+            Defence::ResponderBinding => 42,
+            Defence::WaitFromBinding => 43,
         }
     }
 
@@ -287,7 +299,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 42]));
+        FIRED.with(|fired| fired.set([0; 44]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -353,7 +353,8 @@ pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> 
         InProcessRaftNetworkEvent::VoteAnswered { .. }
         | InProcessRaftNetworkEvent::ConflictBelowMatching { .. }
         | InProcessRaftNetworkEvent::FullSnapshotStarted { .. }
-        | InProcessRaftNetworkEvent::FullSnapshotEnded { .. } => return None,
+        | InProcessRaftNetworkEvent::FullSnapshotEnded { .. }
+        | InProcessRaftNetworkEvent::AnswerAccepted { .. } => return None,
     })
 }
 

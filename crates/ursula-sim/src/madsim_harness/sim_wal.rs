@@ -79,8 +79,6 @@ pub(crate) struct SimNodeWal {
     fenced: Option<FencedRuns>,
     /// The node's current run of the WAL; `None` while the node is down.
     run: Arc<Mutex<Option<RaftWal>>>,
-    /// When the current run started.
-    started: Arc<Mutex<Option<madsim::time::Instant>>>,
     /// The data groups' stores the node handed out.
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
     /// The meta group's store the node handed out last.
@@ -109,7 +107,6 @@ impl SimNodeWal {
             topology: ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
             fenced: None,
             run: Arc::new(Mutex::new(None)),
-            started: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
             meta: Arc::new(Mutex::new(Weak::new())),
         }
@@ -130,18 +127,19 @@ impl SimNodeWal {
             topology: self.topology.clone(),
             fenced: self.fenced.clone(),
             run: Arc::new(Mutex::new(None)),
-            started: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
             meta: Arc::new(Mutex::new(Weak::new())),
         }
     }
 
-    /// When the node's current run started, if it runs.
-    pub(super) fn started_at(&self) -> Option<madsim::time::Instant> {
-        *self
-            .started
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+    /// How the node's runs start, when they run behind a disk lease.
+    pub(super) fn fenced_runs(&self) -> Option<FencedRuns> {
+        self.fenced.clone()
+    }
+
+    /// How the node's journals are tuned.
+    pub(super) fn tuning(&self) -> JournalTuning {
+        self.tuning
     }
 
     /// Sets the number of groups before this simulated node first starts.
@@ -160,7 +158,6 @@ impl SimNodeWal {
             topology: self.topology.clone(),
             fenced: self.fenced.clone(),
             run: Arc::new(Mutex::new(None)),
-            started: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
             meta: Arc::new(Mutex::new(Weak::new())),
         }
@@ -189,10 +186,6 @@ impl SimNodeWal {
             None => RaftWal::start_with(&self.root, self.tuning, &self.topology)?,
         };
         *run = Some(started.clone());
-        *self
-            .started
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(madsim::time::Instant::now());
         Ok(started)
     }
 

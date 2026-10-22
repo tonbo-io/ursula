@@ -188,7 +188,13 @@ pub use hosting::HostingStatus;
 pub use hosting::HostingStatusWatch;
 pub use hosting::HostingTask;
 #[cfg(any(test, madsim))]
+pub use in_process::FenceLoss;
+#[cfg(any(test, madsim))]
 pub use in_process::InProcessBarrierError;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessCallLost;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessCaller;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessEndpoint;
 #[cfg(any(test, madsim))]
