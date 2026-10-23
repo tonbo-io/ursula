@@ -849,8 +849,10 @@ pub enum WaitReason {
     NotAMember,
     NoLiveQuorum,
     TargetSettled,
-    /// Learners whose matched index is behind the committed one, by
-    /// ascending node id.
+    /// Learners that have not caught up, by ascending node id, each with
+    /// its matched index, and the leader's commit index. A learner catches
+    /// up once it matches, within the leader lease, the commit index of the
+    /// start of its catch-up round (`ursula_control::CatchUpRounds`).
     CatchingUp {
         committed: u64,
         behind: Vec<LearnerLag>,

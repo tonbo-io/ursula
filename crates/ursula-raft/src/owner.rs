@@ -154,6 +154,11 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         self.handoff_ack_window
     }
 
+    /// The group's OpenRaft leader lease ([`crate::leadership::leader_lease`]).
+    pub(crate) fn lease(&self) -> Duration {
+        self.lease
+    }
+
     /// How long after this leader submitted a leadership transfer it may
     /// still lead at the transfer's vote: the transfer deadline, after which
     /// it abandons the transfer and steps down

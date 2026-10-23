@@ -226,11 +226,8 @@ pub(crate) async fn handoff_shutdown_leadership(
     if remaining_leaders() == 0 {
         return 0;
     }
-    let participation = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-    {
-        Ok(client) => PeerParticipation::new(node_id, client),
+    let participation = match PeerParticipation::new(node_id) {
+        Ok(participation) => participation,
         Err(err) => {
             tracing::warn!(%err, "shutdown: cannot discover eligible leadership targets");
             return remaining_leaders();

@@ -8958,10 +8958,6 @@ const SLOW_LINK_IDLE_ONE_WAY: Duration = Duration::from_millis(200);
 const SLOW_LINK_BUSY_ONE_WAY: Duration = Duration::from_millis(400);
 /// A cluster group's leader lease, its `election_timeout_max`.
 const SLOW_LINK_LEADER_LEASE: Duration = Duration::from_secs(3);
-/// The cluster-egress probe timeout of the slow-link test, in milliseconds:
-/// longer than either phase's round trip, plus a window update for the
-/// probe's payload.
-const SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS: u64 = 5000;
 
 /// A TCP link in front of a node's listener that holds every byte it
 /// carries for the same one-way delay in each direction, as a `netem delay`
@@ -9145,10 +9141,10 @@ fn check_slow_append(
 ///
 /// Linearizable reads, back at the first delay, return every write.
 ///
-/// The nodes' cluster-egress probes wait [`SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS`]
-/// instead of the default 200 ms. The egress gate judges added delay as
-/// impaired egress by design and would shed every node's leaderships, which
-/// is not what this test pins.
+/// The nodes' cluster-egress gates run at their defaults, so every node's
+/// probe fails in both phases. No node sheds, since no peer does better: a
+/// gate that shed on its own probe alone would move every leadership off
+/// every node, and each would refuse the others' handoffs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9169,7 +9165,6 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
         .collect::<Vec<_>>();
     let meta = MetaToml {
         meta_voters: Some(META_VOTERS),
-        egress_probe_timeout_ms: Some(SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS),
         ..MetaToml::default()
     };
     let client = bounded_client();
@@ -9252,6 +9247,169 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
         )
         .await;
     }
+}
+
+/// One-way delay of every link but the incoming learner's in
+/// [`cli_a_move_over_slow_links_converges_under_steady_writes`]: a round
+/// trip of 500 ms, under the 600 ms heartbeat interval.
+const SLOW_MOVE_ONE_WAY: Duration = Duration::from_millis(250);
+/// One-way delay of the incoming learner's own link: it acknowledges each
+/// entry 300 ms after the voters do, so under steady writes the commit index
+/// is ahead of its matched index at nearly every sample.
+const SLOW_MOVE_LEARNER_ONE_WAY: Duration = Duration::from_millis(400);
+/// Writers that append back to back to the moving group, so its commit
+/// index moves every few tens of milliseconds.
+const SLOW_MOVE_WRITERS: usize = 16;
+
+/// A move finishes over a slow cluster plane under steady writes. Four
+/// nodes at replication factor 3 settle, every link then holds each byte
+/// for [`SLOW_MOVE_ONE_WAY`] and the link of the one node outside a group
+/// for [`SLOW_MOVE_LEARNER_ONE_WAY`], and that node replaces a follower of
+/// the group while [`SLOW_MOVE_WRITERS`] writers append to it. The move
+/// converges and the node serves the group as a voter.
+///
+/// - The learner's matched index trails the commit index at nearly every
+///   sample, so a leader that promotes only a learner that matched the
+///   commit index of the moment never promotes it. Each round of the
+///   catch-up rule ends one learner round trip after it starts.
+/// - Each participation answer, the learner's recovery gate among them,
+///   takes a round trip of 500 ms or 800 ms, which a peer query that gave
+///   up after 500 ms never gets.
+/// - The cluster-egress gates run at their defaults, so every node's probe
+///   fails. No node sheds for it, since no peer does better.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the slow move test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 4);
+    let mut links = Vec::new();
+    for node in &nodes {
+        links.push(DelayedLink::start(&node.url()).await);
+    }
+    let peers = nodes
+        .iter()
+        .zip(&links)
+        .map(|(node, link)| (node.id, link.url.clone()))
+        .collect::<Vec<_>>();
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let (group, from) = current_voters(&cluster)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no group: {cluster:?}"));
+    let learner = nodes
+        .iter()
+        .map(|node| node.id)
+        .find(|id| !from.contains(id))
+        .unwrap_or_else(|| panic!("group {group:?} is placed on every node: {cluster:?}"));
+    let stream = stream_per_group("slowmove").swap_remove(usize::try_from(group.0).unwrap());
+    let url = |node: &MetaNode| format!("{}/slowmove/{stream}", node.url());
+    put_until_created(&client, &url(&nodes[0])).await;
+    post_until_no_content(&client, &url(&nodes[0]), "fast;").await;
+    let leaders = wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let leader = leaders[&u64::from(group.0)];
+    let source = *from
+        .iter()
+        .find(|id| **id != leader)
+        .expect("a follower to replace");
+    let to: BTreeSet<u64> = from
+        .iter()
+        .copied()
+        .filter(|id| *id != source)
+        .chain([learner])
+        .collect();
+
+    for (node, link) in nodes.iter().zip(&links) {
+        link.set_delay(if node.id == learner {
+            SLOW_MOVE_LEARNER_ONE_WAY
+        } else {
+            SLOW_MOVE_ONE_WAY
+        });
+    }
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut writers = tokio::task::JoinSet::new();
+    for _ in 0..SLOW_MOVE_WRITERS {
+        let client = client.clone();
+        let url = url(node_of(&nodes, leader));
+        let writing = writing.clone();
+        writers.spawn(async move {
+            let mut acknowledged = 0_u64;
+            while writing.load(std::sync::atomic::Ordering::SeqCst) {
+                if append_once(&client, &url, "steady;").await.is_ok() {
+                    acknowledged = acknowledged.checked_add(1).unwrap();
+                } else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            acknowledged
+        });
+    }
+    // The learner may not be listed live yet when the move is asked: the
+    // meta leader's report trails the delay, and the move's own liveness
+    // check is not what this test pins.
+    let (end, out) = placement_move(
+        &nodes,
+        &[],
+        group,
+        replace(source, learner),
+        NewVoters::MayBeDown,
+        true,
+    )
+    .await;
+    writing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut acknowledged = 0_u64;
+    while let Some(writer) = writers.join_next().await {
+        let writer = writer.expect("a writer task");
+        assert!(writer > 0, "a writer had no append acknowledged\n{out}");
+        acknowledged = acknowledged.checked_add(writer).unwrap();
+    }
+    assert_eq!(
+        end,
+        GroupEnd::Converged { to: voter_set(&to) },
+        "{out}\n{}",
+        procs.reports()
+    );
+    let target = node_of(&nodes, learner);
+    let what = format!("node {learner} is a voter of group {}", group.0);
+    eventually(&mut procs, &what, async || {
+        let replica = replica_of(&client, target, group).await?;
+        if replica.voter_configs == vec![to.clone()] {
+            Ok(())
+        } else {
+            Err(format!("{replica:?}"))
+        }
+    })
+    .await;
+    for node in &nodes {
+        let shed = leadership_shed(&client, node).await;
+        assert!(
+            !shed
+                .state
+                .split('|')
+                .any(|reason| reason == ursula_raft::LeadershipShedReason::ClusterEgress.as_str()),
+            "node {} sheds for cluster egress over a uniform delay: {shed:?}",
+            node.id
+        );
+    }
+    tracing::info!(
+        acknowledged,
+        "slow move: appends acknowledged during the move"
+    );
 }
 
 /// IT-4 (#768): a WAL root opens only under the node id that created it.
@@ -10298,7 +10456,7 @@ fn write_node_toml(
     admin_port
 }
 
-/// The meta, placement, cold-flush and egress-probe keys of a node config.
+/// The meta, placement and cold-flush keys of a node config.
 /// `None` leaves a key out, so the server's default applies.
 #[derive(Debug, Clone, Copy, Default)]
 struct MetaToml<'a> {
@@ -10308,8 +10466,6 @@ struct MetaToml<'a> {
     replication_factor: Option<u8>,
     /// `storage.cold.flush_min_hot_size`, in bytes.
     flush_min_hot_bytes: Option<u64>,
-    /// `governance.cluster_probe.timeout`, in milliseconds.
-    egress_probe_timeout_ms: Option<u64>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -10442,14 +10598,6 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
-        }
-
-        if let Some(timeout_ms) = meta.egress_probe_timeout_ms {
-            writeln!(
-                config,
-                "\n[governance.cluster_probe]\ntimeout = \"{timeout_ms}ms\""
-            )
-            .unwrap();
         }
 
         std::fs::write(path, config).expect("write node toml config");

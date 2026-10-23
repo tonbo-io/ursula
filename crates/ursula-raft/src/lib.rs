@@ -151,6 +151,7 @@ mod voter;
 pub mod wal;
 
 pub use election::ElectionPolicy;
+pub use engine::PEER_ANSWER_TIMEOUT;
 pub use engine::PlacedRaftGroupEngineFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;

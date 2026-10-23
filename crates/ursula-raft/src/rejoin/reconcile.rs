@@ -51,6 +51,7 @@ use openraft::rt::WatchSender;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
+use ursula_control::CatchUpRounds;
 use ursula_control::ConfirmedStamp;
 use ursula_control::ControlApplied;
 use ursula_control::ControlError;
@@ -267,6 +268,7 @@ fn leadership(
         membership,
         committed_index: log_index(metrics.local_committed.as_ref()).unwrap_or(0),
         matched,
+        caught_up: BTreeSet::new(),
         live,
         handoff_ready: inputs.handoff_ready,
         gates: BTreeMap::new(),
@@ -591,6 +593,65 @@ struct ShellState {
     reread: bool,
     /// The learners' smallest gaps since the shell last made progress.
     gaps: CatchUpGaps,
+    /// The learners' catch-up rounds under this replica's leadership.
+    catch_up: LeaderCatchUp,
+}
+
+/// The catch-up rounds ([`CatchUpRounds`]) of the learners of one
+/// leadership: a new vote starts every learner's rounds again.
+struct LeaderCatchUp {
+    /// The time the rounds count from.
+    origin: crate::rt::time::Instant,
+    vote: Option<UrsulaVote>,
+    rounds: CatchUpRounds,
+}
+
+impl Default for LeaderCatchUp {
+    fn default() -> Self {
+        Self {
+            origin: crate::rt::time::Instant::now(),
+            vote: None,
+            rounds: CatchUpRounds::default(),
+        }
+    }
+}
+
+impl LeaderCatchUp {
+    /// The learners of `leader`, the view of a leader at `vote`, that caught
+    /// up. A round must end within `bound`, the group's leader lease: a
+    /// voter that answers its leader later than that does not keep the
+    /// leader's lease, so a learner that matches the commit index later
+    /// than that would not either once promoted.
+    fn observe(
+        &mut self,
+        vote: UrsulaVote,
+        leader: &LeaderView,
+        bound: Duration,
+    ) -> BTreeSet<NodeId> {
+        if self.vote != Some(vote) {
+            self.vote = Some(vote);
+            self.rounds = CatchUpRounds::default();
+        }
+        // Nothing is promoted from an uncommitted membership, and its
+        // learners' rounds go on once it commits.
+        let EffectiveMembership::Committed { config, .. } = &leader.membership else {
+            return BTreeSet::new();
+        };
+        let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.rounds.observe(
+            millis(self.origin.elapsed()),
+            millis(bound),
+            leader.committed_index,
+            &leader.matched,
+            config.learners(),
+        )
+    }
+
+    /// The replica does not lead: the next leadership starts again.
+    fn forget(&mut self) {
+        self.vote = None;
+        self.rounds = CatchUpRounds::default();
+    }
 }
 
 /// The smallest gap of each learner a `catching_up` wait has shown since
@@ -802,6 +863,17 @@ where
             pending,
             inputs,
         );
+        match &mut view.leadership {
+            Leadership::Leading(leader) => {
+                leader.caught_up =
+                    state
+                        .catch_up
+                        .observe(metrics.vote, leader, self.core.owner().lease());
+            }
+            Leadership::NotLeading => state.catch_up.forget(),
+            // A pending transfer or step plans nothing, and the rounds go on.
+            Leadership::Transferring { .. } | Leadership::StepPending => {}
+        }
         if let Leadership::Leading(leader) = &mut view.leadership {
             let needed = leader.gates_needed(&read.target);
             if !needed.is_empty() {

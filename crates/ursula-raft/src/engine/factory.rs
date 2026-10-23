@@ -32,6 +32,17 @@ use crate::rejoin::RECOVERY_STALL_AFTER;
 /// Minimum election timeout of every cluster Raft group, in milliseconds.
 pub(crate) const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 
+/// How long a node waits for a peer's answer, on either plane: one Raft
+/// Append call (`grpc::RAFT_GRPC_APPEND_TIMEOUT`), and each question the
+/// control plane asks a peer: its participation answer, which carries its
+/// campaign stance, recovery gates, leader count, WAL-disk state and egress
+/// probe verdict. It is the minimum election timeout of a cluster group, the
+/// slowest round trip a group keeps a leader over, so the control plane that
+/// picks a group's leaders and promotes its learners never gives up on a
+/// peer that Raft still works with. A tighter wait fails every question once
+/// a round trip, plus a connection's set-up, takes longer.
+pub const PEER_ANSWER_TIMEOUT: Duration = Duration::from_millis(GROUP_ELECTION_TIMEOUT_MIN_MS);
+
 /// Heartbeat interval of every cluster Raft group, in milliseconds: two
 /// fifths of the minimum election timeout.
 ///

@@ -969,6 +969,19 @@ impl RecoveryGatesReport {
     }
 }
 
+/// What a node's last cluster-egress probe found (`governance.cluster_probe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressProbeStatus {
+    /// The node has not probed: its gate is off, or it votes in no group
+    /// with a peer that `raft.peers` lists.
+    Unprobed,
+    /// Enough peers answered for a quorum of every group the node votes in.
+    Clean,
+    /// Too few peers answered for a quorum of some group the node votes in.
+    Degraded,
+}
+
 /// Answer of `GET /__ursula/leadership-shed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeadershipShedStatus {
@@ -989,6 +1002,10 @@ pub struct LeadershipShedStatus {
     /// How many data groups the node leads. The leadership balancer reads
     /// its peers' counts here.
     pub leader_count: u32,
+    /// What the node's last cluster-egress probe found. A node whose own
+    /// probe is degraded sheds its leaderships only while a peer answers
+    /// `clean`, a node that can do better.
+    pub egress: EgressProbeStatus,
 }
 /// Answer of `POST /__ursula/backup/group/{group}/import`. The import is a
 /// history event keyed by the backup's BLAKE3 digest (#581 section 4.4): a

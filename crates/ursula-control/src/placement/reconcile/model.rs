@@ -1094,6 +1094,12 @@ impl Group {
                 membership,
                 committed_index: self.commit_index,
                 matched,
+                caught_up: config
+                    .learners()
+                    .iter()
+                    .copied()
+                    .filter(|node| self.caught_up.contains(node))
+                    .collect(),
                 live,
                 handoff_ready,
                 gates,

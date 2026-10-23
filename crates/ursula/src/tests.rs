@@ -9963,7 +9963,7 @@ mod cluster_egress {
                 tokio::time::Instant::now(),
                 usize::MAX,
                 &[],
-                &ShedTargets::for_every_handoff(std::collections::HashSet::from([1, 2, 3, 4])),
+                &ShedTargets::new(std::collections::HashSet::from([1, 2, 3, 4])),
                 can_take_over,
             )
             .plan
@@ -10183,11 +10183,8 @@ mod cluster_egress {
 /// node 1 when the test starts.
 mod leadership_shed {
     use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use axum::Json;
@@ -10195,6 +10192,7 @@ mod leadership_shed {
     use axum::routing::get;
     use tokio::sync::watch;
     use tokio::time::Instant;
+    use ursula_proto::admin::EgressProbeStatus;
     use ursula_proto::admin::LeadershipShedStatus;
     use ursula_raft::LeadershipShedReason;
     use ursula_raft::RaftGroupHandleRegistry;
@@ -10337,32 +10335,6 @@ mod leadership_shed {
             );
         }
 
-        /// Adds the term of each group node 1 leads to `led_terms`, every
-        /// 50 ms until `until` finishes.
-        async fn record_node_1_leader_terms(
-            &self,
-            led_terms: &mut BTreeMap<u32, BTreeSet<u64>>,
-            until: impl std::future::Future<Output = ()>,
-        ) {
-            let mut samples = tokio::time::interval(Duration::from_millis(50));
-            tokio::pin!(until);
-            loop {
-                tokio::select! {
-                    () = &mut until => return,
-                    _ = samples.tick() => {
-                        for snap in self.node_1().registry.metrics_snapshot() {
-                            if snap.current_leader == Some(1) {
-                                led_terms
-                                    .entry(snap.raft_group_id)
-                                    .or_default()
-                                    .insert(snap.current_term);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         /// Waits until node 1 is shedding for `reason`.
         async fn wait_until_node_1_sheds(&self, reason: LeadershipShedReason) {
             let deadline = deadline(Duration::from_secs(30));
@@ -10389,7 +10361,7 @@ mod leadership_shed {
         }
 
         fn participation(&self) -> PeerParticipation {
-            PeerParticipation::new(1, peer_client())
+            PeerParticipation::with_client(1, peer_client())
         }
 
         /// Node 1's participation when its leadership-shed requests to node
@@ -10689,9 +10661,7 @@ mod leadership_shed {
             assert!(Instant::now() < deadline, "the drain does not finish");
             // Node 1 sheds, and both peers may campaign.
             let may_campaign = cluster.wait_until_may_campaign([2, 3]).await;
-            let step = shed
-                .step(&ShedTargets::for_every_handoff(may_campaign), &[])
-                .await;
+            let step = shed.step(&ShedTargets::new(may_campaign), &[]).await;
             assert!(step.submitted.len() <= PER_TICK, "{step:?}");
             for handoff in &step.submitted {
                 let count = targets.entry(handoff.target).or_default();
@@ -10752,9 +10722,7 @@ mod leadership_shed {
             .await
             .may_campaign();
         assert!(may_campaign.is_empty(), "{may_campaign:?}");
-        let stranded = shed
-            .step(&ShedTargets::for_every_handoff(may_campaign), &[])
-            .await;
+        let stranded = shed.step(&ShedTargets::new(may_campaign), &[]).await;
         assert!(stranded.submitted.is_empty(), "{stranded:?}");
         assert_eq!(stranded.stranded.len(), usize::try_from(GROUPS).unwrap());
 
@@ -10768,7 +10736,7 @@ mod leadership_shed {
             .collect();
         let submitting = Instant::now();
         let first = shed
-            .step(&ShedTargets::for_every_handoff(HashSet::from([2, 3])), &[])
+            .step(&ShedTargets::new(HashSet::from([2, 3])), &[])
             .await;
         assert_eq!(first.submitted.len(), PER_TICK, "{first:?}");
         let settle = node_1
@@ -10839,13 +10807,11 @@ mod leadership_shed {
                 cluster.leaders()
             );
             steps.tick().await;
-            let may_campaign = participation
+            let targets = participation
                 .campaign_stances(&node_1.registry)
                 .await
-                .may_campaign();
-            let step = shed
-                .step(&ShedTargets::for_every_handoff(may_campaign), &[])
-                .await;
+                .shed_targets();
+            let step = shed.step(&targets, &[]).await;
             assert!(step.submitted.len() <= PER_TICK, "{step:?}");
             stalled.extend(step.stalled);
             resubmitted.extend(
@@ -10885,96 +10851,51 @@ mod leadership_shed {
         (format!("http://{address}"), listener)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_egress_gate_hands_every_leadership_off_on_its_shed_tick() {
-        let cluster = Cluster::led_by_node_1().await;
-        let node_1 = cluster.node_1();
-        // Node 1's egress fails: neither its probes nor its leadership-shed
-        // requests to nodes 2 and 3 get an answer, as over an impaired path,
-        // while Raft still reaches both.
-        let (url_2, _silent_2) = silent_url().await;
-        let (url_3, _silent_3) = silent_url().await;
-        let peers = crate::shared_peers([cluster.peers[0].clone(), (2, url_2), (3, url_3)]);
-        let participation = PeerParticipation::with_addresses(
-            1,
-            peers,
-            reqwest::Client::builder()
-                .timeout(Duration::from_millis(500))
-                .build()
-                .expect("peer client"),
-        );
-        // One bad tick sheds, and the next tick comes 5 s later.
-        crate::bootstrap::spawn_egress_gate(
-            &node_1.registry,
-            &participation,
-            &ursula_config::ClusterProbeConfig {
-                interval: ursula_config::HumanDuration::sec(5),
-                unhealthy_ticks: 1,
-                ..ursula_config::ClusterProbeConfig::default()
-            },
-        );
-        cluster
-            .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
-            .await;
-        // Every leadership leaves before the next tick, to peers that did
-        // not answer whether they may campaign. A gate that handed off a few
-        // per tick would keep some on node 1 for another 5 s.
-        cluster
-            .wait_until_node_1_leads_nothing(Duration::from_secs(4))
-            .await;
-        let (to_2, to_3) = (cluster.led_by(2), cluster.led_by(3));
-        assert!(to_2 >= 4 && to_3 >= 4, "node 2 leads {to_2}, node 3 {to_3}");
-        cluster.shutdown().await;
-    }
-
     /// Answers node 1's leadership-shed requests for one peer, and serves
     /// nothing else, so the egress gate's probe to it gets 404 and fails.
-    /// It answers whether the peer may campaign as the test sets it, and
-    /// leaves the requests that `dropped` picks by number (the first is 1)
-    /// without an answer, as a lossy path would.
+    /// It answers whether the peer may campaign and what its own egress
+    /// probe found as the test sets them, and leaves every request without
+    /// an answer while `silent`, as a lost path would.
     struct ShedStateStub {
         url: String,
-        may_campaign: Arc<AtomicBool>,
+        egress: Arc<std::sync::Mutex<EgressProbeStatus>>,
         requests: watch::Receiver<u64>,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl ShedStateStub {
-        async fn serve(dropped: fn(u64) -> bool) -> Self {
+        async fn serve(silent: bool, egress: EgressProbeStatus) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind stub");
             let address = listener.local_addr().expect("stub address");
-            let may_campaign = Arc::new(AtomicBool::new(false));
+            let egress = Arc::new(std::sync::Mutex::new(egress));
             let (count, requests) = watch::channel(0_u64);
             let count = Arc::new(count);
-            let answer = may_campaign.clone();
+            let answer = egress.clone();
             let app = Router::new().route(
                 crate::LEADERSHIP_SHED_PATH,
                 get(move || {
                     let answer = answer.clone();
                     let count = count.clone();
                     async move {
-                        let mut number = 0;
-                        count.send_modify(|count| {
-                            *count = count.saturating_add(1);
-                            number = *count;
-                        });
-                        if dropped(number) {
+                        count.send_modify(|count| *count = count.saturating_add(1));
+                        if silent {
                             // The client gives up at its timeout.
                             std::future::pending::<()>().await;
                         }
-                        let should_campaign = answer.load(Ordering::SeqCst);
+                        let egress = *answer.lock().unwrap();
                         Json(LeadershipShedStatus {
                             cluster_id: crate::tests::static_test_cluster_id(),
                             bits: 0,
                             state: String::new(),
-                            should_accept_transfer: should_campaign,
-                            should_campaign,
+                            should_accept_transfer: true,
+                            should_campaign: true,
                             recovery_barriers_ready: true,
                             should_shed_current_leaders: false,
                             recovery_gates: std::collections::BTreeMap::new(),
                             leader_count: 0,
+                            egress,
                         })
                     }
                 }),
@@ -10984,7 +10905,7 @@ mod leadership_shed {
             });
             Self {
                 url: format!("http://{address}"),
-                may_campaign,
+                egress,
                 requests,
                 task,
             }
@@ -11006,62 +10927,95 @@ mod leadership_shed {
         }
     }
 
-    /// Every node sheds for cluster egress at once, as in a cluster-wide
-    /// grey failure, so each peer refuses a transfer without a word. Node
-    /// 1's questions to its peers travel the impaired path: they are
-    /// answered "may not campaign", and now and then not at all. A peer
-    /// that did not answer gets a leadership's first handoff only, so each
-    /// leadership stalls at most once while no peer may campaign, and the
-    /// gate hands the stalled ones off again on a later tick, once a peer
-    /// answers that it may campaign.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_cluster_wide_egress_shed_hands_each_leadership_off_once_until_a_peer_may_campaign() {
-        let cluster = Cluster::led_by_node_1().await;
-        let node_1 = cluster.node_1();
-        for node_id in [2, 3] {
-            cluster
-                .node(node_id)
-                .registry
-                .mark_leadership_shed(LeadershipShedReason::ClusterEgress);
-        }
-        // The gate asks both stubs once per tick while it drains, so a
-        // stub's request number is the tick's. On the third tick of every
-        // ten only node 3 answers (no), and on the fifth neither answers.
-        let stub_2 = ShedStateStub::serve(|request| matches!(request % 10, 3 | 5)).await;
-        let stub_3 = ShedStateStub::serve(|request| request % 10 == 5).await;
-        let peers = crate::shared_peers([
-            cluster.peers[0].clone(),
-            (2, stub_2.url.clone()),
-            (3, stub_3.url.clone()),
-        ]);
-        let participation = PeerParticipation::with_addresses(
+    /// Node 1's participation through `stubs`, in place of nodes 2 and 3,
+    /// while Raft still reaches both nodes. Each request gives up after
+    /// 500 ms.
+    fn participation_through(cluster: &Cluster, stubs: [&ShedStateStub; 2]) -> PeerParticipation {
+        PeerParticipation::with_addresses(
             1,
-            peers,
+            crate::shared_peers([
+                cluster.peers[0].clone(),
+                (2, stubs[0].url.clone()),
+                (3, stubs[1].url.clone()),
+            ]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(500))
                 .build()
                 .expect("peer client"),
-        );
-        let settle = node_1
-            .registry
-            .get(RaftGroupId(0))
-            .expect("registered group")
-            .handoff_settle_time();
-        // The terms in which node 1 led each group. Each handoff that does
-        // not move a leadership adds one: Raft abandons the transfer, and
-        // node 1 steps down and wins the group back in a newer term.
-        let mut led_terms: BTreeMap<u32, BTreeSet<u64>> = cluster
-            .terms()
-            .into_iter()
-            .map(|(group, term)| (group, BTreeSet::from([term])))
-            .collect();
+        )
+    }
+
+    /// Node 1's probes fail, and so do its peers' own, as under a delay on
+    /// every node's path: no peer can do better, so node 1 keeps its
+    /// leaderships and its elections. A gate that sheds on its own probe
+    /// alone would shed every node of such a cluster, and each would refuse
+    /// the others' handoffs. Once a peer answers that its probe is clean,
+    /// node 1's egress is the worse one and it sheds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_egress_gate_sheds_only_while_a_peer_does_better() {
+        let cluster = Cluster::led_by_node_1().await;
+        let node_1 = cluster.node_1();
+        let stub_2 = ShedStateStub::serve(false, EgressProbeStatus::Degraded).await;
+        let stub_3 = ShedStateStub::serve(false, EgressProbeStatus::Degraded).await;
         // The probes fail, since the stubs serve no probe route. One bad
-        // tick sheds, and the gate ticks every second.
+        // tick sheds, and the gate ticks every 500 ms.
         crate::bootstrap::spawn_egress_gate(
             &node_1.registry,
-            &participation,
+            &participation_through(&cluster, [&stub_2, &stub_3]),
             &ursula_config::ClusterProbeConfig {
-                interval: ursula_config::HumanDuration::sec(1),
+                unhealthy_ticks: 1,
+                ..ursula_config::ClusterProbeConfig::default()
+            },
+        );
+        // The gate asks its peers on every degraded tick.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            stub_2.wait_for_requests(6).await;
+            stub_3.wait_for_requests(6).await;
+        })
+        .await
+        .expect("the gate asks its peers on every degraded tick");
+        assert!(
+            !node_1
+                .registry
+                .leadership_shed_state()
+                .contains(LeadershipShedReason::ClusterEgress.into()),
+            "node 1 shed while no peer does better"
+        );
+        assert_eq!(
+            node_1.registry.egress_probe(),
+            EgressProbeStatus::Degraded,
+            "node 1 reports its own probe"
+        );
+        assert_eq!(cluster.led_by(1), usize::try_from(GROUPS).unwrap());
+
+        *stub_3.egress.lock().unwrap() = EgressProbeStatus::Clean;
+        cluster
+            .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
+            .await;
+        cluster
+            .wait_until_node_1_leads_nothing(Duration::from_secs(30))
+            .await;
+        cluster.shutdown().await;
+    }
+
+    /// Node 1's egress fails while node 2 answers that its own probe is
+    /// clean and that it may campaign. Node 3 never answers, as over a lost
+    /// path: it may be shedding too and refuse a transfer without a word,
+    /// so it takes no leadership. Every leadership leaves on the shed tick,
+    /// all to node 2: a gate that handed off a few per tick would keep some
+    /// on node 1 for another 5 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_egress_gate_hands_every_leadership_at_once_to_peers_that_answered() {
+        let cluster = Cluster::led_by_node_1().await;
+        let node_1 = cluster.node_1();
+        let stub_2 = ShedStateStub::serve(false, EgressProbeStatus::Clean).await;
+        let stub_3 = ShedStateStub::serve(true, EgressProbeStatus::Clean).await;
+        // One bad tick sheds, and the next tick comes 5 s later.
+        crate::bootstrap::spawn_egress_gate(
+            &node_1.registry,
+            &participation_through(&cluster, [&stub_2, &stub_3]),
+            &ursula_config::ClusterProbeConfig {
+                interval: ursula_config::HumanDuration::sec(5),
                 unhealthy_ticks: 1,
                 ..ursula_config::ClusterProbeConfig::default()
             },
@@ -11069,49 +11023,14 @@ mod leadership_shed {
         cluster
             .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
             .await;
-        // By the fifteenth tick the leaderships handed to a peer that did
-        // not answer on the fifth have stalled, and that peer has gone
-        // unanswered twice more. A handoff on the fifteenth tick would
-        // stall within the settle time.
         cluster
-            .record_node_1_leader_terms(&mut led_terms, async {
-                tokio::time::timeout(Duration::from_secs(60), async {
-                    stub_2.wait_for_requests(15).await;
-                    stub_3.wait_for_requests(15).await;
-                })
-                .await
-                .expect(
-                    "the gate asks its peers on every tick while it has leaderships to hand off",
-                );
-                tokio::time::sleep(settle.saturating_add(Duration::from_secs(1))).await;
-            })
-            .await;
-        for (group, terms) in &led_terms {
-            assert!(
-                terms.len() <= 2,
-                "group {group} was handed off more than once while no peer may campaign: node 1 \
-                 led it in terms {terms:?}"
-            );
-        }
-        assert!(
-            led_terms.values().any(|terms| terms.len() == 2),
-            "no leadership went to a peer that did not answer: {led_terms:?}"
-        );
-
-        // Node 3 may campaign again and says so. The gate hands the stalled
-        // leaderships off again, all to node 3, on a later tick.
-        cluster
-            .node(3)
-            .registry
-            .clear_leadership_shed(LeadershipShedReason::ClusterEgress);
-        stub_3.may_campaign.store(true, Ordering::SeqCst);
-        cluster
-            .wait_until_node_1_leads_nothing(Duration::from_secs(30))
+            .wait_until_node_1_leads_nothing(Duration::from_secs(4))
             .await;
         assert_eq!(
-            cluster.led_by(3),
+            cluster.led_by(2),
             usize::try_from(GROUPS).unwrap(),
-            "node 3 is the only peer that may campaign"
+            "node 3 did not answer: leaders {:?}",
+            cluster.leaders()
         );
         cluster.shutdown().await;
     }

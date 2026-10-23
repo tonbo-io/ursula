@@ -252,19 +252,8 @@ fn spawn_raft_node(
     let cold_store = cold_store(config, fence.clone())?;
 
     // Built before the runtime starts, so a failure leaves nothing running.
-    let participation = PeerParticipation::new(
-        node_id,
-        reqwest::Client::builder()
-            .timeout(
-                config
-                    .governance
-                    .leadership_balance
-                    .peer_timeout
-                    .as_duration(),
-            )
-            .build()
-            .map_err(|source| SpawnRuntimeError::PeerStatusClient { source })?,
-    );
+    let participation = PeerParticipation::new(node_id)
+        .map_err(|source| SpawnRuntimeError::PeerStatusClient { source })?;
 
     let wal_config = &config.raft.wal;
     let shard_map = ursula_shard::StaticShardMap::new(runtime_config.core_count, group_count)

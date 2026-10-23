@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::time::Duration;
 
+use ursula_proto::admin::EgressProbeStatus;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::PeerDirectory;
 use ursula_raft::RaftGroupHandleRegistry;
@@ -13,18 +13,21 @@ use crate::bootstrap::health_gate::LeadershipShed;
 use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
+use crate::bootstrap::participation::CampaignStances;
 use crate::bootstrap::participation::PeerParticipation;
-
-const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
-const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
 
 /// M2 — egress-health leadership gate. Each node actively measures its own
 /// egress to peers over the cluster plane (a payload POST with a tight
 /// deadline, sized so 15% loss / added delay fails it while a healthy link
 /// passes trivially — a heartbeat-sized probe would mask loss). A node
 /// that cannot push to a quorum of peers cannot replicate, so it sheds
-/// leadership and disables elections; it clears this reason once its egress is
-/// clean and re-enables elections only if no other shed reason remains.
+/// leadership and disables elections, but only while some peer can do
+/// better: a peer whose own last probe was clean, as its participation
+/// answer reports. A delay or loss on every node's path is no fault of this
+/// node, and handing its leaderships to nodes no better off would only
+/// leave groups without a leader while each refuses them. The node clears
+/// this reason once its egress is clean, or no peer does better, and
+/// re-enables elections only if no other shed reason remains.
 ///
 /// Unlike inferring health from commit progress (load-dependent, and gone once
 /// the client gives up), this probe is role-independent: a yielded follower
@@ -127,48 +130,40 @@ pub(crate) fn cluster_egress_probe_plan(
 /// Cluster egress gate. Each tick it probes the peers of `participation`
 /// ([`PeerParticipation::peers`], the bound `raft.peers` read at each tick)
 /// that are voters of the groups whose replica on this node counts as a
-/// voter ([`cluster_egress_probe_plan`]) and, while it sheds, hands every
-/// leadership it held when it shed to its peers at once,
-/// and plans again on every tick for the ones still pending. The peers'
-/// answers to `participation` travel the path the gate judges impaired, so
-/// a leadership's first handoff may also go to a peer that did not answer,
-/// while a leadership whose handoff did not move goes only to a peer that
-/// answered that it may campaign
-/// ([`crate::bootstrap::participation::CampaignStances::shed_targets_over_impaired_path`]).
+/// voter ([`cluster_egress_probe_plan`]), and records the verdict in the
+/// registry, which this node's participation answer reports. A degraded
+/// tick counts against the node only while a peer answers that its own
+/// probe was clean ([`CampaignStances::peer_with_clean_egress`]). While it
+/// sheds, the gate hands every leadership it held when it shed to its
+/// peers at once, and plans again on every tick for the ones still
+/// pending, each only to a peer that answered that it may campaign
+/// ([`CampaignStances::shed_targets`]).
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
     let node_id = participation.node_id();
-    let interval_ms = cp_cfg.interval.as_duration().as_millis() as usize;
-    if interval_ms == 0 {
+    let interval = cp_cfg.interval.as_duration();
+    if interval.is_zero() {
         return;
     }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
-    let probe_timeout_ms = cp_cfg.timeout.as_duration().as_millis() as usize;
     let unhealthy_ticks = cp_cfg.unhealthy_ticks;
     let heal_ticks = cp_cfg.heal_ticks;
+    let client = match reqwest::Client::builder()
+        .timeout(cp_cfg.timeout.as_duration())
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!("cluster-egress: failed to build probe client: {err}");
+            return;
+        }
+    };
     let registry = registry.clone();
     let participation = participation.clone();
     tokio::spawn(async move {
-        let interval = Duration::from_millis(
-            u64::try_from(interval_ms)
-                .unwrap_or(u64::try_from(DEFAULT_CLUSTER_PROBE_INTERVAL_MS).unwrap_or(500)),
-        );
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(
-                u64::try_from(probe_timeout_ms)
-                    .unwrap_or(u64::try_from(DEFAULT_CLUSTER_PROBE_TIMEOUT_MS).unwrap_or(200)),
-            ))
-            .build()
-        {
-            Ok(client) => client,
-            Err(err) => {
-                tracing::error!("cluster-egress: failed to build probe client: {err}");
-                return;
-            }
-        };
         let payload = vec![0u8; probe_bytes];
         let mut hysteresis = HealthHysteresis::new(unhealthy_ticks, heal_ticks);
         // A node that cannot reach a quorum cannot replicate, so its
@@ -189,6 +184,7 @@ pub fn spawn_egress_gate(
                 &registry.counting_voter_configs(),
             );
             if plan.is_empty() {
+                registry.record_egress_probe(EgressProbeStatus::Unprobed);
                 continue;
             }
             // Each peer once per tick, whatever the group count.
@@ -209,17 +205,36 @@ pub fn spawn_egress_gate(
                     group.needed_peers,
                 )
             });
-            let tick = if degraded_probe.is_none() {
-                TickHealth::Good
+            registry.record_egress_probe(if degraded_probe.is_some() {
+                EgressProbeStatus::Degraded
             } else {
+                EgressProbeStatus::Clean
+            });
+            // The peers' answers are asked only when they decide something:
+            // whether a peer does better than a degraded probe, and where a
+            // shed hands its leaderships.
+            let stances = if degraded_probe.is_some() || shed.is_draining() {
+                Some(participation.campaign_stances(&registry).await)
+            } else {
+                None
+            };
+            let better = degraded_probe.and(
+                stances
+                    .as_ref()
+                    .and_then(CampaignStances::peer_with_clean_egress),
+            );
+            let tick = if better.is_some() {
                 TickHealth::Bad
+            } else {
+                TickHealth::Good
             };
             match hysteresis.observe(tick) {
                 HealthTransition::Shed => {
-                    if let Some((group, healthy_peers, peer_count, needed_peers)) = &degraded_probe
+                    if let (Some((group, healthy_peers, peer_count, needed_peers)), Some(better)) =
+                        (&degraded_probe, better)
                     {
                         tracing::warn!(
-                            "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
+                            "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}) while node {better} reaches its quorums; yielding leadership",
                             group.0,
                         );
                     }
@@ -229,9 +244,11 @@ pub fn spawn_egress_gate(
                 HealthTransition::Hold => {}
             }
             if shed.is_draining() {
-                let stances = participation.campaign_stances(&registry).await;
-                shed.step(&stances.shed_targets_over_impaired_path(), &[])
-                    .await;
+                let stances = match stances {
+                    Some(stances) => stances,
+                    None => participation.campaign_stances(&registry).await,
+                };
+                shed.step(&stances.shed_targets(), &[]).await;
             }
         }
     });
