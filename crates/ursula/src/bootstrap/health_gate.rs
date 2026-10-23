@@ -65,6 +65,9 @@ pub(crate) enum TickHealth {
     Inconclusive,
     /// A signal fails.
     Bad,
+    /// A signal fails that rules out serving by itself: the tick sheds at
+    /// once, without the streak of `unhealthy_ticks` a bad tick waits for.
+    Disqualifying,
 }
 
 impl TickHealth {
@@ -101,8 +104,9 @@ enum Stance {
 }
 
 /// The hysteresis of every leadership health gate: shed after
-/// `unhealthy_ticks` bad ticks with no good tick between them, and heal
-/// after `heal_ticks` good ticks in a row. A count of 0 acts as 1.
+/// `unhealthy_ticks` bad ticks with no good tick between them, or on one
+/// disqualifying tick, and heal after `heal_ticks` good ticks in a row. A
+/// count of 0 acts as 1.
 #[derive(Debug, Clone)]
 pub(crate) struct HealthHysteresis {
     unhealthy_ticks: usize,
@@ -129,6 +133,9 @@ impl HealthHysteresis {
                     (Stance::Serving { bad_ticks }, HealthTransition::Hold)
                 }
             }
+            (Stance::Serving { .. }, TickHealth::Disqualifying) => {
+                (Stance::Shedding { good_ticks: 0 }, HealthTransition::Shed)
+            }
             (Stance::Serving { bad_ticks }, TickHealth::Inconclusive) => {
                 (Stance::Serving { bad_ticks }, HealthTransition::Hold)
             }
@@ -143,9 +150,10 @@ impl HealthHysteresis {
                     (Stance::Shedding { good_ticks }, HealthTransition::Hold)
                 }
             }
-            (Stance::Shedding { .. }, TickHealth::Inconclusive | TickHealth::Bad) => {
-                (Stance::Shedding { good_ticks: 0 }, HealthTransition::Hold)
-            }
+            (
+                Stance::Shedding { .. },
+                TickHealth::Inconclusive | TickHealth::Bad | TickHealth::Disqualifying,
+            ) => (Stance::Shedding { good_ticks: 0 }, HealthTransition::Hold),
         };
         self.stance = stance;
         transition
@@ -952,10 +960,10 @@ mod tests {
         ticks.iter().map(|tick| hysteresis.observe(*tick)).collect()
     }
 
-    /// The hysteresis spelled out over the tick history: shed once the ticks
-    /// since the last good tick (and since the last heal) hold
-    /// `unhealthy_ticks` bad ones, heal once the ticks since the shed end in
-    /// `heal_ticks` good ones.
+    /// The hysteresis spelled out over the tick history: shed on a
+    /// disqualifying tick, or once the ticks since the last good tick (and
+    /// since the last heal) hold `unhealthy_ticks` bad ones, heal once the
+    /// ticks since the shed end in `heal_ticks` good ones.
     fn reference(
         ticks: &[TickHealth],
         unhealthy_ticks: usize,
@@ -987,7 +995,7 @@ mod tests {
                     .iter()
                     .filter(|tick| **tick == TickHealth::Bad)
                     .count();
-                if bad >= unhealthy_ticks {
+                if bad >= unhealthy_ticks || ticks[now] == TickHealth::Disqualifying {
                     HealthTransition::Shed
                 } else {
                     HealthTransition::Hold
@@ -1007,6 +1015,7 @@ mod tests {
             Just(TickHealth::Good),
             Just(TickHealth::Inconclusive),
             Just(TickHealth::Bad),
+            Just(TickHealth::Disqualifying),
         ]
     }
 
@@ -1048,6 +1057,28 @@ mod tests {
             vec![Hold, Hold, Hold, Hold, Heal, Hold],
         );
         assert!(!hysteresis.is_shedding());
+    }
+
+    /// A disqualifying tick sheds without a streak, and breaks a good one
+    /// as a bad tick does.
+    #[test]
+    fn a_disqualifying_tick_sheds_at_once() {
+        use HealthTransition::Heal;
+        use HealthTransition::Hold;
+        use HealthTransition::Shed;
+        use TickHealth::Bad;
+        use TickHealth::Disqualifying;
+        use TickHealth::Good;
+
+        let mut hysteresis = HealthHysteresis::new(3, 2);
+        assert_eq!(transitions(&mut hysteresis, &[Bad, Disqualifying]), vec![
+            Hold, Shed
+        ]);
+        assert_eq!(
+            transitions(&mut hysteresis, &[Good, Disqualifying, Good, Good]),
+            vec![Hold, Hold, Hold, Heal],
+        );
+        assert_eq!(transitions(&mut hysteresis, &[Disqualifying]), vec![Shed]);
     }
 
     #[test]

@@ -37,10 +37,13 @@ pub(crate) const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 /// control plane asks a peer: its participation answer, which carries its
 /// campaign stance, recovery gates, leader count, WAL-disk state and egress
 /// probe verdict. It is the minimum election timeout of a cluster group, the
-/// slowest round trip a group keeps a leader over, so the control plane that
-/// picks a group's leaders and promotes its learners never gives up on a
-/// peer that Raft still works with. A tighter wait fails every question once
-/// a round trip, plus a connection's set-up, takes longer.
+/// slowest round trip a group keeps a leader over, so a question that takes
+/// the round trips of an append on an open connection is answered in time.
+/// A question over a fresh connection takes a handshake round trip more,
+/// and one that times out drops its connection, so from round trips of
+/// about half the wait the control plane may give up on a peer that Raft
+/// still works with. A tighter wait fails every question at round trips
+/// shorter still.
 pub const PEER_ANSWER_TIMEOUT: Duration = Duration::from_millis(GROUP_ELECTION_TIMEOUT_MIN_MS);
 
 /// Heartbeat interval of every cluster Raft group, in milliseconds: two

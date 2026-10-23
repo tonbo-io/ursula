@@ -10,6 +10,12 @@
 //! an index within `bound` of the time it was committed never catches up,
 //! however long it replicates.
 //!
+//! One round in time is enough, where the thesis waits for several rounds
+//! to converge, so a learner that replicates slower than the leader
+//! commits is promoted while its lag is still small and falls behind
+//! after. With three or more voters that costs no quorum: the others still
+//! form one.
+//!
 //! Pure: the shell passes the time, the leader's commit index and each
 //! learner's matched index.
 

@@ -149,6 +149,16 @@ impl CampaignStances {
         self
     }
 
+    /// These stances with `egress` as the peers' egress probe verdicts.
+    #[cfg(test)]
+    pub(crate) fn with_egress(
+        mut self,
+        egress: impl IntoIterator<Item = (u64, EgressProbeStatus)>,
+    ) -> Self {
+        self.egress = egress.into_iter().collect();
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn of(&self, node_id: u64) -> Option<CampaignStance> {
         self.by_node.get(&node_id).copied()

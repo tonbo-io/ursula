@@ -474,8 +474,10 @@ mod tests {
         assert!(phases < super::SHUTDOWN_GRACE, "{phases:?}");
         // The handoff asks its peers before each of its rounds, and a silent
         // peer holds a round for `PEER_ANSWER_TIMEOUT`. The handoff grace
-        // bounds those waits too, and still holds a leadership's first
-        // handoff and a retry on another target with a peer silent.
+        // bounds those waits too, and still holds two rounds with a peer
+        // silent: a leadership no peer could take on the first round gets a
+        // second. A submitted leadership is not submitted again within the
+        // grace (`handoff_settle_time` is longer).
         let rounds_with_a_silent_peer = ursula_raft::PEER_ANSWER_TIMEOUT.saturating_mul(2);
         assert!(
             rounds_with_a_silent_peer < super::SHUTDOWN_HANDOFF_GRACE,

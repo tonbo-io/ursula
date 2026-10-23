@@ -10144,9 +10144,14 @@ impl ProducerLoad {
 ///    no write whose `503` proves it applied nothing. A leader that holds
 ///    writes for as long as it cannot reach a quorum fails it. No peer
 ///    answers the cut-off node, so it reports a degraded probe, sheds for
-///    cluster egress and stops campaigning: its terms hold for longer than
-///    an election timeout while the cut lasts, it never holds a term above
-///    the new leader's, and after the heal it follows the group's leader.
+///    cluster egress on its first such tick and stops campaigning. Before
+///    the shed it may campaign once in each group it follows, never twice,
+///    so no term of it is more than one above its term at the cut, and
+///    none of the group it led is above the new leader's. Its terms then
+///    hold for longer than an election timeout while the cut lasts, and
+///    after the heal it follows each group's leader. A gate that waited out
+///    a streak of bad ticks, or a tick that waited for its probes and its
+///    peers' answers one after the other, lets it campaign twice.
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
@@ -10215,6 +10220,17 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     let direct_load = GatewayLoad::start(vec![direct.clone()], "direct");
     let gateway_load = GatewayLoad::start(vec![through.clone()], "gateway");
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let terms_of = async |id: u64| -> BTreeMap<u64, u64> {
+        let metrics = try_node_metrics(&client, &client_url(id))
+            .await
+            .unwrap_or_else(|err| panic!("node {id}'s metrics: {err}"));
+        metrics
+            .groups
+            .iter()
+            .map(|group| (group.raft_group_id, group.current_term))
+            .collect()
+    };
+    let cut_terms = terms_of(leader).await;
     let cut = tokio::time::Instant::now();
     relays.cut(leader, &sink);
     let others: Vec<u64> = all.iter().copied().filter(|id| *id != leader).collect();
@@ -10254,17 +10270,19 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
         }
     })
     .await;
-    let terms_of = async |id: u64| -> BTreeMap<u64, u64> {
-        let metrics = try_node_metrics(&client, &client_url(id))
-            .await
-            .unwrap_or_else(|err| panic!("node {id}'s metrics: {err}"));
-        metrics
-            .groups
-            .iter()
-            .map(|group| (group.raft_group_id, group.current_term))
-            .collect()
-    };
     let shed_terms = terms_of(leader).await;
+    // A follower campaigns at the earliest 779 ms after the cut and again
+    // 1.5 s later, while the gate sheds at most 2 s after the cut: once.
+    let raised: Vec<(u64, u64, u64)> = shed_terms
+        .iter()
+        .map(|(group, term)| (*group, cut_terms[group], *term))
+        .filter(|(_, at_cut, shed)| *shed > at_cut.saturating_add(1))
+        .collect();
+    assert!(
+        raised.is_empty(),
+        "node {leader} campaigned more than once in a group before it shed (group, term at \
+         the cut, term at the shed): {raised:?}"
+    );
     // Longer than the 3 s maximum election timeout: a node that still
     // campaigned would raise the term of every group it follows.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -10296,35 +10314,38 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     let gateway_writes = gateway_load.stop().await;
     // The healed node still sheds after the heal (its gate clears after six
     // clean ticks), so it neither campaigns nor takes a leadership from the
-    // balancer, and it follows a leader among the other nodes at that
-    // leader's term. The balancer may still move the group between the
-    // other two nodes, which raises the term too, so the check names
-    // neither the leader nor the term.
-    let replica_of = async |id: u64| {
+    // balancer, and in every group it follows a leader among the other
+    // nodes at that leader's term: a group whose term it raised by its one
+    // election elects again among them. The balancer may still move a group
+    // between the other two nodes, which raises the term too, so the check
+    // names neither the leader nor the term.
+    let replica_of = async |id: u64, group: u64| {
         try_node_metrics(&client, &client_url(id))
             .await?
             .groups
             .into_iter()
-            .find(|replica| replica.raft_group_id == group_id)
-            .ok_or_else(|| format!("node {id} runs no replica of group {group_id}"))
+            .find(|replica| replica.raft_group_id == group)
+            .ok_or_else(|| format!("node {id} runs no replica of group {group}"))
     };
-    let what = format!("node {leader} follows the group's leader after the heal");
-    eventually(&mut procs, &what, async || {
-        let healed_replica = replica_of(leader).await?;
-        let new_leader = live_leader(&client, &planes, &others, group_id).await?;
-        let leading = replica_of(new_leader).await?;
-        if healed_replica.current_leader == Some(new_leader)
-            && healed_replica.current_term == leading.current_term
-            && leading.current_term >= holder_term
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "node {leader}: {healed_replica:?}, node {new_leader}: {leading:?}"
-            ))
-        }
-    })
-    .await;
+    for group in shed_terms.keys().copied() {
+        let what = format!("node {leader} follows group {group}'s leader after the heal");
+        eventually(&mut procs, &what, async || {
+            let healed_replica = replica_of(leader, group).await?;
+            let new_leader = live_leader(&client, &planes, &others, group).await?;
+            let leading = replica_of(new_leader, group).await?;
+            if healed_replica.current_leader == Some(new_leader)
+                && healed_replica.current_term == leading.current_term
+                && (group != group_id || leading.current_term >= holder_term)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "node {leader}: {healed_replica:?}, node {new_leader}: {leading:?}"
+                ))
+            }
+        })
+        .await;
+    }
     for (writes, via) in [
         (&direct_writes, "the cut-off leader"),
         (&gateway_writes, "the gateway"),

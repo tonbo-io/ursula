@@ -10967,13 +10967,13 @@ mod leadership_shed {
                 ..ursula_config::ClusterProbeConfig::default()
             },
         );
-        // The gate asks its peers on every degraded tick.
+        // The gate asks its peers on every tick.
         tokio::time::timeout(Duration::from_secs(30), async {
             stub_2.wait_for_requests(6).await;
             stub_3.wait_for_requests(6).await;
         })
         .await
-        .expect("the gate asks its peers on every degraded tick");
+        .expect("the gate asks its peers on every tick");
         assert!(
             !node_1
                 .registry
@@ -11001,27 +11001,38 @@ mod leadership_shed {
     /// Node 1's probes fail and neither peer answers its participation
     /// question, as when node 1 is cut off from both: too few peers answer
     /// for a quorum of its groups, so node 1 sheds and stops campaigning,
-    /// though no peer reported a clean probe. A gate that shed only for a
-    /// peer that does better would leave a cut-off node campaigning on
-    /// every election timeout, and the term it raised would depose its
-    /// groups' leaders once the cut heals.
+    /// though no peer reported a clean probe, and on its first such tick,
+    /// whatever `unhealthy_ticks` says. A gate that shed only for a peer
+    /// that does better would leave a cut-off node campaigning on every
+    /// election timeout, and one that waited out the bad streak would let
+    /// it campaign more than once: each election raises a term that
+    /// deposes the group's leader once the cut heals.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_egress_gate_sheds_when_too_few_peers_answer() {
+    async fn the_egress_gate_sheds_on_the_first_tick_too_few_peers_answer() {
         let cluster = Cluster::led_by_node_1().await;
         let node_1 = cluster.node_1();
         let stub_2 = ShedStateStub::serve(true, EgressProbeStatus::Degraded).await;
         let stub_3 = ShedStateStub::serve(true, EgressProbeStatus::Degraded).await;
+        // The first tick comes 5 s after the start and waits 500 ms for the
+        // answers, and the second one 5 s after that.
+        let started = Instant::now();
         crate::bootstrap::spawn_egress_gate(
             &node_1.registry,
             &participation_through(&cluster, [&stub_2, &stub_3]),
             &ursula_config::ClusterProbeConfig {
-                unhealthy_ticks: 1,
+                interval: ursula_config::HumanDuration::sec(5),
+                unhealthy_ticks: 3,
                 ..ursula_config::ClusterProbeConfig::default()
             },
         );
         cluster
             .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
             .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(9),
+            "node 1 shed only on a later tick: {:?}",
+            started.elapsed()
+        );
         assert!(
             !node_1.registry.should_campaign(),
             "node 1 campaigns while no peer answers it"

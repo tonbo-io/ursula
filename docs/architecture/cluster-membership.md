@@ -97,7 +97,9 @@ A degraded probe sheds the node only for a fault of its own
 (`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): a peer's
 participation answer reports a clean probe, or fewer peers answer than a
 quorum of one of its configs needs, so a node cut off from its peers stops
-campaigning, while a delay on every node's path sheds none.
+campaigning, while a delay on every node's path sheds none. Too few answers
+shed on the first tick that sees them, so a cut-off node campaigns at most once
+in each group it follows before its elections stop.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. The server builds one `PeerDirectory` from `raft.peers` at config
@@ -301,8 +303,10 @@ learner's node for its participation answer (`GET
 /__ursula/leadership-shed`), which lists the recovery gate of every replica
 the node runs. It waits one minimum election timeout for the answer
 (`ursula_raft::PEER_ANSWER_TIMEOUT`, 1.5 s), as every question a node asks
-its peers does and as a Raft append call does, so the control plane never
-gives up on a peer that Raft still keeps a leader with. A learner whose
+its peers does and as a Raft append call does. A question over a fresh
+connection takes a handshake round trip more than an append on an open gRPC
+stream, so from round trips of about half that wait the control plane may give
+up on a peer that Raft still keeps a leader with. A learner whose
 answer shows a gated state waits as
 `gate_closed`, and one that does not answer, answers for another cluster or
 lists no gate of the group waits as `gate_unknown`. A group placed by hand in
