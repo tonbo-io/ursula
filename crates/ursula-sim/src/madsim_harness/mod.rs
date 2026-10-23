@@ -1147,6 +1147,7 @@ fn network_rpc_kind_name(kind: InProcessRaftRpcKind) -> &'static str {
     match kind {
         InProcessRaftRpcKind::AppendEntries => "append_entries",
         InProcessRaftRpcKind::Vote => "vote",
+        InProcessRaftRpcKind::PreVote => "pre_vote",
         InProcessRaftRpcKind::FullSnapshot => "full_snapshot",
         InProcessRaftRpcKind::TransferLeader => "transfer_leader",
     }
@@ -1908,13 +1909,13 @@ async fn build_restartable_three_node_cluster_with_cold_store(
 ) {
     let registry = InProcessRaftRegistry::default();
     let config = Arc::new(
-        Config {
+        ursula_raft::with_group_election_protocol(Config {
             cluster_name: "ursula-sim-three-node".to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 50,
             election_timeout_max: 100,
             ..Default::default()
-        }
+        })
         .validate()
         .expect("valid raft config"),
     );
@@ -1967,7 +1968,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
     let registry = InProcessRaftRegistry::default();
     let config = Arc::new(
-        Config {
+        ursula_raft::with_group_election_protocol(Config {
             cluster_name: "ursula-sim-lagging-learner-snapshot".to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 50,
@@ -1977,7 +1978,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
             replication_lag_threshold: 0,
             snapshot_policy: SnapshotPolicy::Never,
             ..Default::default()
-        }
+        })
         .validate()
         .expect("valid raft config"),
     );
@@ -2040,7 +2041,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
 ) {
     let registry = InProcessRaftRegistry::default();
     let config = Arc::new(
-        Config {
+        ursula_raft::with_group_election_protocol(Config {
             cluster_name: "ursula-sim-three-node-snapshot-purge".to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 50,
@@ -2050,7 +2051,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
             replication_lag_threshold: 0,
             snapshot_policy: SnapshotPolicy::Never,
             ..Default::default()
-        }
+        })
         .validate()
         .expect("valid raft config"),
     );

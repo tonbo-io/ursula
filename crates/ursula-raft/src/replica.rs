@@ -55,6 +55,7 @@ use crate::types::RaftGroupResponse;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaVote;
+use crate::types::VoteRound;
 
 /// The history event a leader's history driver proposes
 /// ([`crate::history::run_history_driver`]), before its plane encodes it.
@@ -217,7 +218,9 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
 
     /// An inbound append, through the recovery gate's screens: the vote
     /// floor, then, in the owner job, a plan that closed the replica
-    /// meanwhile and the commit screen (#613).
+    /// meanwhile and the commit screen (#613). An append the screens let
+    /// through to OpenRaft is the replica's contact with its leader
+    /// ([`crate::LeaderContact`]).
     pub(crate) async fn append_entries(
         &self,
         group: RaftTarget,
@@ -233,6 +236,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             return Ok(AppendEntriesResponse::HigherVote(floor));
         }
         let raft = self.owner().clone();
+        let contact = raft.contact().clone();
         let rejoin = self.recovery.clone();
         let response = raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
@@ -255,6 +259,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                 }
                 rejoin.observe_inbound_append(&request);
             }
+            contact.observe(&request);
             Ok(raft.append_entries(request).await)
         })
         .await
@@ -267,16 +272,20 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         Ok(response)
     }
 
-    /// An inbound vote for `group`, through the node fence's hold and the
-    /// recovery gate's vote screen. While the fence holds the replica out
-    /// ([`crate::predecessor_wait::fence_holds`]) it grants no vote: in any
-    /// group or meta while this run owes its predecessor wait, whose
-    /// predecessor may still vote as this node, and in a data group while
-    /// this run's unbound root awaits its binding. The bootstrap probe vote
-    /// is still answered, as the gate answers it.
+    /// An inbound vote or pre-vote for `group` (`round`), through the node
+    /// fence's hold and the recovery gate's vote screen. While the fence
+    /// holds the replica out ([`crate::predecessor_wait::fence_holds`]) it
+    /// grants no vote: in any group or meta while this run owes its
+    /// predecessor wait, whose predecessor may still vote as this node, and
+    /// in a data group while this run's unbound root awaits its binding.
+    /// The bootstrap probe vote is still answered, as the gate answers it.
+    /// A pre-vote passes the same screens as a vote, so a replica that
+    /// would refuse a candidate's vote also refuses its pre-vote, and the
+    /// candidate does not raise its term for an election it cannot win.
     pub(crate) async fn vote(
         &self,
         group: RaftTarget,
+        round: VoteRound,
         request: VoteRequest<C>,
     ) -> Result<VoteResponse<C>, GroupEngineError> {
         let raft = self.owner().clone();
@@ -290,6 +299,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                 tracing::info!(
                     node_id = metrics.id,
                     candidate = %request.vote,
+                    round = round.rpc(),
                     "refusing a vote while the node fence holds this replica out: a predecessor that \
                      may still run is waited out, or this unbound root awaits its binding"
                 );
@@ -298,7 +308,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             if let Some(refusal) = rejoin.and_then(|rejoin| rejoin.screen_vote(&request)) {
                 return Ok(refusal);
             }
-            raft.vote(request).await
+            match round {
+                VoteRound::Vote => raft.vote(request).await,
+                VoteRound::PreVote => raft.pre_vote(request).await,
+            }
         })
         .await
         .map_err(crate::owner::owner_stopped)?
@@ -414,7 +427,8 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             current_term: metrics.current_term,
             // A stopped replica leads nothing. Its last observation is
             // stale, so leader counts and drains must not see it.
-            current_leader: metrics.current_leader.filter(|_| running),
+            current_leader: crate::leadership::named_leader(&metrics, raft.contact())
+                .filter(|_| running),
             last_log: last_log.map(progress),
             committed: metrics.local_committed.map(progress),
             last_applied: metrics.last_applied.map(progress),
@@ -571,6 +585,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             .clone()
             .ok_or(RecoveryGateError::NotRegistered { group })?;
         let owner = self.owner().clone();
+        let contact = owner.contact().clone();
         let plan = *plan;
         let job = rejoin.clone();
         let history = self.history.clone();
@@ -581,7 +596,11 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         let job = crate::rt::spawn(async move {
             owner
                 .call(move |raft| async move {
-                    let core = RaftPlanCore { raft: &raft, group };
+                    let core = RaftPlanCore {
+                        raft: &raft,
+                        group,
+                        contact: &contact,
+                    };
                     job.accept_recovery_plan(&plan, &core, &history, applied)
                         .await
                 })

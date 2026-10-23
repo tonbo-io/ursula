@@ -1,7 +1,7 @@
 //! This node's registration with the meta group (design 3.6).
 //!
 //! A node registers itself at every start, and again after
-//! [`REREGISTER_AFTER`] without a meta leader, naming the root it runs on
+//! [`REREGISTER_AFTER`] without a live meta leader, naming the root it runs on
 //! and, as `empty`, whether the meta group never bound that root
 //! (`RootStanding::Unbound`). The first answer is recorded as the root's
 //! binding, `fsync`ed, before it is published ([`RootGuard::bind`]). It
@@ -207,15 +207,25 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
     }
 }
 
-/// Since when this node has known no meta leader, `None` while its meta
-/// replica knows one, as the meta leader's tracker publishes it.
+/// Since when this node has known no live meta leader, `None` while its
+/// meta replica knows one, as the meta leader's tracker publishes it.
 pub type MetaLeaderless = Option<Instant>;
 
+/// How often the meta leader's tracker reads its replica's leader again
+/// while its metrics stay unchanged: a leader goes from live to lapsed
+/// with no change of the metrics.
+const META_LEADER_RECHECK: Duration = Duration::from_millis(500);
+
 /// Follows this node's running meta replica and publishes on `leaderless`
-/// since when it has known no meta leader. A node without a running meta
-/// replica knows none, and so does one whose replica stopped while it is
-/// still published, whose metrics close at once. Runs until its task is
-/// aborted.
+/// since when it has known no live meta leader
+/// ([`crate::leadership::knows_live_leader`]): one it leads with a recent
+/// quorum, or follows and heard from recently. A follower that hears its
+/// leader no more keeps naming it in OpenRaft's metrics, since with
+/// pre-vote it raises no term of its own, so the tracker reads the
+/// leader's liveness, again every [`META_LEADER_RECHECK`]. A node without
+/// a running meta replica knows none, and so does one whose replica
+/// stopped while it is still published, whose metrics close at once. Runs
+/// until its task is aborted.
 pub(crate) async fn track_meta_leader(
     registry: RaftGroupHandleRegistry,
     leaderless: watch::Sender<MetaLeaderless>,
@@ -249,9 +259,11 @@ pub(crate) async fn track_meta_leader(
         };
         let current = Arc::downgrade(&active);
         let mut metrics = active.core.owner().metrics();
+        let contact = active.core.owner().contact().clone();
         drop(active);
         loop {
-            if metrics.borrow_watched().current_leader.is_some() {
+            let live = crate::leadership::knows_live_leader(&metrics.borrow_watched(), &contact);
+            if live {
                 leaderless.send_if_modified(|since| since.take().is_some());
             } else {
                 mark_leaderless();
@@ -271,6 +283,7 @@ pub(crate) async fn track_meta_leader(
                     // Another replica may run now: follow the one published.
                     break;
                 }
+                () = crate::rt::time::sleep(META_LEADER_RECHECK) => {}
             }
         }
     }

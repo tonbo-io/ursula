@@ -637,7 +637,7 @@ fn a_restart_with_a_regressed_view_creates_nothing_unconfirmed() {
 /// Group 0 on `{1}` moves to `{2}`. The move's joint entry commits and its
 /// second step waits for the next settle, which appends the uniform `{2}`
 /// while node 2 is cut off on the data plane: it stays uncommitted. Node 2
-/// was cut off past an election timeout and campaigned (pre-vote is off),
+/// was cut off past an election timeout and campaigned,
 /// so its higher vote deposes node 1 before node 1's next append reaches
 /// it. Node 1, no voter of the uniform entry but one of the committed joint
 /// config, wins the election that follows with node 2's vote, its log

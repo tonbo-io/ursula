@@ -246,6 +246,13 @@ impl RaftInternal for WedgedPeer {
         std::future::pending().await
     }
 
+    async fn pre_vote(
+        &self,
+        _request: Request<pb::RaftRpcEnvelopeV1>,
+    ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
+        std::future::pending().await
+    }
+
     async fn full_snapshot(
         &self,
         _request: Request<pb::RaftFullSnapshotRequestV1>,

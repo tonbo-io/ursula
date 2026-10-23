@@ -30,18 +30,14 @@ use crate::bootstrap::participation::PeerParticipation;
 /// every node's path is no fault of this node: every peer still answers
 /// within the bound a Raft append gets, and handing its leaderships to
 /// nodes no better off would only leave groups without a leader while each
-/// refuses them. A node that cannot reach a quorum must stop campaigning,
-/// though: Ursula runs without pre-vote, so each of its elections raises
-/// the group's term, and once the cut heals that term deposes the group's
-/// leader. So it sheds on its first tick that hears too few peers, which
-/// ends one tick interval plus [`ursula_raft::PEER_ANSWER_TIMEOUT`] after
-/// the cut at the latest, 2 s with the default 500 ms interval. A replica
-/// of it that follows a group may campaign once before that, but not
-/// twice: its first election comes at least the minimum election timeout
-/// less a heartbeat wait (721 ms) after the cut, 779 ms, and its second a
-/// minimum election timeout (1.5 s) later. Only pre-vote, or a quorum
-/// check before campaigning, would keep that one election from raising
-/// the group's term. The node clears this reason once its egress is
+/// refuses them. A node that cannot reach a quorum sheds on its first tick
+/// that hears too few peers, which ends one tick interval plus
+/// [`ursula_raft::PEER_ANSWER_TIMEOUT`] after the cut at the latest, 2 s
+/// with the default 500 ms interval: it cannot replicate, so its
+/// leaderships go to peers that can. Its elections stop with the shed.
+/// Before the shed its replicas that follow a group run pre-votes, which
+/// no peer answers, so they raise no term that would depose the group's
+/// leader once the cut heals. The node clears this reason once its egress is
 /// clean, or the fault is gone, and re-enables elections only if no other
 /// shed reason remains.
 ///

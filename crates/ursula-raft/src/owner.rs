@@ -33,6 +33,8 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::NodeFence;
 
 use crate::leadership::GroupLeadership;
+use crate::leadership::LeaderContact;
+use crate::leadership::named_leader;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::state_machine::RaftGroupStateMachine;
@@ -75,6 +77,9 @@ pub struct OwnerRaftHandle<
     /// The group's OpenRaft leader lease, which the one leader predicate
     /// reads too ([`crate::leadership::leader_lease`]).
     lease: Duration,
+    /// The replica's last contact with its leader, which the one leader
+    /// predicate reads for a follower ([`crate::leadership::named_leader`]).
+    contact: LeaderContact,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHandle<SM> {
@@ -88,6 +93,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHa
             transfer_deadline: self.transfer_deadline,
             fence: self.fence.clone(),
             lease: self.lease,
+            contact: self.contact.clone(),
         }
     }
 }
@@ -139,12 +145,19 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
             transfer_deadline,
             fence,
             lease,
+            contact: LeaderContact::default(),
         }
     }
 
     /// The node fence this replica's leadership reads.
     pub fn fence(&self) -> &NodeFence {
         &self.fence
+    }
+
+    /// The replica's last contact with its leader, which its leadership
+    /// reads too.
+    pub fn contact(&self) -> &LeaderContact {
+        &self.contact
     }
 
     /// How recently a handoff target must have acknowledged this leader:
@@ -334,7 +347,12 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     /// This replica's view of the group's leadership, from one borrow of
     /// its Raft metrics, without a trip through the group's core.
     pub fn leadership(&self) -> GroupLeadership {
-        GroupLeadership::of(&self.metrics.borrow_watched(), &self.fence, self.lease)
+        GroupLeadership::of(
+            &self.metrics.borrow_watched(),
+            &self.fence,
+            self.lease,
+            &self.contact,
+        )
     }
 
     /// OpenRaft's data metrics, which carry the full last log id. Its
@@ -362,8 +380,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         self.leadership().leads()
     }
 
-    pub async fn current_leader(&self) -> Option<u64> {
-        self.metrics.borrow_watched().current_leader
+    /// The leader this replica names ([`crate::leadership::named_leader`]):
+    /// itself, or a leader it heard from recently.
+    pub fn current_leader(&self) -> Option<u64> {
+        named_leader(&self.metrics.borrow_watched(), &self.contact)
     }
 
     pub fn trigger(&self) -> OwnerTrigger<SM> {

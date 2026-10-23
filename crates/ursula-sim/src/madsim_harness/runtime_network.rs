@@ -424,13 +424,13 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
         let front_door = self.front_door.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
             let registry = InProcessRaftRegistry::default();
-            let mut config = Config {
+            let mut config = ursula_raft::with_group_election_protocol(Config {
                 cluster_name: format!("ursula-sim-runtime-group-{}", placement.raft_group_id.0),
                 heartbeat_interval: 10,
                 election_timeout_min: 50,
                 election_timeout_max: 100,
                 ..Default::default()
-            };
+            });
             if aggressive_snapshot_purge {
                 config.max_in_snapshot_log_to_keep = 0;
                 config.purge_batch_size = 1;

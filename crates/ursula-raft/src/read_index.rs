@@ -110,7 +110,8 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>> Re
                 state.lock().unwrap_or_else(PoisonError::into_inner).open = false;
             }
             let fence = raft.fence().clone();
-            raft.call(move |raft| async move { confirm(&raft, &fence).await })
+            let contact = raft.contact().clone();
+            raft.call(move |raft| async move { confirm(&raft, &fence, &contact).await })
                 .await
                 .map_err(crate::owner::owner_stopped)?
         }
@@ -154,8 +155,9 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>>
 async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: &Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
+    contact: &crate::LeaderContact,
 ) -> Outcome {
-    if !GroupLeadership::of_raft(raft, fence).leads() {
+    if !GroupLeadership::of_raft(raft, fence, contact).leads() {
         return Ok(None);
     }
     let budget = Duration::from_millis(raft.config().election_timeout_min);
@@ -167,7 +169,7 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             group_engine_linearizable_read_error(
                 err,
                 OPERATION,
-                &GroupLeadership::of_raft(raft, fence),
+                &GroupLeadership::of_raft(raft, fence, contact),
             )
         })?;
     let read_log_id = *linearizer.read_log_id().log_id();

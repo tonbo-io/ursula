@@ -1962,6 +1962,7 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     let batch = crate::forward::write_commands_on_raft(
         follower.raft_handle(),
         follower.fence(),
+        follower.contact(),
         &follower.history,
         vec![
             append_command(stream_id.clone(), b"a"),
@@ -2254,12 +2255,21 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         // The deposed node now follows, so its own check refuses before
         // proposal. Running it after the hand-off would misclassify the
         // write. A write its lapse answered can end before the node hears
-        // of the new leader.
-        rafts[index(leader_id)]
-            .wait(Some(Duration::from_secs(10)))
-            .current_leader(new_leader, "the deposed node follows the new leader")
-            .await
-            .expect("the deposed node follows the new leader");
+        // of the new leader. OpenRaft may name the new leader from a higher
+        // vote in an answer before the new leader's first append reaches
+        // the node, and only that append makes it follow the new leader.
+        let deposed = engines[index(leader_id)].read_barrier.owner();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while deposed.leadership().role
+                != (crate::LeaderRole::Follows {
+                    leader_id: new_leader,
+                })
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("{write:?}: the deposed node follows the new leader"));
         let checked = engines[index(leader_id)]
             .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"abc"))
             .await

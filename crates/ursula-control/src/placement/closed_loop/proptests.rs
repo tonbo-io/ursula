@@ -7,10 +7,12 @@
 //! The adversary crashes, restarts with regressed views, cuts nodes off on
 //! the data plane (they keep their gates, and a cut-off leader keeps leading
 //! its own copy once the others elected another) and heals a cut shorter or
-//! longer than an election timeout. Ursula runs OpenRaft with pre-vote off,
-//! so a voter back from a longer cut campaigned during it, and its higher
-//! vote deposes the leaders replicating to it before their next append
-//! reaches it. In the election that follows, a voter of the committed joint
+//! longer than an election timeout. A voter back from a longer cut
+//! campaigned during it: pre-vote keeps a voter that reaches no other from
+//! campaigning, but not one that a partial cut leaves with a voter that
+//! lost the leader too, which the model's cut stands for as well. Its
+//! higher vote deposes the leaders replicating to it before their next
+//! append reaches it. In the election that follows, a voter of the committed joint
 //! config holding the uncommitted uniform entry may win, an outgoing one
 //! included. The adversary also lags meta replicas, keeps step futures past
 //! their leadership, holds reports in flight, drops and delays second steps,

@@ -43,6 +43,7 @@ use crate::state_machine::RaftGroupStateMachine;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaSnapshot;
+use crate::types::VoteRound;
 
 /// How the in-process network delivers RPCs to the replicas of one state
 /// machine: what a node registers to answer them, and the production entry
@@ -68,6 +69,7 @@ pub trait InProcessEndpoint:
 
     fn vote(
         endpoint: &Self::Endpoint,
+        round: VoteRound,
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> impl Future<
         Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
@@ -114,11 +116,12 @@ impl InProcessEndpoint for RaftGroupStateMachine {
 
     fn vote(
         (group, registry): &Self::Endpoint,
+        round: VoteRound,
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> impl Future<
         Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
     > + Send {
-        registry.vote(*group, rpc)
+        registry.vote(*group, round, rpc)
     }
 
     fn install_full_snapshot(
@@ -701,7 +704,7 @@ impl InProcessRegistry<RaftGroupStateMachine> {
             .request(node_id, receiver, crate::incarnation::Rpc::Raft)
             .ok()?;
         let response = endpoint
-            .vote(group, crate::bootstrap_probe_vote())
+            .vote(group, VoteRound::Vote, crate::bootstrap_probe_vote())
             .await
             .ok()?;
         caller.answer(node_id, receiver).ok()?;
@@ -752,7 +755,7 @@ impl InProcessRegistry<RaftGroupStateMachine> {
                 .ok_or(ursula_runtime::GroupEngineError::Infra(
                     ursula_runtime::GroupInfraError::OwnerStopped,
                 ))?;
-        endpoint.vote(group, request).await
+        endpoint.vote(group, VoteRound::Vote, request).await
     }
 
     pub fn rejoin(&self, node_id: u64) -> Option<Arc<GroupRejoin>> {
@@ -807,6 +810,7 @@ impl InProcessEndpoint for crate::meta::MetaStateMachine {
 
     fn vote(
         registry: &Self::Endpoint,
+        round: VoteRound,
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> impl Future<
         Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
@@ -814,7 +818,7 @@ impl InProcessEndpoint for crate::meta::MetaStateMachine {
         let meta = registry.meta();
         async move {
             match meta {
-                Some(meta) => meta.vote(rpc).await,
+                Some(meta) => meta.vote(round, rpc).await,
                 None => Err(no_meta_replica()),
             }
         }
@@ -922,7 +926,10 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
         caller
             .request(node_id, receiver, crate::incarnation::Rpc::Raft)
             .ok()?;
-        let response = meta.vote(crate::bootstrap_probe_vote()).await.ok()?;
+        let response = meta
+            .vote(VoteRound::Vote, crate::bootstrap_probe_vote())
+            .await
+            .ok()?;
         caller.answer(node_id, receiver).ok()?;
         Some(crate::PeerGroupLog::from_vote_response(&response))
     }
@@ -1207,8 +1214,18 @@ impl<SM: InProcessEndpoint> RaftNetworkFactory<UrsulaRaftTypeConfig>
 pub enum InProcessRaftRpcKind {
     AppendEntries,
     Vote,
+    PreVote,
     FullSnapshot,
     TransferLeader,
+}
+
+impl From<VoteRound> for InProcessRaftRpcKind {
+    fn from(round: VoteRound) -> Self {
+        match round {
+            VoteRound::Vote => Self::Vote,
+            VoteRound::PreVote => Self::PreVote,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1809,6 +1826,56 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
         }
         Ok(())
     }
+
+    /// Delivers a vote or a pre-vote (`round`) through the target's
+    /// production entry point, as the gRPC plane delivers both. Only a
+    /// real vote's grant saves anything, so only its answer is a promise
+    /// and an [`InProcessRaftNetworkEvent::VoteAnswered`].
+    async fn deliver_vote(
+        &self,
+        round: VoteRound,
+        rpc: VoteRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
+        let kind = InProcessRaftRpcKind::from(round);
+        self.before_rpc(kind).await.map_err(RPCError::Unreachable)?;
+        let target = self
+            .target_endpoint()
+            .map_err(RPCError::Unreachable)?
+            .ok_or_else(|| {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                        source: self.source,
+                        target: self.target,
+                        kind,
+                    });
+                RPCError::Unreachable(self.missing_target_error())
+            })?;
+        self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
+            source: self.source,
+            target: self.target,
+            kind,
+        });
+        self.deliver(Some(&target)).map_err(RPCError::Unreachable)?;
+        let target_gate = SM::gate(&target);
+        let response = SM::vote(&target, round, rpc).await.map_err(|err| {
+            RPCError::Network(NetworkError::from_string(format!(
+                "remote {}: {err}",
+                round.rpc()
+            )))
+        })?;
+        let saved = round == VoteRound::Vote && response.vote_granted;
+        self.answer(Some(&target), saved)
+            .map_err(RPCError::Unreachable)?;
+        if round == VoteRound::Vote {
+            self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
+                source: self.source,
+                target: self.target,
+                granted: response.vote_granted,
+                target_gate,
+            });
+        }
+        Ok(response)
+    }
 }
 
 impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNetwork<SM> {
@@ -1890,40 +1957,15 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
         _option: RPCOption,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        self.before_rpc(InProcessRaftRpcKind::Vote)
-            .await
-            .map_err(RPCError::Unreachable)?;
-        let target = self
-            .target_endpoint()
-            .map_err(RPCError::Unreachable)?
-            .ok_or_else(|| {
-                self.policy
-                    .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
-                        source: self.source,
-                        target: self.target,
-                        kind: InProcessRaftRpcKind::Vote,
-                    });
-                RPCError::Unreachable(self.missing_target_error())
-            })?;
-        self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
-            source: self.source,
-            target: self.target,
-            kind: InProcessRaftRpcKind::Vote,
-        });
-        self.deliver(Some(&target)).map_err(RPCError::Unreachable)?;
-        let target_gate = SM::gate(&target);
-        let response = SM::vote(&target, rpc).await.map_err(|err| {
-            RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
-        })?;
-        self.answer(Some(&target), response.vote_granted)
-            .map_err(RPCError::Unreachable)?;
-        self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
-            source: self.source,
-            target: self.target,
-            granted: response.vote_granted,
-            target_gate,
-        });
-        Ok(response)
+        self.deliver_vote(VoteRound::Vote, rpc).await
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<UrsulaRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
+        self.deliver_vote(VoteRound::PreVote, rpc).await
     }
 
     async fn full_snapshot(

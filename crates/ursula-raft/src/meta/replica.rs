@@ -92,6 +92,7 @@ use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaSnapshot;
 use crate::types::UrsulaVote;
+use crate::types::VoteRound;
 
 /// What a meta replica opens with, and opens with again on a restart.
 #[derive(Debug, Clone)]
@@ -291,10 +292,15 @@ impl ActiveMeta {
         }
     }
 
-    /// An inbound vote, through the recovery gate's vote screen.
-    pub async fn vote(&self, request: VoteRequest<C>) -> Result<VoteResponse<C>, GroupEngineError> {
+    /// An inbound vote or pre-vote (`round`), through the recovery gate's
+    /// vote screen.
+    pub async fn vote(
+        &self,
+        round: VoteRound,
+        request: VoteRequest<C>,
+    ) -> Result<VoteResponse<C>, GroupEngineError> {
         self.core.apply_health.check(RaftTarget::Meta)?;
-        self.core.vote(RaftTarget::Meta, request).await
+        self.core.vote(RaftTarget::Meta, round, request).await
     }
 
     /// An inbound full snapshot. A meta snapshot is inline, so nothing is
@@ -378,7 +384,9 @@ impl ActiveMeta {
         if probe.claim != self.claim {
             return Ok(GenesisAnswer::Mismatch(self.claim.clone()));
         }
-        Ok(GenesisAnswer::Vote(self.vote(probe.vote).await?))
+        Ok(GenesisAnswer::Vote(
+            self.vote(VoteRound::Vote, probe.vote).await?,
+        ))
     }
 
     /// A leadership transfer this node received, once the election policy
@@ -432,10 +440,12 @@ impl ActiveMeta {
         self.core.apply_health.check(RaftTarget::Meta)?;
         let history = Arc::clone(&self.core.history);
         let fence = self.core.owner().fence().clone();
+        let contact = self.core.owner().contact().clone();
         self.core
             .owner()
             .call(move |raft| async move {
-                crate::forward::write_commands_on_raft(raft, &fence, &history, commands).await
+                crate::forward::write_commands_on_raft(raft, &fence, &contact, &history, commands)
+                    .await
             })
             .await
             .map_err(crate::owner::owner_stopped)?

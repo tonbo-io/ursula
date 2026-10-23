@@ -14,14 +14,28 @@
 //! a leader leads nothing here either ([`LeaderRole::Lapsed`]): a write
 //! routed to it is refused before its body, and a write it proposed earlier
 //! stops waiting for an answer only its quorum could give ([`until_lapsed`]).
+//!
+//! A follower names a leader only while that leader is live: its
+//! AppendEntries reached the replica recently ([`LeaderContact`]). OpenRaft
+//! names the leader of the replica's committed vote, and with pre-vote a
+//! follower that hears its leader no more raises no term of its own, so it
+//! keeps naming that leader until another leader's append reaches it. Every
+//! reader that routes to, reports or counts on a follower's leader reads
+//! [`named_leader`] instead.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::rt::Instant as _;
 use openraft::rt::WatchReceiver;
+use openraft::type_config::TypeConfigExt;
+use openraft::type_config::alias::InstantOf;
 use openraft::type_config::alias::WatchReceiverOf;
+use openraft::vote::RaftLeaderId;
 use ursula_runtime::CommittedLeader;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::NodeFence;
@@ -29,16 +43,20 @@ use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
 use ursula_runtime::node_fence::fence_now;
 
+use crate::rejoin::LIVE_LEADER_QUORUM_ACK;
+use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaVote;
 
 /// This replica's role in its group, as its Raft metrics show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaderRole {
     /// This replica is the leader (`ServerState::Leader`).
     Leads,
-    /// Another node leads the group.
+    /// Another node leads the group, and its AppendEntries reached this
+    /// replica within [`LIVE_LEADER_QUORUM_ACK`] ([`named_leader`]).
     Follows { leader_id: u64 },
-    /// No leader is known, or this replica is between roles.
+    /// No live leader is known, or this replica is between roles.
     Unknown,
     /// OpenRaft keeps this replica in its leader state, but it cannot
     /// commit: its node fence does not admit it, or no quorum acknowledged
@@ -63,48 +81,27 @@ pub struct GroupLeadership {
 
 impl GroupLeadership {
     /// The view `metrics` show behind `fence`, for a group whose OpenRaft
-    /// leader lease is `lease` ([`leader_lease`]). Only `ServerState::Leader`
-    /// leads: a node that names itself leader in any other state is between
-    /// roles. While the fence does not admit, a leader has lapsed and any
-    /// other replica's role is unknown. After the fence lifted, a leader
-    /// leads again only once OpenRaft confirmed its leadership
-    /// ([`fence_lets_lead`]). A leader that no quorum acknowledged within
-    /// `lease` has lapsed ([`lease_holds`]).
+    /// leader lease is `lease` ([`leader_lease`]), with the replica's
+    /// `contact` with its leader. Only `ServerState::Leader` leads: a node
+    /// that names itself leader in any other state is between roles. While
+    /// the fence does not admit, a leader has lapsed and any other replica's
+    /// role is unknown. After the fence lifted, a leader leads again only
+    /// once OpenRaft confirmed its leadership ([`fence_lets_lead`]). A
+    /// leader that no quorum acknowledged within `lease` has lapsed
+    /// ([`lease_holds`]). A follower follows only a live leader
+    /// ([`named_leader`]).
     pub fn of(
         metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
         fence: &NodeFence,
         lease: Duration,
+        contact: &LeaderContact,
     ) -> Self {
-        let now = fence_now();
-        let leader = metrics.state == ServerState::Leader;
-        let role = if !fence.admits(now) && fence_rules_leadership() {
-            if leader {
-                LeaderRole::Lapsed
-            } else {
-                LeaderRole::Unknown
-            }
-        } else if leader {
-            let own_quorum = own_quorum(metrics);
-            let acked_age = metrics
-                .last_quorum_acked
-                .as_ref()
-                .map(|acked| acked.elapsed());
-            let since_lift = fence
-                .lifted_at()
-                .map(|lifted| now.saturating_duration_since(lifted));
-            let confirmed = fence_lets_lead(own_quorum, acked_age, since_lift)
-                && lease_holds(own_quorum, acked_age, lease);
-            if confirmed || !fence_rules_leadership() {
-                LeaderRole::Leads
-            } else {
-                LeaderRole::Lapsed
-            }
-        } else {
-            match metrics.current_leader {
+        let role = lead_role(metrics, fence, lease).unwrap_or_else(|| {
+            match named_leader(metrics, contact) {
                 Some(leader_id) if leader_id != metrics.id => LeaderRole::Follows { leader_id },
                 _ => LeaderRole::Unknown,
             }
-        };
+        });
         Self {
             node_id: metrics.id,
             term: metrics.current_term,
@@ -112,16 +109,18 @@ impl GroupLeadership {
         }
     }
 
-    /// The view of the replica that runs `raft`, behind `fence`, with its
-    /// group's lease taken from the Raft's own config.
+    /// The view of the replica that runs `raft`, behind `fence`, with
+    /// `contact`, and its group's lease taken from the Raft's own config.
     pub(crate) fn of_raft<SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig>>(
         raft: &openraft::Raft<UrsulaRaftTypeConfig, SM>,
         fence: &NodeFence,
+        contact: &LeaderContact,
     ) -> Self {
         Self::of(
             &raft.metrics().borrow_watched(),
             fence,
             leader_lease(raft.config()),
+            contact,
         )
     }
 
@@ -185,6 +184,105 @@ impl GroupLeadership {
     }
 }
 
+/// The role of a replica that OpenRaft keeps in its leader state, or of
+/// any replica while the fence does not admit: `None` for a replica that
+/// follows or campaigns, whose role [`named_leader`] decides.
+fn lead_role(
+    metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+    fence: &NodeFence,
+    lease: Duration,
+) -> Option<LeaderRole> {
+    let now = fence_now();
+    let leader = metrics.state == ServerState::Leader;
+    if !fence.admits(now) && fence_rules_leadership() {
+        return Some(if leader {
+            LeaderRole::Lapsed
+        } else {
+            LeaderRole::Unknown
+        });
+    }
+    if !leader {
+        return None;
+    }
+    let own_quorum = own_quorum(metrics);
+    let acked_age = metrics
+        .last_quorum_acked
+        .as_ref()
+        .map(|acked| acked.elapsed());
+    let since_lift = fence
+        .lifted_at()
+        .map(|lifted| now.saturating_duration_since(lifted));
+    let confirmed = fence_lets_lead(own_quorum, acked_age, since_lift)
+        && lease_holds(own_quorum, acked_age, lease);
+    Some(if confirmed || !fence_rules_leadership() {
+        LeaderRole::Leads
+    } else {
+        LeaderRole::Lapsed
+    })
+}
+
+/// The leader the replica whose metrics are `metrics` names, with its
+/// `contact` with its leader: itself while OpenRaft names it (its committed
+/// vote is its own), another node only while that node's AppendEntries
+/// reached it within [`LIVE_LEADER_QUORUM_ACK`] ([`LeaderContact`]). The
+/// one predicate for a follower's leader: the leader view, the forwards of
+/// leader-only RPCs, the admin snapshot and readiness all read it.
+///
+/// OpenRaft names the leader of the replica's committed vote. With pre-vote
+/// a follower whose leader went silent raises no term of its own, so its
+/// vote stays committed and OpenRaft keeps naming that leader, possibly for
+/// as long as the group has no quorum.
+pub(crate) fn named_leader(
+    metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+    contact: &LeaderContact,
+) -> Option<u64> {
+    let leader = metrics.current_leader?;
+    (leader == metrics.id || contact.live_leader(metrics.id) == Some(leader)).then_some(leader)
+}
+
+/// Whether the replica whose metrics are `metrics`, with `contact`, knows
+/// a live leader of its group: it leads with a quorum that acknowledged it
+/// recently ([`crate::leads_live`]), or follows a leader whose
+/// AppendEntries reached it recently ([`LeaderContact::live_leader`]).
+pub(crate) fn knows_live_leader(
+    metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+    contact: &LeaderContact,
+) -> bool {
+    crate::rejoin::leads_live(metrics) || contact.live_leader(metrics.id).is_some()
+}
+
+/// A replica's last contact with its leader: the committed leader whose
+/// AppendEntries reached it last, and when. Recorded for every inbound
+/// append the replica's screens let through to OpenRaft
+/// ([`crate::replica::ReplicaCore::append_entries`]), heartbeats included.
+/// Shared by every clone of the replica's owner handle.
+#[derive(Debug, Clone, Default)]
+pub struct LeaderContact(Arc<Mutex<Option<LastAppend>>>);
+
+/// The committed leader's vote on the last append, and when it arrived.
+type LastAppend = (UrsulaVote, InstantOf<UrsulaRaftTypeConfig>);
+
+impl LeaderContact {
+    /// Records `request`, an append the replica hands to OpenRaft, when its
+    /// vote is a committed leader's.
+    pub(crate) fn observe(&self, request: &UrsulaAppendEntriesRequest) {
+        if request.vote.is_committed() {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((request.vote, UrsulaRaftTypeConfig::now()));
+        }
+    }
+
+    /// The live leader of replica `own`: the committed leader, another
+    /// node, whose AppendEntries reached it within
+    /// [`LIVE_LEADER_QUORUM_ACK`] (m2, #581 review: an append may reach the
+    /// replica before its metrics show the leader).
+    pub fn live_leader(&self, own: u64) -> Option<u64> {
+        let (vote, at) = (*self.0.lock().unwrap_or_else(PoisonError::into_inner))?;
+        let leader = *vote.leader_id().node_id();
+        (leader != own && at.elapsed() < LIVE_LEADER_QUORUM_ACK).then_some(leader)
+    }
+}
+
 /// OpenRaft's leader lease of a group that runs `config`: OpenRaft takes it
 /// from `election_timeout_max`, and refuses a write while no quorum
 /// acknowledged its leader within it. Its followers campaign within the same
@@ -232,7 +330,7 @@ pub(crate) async fn until_lapsed(
     loop {
         let look_again = {
             let current = metrics.borrow_watched();
-            if GroupLeadership::of(&current, fence, lease).role == LeaderRole::Lapsed {
+            if lead_role(&current, fence, lease) == Some(LeaderRole::Lapsed) {
                 return;
             }
             match current.last_quorum_acked.as_ref() {
@@ -301,6 +399,7 @@ mod tests {
     use ursula_runtime::node_fence::fence_now;
 
     use super::GroupLeadership;
+    use super::LeaderContact;
     use super::LeaderRole;
     use super::fence_lets_lead;
     use super::lease_holds;
@@ -316,12 +415,13 @@ mod tests {
         let mut metrics = RaftMetrics::<C>::new_initial(1);
         metrics.state = ServerState::Leader;
         metrics.current_leader = Some(1);
-        let fenced = GroupLeadership::of(&metrics, &fence, LEASE);
+        let contact = LeaderContact::default();
+        let fenced = GroupLeadership::of(&metrics, &fence, LEASE, &contact);
         assert_eq!(fenced.role, LeaderRole::Lapsed);
         assert_eq!(fenced.upload_fence(), None);
         let start = fence_now();
         fence.record_probe(start, ProbeOutcome::Synced, start);
-        assert!(GroupLeadership::of(&metrics, &fence, LEASE).leads());
+        assert!(GroupLeadership::of(&metrics, &fence, LEASE, &contact).leads());
     }
 
     /// A leader leads while a quorum acknowledged it within its lease, or

@@ -71,12 +71,14 @@ const GROUP_HEARTBEAT_INTERVAL_MS: u64 = GROUP_ELECTION_TIMEOUT_MIN_MS * 2 / 5;
 /// transport gives each Append call `election_timeout_min` to answer
 /// (`grpc::RAFT_GRPC_APPEND_TIMEOUT`), so a slow link slows commits instead
 /// of stopping them.
+///
+/// Elections follow [`with_group_election_protocol`].
 pub(crate) fn cluster_raft_config(
     cluster_name: String,
     engine: &RaftEngineConfig,
     enable_elect: bool,
 ) -> Config {
-    Config {
+    with_group_election_protocol(Config {
         cluster_name,
         heartbeat_interval: GROUP_HEARTBEAT_INTERVAL_MS,
         election_timeout_min: GROUP_ELECTION_TIMEOUT_MIN_MS,
@@ -91,6 +93,27 @@ pub(crate) fn cluster_raft_config(
         // only a process restart recovers it).
         snapshot_policy: SnapshotPolicy::Never,
         ..Default::default()
+    })
+}
+
+/// The election protocol of every Raft group Ursula runs, data and meta,
+/// in a cluster and in the simulation: `config` with these settings
+/// replaced, its timeouts kept.
+///
+/// Every group runs a pre-vote round before it campaigns: a voter whose
+/// election timed out raises its term only once a quorum answers that it
+/// would grant the vote. A voter that cannot win leaves the term alone: one
+/// restarted before its leader's first heartbeat reached it, whose peers
+/// still hold the leader's lease, or one cut off from its peers. Without it
+/// such a voter's higher term deposes the group's leader at its next
+/// append, and the group elects again. A leadership transfer, and the
+/// campaign after a step-down, start a real election at once. After a plain
+/// step-down the other voters' pre-votes pass only once their own view of
+/// the old leader's lease (`election_timeout_max`) has lapsed.
+pub fn with_group_election_protocol(config: Config) -> Config {
+    Config {
+        enable_pre_vote: Some(true),
+        ..config
     }
 }
 

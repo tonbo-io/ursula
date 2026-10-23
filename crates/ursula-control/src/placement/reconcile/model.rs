@@ -915,9 +915,12 @@ impl Group {
     }
 
     /// `node` reaches the others again after a cut longer than an election
-    /// timeout. Ursula runs OpenRaft with pre-vote off, so a node that may
-    /// campaign (a voter of its effective or committed membership, its gate
-    /// open) campaigned during the cut and comes back with a higher vote.
+    /// timeout. A node that may campaign (a voter of its effective or
+    /// committed membership, its gate open) campaigned during the cut and
+    /// comes back with a higher vote. Pre-vote keeps a node cut off from
+    /// every peer from campaigning, but not one that a partial cut leaves
+    /// with a voter that lost the leader too, which this cut stands for as
+    /// well.
     /// A live leader replicating to it refuses that vote on its newer log,
     /// its next append to `node` is rejected by the higher vote, and it
     /// steps down (`Notification::HigherVote`) before anything it appended

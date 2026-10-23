@@ -478,7 +478,7 @@ The first read of a cold offset triggers an S3 `GetObject` range read. It runs o
 
 ### A group has no leader (`current_leader: null`)
 
-Either an election is in progress or quorum is lost for that group. Only streams hashed to that group are affected.
+Either an election is in progress or quorum is lost for that group. Only streams hashed to that group are affected. A follower names a leader only while that leader's appends reach it, within the last 3 s, so a follower cut off from its leader shows `null` even while the other nodes still name one.
 
 - Multiple nodes briefly claim leader: election is flapping. Check peer reachability and CPU pressure.
 - No node claims leader: fewer than `n/2+1` voters are reachable, or a majority of the group's voters are behind their recovery gates. Restore reachability. For gated voters, see [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).

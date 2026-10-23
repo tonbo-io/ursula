@@ -19,8 +19,10 @@
 //!   data recovery plans. A node cut off on the data plane stays a member
 //!   that nobody reaches. Back from a cut longer than an election timeout,
 //!   a voter that campaigned during it deposes the leaders that replicate
-//!   to it before their next append lands, as pre-vote is off, and an
-//!   election follows. On top of the group the model keeps the copy each
+//!   to it before their next append lands, and an election follows. Pre-vote
+//!   keeps a node that reaches no voter from campaigning, but not one that a
+//!   partial cut leaves with a voter that lost the leader too, which the
+//!   model's cut stands for as well. On top of the group the model keeps the copy each
 //!   cut-off leader still leads once the others elected another, and step
 //!   futures kept past their leadership.
 //!
@@ -252,9 +254,10 @@ pub(super) enum Action {
 pub(super) enum Outage {
     /// Shorter: the node never campaigned, and reconnects with its gate.
     Short,
-    /// Longer: a node that may campaign did, with pre-vote off, and its
-    /// higher vote deposes the leaders that replicate to it before any
-    /// heartbeat lands (`Group::reconnect_after_timeout`).
+    /// Longer: a node that may campaign did, as one that a partial cut
+    /// leaves with a voter that lost the leader too passes its pre-vote,
+    /// and its higher vote deposes the leaders that replicate to it before
+    /// any heartbeat lands (`Group::reconnect_after_timeout`).
     Long,
 }
 

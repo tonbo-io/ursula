@@ -457,13 +457,13 @@ impl JournalCluster {
     fn unstarted_voters(name: &str, tuning: JournalTuning, voters: u64, spares: u64) -> Self {
         let nodes = voters.saturating_add(spares);
         let drivers = SNAPSHOT_DRIVERS.with(std::cell::Cell::get);
-        let mut config = Config {
+        let mut config = ursula_raft::with_group_election_protocol(Config {
             cluster_name: name.to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 50,
             election_timeout_max: 100,
             ..Default::default()
-        };
+        });
         if let Some(drivers) = drivers {
             // As a node with a snapshot driver configures OpenRaft.
             config.snapshot_policy = openraft::SnapshotPolicy::Never;

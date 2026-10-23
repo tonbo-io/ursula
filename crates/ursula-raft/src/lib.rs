@@ -102,6 +102,7 @@ pub mod raft_internal_proto {
 mod leadership;
 mod owner;
 pub use leadership::GroupLeadership;
+pub use leadership::LeaderContact;
 pub use leadership::LeaderRole;
 pub use owner::OwnerRaftHandle;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
@@ -156,6 +157,7 @@ pub use engine::PlacedRaftGroupEngineFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineOptions;
+pub use engine::with_group_election_protocol;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
 pub use format_epoch::probe_peer_format_epoch;
@@ -171,6 +173,7 @@ pub use grpc::RAFT_GRPC_GENESIS_PROBE_PATH;
 pub use grpc::RAFT_GRPC_GROUP_READ_PATH;
 pub use grpc::RAFT_GRPC_GROUP_WRITE_PATH;
 pub use grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
+pub use grpc::RAFT_GRPC_PRE_VOTE_PATH;
 pub use grpc::RAFT_GRPC_REJOIN_BARRIER_PATH;
 pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
@@ -369,6 +372,7 @@ pub use types::UrsulaSnapshot;
 pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
+pub use types::VoteRound;
 pub use ursula_shard::RaftTarget;
 pub use voter::LeftMarks;
 

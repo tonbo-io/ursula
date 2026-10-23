@@ -72,6 +72,7 @@ use crate::types::SnapshotData;
 use crate::types::SnapshotLease;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaSnapshot;
+use crate::types::VoteRound;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SingleNodeRaftNetworkFactory;
@@ -1646,15 +1647,18 @@ impl RaftGroupHandleRegistry {
             .await
     }
 
+    /// An inbound vote or pre-vote (`round`) for data group
+    /// `raft_group_id`.
     pub async fn vote(
         &self,
         raft_group_id: RaftGroupId,
+        round: VoteRound,
         request: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let entry = self.entry(raft_group_id)?;
         entry
             .core
-            .vote(RaftTarget::Data(raft_group_id), request)
+            .vote(RaftTarget::Data(raft_group_id), round, request)
             .await
     }
 

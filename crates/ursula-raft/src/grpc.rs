@@ -76,6 +76,7 @@ use crate::types::UrsulaSnapshot;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
+use crate::types::VoteRound;
 
 /// Reply to an append-stream caller that may have stopped waiting. A dropped
 /// receiver makes the reply moot.
@@ -226,9 +227,33 @@ static GRPC_APPEND_REPLICATION: CachePadded<AppendReplicationCounters> =
         entries: AtomicU64::new(0),
     });
 static GRPC_APPEND_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Accounting for the Vote or the PreVote RPCs a node sends.
+struct VoteCounters {
+    requests: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+}
+
+impl VoteCounters {
+    const fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            request_bytes: AtomicU64::new(0),
+            response_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// The counters of `round`'s RPC.
+    fn of(round: VoteRound) -> &'static Self {
+        match round {
+            VoteRound::Vote => &GRPC_VOTE,
+            VoteRound::PreVote => &GRPC_PRE_VOTE,
+        }
+    }
+}
+
+static GRPC_VOTE: VoteCounters = VoteCounters::new();
+static GRPC_PRE_VOTE: VoteCounters = VoteCounters::new();
 static GRPC_SNAPSHOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -685,6 +710,9 @@ pub struct RaftGrpcMetricsSnapshot {
     pub raft_grpc_vote_requests: u64,
     pub raft_grpc_vote_request_bytes: u64,
     pub raft_grpc_vote_response_bytes: u64,
+    pub raft_grpc_pre_vote_requests: u64,
+    pub raft_grpc_pre_vote_request_bytes: u64,
+    pub raft_grpc_pre_vote_response_bytes: u64,
     pub raft_grpc_snapshot_requests: u64,
     pub raft_grpc_snapshot_request_bytes: u64,
     pub raft_grpc_snapshot_payload_bytes: u64,
@@ -743,9 +771,12 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
             .entries
             .load(Ordering::Relaxed),
         raft_grpc_append_response_bytes: GRPC_APPEND_RESPONSE_BYTES.load(Ordering::Relaxed),
-        raft_grpc_vote_requests: GRPC_VOTE_REQUESTS.load(Ordering::Relaxed),
-        raft_grpc_vote_request_bytes: GRPC_VOTE_REQUEST_BYTES.load(Ordering::Relaxed),
-        raft_grpc_vote_response_bytes: GRPC_VOTE_RESPONSE_BYTES.load(Ordering::Relaxed),
+        raft_grpc_vote_requests: GRPC_VOTE.requests.load(Ordering::Relaxed),
+        raft_grpc_vote_request_bytes: GRPC_VOTE.request_bytes.load(Ordering::Relaxed),
+        raft_grpc_vote_response_bytes: GRPC_VOTE.response_bytes.load(Ordering::Relaxed),
+        raft_grpc_pre_vote_requests: GRPC_PRE_VOTE.requests.load(Ordering::Relaxed),
+        raft_grpc_pre_vote_request_bytes: GRPC_PRE_VOTE.request_bytes.load(Ordering::Relaxed),
+        raft_grpc_pre_vote_response_bytes: GRPC_PRE_VOTE.response_bytes.load(Ordering::Relaxed),
         raft_grpc_snapshot_requests: GRPC_SNAPSHOT_REQUESTS.load(Ordering::Relaxed),
         raft_grpc_snapshot_request_bytes: GRPC_SNAPSHOT_REQUEST_BYTES.load(Ordering::Relaxed),
         raft_grpc_snapshot_payload_bytes: GRPC_SNAPSHOT_PAYLOAD_BYTES.load(Ordering::Relaxed),
@@ -795,6 +826,7 @@ fn record_append_logical_sample(sample: AppendLogicalSample) {
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_APPEND_STREAM_PATH: &str = "/ursula.raft.v1.RaftInternal/AppendStream";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
+pub const RAFT_GRPC_PRE_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/PreVote";
 pub const RAFT_GRPC_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.RaftInternal/FullSnapshot";
 pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupWrite";
 pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupRead";
@@ -1174,6 +1206,33 @@ async fn handle_append_stream_item(
     Ok(raft_internal_proto::RaftAppendStreamResponseItem { request_id, result })
 }
 
+/// The server side of the Vote and PreVote RPCs (`round`): one preamble
+/// check, payload, entry point and fence answer for both.
+async fn answer_vote(
+    registry: &RaftGroupHandleRegistry,
+    round: VoteRound,
+    request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
+) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
+    let admitted = request.extensions().get::<AdmittedPeer>().copied();
+    let envelope = request.into_inner();
+    let replica = validate_raft_rpc_preamble(
+        registry,
+        envelope.protocol_version,
+        &envelope,
+        admitted.as_ref(),
+    )?;
+    let request: UrsulaVoteRequest = decode_rpc_payload(&envelope.payload, "raft vote request")?;
+    let response = match replica {
+        LocalReplica::Data(group) => registry.vote(group, round, request).await,
+        LocalReplica::Meta(meta) => meta.vote(round, request).await,
+    }
+    .map_err(group_rpc_status)?;
+    answer_fence(registry)?;
+    Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
+        payload: encode_wire(&response),
+    }))
+}
+
 #[tonic::async_trait]
 impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService {
     type AppendStreamStream = Pin<
@@ -1290,25 +1349,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
-        let admitted = request.extensions().get::<AdmittedPeer>().copied();
-        let envelope = request.into_inner();
-        let replica = validate_raft_rpc_preamble(
-            &self.registry,
-            envelope.protocol_version,
-            &envelope,
-            admitted.as_ref(),
-        )?;
-        let request: UrsulaVoteRequest =
-            decode_rpc_payload(&envelope.payload, "raft vote request")?;
-        let response = match replica {
-            LocalReplica::Data(group) => self.registry.vote(group, request).await,
-            LocalReplica::Meta(meta) => meta.vote(request).await,
-        }
-        .map_err(group_rpc_status)?;
-        answer_fence(&self.registry)?;
-        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: encode_wire(&response),
-        }))
+        answer_vote(&self.registry, VoteRound::Vote, request).await
+    }
+
+    async fn pre_vote(
+        &self,
+        request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
+        answer_vote(&self.registry, VoteRound::PreVote, request).await
     }
 
     async fn full_snapshot(
@@ -1390,6 +1438,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .receive(admitted.as_ref(), Rpc::Forward)?;
                     let raft = entry.raft().clone();
                     let fence = raft.fence().clone();
+                    let contact = raft.contact().clone();
                     let history = entry.core.history.clone();
                     let commands = commands(&request)?;
                     let count = commands.len();
@@ -1398,7 +1447,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     // pending history, an unknown outcome).
                     let results = raft
                         .call(move |raft| async move {
-                            write_commands_on_raft(raft, &fence, &history, commands).await
+                            write_commands_on_raft(raft, &fence, &contact, &history, commands).await
                         })
                         .await
                         .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
@@ -2159,6 +2208,39 @@ impl GrpcRaftNetwork {
             request: encode_wire(request),
             ..Default::default()
         })
+    }
+
+    /// Sends a vote or a pre-vote (`round`): the same envelope, call path
+    /// and error classification, on the RPC of its round.
+    async fn send_vote(
+        &mut self,
+        round: VoteRound,
+        rpc: UrsulaVoteRequest,
+        option: RPCOption,
+    ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
+        let envelope = self.vote_envelope(rpc);
+        let counters = VoteCounters::of(round);
+        counters.requests.fetch_add(1, Ordering::Relaxed);
+        counters
+            .request_bytes
+            .fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
+        let ack = self
+            .call(
+                round.rpc(),
+                envelope,
+                option,
+                |mut client, request| async move {
+                    match round {
+                        VoteRound::Vote => client.vote(request).await,
+                        VoteRound::PreVote => client.pre_vote(request).await,
+                    }
+                },
+            )
+            .await?;
+        counters
+            .response_bytes
+            .fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
+        self.decode_rpc_ack(round.rpc(), &ack.payload)
     }
 
     pub(crate) fn vote_envelope(
@@ -2982,16 +3064,18 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaVoteRequest,
         option: RPCOption,
     ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
-        let envelope = self.vote_envelope(rpc);
-        GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        GRPC_VOTE_REQUEST_BYTES.fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
-        let ack = self
-            .call("Vote", envelope, option, |mut client, request| async move {
-                client.vote(request).await
-            })
-            .await?;
-        GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-        self.decode_rpc_ack("Vote", &ack.payload)
+        self.send_vote(VoteRound::Vote, rpc, option).await
+    }
+
+    /// A pre-vote goes the way of a vote, its errors classified alike: a
+    /// failed call is no grant, so a candidate that reaches too few peers
+    /// does not campaign.
+    async fn pre_vote(
+        &mut self,
+        rpc: UrsulaVoteRequest,
+        option: RPCOption,
+    ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
+        self.send_vote(VoteRound::PreVote, rpc, option).await
     }
 
     async fn full_snapshot(
@@ -4648,6 +4732,13 @@ mod barrier_asker_tests {
         }
 
         async fn vote(
+            &self,
+            _request: Request<pb::RaftRpcEnvelopeV1>,
+        ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn pre_vote(
             &self,
             _request: Request<pb::RaftRpcEnvelopeV1>,
         ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
