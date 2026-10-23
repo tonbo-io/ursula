@@ -80,6 +80,8 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(log = %usage_path.display(), "gateway usage accounting enabled");
     }
 
+    // The gateway probes every upstream from its start until the router
+    // drops it, after the drain.
     let app = router(Arc::new(gateway));
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

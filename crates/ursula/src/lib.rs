@@ -1524,6 +1524,12 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
 }
 
+/// The liveness route the gateway probes: it reads no node state, so it
+/// answers as long as the client plane serves.
+async fn liveness() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 /// What readiness decides on, besides the reports it carries.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReadinessFacts {
@@ -1718,6 +1724,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(READINESS_PATH, get(readiness))
+        .route(ursula_headers::routing::LIVENESS_PATH, get(liveness))
         .route("/__ursula/usage", get(bucket_usage))
         .route(
             placement_status::PLACEMENT_PATH,

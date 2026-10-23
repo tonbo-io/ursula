@@ -49,32 +49,38 @@ identifies the Raft leader.
   not know the leader, or under backpressure), or when a request to it fails.
   The cache holds up to 16384 routes and starts over when full. Requests
   without a route go to a configured upstream picked at random.
+- **Probes.** The gateway sends `GET /__ursula/live` to every upstream every
+  250 ms, one probe at a time per upstream, whether or not requests go there.
+  A node answers it `204` without reading any state. A probe that fails at
+  the transport or gets no response headers within 1.5 s ejects the
+  upstream, and any answer to a probe readmits it. A node that stops
+  answering, such as a stopped process (`SIGSTOP`) or a frozen host, is out
+  of selection within 1.75 s of its last answer on every gateway, and back
+  within 250 ms of answering again. A uniform delay ejects nothing: under a
+  500 ms round trip a probe takes one round trip on a pooled connection. A
+  probe past 1.5 s keeps waiting for its answer, up to
+  `--response-header-timeout`, and readmits the upstream when it comes, so
+  that the connection it opened goes into the pool even when a new
+  connection takes longer than 1.5 s. Every `Gateway` probes its upstreams
+  from its construction until its last clone is dropped.
 - **Ejection.** An upstream that fails at the transport (it refuses or times
-  out the connection, or the exchange breaks) is ejected: requests skip it
-  for 10 s. Each failure after a window ejects it again for twice as long,
-  up to 60 s. Failures of requests that were already in flight do not
-  lengthen a window. An upstream that sends no response headers within
-  `--response-header-timeout` is ejected too: a leader that lost its quorum
-  answers a write within its leader lease, so a missing answer mostly marks
-  a node that does not answer at all, such as a stopped process. A live node
-  can still hold a request longer (a write waiting for its group's first
-  open, a read forwarded to an unreachable leader, a snapshot commit of many
-  parts) and is then ejected although it is healthy. It comes back with its
-  next answer. A node that vanished fails within
-  `--upstream-tcp-user-timeout`.
-- **Probe.** When a window expires, the next request that selects the
-  upstream, along a cached route, at random, or as a search hop after a
-  leader redirect, probes it. The other requests
-  keep skipping the upstream until the probe answers or fails, or for at most
-  `--connect-timeout` plus `--upstream-tcp-user-timeout`, after which the
-  next request that selects it probes it again. Any response from the
-  upstream, whatever its status, ends its ejection. That includes the
-  response to a request that follows a leader redirect to it.
-- **Fallback.** If every upstream is ejected or being probed, requests go
-  along their cached route, or else to any upstream, rather than to none.
+  out the connection, or the exchange breaks) is ejected too, and so is one
+  that sends no response headers within `--response-header-timeout`: a
+  leader that lost its quorum answers a write within its leader lease, so a
+  missing answer mostly marks a node that does not answer at all. A live
+  node can still hold a request longer (a write waiting for its group's
+  first open, a read forwarded to an unreachable leader, a snapshot commit
+  of many parts), and is then ejected although it is healthy, until it
+  answers its next probe. An ejected upstream stays out of selection until
+  it answers, a probe or a request. Requests skip it along a cached route,
+  at random, and on every hop after a redirect, a leader redirect's
+  included. A node that vanished fails within `--upstream-tcp-user-timeout`.
+- **Fallback.** If every upstream is ejected, none is: requests go along
+  their cached route, or else to any upstream, and follow every redirect, as
+  if nothing were ejected.
 - **Metrics.** `/__ursula/gateway/metrics` reports `upstream_ejections`
-  (times an upstream was ejected) and `upstream_ejected` (upstreams skipped
-  now, inside a window or with a probe outstanding), next to the leader-cache
+  (times an upstream was ejected) and `upstream_ejected` (upstreams ejected
+  now), next to the leader-cache
   counters `leader_cache_hits`, `leader_cache_misses`, `leader_cache_updates`,
   `leader_cache_evictions` and `leader_cache_entries`, and the redirect
   counters `leader_redirects` (hops that followed a redirect, search hops
@@ -132,14 +138,17 @@ alone in `x-ursula-raft-group`:
 
 - After a leader redirect, it sends the request to the upstream that the
   redirect's `Location` names, unless the request already went to that
-  upstream. When that upstream cannot be connected to, the request ends with
-  `503` and `Retry-After`.
+  upstream or it is ejected: the peers of a stopped leader name it until
+  they elect another, and the probes eject it before that. When that
+  upstream cannot be connected to, the request ends with `503` and
+  `Retry-After`.
 - The host that a non-hosting node's redirect names is a hint, often the
   node its group moves away from. The gateway sends the request there only
   when the request has not tried that upstream and it is not ejected. A hop
   to it that cannot connect sent nothing, so the gateway searches on as it
-  does after a search hop that cannot connect. A blackholed host costs one
-  connect, after which it is ejected and later hints to it are passed over.
+  does after a search hop that cannot connect. A blackholed host costs at
+  most one connect, after which it is ejected, by that connect or by the
+  probes, and later hints to it are passed over.
   The search after that connect starts only when the connect timeout is
   shorter than the 5 s redirect deadline. With the default `--connect-timeout 5`,
   the request that pays the blackholed connect ends with `503` and
@@ -148,9 +157,8 @@ alone in `x-ursula-raft-group`:
   names the nodes otherwise than their client URLs, it searches: it sends the
   request to the next upstream it has not tried yet, starting after the one
   that redirected, in the configured order and around. It skips ejected
-  upstreams, and one whose ejection window has expired becomes the request's
-  probe. A search hop that cannot connect sent nothing, so the search goes on
-  to the next upstream.
+  upstreams. A search hop that cannot connect sent nothing, so the search
+  goes on to the next upstream.
 - At most three hops follow redirects, search hops included, and none starts
   later than 5 s after the request's first redirect. A hop under way runs to
   its answer, so a long-poll or a large upload that reached the leader is not

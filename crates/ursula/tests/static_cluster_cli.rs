@@ -6391,13 +6391,13 @@ async fn wait_leaders_settle(
 ///    leader by node 5 under write load. The lowest-id voter that stays is
 ///    killed for the first group and stopped (`SIGSTOP`, a blackhole) for
 ///    the second, before the load starts. With it dead, the gateway answers
-///    every write `204` or a `503` with `Retry-After`. With it stopped, a
-///    write the gateway sends it gets the gateway's `504` at its header
-///    timeout, well within the load's 10 s, and its outcome is unknown: no
-///    write goes unanswered. Each stream holds every acknowledged write
-///    once, in order, and no write whose `503` code proves it applied
-///    nothing. A leader that
-///    hands off only to the dead or stopped voter, or a proven refusal that
+///    every write `204` or a `503` with `Retry-After`. With it stopped, the
+///    gateway's probes eject it, and a write the gateway sends it before
+///    that gets the gateway's `504` at its header timeout, well within the
+///    load's 10 s, and its outcome is unknown: no write goes unanswered.
+///    Each stream holds every acknowledged write once, in order, and no
+///    write whose `503` code proves it applied nothing. A leader that hands
+///    off only to the dead or stopped voter, or a proven refusal that
 ///    applied, fails it.
 /// 5. Node 4, a meta learner, restarts with its meta snapshot record
 ///    corrupted and reports its meta damaged. The moved group's staying meta
@@ -10348,13 +10348,15 @@ struct ProducerAttempt {
 /// one write at a time, every 20 ms until stopped. A write whose answer does
 /// not say that it holds is sent again with the same seq and payload, as a
 /// producer client does, so the stream holds each seq once and in order.
+/// Each attempt goes to the next URL of the stream in turn, as a client
+/// behind a load balancer over several gateways sends its retries.
 struct ProducerLoad {
     stop: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<Vec<ProducerAttempt>>,
 }
 
 impl ProducerLoad {
-    fn start(stream: String, prefix: &'static str) -> Self {
+    fn start(urls: Vec<String>, prefix: &'static str) -> Self {
         use ursula_headers::names;
         use ursula_headers::write_outcome::WriteKind;
         use ursula_headers::write_outcome::WriteOutcome;
@@ -10367,10 +10369,13 @@ impl ProducerLoad {
                 let client = bounded_client();
                 let mut attempts: Vec<ProducerAttempt> = Vec::new();
                 let mut seq = 0_u64;
-                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                for stream in urls.iter().cycle() {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                     let sent = tokio::time::Instant::now();
                     let answer = client
-                        .post(&stream)
+                        .post(stream)
                         .header("content-type", "text/plain")
                         .header(names::PRODUCER_ID, prefix)
                         .header(names::PRODUCER_EPOCH, "0")
@@ -10710,7 +10715,7 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     .await;
     let stream = format!("{gateway}/stopped/{}", stream_per_group("stopped")[group]);
     create_stream(&client, &mut procs, &stream).await;
-    let load = ProducerLoad::start(stream.clone(), "stopped");
+    let load = ProducerLoad::start(vec![stream.clone()], "stopped");
     tokio::time::sleep(Duration::from_secs(1)).await;
     let stopped = tokio::time::Instant::now();
     procs.signal(leader, "-STOP");
@@ -10748,6 +10753,201 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     let in_order: Vec<String> = (0..held.len())
         .map(|seq| format!("stopped-{seq}"))
         .collect();
+    assert_eq!(held, in_order, "the stream holds each seq once, in order");
+}
+
+/// The longest a gateway's probes take to eject a node that stops
+/// answering: a probe interval (250 ms) and a probe timeout (1.5 s), and a
+/// margin for a loaded runner.
+const PROBES_EJECT_WITHIN: Duration = Duration::from_secs(3);
+
+/// The gateway's default `--response-header-timeout`.
+const GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many upstreams the gateway at `gateway` leaves out of selection now,
+/// from its metrics.
+async fn gateway_ejected(client: &reqwest::Client, gateway: &str) -> Result<u64, String> {
+    let url = format!("{gateway}/__ursula/gateway/metrics");
+    let metrics: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    metrics["upstream_ejected"]
+        .as_u64()
+        .ok_or_else(|| format!("GET {url}: no upstream_ejected in {metrics}"))
+}
+
+/// Polls every gateway of `gateways` until each reports `ejected` upstreams
+/// left out of selection, and answers how long each took from `since`.
+/// Fails after `within`.
+async fn wait_gateways_eject(
+    client: &reqwest::Client,
+    gateways: &[&str],
+    ejected: u64,
+    since: tokio::time::Instant,
+    within: Duration,
+) -> Vec<Duration> {
+    let mut took: Vec<Option<Duration>> = vec![None; gateways.len()];
+    loop {
+        for (gateway, took) in gateways.iter().zip(took.iter_mut()) {
+            if took.is_none() && gateway_ejected(client, gateway).await == Ok(ejected) {
+                *took = Some(since.elapsed());
+            }
+        }
+        if took.iter().all(Option::is_some) {
+            return took.into_iter().flatten().collect();
+        }
+        assert!(
+            since.elapsed() < within,
+            "not every gateway reports {ejected} upstreams ejected within {within:?}: {took:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Every gateway in front of a cluster leaves a stopped node out of
+/// selection on its own, whether or not requests reach it, so a write that
+/// a client retries on another gateway does not wait for the node again.
+/// Three nodes behind three gateways:
+///
+/// 1. A producer appends to a stream of a group through gateways A and B in
+///    turn, each retry to the other one, as a client behind a load balancer
+///    over the gateways does. Gateway C gets no request.
+/// 2. The group's leader is stopped (`SIGSTOP`). Each of the three gateways
+///    reports it ejected within [`PROBES_EJECT_WITHIN`] of the stop, C
+///    included, and the other nodes elect a leader.
+/// 3. At most one attempt of each seq waits out the gateway's header
+///    timeout, and no attempt sent once the gateways ejected the node does.
+///    A write after the stop holds. A gateway that ejects a node only once
+///    a request to it timed out makes the retry on the other gateway wait
+///    again, and fails it.
+/// 4. Once the node continues (`SIGCONT`), every gateway readmits it within
+///    [`PROBES_EJECT_WITHIN`]. The stream holds each seq once, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_every_gateway_ejects_a_stopped_node_and_a_retry_does_not_wait_for_it_again() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the gateway ejection test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    for node in &nodes {
+        wait_readiness_reason(&client, &mut procs, node, None).await;
+    }
+    let (_gateway_a, a) = spawn_gateway(binary, &nodes);
+    let (_gateway_b, b) = spawn_gateway(binary, &nodes);
+    let (_gateway_c, c) = spawn_gateway(binary, &nodes);
+    let group = 0_usize;
+    let stream = &stream_per_group("frozen")[group];
+    let through = |gateway: &str| format!("{gateway}/frozen/{stream}");
+    create_stream(&client, &mut procs, &through(&a)).await;
+    let leaders = wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let leader = leaders[&u64::try_from(group).unwrap()];
+    for gateway in [&a, &b, &c] {
+        assert_eq!(gateway_ejected(&client, gateway).await, Ok(0), "{gateway}");
+    }
+
+    // 1. and 2. The leader stops under the load.
+    let load = ProducerLoad::start(vec![through(&a), through(&b)], "frozen");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stopped = tokio::time::Instant::now();
+    procs.signal(leader, "-STOP");
+    let ejected =
+        wait_gateways_eject(&client, &[&a, &b, &c], 1, stopped, PROBES_EJECT_WITHIN).await;
+    let ejected_by = stopped
+        .checked_add(ejected.iter().copied().max().unwrap())
+        .unwrap();
+    let others: Vec<&MetaNode> = nodes.iter().filter(|node| node.id != leader).collect();
+    eventually(&mut procs, "the other nodes elect a leader", async || {
+        for node in &others {
+            let replica = try_node_metrics(&client, &node.url())
+                .await?
+                .groups
+                .into_iter()
+                .find(|replica| replica.raft_group_id == u64::try_from(group).unwrap());
+            if replica.is_some_and(|replica| {
+                replica.current_leader == Some(node.id) && replica.leads_live
+            }) {
+                return Ok(node.id);
+            }
+        }
+        Err(format!(
+            "no leader among {:?} yet",
+            others.iter().map(|node| node.id).collect::<Vec<_>>()
+        ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let attempts = load.stop().await;
+
+    // 3. No attempt waits for the stopped node twice.
+    let waited: Vec<&ProducerAttempt> = attempts
+        .iter()
+        .filter(|attempt| attempt.took >= GATEWAY_HEADER_TIMEOUT)
+        .collect();
+    let late: Vec<&&ProducerAttempt> = waited
+        .iter()
+        .filter(|attempt| attempt.sent >= ejected_by)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "attempts sent after every gateway ejected node {leader} (within {ejected:?}) waited for it: {late:?}"
+    );
+    let mut waits_per_seq: BTreeMap<u64, usize> = BTreeMap::new();
+    for attempt in &waited {
+        let waits = waits_per_seq.entry(attempt.seq).or_default();
+        *waits = waits.saturating_add(1);
+    }
+    assert!(
+        waits_per_seq.values().all(|waits| *waits <= 1),
+        "a write waited for the stopped node more than once: {waited:?}"
+    );
+    let slow: Vec<&ProducerAttempt> = attempts
+        .iter()
+        .filter(|attempt| attempt.took >= STOPPED_LEADER_ANSWERS_WITHIN)
+        .collect();
+    assert!(slow.is_empty(), "writes answered late: {slow:?}");
+    let held = attempts
+        .iter()
+        .find(|attempt| attempt.sent >= stopped && attempt.outcome.holds())
+        .unwrap_or_else(|| panic!("no write after node {leader} stopped holds: {attempts:?}"));
+    let held_seq = held.seq;
+
+    // 4. The node continues and every gateway readmits it.
+    let continued = tokio::time::Instant::now();
+    procs.signal(leader, "-CONT");
+    wait_gateways_eject(&client, &[&a, &b, &c], 0, continued, PROBES_EJECT_WITHIN).await;
+    let acknowledged: Vec<String> = (0..=held_seq).map(|seq| format!("frozen-{seq};")).collect();
+    let read = read_until_holding(
+        &client,
+        &format!("{}?offset=0&max_bytes=8388608", through(&a)),
+        &acknowledged,
+    )
+    .await;
+    let held: Vec<String> = String::from_utf8_lossy(&read)
+        .split(';')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let in_order: Vec<String> = (0..held.len()).map(|seq| format!("frozen-{seq}")).collect();
     assert_eq!(held, in_order, "the stream holds each seq once, in order");
 }
 
