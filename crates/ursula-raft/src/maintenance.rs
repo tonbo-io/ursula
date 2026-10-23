@@ -44,7 +44,7 @@ use crate::types::RaftGroupMetricsSnapshot;
 /// How far a replica's applied index may trail its committed one.
 pub const LAG_TOLERANCE: u64 = 16;
 
-/// How long a node may know no meta leader before it reports
+/// How long a node may know no live meta leader before it reports
 /// `meta_unavailable`: the window after which it also registers again.
 pub const META_UNAVAILABLE_AFTER: Duration = crate::meta::registration::REREGISTER_AFTER;
 
@@ -101,7 +101,7 @@ pub struct MaintenanceInputs<'a, C> {
 /// node holds or runs replicas, and `placement_unknown` when it holds none,
 /// confirmed no view in this run, and was not answered `forming` or
 /// `unreferenced`. `meta_unavailable` comes after
-/// [`META_UNAVAILABLE_AFTER`] without a meta leader, unless the node holds
+/// [`META_UNAVAILABLE_AFTER`] without a live meta leader, unless the node holds
 /// nothing and is placed nowhere.
 ///
 /// Group issues: every running replica is checked against its effective

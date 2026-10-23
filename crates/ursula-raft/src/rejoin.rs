@@ -1649,6 +1649,16 @@ impl GroupRejoin {
         self.cut_refused
     }
 
+    /// Whether the replica whose metrics are `metrics`, behind this gate,
+    /// knows a live leader of its group: it leads live ([`leads_live`]) or
+    /// follows a live leader ([`Self::follows_live_leader`]). OpenRaft's
+    /// `current_leader` is not that: with pre-vote, a follower that no
+    /// longer hears its leader keeps naming it, since it raises no term of
+    /// its own, until another leader's append reaches it.
+    pub(crate) fn knows_live_leader(&self, metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
+        leads_live(metrics) || self.follows_live_leader().is_some()
+    }
+
     /// The live leader this replica follows: a committed leader whose
     /// AppendEntries reached it within [`LIVE_LEADER_QUORUM_ACK`] (m2, #581
     /// review: an append may reach the replica before its metrics show the
