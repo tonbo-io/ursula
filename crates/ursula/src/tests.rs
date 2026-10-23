@@ -1509,6 +1509,9 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"raft_grpc_vote_requests\":"));
     assert!(body.contains("\"raft_grpc_vote_request_bytes\":"));
     assert!(body.contains("\"raft_grpc_vote_response_bytes\":"));
+    assert!(body.contains("\"raft_grpc_pre_vote_requests\":"));
+    assert!(body.contains("\"raft_grpc_pre_vote_request_bytes\":"));
+    assert!(body.contains("\"raft_grpc_pre_vote_response_bytes\":"));
     assert!(body.contains("\"raft_grpc_snapshot_requests\":"));
     assert!(body.contains("\"raft_grpc_snapshot_request_bytes\":"));
     assert!(body.contains("\"raft_grpc_snapshot_payload_bytes\":"));
@@ -5759,6 +5762,7 @@ async fn cluster_router_serves_every_raft_rpc_path() {
         RAFT_GRPC_APPEND_PATH,
         RAFT_GRPC_APPEND_STREAM_PATH,
         RAFT_GRPC_VOTE_PATH,
+        RAFT_GRPC_PRE_VOTE_PATH,
         RAFT_GRPC_FULL_SNAPSHOT_PATH,
         RAFT_GRPC_GROUP_WRITE_PATH,
         RAFT_GRPC_GROUP_READ_PATH,

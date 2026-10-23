@@ -135,6 +135,13 @@ impl RaftInternal for RecoveryTestService {
         self.inner.vote(request).await
     }
 
+    async fn pre_vote(
+        &self,
+        request: Request<pb::RaftRpcEnvelopeV1>,
+    ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
+        self.inner.pre_vote(request).await
+    }
+
     async fn full_snapshot(
         &self,
         request: Request<pb::RaftFullSnapshotRequestV1>,

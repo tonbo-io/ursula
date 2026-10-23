@@ -155,6 +155,32 @@ pub type UrsulaVote = VoteOf<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteRequest = VoteRequest<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteResponse = VoteResponse<UrsulaRaftTypeConfig>;
 
+/// The round of an election an inbound vote request belongs to. Both carry
+/// a [`UrsulaVoteRequest`], travel the same transport and pass the same
+/// screens (the node fence, the recovery gate); only what the replica's
+/// Raft does with a request that passes differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoteRound {
+    /// A real vote: a grant saves the candidate's vote.
+    Vote,
+    /// A pre-vote (`Config::enable_pre_vote`): whether the replica would
+    /// grant the vote, answered without saving anything. A candidate
+    /// raises its term only once a quorum would grant it, so a replica
+    /// that cannot win, one restarted before its leader's first heartbeat
+    /// reached it or one cut off from its peers, leaves the term alone.
+    PreVote,
+}
+
+impl VoteRound {
+    /// The RPC's name, in transport errors and logs.
+    pub(crate) fn rpc(self) -> &'static str {
+        match self {
+            Self::Vote => "Vote",
+            Self::PreVote => "PreVote",
+        }
+    }
+}
+
 /// Raft-level response for one applied log entry. A data group's write
 /// outcomes carry the canonical [`GroupWriteResponse`]/[`GroupEngineError`]
 /// directly, the meta group's its [`MetaResponse`]; blank and membership

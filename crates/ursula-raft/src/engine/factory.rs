@@ -71,6 +71,15 @@ const GROUP_HEARTBEAT_INTERVAL_MS: u64 = GROUP_ELECTION_TIMEOUT_MIN_MS * 2 / 5;
 /// transport gives each Append call `election_timeout_min` to answer
 /// (`grpc::RAFT_GRPC_APPEND_TIMEOUT`), so a slow link slows commits instead
 /// of stopping them.
+///
+/// Every group runs a pre-vote round before it campaigns: a voter whose
+/// election timed out raises its term only once a quorum answers that it
+/// would grant the vote. A voter that cannot win leaves the term alone: one
+/// restarted before its leader's first heartbeat reached it, whose peers
+/// still hold the leader's lease, or one cut off from its peers. Without it
+/// such a voter's higher term deposes the group's leader at its next
+/// append, and the group elects again. A leadership transfer, and the
+/// campaign after a step-down, start a real election at once.
 pub(crate) fn cluster_raft_config(
     cluster_name: String,
     engine: &RaftEngineConfig,
@@ -84,6 +93,7 @@ pub(crate) fn cluster_raft_config(
         install_snapshot_timeout: engine.install_snapshot_timeout_ms,
         max_in_snapshot_log_to_keep: engine.max_in_snapshot_log_to_keep,
         enable_elect,
+        enable_pre_vote: Some(true),
         // The snapshot drivers alone take snapshots (F12e), a data group's
         // gated on S3 health. OpenRaft must not trigger its own: a
         // build_snapshot failure during an S3 outage is fatal to the group

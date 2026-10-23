@@ -139,6 +139,7 @@ use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GENESIS_PROBE_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
+use ursula_raft::RAFT_GRPC_PRE_VOTE_PATH;
 use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
@@ -1153,6 +1154,13 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
         raft_internal_proto::raft_internal_server::RaftInternal::vote(&self.raft, request).await
     }
 
+    async fn pre_vote(
+        &self,
+        request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
+        raft_internal_proto::raft_internal_server::RaftInternal::pre_vote(&self.raft, request).await
+    }
+
     async fn full_snapshot(
         &self,
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
@@ -1451,6 +1459,10 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         )
         .route_service(
             RAFT_GRPC_VOTE_PATH,
+            raft_grpc_service(state.clone(), raft_registry.clone()),
+        )
+        .route_service(
+            RAFT_GRPC_PRE_VOTE_PATH,
             raft_grpc_service(state.clone(), raft_registry.clone()),
         )
         .route_service(

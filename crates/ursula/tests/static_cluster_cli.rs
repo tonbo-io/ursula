@@ -9962,6 +9962,274 @@ async fn cli_restarts_on_the_same_boot_owe_no_predecessor_wait() {
     read_until_matches(&client, &read(&nodes[2]), &on_node_1).await;
 }
 
+/// How long a group may go without a leader while one of its voters
+/// restarts cleanly: one election timeout, the maximum (3 s), as OpenRaft
+/// draws each timeout between its minimum and maximum.
+const CLEAN_RESTART_LEADERLESS_WITHIN: Duration = Duration::from_secs(3);
+
+/// A clean restart of a voter costs no election beyond its handoff. The
+/// leadership balancer is off, so nothing else moves a leadership. A node
+/// that leads some groups and follows others stops by SIGTERM, hands its
+/// leaderships off, the meta group's included, and starts again. Then
+/// every group it led is one term above its term before the stop, the
+/// handoff's election, every other group keeps its term and its leader,
+/// and no group, data or meta, goes without a leader for longer than
+/// [`CLEAN_RESTART_LEADERLESS_WITHIN`].
+///
+/// The restarted replicas' election timers may fire before their leaders'
+/// first heartbeats reach them. Each then runs a pre-vote, which its peers
+/// refuse, as they still hold their leader's lease, and leaves the term
+/// alone. Without pre-vote it raises its term, its leader steps down at
+/// its next append to it, and the group elects again: two terms more in
+/// each group the node follows, with no leader in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the clean restart test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        leadership_balance_interval: Some("0s"),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let before = settled_leaders_and_terms(&client, &mut procs, &nodes).await;
+    let data_led = |id: u64| {
+        before
+            .iter()
+            .filter(|(group, (leader, _))| {
+                matches!(group, ReplicatedGroup::Data(_)) && *leader == id
+            })
+            .count()
+    };
+    // A node that both leads and follows data groups when there is one,
+    // so the restart covers a handoff and the groups it follows.
+    let restarting = nodes
+        .iter()
+        .map(|node| node.id)
+        .max_by_key(|id| {
+            let led = data_led(*id);
+            (led > 0 && led < META_TEST_GROUPS, led)
+        })
+        .expect("a node of the cluster");
+    assert!(
+        data_led(restarting) > 0,
+        "no node leads a data group: {before:?}"
+    );
+    let index = nodes
+        .iter()
+        .position(|node| node.id == restarting)
+        .expect("the restarting node");
+
+    let sampler = LeaderlessSampler::start(&nodes);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut outgoing = procs.0.remove(&restarting).expect("the node runs");
+    sigterm_and_wait_for_clean_exit(&mut outgoing).await;
+    let log = std::fs::read_to_string(&outgoing.stderr_path).expect("shutdown log");
+    assert!(
+        log.contains("shutdown leadership handoff complete"),
+        "node {restarting} did not hand off every leadership: {log}"
+    );
+    drop(outgoing);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    procs.start(binary, &nodes[index]);
+    wait_readiness_reason(&client, &mut procs, &nodes[index], None).await;
+    // Two election timeouts more: a restarted replica that campaigns has
+    // done so by then.
+    tokio::time::sleep(CLEAN_RESTART_LEADERLESS_WITHIN.saturating_mul(2)).await;
+    let leaderless = sampler.stop().await;
+    let after = settled_leaders_and_terms(&client, &mut procs, &nodes).await;
+
+    let expected: BTreeMap<ReplicatedGroup, u64> = before
+        .iter()
+        .map(|(group, (leader, term))| {
+            let elections = u64::from(*leader == restarting);
+            (*group, term.saturating_add(elections))
+        })
+        .collect();
+    let terms: BTreeMap<ReplicatedGroup, u64> = after
+        .iter()
+        .map(|(group, (_, term))| (*group, *term))
+        .collect();
+    assert_eq!(
+        terms, expected,
+        "node {restarting}'s restart cost elections beyond its handoff: before {before:?}, \
+         after {after:?}"
+    );
+    for (group, (leader, _)) in &before {
+        if *leader != restarting {
+            assert_eq!(
+                after[group].0, *leader,
+                "{group:?} changed its leader in node {restarting}'s restart: before {before:?}, \
+                 after {after:?}"
+            );
+        }
+    }
+    assert_eq!(
+        leaderless.keys().copied().collect::<BTreeSet<_>>(),
+        before.keys().copied().collect::<BTreeSet<_>>(),
+        "the sampler saw every group"
+    );
+    let long: Vec<(&ReplicatedGroup, &Duration)> = leaderless
+        .iter()
+        .filter(|(_, gap)| **gap >= CLEAN_RESTART_LEADERLESS_WITHIN)
+        .collect();
+    assert!(
+        long.is_empty(),
+        "groups without a leader for {CLEAN_RESTART_LEADERLESS_WITHIN:?} or longer in node \
+         {restarting}'s restart: {long:?}"
+    );
+}
+
+/// A Raft group of a meta test cluster: the meta group or a data group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReplicatedGroup {
+    Meta,
+    Data(u64),
+}
+
+/// The replicas `metrics` reports, the meta replica's included, by group.
+fn replicas_by_group(
+    metrics: &ursula_proto::admin::NodeMetrics,
+) -> impl Iterator<Item = (ReplicatedGroup, &RaftGroupMetrics)> {
+    metrics
+        .meta
+        .iter()
+        .map(|meta| (ReplicatedGroup::Meta, meta))
+        .chain(
+            metrics
+                .groups
+                .iter()
+                .map(|group| (ReplicatedGroup::Data(group.raft_group_id), group)),
+        )
+}
+
+/// Each group's `(leader, term)`, the meta group's included, once every
+/// node of `nodes` runs a replica of each and names the same leader and
+/// term for it in two samples in a row.
+async fn settled_leaders_and_terms(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> BTreeMap<ReplicatedGroup, (u64, u64)> {
+    let mut last = None;
+    eventually(
+        procs,
+        "every group settles on one leader and term",
+        async || {
+            let mut views: BTreeMap<ReplicatedGroup, Vec<(Option<u64>, u64)>> = BTreeMap::new();
+            for node in nodes {
+                let metrics = try_node_metrics(client, &node.url()).await?;
+                for (group, replica) in replicas_by_group(&metrics) {
+                    views
+                        .entry(group)
+                        .or_default()
+                        .push((replica.current_leader, replica.current_term));
+                }
+            }
+            let mut settled = BTreeMap::new();
+            for (group, view) in &views {
+                match view.as_slice() {
+                    [(Some(leader), term), rest @ ..]
+                        if rest.len().saturating_add(1) == nodes.len()
+                            && rest.iter().all(|other| *other == (Some(*leader), *term)) =>
+                    {
+                        settled.insert(*group, (*leader, *term));
+                    }
+                    _ => return Err(format!("{group:?} is not settled: {views:?}")),
+                }
+            }
+            if settled.len() != META_TEST_GROUPS.saturating_add(1) {
+                return Err(format!("not every group runs on every node: {views:?}"));
+            }
+            if last.as_ref() == Some(&settled) {
+                Ok(settled)
+            } else {
+                let found = format!("a first sample: {settled:?}");
+                last = Some(settled);
+                Err(found)
+            }
+        },
+    )
+    .await
+}
+
+/// For each group, the longest stretch in which no node of a meta test
+/// cluster claimed its leadership, sampled from every node's metrics about
+/// every 100 ms while a phase of a test runs. A node that does not answer
+/// a sample claims nothing in it.
+struct LeaderlessSampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<BTreeMap<ReplicatedGroup, Duration>>,
+}
+
+impl LeaderlessSampler {
+    fn start(nodes: &[MetaNode]) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("HTTP client");
+        let urls: Vec<String> = nodes.iter().map(MetaNode::url).collect();
+        let task = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut since = BTreeMap::<ReplicatedGroup, std::time::Instant>::new();
+                let mut longest = BTreeMap::<ReplicatedGroup, Duration>::new();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut led = BTreeMap::<ReplicatedGroup, bool>::new();
+                    for url in &urls {
+                        let Ok(metrics) = try_node_metrics(&client, url).await else {
+                            continue;
+                        };
+                        for (group, replica) in replicas_by_group(&metrics) {
+                            let claims = replica.current_leader == Some(replica.node_id);
+                            *led.entry(group).or_default() |= claims;
+                        }
+                    }
+                    let now = std::time::Instant::now();
+                    for (group, claimed) in led {
+                        let gap = longest.entry(group).or_default();
+                        if claimed {
+                            if let Some(start) = since.remove(&group) {
+                                *gap = (*gap).max(now.saturating_duration_since(start));
+                            }
+                        } else {
+                            since.entry(group).or_insert(now);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let now = std::time::Instant::now();
+                for (group, start) in since {
+                    let gap = longest.entry(group).or_default();
+                    *gap = (*gap).max(now.saturating_duration_since(start));
+                }
+                longest
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops sampling, and answers each group's longest stretch without a
+    /// leader.
+    async fn stop(self) -> BTreeMap<ReplicatedGroup, Duration> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the sampler ends")
+    }
+}
+
 /// Reads `url` until it holds each of `writes` in order, among writes whose
 /// outcome is unknown, and answers what it read.
 async fn read_until_holding(client: &reqwest::Client, url: &str, writes: &[String]) -> Vec<u8> {
@@ -10442,14 +10710,14 @@ impl ProducerLoad {
 ///    no write whose `503` proves it applied nothing. A leader that holds
 ///    writes for as long as it cannot reach a quorum fails it. No peer
 ///    answers the cut-off node, so it reports a degraded probe, sheds for
-///    cluster egress on its first such tick and stops campaigning. Before
-///    the shed it may campaign once in each group it follows, never twice,
-///    so no term of it is more than one above its term at the cut, and
-///    none of the group it led is above the new leader's. Its terms then
-///    hold for longer than an election timeout while the cut lasts, and
-///    after the heal it follows each group's leader. A gate that waited out
-///    a streak of bad ticks, or a tick that waited for its probes and its
-///    peers' answers one after the other, lets it campaign twice.
+///    cluster egress on its first such tick and stops campaigning. Its
+///    pre-votes reach no peer, so before the shed too it raises no term of
+///    a group it follows: no term of it is more than one above its term at
+///    the cut, which leaves room for a leadership move that reached it as
+///    the cut began, and none of the group it led is above the new
+///    leader's. Its terms then hold for longer than an election timeout
+///    while the cut lasts, and after the heal it follows each group's
+///    leader.
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
@@ -10538,9 +10806,9 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     .await;
     let elected = tokio::time::Instant::now();
     // No peer answers the cut-off node, so its egress gate sheds and stops
-    // its elections. It must not campaign while the cut lasts: without
-    // pre-vote, each election raises its term, which deposes the group's
-    // leader once the cut heals.
+    // its elections. It must not raise a term while the cut lasts: a term
+    // above its group's leader's deposes that leader once the cut heals.
+    // Its pre-votes reach no peer, so it never campaigns.
     let cut_plane = planes
         .iter()
         .find(|plane| plane.node_id == leader)
@@ -10569,8 +10837,9 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     })
     .await;
     let shed_terms = terms_of(leader).await;
-    // A follower campaigns at the earliest 779 ms after the cut and again
-    // 1.5 s later, while the gate sheds at most 2 s after the cut: once.
+    // A follower's pre-vote, at the earliest 779 ms after the cut, gets no
+    // grant, so it does not campaign before the gate sheds, at most 2 s
+    // after the cut.
     let raised: Vec<(u64, u64, u64)> = shed_terms
         .iter()
         .map(|(group, term)| (*group, cut_terms[group], *term))
@@ -10578,8 +10847,8 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
         .collect();
     assert!(
         raised.is_empty(),
-        "node {leader} campaigned more than once in a group before it shed (group, term at \
-         the cut, term at the shed): {raised:?}"
+        "node {leader} campaigned in a group before it shed (group, term at the cut, term at \
+         the shed): {raised:?}"
     );
     // Longer than the 3 s maximum election timeout: a node that still
     // campaigned would raise the term of every group it follows.
@@ -10613,9 +10882,8 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     // The healed node still sheds after the heal (its gate clears after six
     // clean ticks), so it neither campaigns nor takes a leadership from the
     // balancer, and in every group it follows a leader among the other
-    // nodes at that leader's term: a group whose term it raised by its one
-    // election elects again among them. The balancer may still move a group
-    // between the other two nodes, which raises the term too, so the check
+    // nodes at that leader's term. The balancer may still move a group
+    // between the other two nodes, which raises the term, so the check
     // names neither the leader nor the term.
     let replica_of = async |id: u64, group: u64| {
         try_node_metrics(&client, &client_url(id))
@@ -11168,6 +11436,9 @@ struct MetaToml<'a> {
     replication_factor: Option<u8>,
     /// `storage.cold.flush_min_hot_size`, in bytes.
     flush_min_hot_bytes: Option<u64>,
+    /// `governance.leadership_balance.interval`: `"0s"` turns the
+    /// leadership balancer off.
+    leadership_balance_interval: Option<&'a str>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -11300,6 +11571,14 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
+        }
+
+        if let Some(interval) = meta.leadership_balance_interval {
+            writeln!(
+                config,
+                "\n[governance.leadership_balance]\ninterval = \"{interval}\""
+            )
+            .unwrap();
         }
 
         std::fs::write(path, config).expect("write node toml config");

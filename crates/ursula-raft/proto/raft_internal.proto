@@ -28,14 +28,14 @@ message RaftRpcEnvelopeV1 {
   uint64 node_id = 2;
   uint32 protocol_version = 3;
   // MessagePack-encoded openraft `AppendEntriesRequest` (Append RPC) or
-  // `VoteRequest` (Vote RPC).
+  // `VoteRequest` (Vote and PreVote RPCs).
   bytes payload = 4;
   RaftPlaneV1 plane = 5;
 }
 
 message RaftRpcAckV1 {
   // MessagePack-encoded openraft `AppendEntriesResponse` (Append RPC) or
-  // `VoteResponse` (Vote RPC).
+  // `VoteResponse` (Vote and PreVote RPCs).
   bytes payload = 1;
 }
 
@@ -246,6 +246,9 @@ service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc AppendStream(stream RaftAppendStreamRequest) returns (stream RaftAppendStreamResponse);
   rpc Vote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  // Whether the target would grant the vote, answered without saving it:
+  // a candidate raises its term only once a quorum would grant its vote.
+  rpc PreVote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);
   rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);

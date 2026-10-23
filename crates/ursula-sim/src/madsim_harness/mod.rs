@@ -1147,6 +1147,7 @@ fn network_rpc_kind_name(kind: InProcessRaftRpcKind) -> &'static str {
     match kind {
         InProcessRaftRpcKind::AppendEntries => "append_entries",
         InProcessRaftRpcKind::Vote => "vote",
+        InProcessRaftRpcKind::PreVote => "pre_vote",
         InProcessRaftRpcKind::FullSnapshot => "full_snapshot",
         InProcessRaftRpcKind::TransferLeader => "transfer_leader",
     }

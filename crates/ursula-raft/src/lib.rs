@@ -171,6 +171,7 @@ pub use grpc::RAFT_GRPC_GENESIS_PROBE_PATH;
 pub use grpc::RAFT_GRPC_GROUP_READ_PATH;
 pub use grpc::RAFT_GRPC_GROUP_WRITE_PATH;
 pub use grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
+pub use grpc::RAFT_GRPC_PRE_VOTE_PATH;
 pub use grpc::RAFT_GRPC_REJOIN_BARRIER_PATH;
 pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
@@ -369,6 +370,7 @@ pub use types::UrsulaSnapshot;
 pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
+pub use types::VoteRound;
 pub use ursula_shard::RaftTarget;
 pub use voter::LeftMarks;
 
