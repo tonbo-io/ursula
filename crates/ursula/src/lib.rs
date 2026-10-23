@@ -3235,7 +3235,8 @@ async fn request_raft_self_election(
         | SelfElectionError::Rejected { .. }
         | SelfElectionError::Transfer(
             IncomingTransferError::OwnCommittedVote { .. }
-            | IncomingTransferError::MayNotCampaign { .. },
+            | IncomingTransferError::MayNotCampaign { .. }
+            | IncomingTransferError::LeaderNotAcknowledged { .. },
         ) => StatusCode::CONFLICT,
         SelfElectionError::Transfer(IncomingTransferError::Group(group))
             if matches!(

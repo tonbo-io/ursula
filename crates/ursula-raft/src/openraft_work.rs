@@ -50,6 +50,7 @@ use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::StreamAppendResult;
+use openraft::raft::TransferLeaderError;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteRequest;
@@ -556,10 +557,53 @@ pub(crate) struct TransferAnswer {
     pub(crate) from: crate::UrsulaVote,
     /// The node the transfer names, which answered it.
     pub(crate) to: u64,
-    /// Whether the target took the transfer: its OpenRaft accepted it and
-    /// campaigns. A refusal by its policy or by OpenRaft, an error and no
-    /// answer within the transfer's timeout all mean it does not campaign.
-    pub(crate) taken: bool,
+    /// What the target answered.
+    pub(crate) outcome: TransferOutcome,
+}
+
+/// What the target of a leadership transfer answered the leader that sent
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferOutcome {
+    /// Its OpenRaft took the transfer and campaigns.
+    Taken,
+    /// It answered that it does not campaign: its election policy refused
+    /// the transfer (an error answer), or its log never caught up with the
+    /// leader's within OpenRaft's wait
+    /// ([`TransferLeaderError::LogNotFlushed`]).
+    Refused,
+    /// It already holds another vote than the leader's
+    /// ([`TransferLeaderError::VoteChanged`]): a newer
+    /// election may already have a leader, which a campaign of the old
+    /// leader could unseat.
+    Superseded,
+    /// No answer reached the leader: the call timed out, the target was
+    /// unreachable, or OpenRaft dropped the call. The target may have
+    /// taken it.
+    Unanswered,
+}
+
+impl TransferOutcome {
+    /// The outcome a transfer RPC returned.
+    fn of(
+        answer: &Result<
+            TransferLeaderResponse<UrsulaRaftTypeConfig>,
+            RPCError<UrsulaRaftTypeConfig>,
+        >,
+    ) -> Self {
+        match answer {
+            Ok(Ok(())) => Self::Taken,
+            Ok(Err(TransferLeaderError::VoteChanged { .. })) => Self::Superseded,
+            Ok(Err(TransferLeaderError::LogNotFlushed { .. })) => Self::Refused,
+            // Each transport sends a refusal by the target as an error
+            // answer over a working channel. Another error answer reads as
+            // a refusal too, which is safe: the leader's campaign after it
+            // starts with a pre-vote, which a quorum that follows a newer
+            // leader refuses.
+            Err(RPCError::Network(_) | RPCError::RemoteError(_)) => Self::Refused,
+            Err(RPCError::Timeout(_) | RPCError::Unreachable(_)) => Self::Unanswered,
+        }
+    }
 }
 
 /// The last answer the target of a leadership transfer sent this engine's
@@ -567,6 +611,11 @@ pub(crate) struct TransferAnswer {
 /// leader stays in the transfer until it sees a higher vote, so the
 /// leader's transfer bound waits on it
 /// ([`crate::owner::OwnerRaftHandle::abandon_stalled_transfer`]).
+///
+/// It holds one answer. A second transfer at the same vote to another
+/// target can replace the first target's answer before the first
+/// transfer's bound reads it, and that bound then ends at the transfer
+/// deadline, as without an answer.
 #[derive(Debug, Clone)]
 pub(crate) struct TransferAnswers(Arc<watch::Sender<Option<TransferAnswer>>>);
 
@@ -588,8 +637,8 @@ impl TransferAnswers {
 }
 
 /// The answer a transfer's target owes while its RPC runs. A call that
-/// OpenRaft drops at its timeout got no answer, which is recorded as not
-/// taken when the guard drops.
+/// OpenRaft drops at its timeout got no answer, which is recorded as
+/// [`TransferOutcome::Unanswered`] when the guard drops.
 struct OwedAnswer {
     answers: TransferAnswers,
     from: crate::UrsulaVote,
@@ -598,15 +647,15 @@ struct OwedAnswer {
 }
 
 impl OwedAnswer {
-    /// Records `taken`, or nothing when `taken` is `None`: the engine
-    /// stops, and nothing waits for the transfer any more.
-    fn settle(mut self, taken: Option<bool>) {
+    /// Records `outcome`, or nothing when it is `None`: the engine stops,
+    /// and nothing waits for the transfer any more.
+    fn settle(mut self, outcome: Option<TransferOutcome>) {
         self.owed = false;
-        if let Some(taken) = taken {
+        if let Some(outcome) = outcome {
             self.answers.record(TransferAnswer {
                 from: self.from,
                 to: self.to,
-                taken,
+                outcome,
             });
         }
     }
@@ -618,7 +667,7 @@ impl Drop for OwedAnswer {
             self.answers.record(TransferAnswer {
                 from: self.from,
                 to: self.to,
-                taken: false,
+                outcome: TransferOutcome::Unanswered,
             });
         }
     }
@@ -825,7 +874,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
             .until_stopping(RaftNetworkV2::transfer_leader(network, req, option))
             .await;
         if let Some(owed) = owed {
-            owed.settle(answer.as_ref().map(|answer| matches!(answer, Ok(Ok(())))));
+            owed.settle(answer.as_ref().map(TransferOutcome::of));
         }
         answer.unwrap_or_else(|| Err(engine_stopped()))
     }

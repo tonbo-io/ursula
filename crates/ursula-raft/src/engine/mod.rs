@@ -919,8 +919,9 @@ impl RaftGroupEngine {
     }
 
     /// Starts a new term with this leader's own campaign: it steps down to
-    /// `target`, another node, and campaigns at once, as a stalled
-    /// leadership transfer's step-down does. A single-voter group, or
+    /// `target`, another node, as a stalled leadership transfer's step-down
+    /// does, and campaigns at once, without that step-down's pre-vote
+    /// round. A single-voter group, or
     /// a campaign the other voters grant, re-elects this node in a new term,
     /// as a fault that ends a leadership without moving it.
     #[cfg(any(test, madsim, feature = "fault-injection"))]

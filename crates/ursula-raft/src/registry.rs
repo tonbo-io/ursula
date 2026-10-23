@@ -581,9 +581,12 @@ impl RaftGroupHandleRegistry {
     }
 
     /// Submit a handoff after checking it against the handoff policy
-    /// ([`Self::check_handoff`]). The receiver independently checks its own
-    /// recovery gate and OpenRaft never reports its refusal, so a handoff
-    /// that has not moved the leadership by its deadline is abandoned.
+    /// ([`Self::check_handoff`]). The receiver checks the one rule again
+    /// ([`ElectionPolicy::may_take_leadership`]). OpenRaft never acts on its
+    /// answer, so this leader reads it: a refusal ends the transfer at once
+    /// and the leader campaigns to lead again, and a transfer that neither
+    /// moves the leadership nor is refused is abandoned at its deadline
+    /// ([`crate::owner::OwnerRaftHandle::abandon_stalled_transfer`]).
     pub async fn transfer_leader(
         &self,
         group: RaftGroupId,
@@ -1407,7 +1410,10 @@ impl RaftGroupHandleRegistry {
     /// not take a planned handoff at all ([`Self::should_accept_transfer`]),
     /// and otherwise each replica the one rule admits
     /// ([`ElectionPolicy::may_take_leadership`]), which the replica checks
-    /// again when the transfer arrives.
+    /// again when the transfer arrives. The node-wide part,
+    /// [`Self::recovery_barriers_ready`], is checked only here: the answer
+    /// a leader reads is the stricter one, so no transfer it starts is
+    /// refused for the difference.
     pub fn takes_leadership(&self) -> BTreeSet<RaftTargetKey> {
         if !self.should_accept_transfer() {
             return BTreeSet::new();

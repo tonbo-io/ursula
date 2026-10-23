@@ -351,14 +351,15 @@ takes any other voter, a leaving one included.
 A leader that started a transfer serves nothing until another node leads:
 OpenRaft forwards its writes to the target, sends no heartbeat and never
 abandons the transfer. Its network clients record what the target answered
-(`openraft_work::TransferAnswers`). A target that refuses the transfer, fails
-it or does not answer within one minimum election timeout ends it at once,
-and one that took it has one more minimum election timeout to win. The
-leader then steps down and campaigns
-(`OwnerRaftHandle::abandon_stalled_transfer`), and the voters that took the
-transfer's broadcast dropped their lease of it and grant its vote, so a
-refused transfer costs the group one election. Two maximum election timeouts
-stay the bound of a transfer that no client of the leader sent.
+(`openraft_work::TransferOutcome`). A target that refuses the transfer ends
+it at once, and one that took it has one minimum election timeout to win. A
+target that already holds another vote, or whose answer does not arrive,
+leaves the transfer two maximum election timeouts, since a newer election may
+be under way. The leader then steps down and campaigns with a pre-vote round
+(`OwnerRaftHandle::abandon_stalled_transfer`), so it never raises the term
+past a leader a quorum follows. The voters that took the transfer's broadcast
+dropped their lease of it and grant its vote, so a refused transfer costs the
+group one election.
 
 A meta outage leaves the layout as meta left it. While the meta group has no
 live quorum no meta read barrier passes, and every voter change and every

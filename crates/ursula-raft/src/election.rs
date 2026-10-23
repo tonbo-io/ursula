@@ -199,8 +199,11 @@ impl ElectionPolicy {
     /// The replica's node answers it for each of its replicas in its
     /// participation answer, which a leader reads before it hands a
     /// leadership over, and the replica checks it again when the transfer
-    /// arrives ([`Self::validate_incoming_transfer`]). A leader therefore
-    /// starts no transfer the target would refuse by the answer it read.
+    /// arrives ([`Self::validate_incoming_transfer`]). The answer adds the
+    /// node's recovery barriers
+    /// ([`crate::RaftGroupHandleRegistry::takes_leadership`]), so it is the
+    /// stricter of the two, and a leader starts no transfer the target
+    /// would refuse by the answer it read.
     pub fn may_take_leadership(&self, gate: Option<&GroupRejoin>) -> bool {
         self.state().should_accept_transfer() && gate.is_none_or(GroupRejoin::may_take_leadership)
     }
@@ -299,12 +302,13 @@ impl ElectionPolicy {
         if vote.is_committed() && *vote.leader_id().node_id() == node_id {
             return Err(IncomingTransferError::OwnCommittedVote { group, vote });
         }
-        let allowed = match ask {
-            TransferAsk::Handoff => self.may_take_leadership(gate),
-            TransferAsk::SelfElection => self.may_accept_transfer(gate),
-        };
-        if !allowed {
+        if !self.may_accept_transfer(gate) {
             return Err(IncomingTransferError::MayNotCampaign { group });
+        }
+        // What a handoff needs beyond the campaign policy: the replica
+        // acknowledged a leader of its group in this run.
+        if ask == TransferAsk::Handoff && !self.may_take_leadership(gate) {
+            return Err(IncomingTransferError::LeaderNotAcknowledged { group });
         }
         Ok(())
     }
@@ -413,10 +417,17 @@ pub enum IncomingTransferError {
     },
     #[error(
         "node may not take a leadership transfer of Raft group {group:?} (recovery gate closed, \
-         its leader not acknowledged in this run, leadership shed or placement unavailable); \
-         refusing it"
+         leadership shed or placement unavailable); refusing it"
     )]
     MayNotCampaign { group: RaftGroupId },
+    /// The replica may campaign but has acknowledged no leader of its group
+    /// since it opened, so a leader may not hand it the leadership
+    /// ([`ElectionPolicy::may_take_leadership`]).
+    #[error(
+        "this node's replica of Raft group {group:?} acknowledged no leader in this run; \
+         refusing a handoff of its leadership"
+    )]
+    LeaderNotAcknowledged { group: RaftGroupId },
     #[error("OpenRaft could not take the leadership transfer for {group:?}: {source}")]
     Raft {
         group: RaftGroupId,

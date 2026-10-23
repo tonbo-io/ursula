@@ -1050,7 +1050,8 @@ impl From<crate::IncomingTransferError> for tonic::Status {
                 tonic::Status::unavailable(ErrorChain(&error).to_string())
             }
             IncomingTransferError::OwnCommittedVote { .. }
-            | IncomingTransferError::MayNotCampaign { .. } => {
+            | IncomingTransferError::MayNotCampaign { .. }
+            | IncomingTransferError::LeaderNotAcknowledged { .. } => {
                 tonic::Status::failed_precondition(error.to_string())
             }
         }
@@ -5166,6 +5167,10 @@ mod group_rpc_status_tests {
             ),
             (
                 IncomingTransferError::MayNotCampaign { group },
+                Code::FailedPrecondition,
+            ),
+            (
+                IncomingTransferError::LeaderNotAcknowledged { group },
                 Code::FailedPrecondition,
             ),
             (

@@ -10229,7 +10229,10 @@ async fn cli_the_balancer_hands_a_restarted_node_leaderships_it_can_take() {
         }
     })
     .await;
-    // The balancer settles, and any election it set off ends.
+    // The balancer settles, and any election it set off ends. A client
+    // pins each node's process incarnation, so the restarted node needs a
+    // new one.
+    let ctl = ctl_client();
     wait_leadership_balanced(&ctl, &ctl_nodes, groups).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let leaderless = sampler.stop().await;

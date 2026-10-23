@@ -180,10 +180,11 @@ pub(crate) fn balance_inputs(
 /// [`ursula_raft::PEER_ANSWER_TIMEOUT`] for each answer, as every question a
 /// node asks its peers does, logging each peer's answer whenever one
 /// changes, and submits every queued leadership to a peer that answered
-/// that it may campaign ([`CampaignStances::shed_targets`], the one target
-/// rule of every shed) and that the registry's handoff check accepts. A
-/// leadership no peer could take on one step is tried again on the next, and the groups no peer can take are
-/// reported with the check's refusals. A submitted leadership waits for its
+/// that its replica of the group may take the leadership
+/// ([`CampaignStances::shed_targets`], the one target rule of every shed)
+/// and that the registry's handoff check accepts. A leadership no peer
+/// could take on one step is tried again on the next, and the groups no
+/// peer can take are reported with the check's refusals. A submitted leadership waits for its
 /// transfer to settle (`handoff_settle_time`, longer than the grace with
 /// the shipped timeouts), so within the grace each leadership is submitted
 /// at most once. Its shed also takes on the leaderships the node gains

@@ -216,8 +216,8 @@ pub(crate) fn cluster_egress_probe_plan(
 /// that does better sheds after `unhealthy_ticks` ticks. While it
 /// sheds, the gate hands every leadership it held when it shed to its
 /// peers at once, and plans again on every tick for the ones still
-/// pending, each only to a peer that answered that it may campaign
-/// ([`CampaignStances::shed_targets`]).
+/// pending, each only to a peer that answered that its replica of the
+/// group may take the leadership ([`CampaignStances::shed_targets`]).
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
