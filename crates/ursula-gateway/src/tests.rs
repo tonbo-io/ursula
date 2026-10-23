@@ -29,6 +29,7 @@ use crate::auth::Authorizer;
 use crate::auth::PrincipalResolver;
 use crate::auth::PrincipalResolverFuture;
 use crate::auth::VerifiedPrincipal;
+use crate::ejection::EjectionChange;
 use crate::probe::PROBE_INTERVAL;
 use crate::probe::PROBE_TIMEOUT;
 
@@ -678,6 +679,102 @@ async fn a_request_in_flight_to_an_upstream_the_probes_eject_goes_on_at_once() {
     }
 }
 
+/// An upstream served as every Ursula node serves its client plane
+/// ([`ursula_observability::serve::serve_until_shutdown`]), which holds each
+/// stream request until `answer` is notified and answers it `200`. It
+/// starts its drain when `drain` is notified: its listener closes, so new
+/// connections are refused, and it still answers the requests it accepted.
+/// Each arrival of a stream request is sent on the returned channel.
+async fn draining_upstream(
+    drain: Arc<tokio::sync::Notify>,
+    answer: Arc<tokio::sync::Notify>,
+) -> (TestUpstream, tokio::sync::mpsc::UnboundedReceiver<()>) {
+    let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new()
+        .route(
+            "/{bucket}/{stream}",
+            any(move || {
+                arrived.send(()).expect("the test awaits arrivals");
+                let answer = Arc::clone(&answer);
+                async move {
+                    answer.notified().await;
+                    "drained"
+                }
+            }),
+        )
+        .route(
+            ursula_headers::routing::LIVENESS_PATH,
+            get(|| async { StatusCode::NO_CONTENT }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("upstream address")
+    );
+    let task = tokio::spawn(async move {
+        ursula_observability::serve::serve_until_shutdown(
+            listener,
+            app,
+            async move { drain.notified().await },
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect("serve upstream");
+    });
+    (TestUpstream { url, task }, arrivals)
+}
+
+/// A producer append in flight to a node when its drain begins, as at a
+/// node's graceful stop, gets that node's answer. Its listener closes and
+/// refuses the probes' new connections, so the gateway ejects it as an
+/// upstream that stopped accepting: no request goes there any more, but the
+/// append it accepted is not sent again elsewhere, where a refusal (`503`,
+/// as from a group whose new leader is not known yet) would leave the
+/// first hop's outcome unknown and answer the client `504`.
+#[tokio::test]
+async fn a_request_in_flight_to_a_draining_upstream_gets_its_answer() {
+    let drain = Arc::new(tokio::sync::Notify::new());
+    let answer = Arc::new(tokio::sync::Notify::new());
+    let (draining, mut arrivals) = draining_upstream(Arc::clone(&drain), Arc::clone(&answer)).await;
+    let refusing = Scripted::spawn().await;
+    refusing.answers(refusal());
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        draining.url.clone(),
+        refusing.url(),
+    ])));
+    gateway.remember_leader("/bucket/stream".to_owned(), draining.url.clone());
+    let mut sent = send(&gateway, producer_post());
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+
+    drain.notify_one();
+    until_ejected(&gateway, 1, probes_eject_within()).await;
+    // Past the ejection, the request still waits for the draining node.
+    tokio::time::sleep(PROBE_INTERVAL.saturating_mul(2)).await;
+    assert!(!sent.is_finished(), "the request ended at the ejection");
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
+    // Its answer readmits the node, which a later probe may eject again.
+    answer.notify_one();
+    let response = sent.await.expect("request task");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    assert_eq!(&body[..], b"drained");
+    assert_eq!(refusing.hits(), 0);
+}
+
 /// A probe past its timeout keeps waiting for its answer, so that the
 /// connection it opened goes into the pool. Here only the first answer on
 /// each connection takes longer than the probe timeout, as every answer on
@@ -751,7 +848,12 @@ async fn a_probe_past_its_timeout_readmits_an_upstream_slow_on_new_connections()
 async fn a_redirect_to_an_ejected_leader_is_not_followed() {
     let (leader, follower) = spawn_raft_redirect_upstreams(answering_router()).await;
     let gateway = Gateway::unprobed(test_config(vec![follower.url.clone(), leader.url.clone()]));
-    assert!(gateway.ejections.failed(&leader.url));
+    assert_eq!(
+        gateway
+            .ejections
+            .failed(&leader.url, Ejection::StoppedAccepting),
+        EjectionChange::Ejected
+    );
     gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
 
     let response = gateway.handle(get_stream()).await;
@@ -834,8 +936,12 @@ fn gateway_keeps_the_cached_route_when_every_upstream_is_ejected() {
         "http://follower.test".to_owned(),
         "http://leader.test".to_owned(),
     ]));
-    gateway.ejections.failed("http://follower.test");
-    gateway.ejections.failed("http://leader.test");
+    gateway
+        .ejections
+        .failed("http://follower.test", Ejection::StoppedAccepting);
+    gateway
+        .ejections
+        .failed("http://leader.test", Ejection::StoppedAccepting);
     gateway.remember_leader("/bucket/stream".to_owned(), "http://leader.test".to_owned());
 
     let uri: Uri = "/bucket/stream".parse().expect("uri");
@@ -2251,7 +2357,9 @@ async fn a_redirect_to_an_unknown_address_searches_the_upstreams_not_yet_reached
     b.answers(unknown());
     leader.answers((StatusCode::OK, HeaderMap::new()));
     let gateway = gateway_starting_at(&[&a, &b, &leader]);
-    gateway.ejections.failed(&b.url());
+    gateway
+        .ejections
+        .failed(&b.url(), Ejection::StoppedAccepting);
     let before = b.hits();
     let response = gateway.handle(post_path("/bucket/stream")).await;
     assert_eq!(response.status(), StatusCode::OK);

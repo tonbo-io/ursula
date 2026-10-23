@@ -9,6 +9,14 @@
 //! within a probe interval and a probe timeout, whether requests reach it or
 //! not, and one that answers again is back within a probe interval.
 //!
+//! Each ejection has a cause ([`Ejection`]). An upstream that refused a
+//! connection, or closed one, stopped accepting requests: a draining node
+//! closes its listener and still answers every request it accepted. One
+//! whose probe got no answer in time stopped answering: a stopped process or
+//! a frozen host answers nothing, the requests it accepted included. Both
+//! leave selection, but only an upstream that stopped answering ends the
+//! wait of a request in flight to it ([`Ejections::stopped_answering`]).
+//!
 //! A request that gets no response headers within the response header
 //! timeout ejects nothing. The probes eject a silent node sooner, and a live
 //! node can hold one request longer than the timeout (a write on a leader
@@ -21,12 +29,13 @@
 //! included. When every upstream is ejected, none is: requests choose among
 //! all of them, as if nothing were ejected, rather than among none. A
 //! request waiting on an upstream can stop waiting once requests skip it
-//! ([`Ejections::until`]).
+//! because it stopped answering ([`Ejections::until`]).
 //!
-//! [`Ejections`] holds the ejected upstreams under a lock shared by every
-//! request, with a count that lets requests skip the lock while nothing is
-//! ejected.
+//! [`Ejections`] holds the ejected upstreams and their causes under a lock
+//! shared by every request, with a count that lets requests skip the lock
+//! while nothing is ejected.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -40,6 +49,48 @@ use rand::seq::IteratorRandom;
 use tokio::sync::watch;
 
 use crate::GatewayError;
+
+/// Why an upstream is out of selection. The later variant is the stronger
+/// evidence: an upstream ejected for both keeps the later until it answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Ejection {
+    /// It failed at the transport without a timeout: it refused a
+    /// connection, as a draining node does once its listener closed, or it
+    /// closed one. It may still answer the requests it accepted, so a request
+    /// in flight to it waits for its answer.
+    StoppedAccepting,
+    /// It sent nothing in time: a probe of it got no response headers within
+    /// the probe timeout, or the transport timed out a connect to it or data
+    /// sent to it. It answers nothing, as a stopped process or a frozen host,
+    /// so a request in flight to it whose repeat is safe goes on at once.
+    StoppedAnswering,
+}
+
+impl Ejection {
+    /// The cause a transport failure, `source`, gives: a timeout says that
+    /// the upstream sent nothing, any other failure that it refused or closed
+    /// the connection.
+    pub(crate) fn of_transport(source: &reqwest::Error) -> Self {
+        if source.is_timeout() {
+            Self::StoppedAnswering
+        } else {
+            Self::StoppedAccepting
+        }
+    }
+}
+
+/// What [`Ejections::failed`] changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EjectionChange {
+    /// The upstream was in selection, and is out of it now.
+    Ejected,
+    /// The upstream was out of selection for a weaker cause, and is out for
+    /// this one now.
+    Escalated,
+    /// Nothing: the upstream was out of selection for this cause or a
+    /// stronger one.
+    Unchanged,
+}
 
 /// Where a request goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +145,7 @@ fn choose<'a>(
 pub(crate) struct Ejections {
     /// Distinct configured upstreams: with as many ejected, none is skipped.
     upstreams: usize,
-    ejected: Mutex<HashSet<String>>,
+    ejected: Mutex<HashMap<String, Ejection>>,
     /// Entries in `ejected`, stored under its lock after every change. While
     /// it is 0, requests skip the lock. A request that reads it during a
     /// change acts as one that started before it.
@@ -111,14 +162,14 @@ impl Ejections {
     pub(crate) fn new(upstreams: &[String]) -> Self {
         Self {
             upstreams: upstreams.iter().collect::<HashSet<_>>().len(),
-            ejected: Mutex::new(HashSet::new()),
+            ejected: Mutex::new(HashMap::new()),
             entries: AtomicUsize::new(0),
             ejections: AtomicU64::new(0),
             changes: watch::Sender::new(()),
         }
     }
 
-    fn with_ejected<T>(&self, f: impl FnOnce(&mut HashSet<String>) -> T) -> T {
+    fn with_ejected<T>(&self, f: impl FnOnce(&mut HashMap<String, Ejection>) -> T) -> T {
         let mut ejected = self.ejected.lock().unwrap_or_else(PoisonError::into_inner);
         let out = f(&mut ejected);
         self.entries.store(ejected.len(), Ordering::Release);
@@ -132,37 +183,60 @@ impl Ejections {
         entries > 0 && entries < self.upstreams
     }
 
-    /// Ejects `upstream`, which failed or did not answer in time. Returns
-    /// whether it was in selection before.
-    pub(crate) fn failed(&self, upstream: &str) -> bool {
-        let ejected = self.with_ejected(|ejected| ejected.insert(upstream.to_owned()));
-        if ejected {
+    /// Ejects `upstream` for `cause`, unless it is out of selection for that
+    /// cause or a stronger one already, and answers what changed.
+    pub(crate) fn failed(&self, upstream: &str, cause: Ejection) -> EjectionChange {
+        let change = self.with_ejected(|ejected| match ejected.get_mut(upstream) {
+            None => {
+                ejected.insert(upstream.to_owned(), cause);
+                EjectionChange::Ejected
+            }
+            Some(held) if *held < cause => {
+                *held = cause;
+                EjectionChange::Escalated
+            }
+            Some(_held) => EjectionChange::Unchanged,
+        });
+        if change != EjectionChange::Unchanged {
             self.changes.send_replace(());
         }
-        ejected
+        change
     }
 
     /// Readmits `upstream`, which answered. Returns whether it was ejected.
     pub(crate) fn answered(&self, upstream: &str) -> bool {
         let readmitted = self.entries.load(Ordering::Acquire) > 0
-            && self.with_ejected(|ejected| ejected.remove(upstream));
+            && self.with_ejected(|ejected| ejected.remove(upstream).is_some());
         if readmitted {
             self.changes.send_replace(());
         }
         readmitted
     }
 
-    /// Ejects `upstream` for `error`, a probe's or a request's transport
-    /// failure, or a probe's timeout, and counts and logs it if it was in
-    /// selection.
-    pub(crate) fn eject(&self, upstream: &str, error: &GatewayError) {
-        if self.failed(upstream) {
+    /// Ejects `upstream` for `cause`, which `error` shows: a probe's or a
+    /// request's transport failure, or a probe's timeout. Counts the ejection
+    /// if the upstream was in selection, and logs it if its cause changed.
+    pub(crate) fn eject(&self, upstream: &str, cause: Ejection, error: &GatewayError) {
+        let change = self.failed(upstream, cause);
+        if change == EjectionChange::Ejected {
             self.ejections.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                upstream,
-                %error,
-                "upstream failed at the transport or did not answer its probe in time; leaving it out of selection until it answers"
-            );
+        }
+        match (change, cause) {
+            (EjectionChange::Unchanged, _) => {}
+            (EjectionChange::Ejected | EjectionChange::Escalated, Ejection::StoppedAccepting) => {
+                tracing::warn!(
+                    upstream,
+                    %error,
+                    "upstream refused or closed a connection; leaving it out of selection until it answers, its requests in flight still wait for their answers"
+                );
+            }
+            (EjectionChange::Ejected | EjectionChange::Escalated, Ejection::StoppedAnswering) => {
+                tracing::warn!(
+                    upstream,
+                    %error,
+                    "upstream sent nothing in time; leaving it out of selection until it answers, its safe requests in flight go on elsewhere"
+                );
+            }
         }
     }
 
@@ -207,7 +281,7 @@ impl Ejections {
             choose(
                 cached,
                 upstreams,
-                |upstream| ejected.contains(upstream),
+                |upstream| ejected.contains_key(upstream),
                 rng,
             )
         })
@@ -216,7 +290,17 @@ impl Ejections {
     /// Whether a hop may go to `upstream`: it is not ejected, or every
     /// upstream is.
     pub(crate) fn admits(&self, upstream: &str) -> bool {
-        !self.skipping() || self.with_ejected(|ejected| !ejected.contains(upstream))
+        !self.skipping() || self.with_ejected(|ejected| !ejected.contains_key(upstream))
+    }
+
+    /// Whether requests skip `upstream` because it stopped answering
+    /// ([`Ejection::StoppedAnswering`]): a request in flight to it gets no
+    /// answer. False while every upstream is ejected, as nothing is skipped
+    /// then.
+    pub(crate) fn stopped_answering(&self, upstream: &str) -> bool {
+        self.skipping()
+            && self
+                .with_ejected(|ejected| ejected.get(upstream) == Some(&Ejection::StoppedAnswering))
     }
 
     /// Upstreams ejected now. Requests skip them unless every upstream is

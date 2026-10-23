@@ -7,11 +7,14 @@
 //! requests always probes. Each probe sends `GET` [`LIVENESS_PATH`] to one
 //! upstream with the client that forwards requests, every
 //! [`PROBE_INTERVAL`], one probe at a time per upstream. A probe that fails
-//! at the transport, or gets no response headers within [`PROBE_TIMEOUT`],
-//! ejects the upstream as a failed request does, and any answer readmits it.
-//! An upstream that stops answering, as a stopped process or a frozen host
-//! does, leaves selection within [`PROBE_INTERVAL`] plus [`PROBE_TIMEOUT`]
-//! of its last answer.
+//! at the transport ejects the upstream as a failed request does, one that
+//! gets no response headers within [`PROBE_TIMEOUT`] ejects it as an
+//! upstream that stopped answering ([`Ejection::StoppedAnswering`]), and any
+//! answer readmits it. An upstream that stops answering, as a stopped
+//! process or a frozen host does, leaves selection within [`PROBE_INTERVAL`]
+//! plus [`PROBE_TIMEOUT`] of its last answer. One that stops accepting, as a
+//! draining node does once its listener closed, leaves it within
+//! [`PROBE_INTERVAL`] of its first refused connection.
 //!
 //! A probe past its timeout keeps waiting for its answer, up to the
 //! response header timeout, and readmits the upstream if it comes. Dropping
@@ -42,6 +45,7 @@ use ursula_headers::routing::LIVENESS_PATH;
 
 use crate::GatewayError;
 use crate::Hop;
+use crate::ejection::Ejection;
 use crate::ejection::Ejections;
 
 /// How often each upstream is probed: the time from one probe's start to
@@ -114,11 +118,14 @@ impl Probe {
             {
                 Ok(sent) => Some(sent),
                 Err(_elapsed) => {
-                    self.ejections
-                        .eject(&self.upstream, &GatewayError::UpstreamTimeout {
+                    self.ejections.eject(
+                        &self.upstream,
+                        Ejection::StoppedAnswering,
+                        &GatewayError::UpstreamTimeout {
                             upstream: self.upstream.clone(),
                             timeout: PROBE_TIMEOUT,
-                        });
+                        },
+                    );
                     tokio::time::timeout_at(after(started, self.answer_bound), send)
                         .await
                         .ok()
@@ -128,10 +135,12 @@ impl Probe {
                 // A `204` has no body, so dropping the answer returns its
                 // connection to the pool.
                 Some(Ok(_answer)) => self.ejections.readmit(&self.upstream),
-                Some(Err(source)) => self.ejections.eject(
-                    &self.upstream,
-                    &GatewayError::of_transport(&self.upstream, Hop::First, source),
-                ),
+                Some(Err(source)) => {
+                    let error = GatewayError::of_transport(&self.upstream, Hop::First, source);
+                    if let Some(cause) = error.ejection() {
+                        self.ejections.eject(&self.upstream, cause, &error);
+                    }
+                }
                 // Ejected at the probe timeout already.
                 None => {}
             }
