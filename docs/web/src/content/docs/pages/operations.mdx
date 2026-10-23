@@ -195,8 +195,10 @@ On the first SIGTERM or Ctrl-C, the voter marks itself maintenance-drained to
 prevent re-acquiring leadership. It keeps Raft transport available while it
 hands off each leadership to an eligible voter (see the handoff rule under
 [Recovering after a host crash](#recovering-after-a-host-crash)). Every 50 ms it
-asks its peers again which of them may take a transfer, logs their answers when
-they change, and submits each leadership that no peer could take yet. A
+asks its peers again which of them may take a transfer, waiting up to one
+minimum election timeout (1.5 seconds) for a peer's answer, logs their answers
+when they change, and submits each leadership that no peer could take yet,
+only to a peer that answered that it may campaign. A
 submitted transfer is not repeated within the handoff: it waits longer than
 five seconds to settle. It logs the groups no peer can take, with the reason
 the handoff check gave for each peer. It waits for observed leadership changes

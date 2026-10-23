@@ -164,9 +164,12 @@ pub(crate) fn balance_inputs(
 /// most `grace`: the maintenance-drain shed of every leadership this node
 /// holds, at once ([`LeadershipShed`], [`ShedPace::AllAtOnce`]), the drain
 /// the health gates run. Every [`SHUTDOWN_HANDOFF_STEP`] it asks the peers
-/// which of them may take a transfer, logging each peer's answer whenever
-/// one changes, and submits every queued leadership to one of them that the
-/// registry's handoff check accepts. A leadership no peer could take on one
+/// which of them may take a transfer, waiting up to
+/// [`ursula_raft::PEER_ANSWER_TIMEOUT`] for each answer, as every question a
+/// node asks its peers does, logging each peer's answer whenever one
+/// changes, and submits every queued leadership to a peer that answered
+/// that it may campaign ([`CampaignStances::shed_targets`], the one target
+/// rule of every shed) and that the registry's handoff check accepts. A leadership no peer could take on one
 /// step is tried again on the next, and the groups no peer can take are
 /// reported with the check's refusals. A submitted leadership waits for its
 /// transfer to settle (`handoff_settle_time`, longer than the grace with
@@ -176,6 +179,9 @@ pub(crate) fn balance_inputs(
 /// ([`ShedMark::UntilExit`]), so the node does not campaign again, and makes
 /// the meta shed hand meta's leadership away (`super::meta_shed`), the one
 /// place meta's leadership is handed off.
+///
+/// The grace bounds the peers' answers too: a silent peer holds each round
+/// for the answer timeout, which leaves time for a few rounds.
 ///
 /// Answers how many leaderships are left here. When some are once the
 /// grace ends, it reports each with the handoff check's last refusals, and

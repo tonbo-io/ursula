@@ -472,6 +472,15 @@ mod tests {
             .saturating_add(super::SHUTDOWN_STEP_DOWN_GRACE)
             .saturating_add(super::SHUTDOWN_DRAIN_GRACE);
         assert!(phases < super::SHUTDOWN_GRACE, "{phases:?}");
+        // The handoff asks its peers before each of its rounds, and a silent
+        // peer holds a round for `PEER_ANSWER_TIMEOUT`. The handoff grace
+        // bounds those waits too, and still holds a leadership's first
+        // handoff and a retry on another target with a peer silent.
+        let rounds_with_a_silent_peer = ursula_raft::PEER_ANSWER_TIMEOUT.saturating_mul(2);
+        assert!(
+            rounds_with_a_silent_peer < super::SHUTDOWN_HANDOFF_GRACE,
+            "{rounds_with_a_silent_peer:?}"
+        );
     }
 
     #[tokio::test]
