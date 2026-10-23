@@ -25,7 +25,7 @@ use crate::bootstrap::participation::PeerParticipation;
 /// leadership and disables elections, but only while that is a fault of
 /// this node ([`EgressFault`]): some peer can do better, a peer whose own
 /// last probe was clean, as its participation answer reports, or too few
-/// peers answer this node at all for a quorum of one of its groups, as when
+/// peers answer this node at all for a quorum of any of its groups, as when
 /// it is cut off or on the minority side of a partition. A delay or loss on
 /// every node's path is no fault of this node: every peer still answers
 /// within the bound a Raft append gets, and handing its leaderships to
@@ -87,6 +87,16 @@ impl ClusterEgressProbePlan {
             (healthy < group.needed_peers).then_some((group, healthy))
         })
     }
+
+    /// Whether fewer of its peers `answered` than a quorum needs in every
+    /// group config of the plan: this node could lead none of its groups.
+    pub(crate) fn isolated(&self, answered: &BTreeSet<u64>) -> bool {
+        !self.groups.is_empty()
+            && self
+                .groups
+                .iter()
+                .all(|group| group.peers.intersection(answered).count() < group.needed_peers)
+    }
 }
 
 /// Why this node's degraded probe is a fault of its own, which sheds its
@@ -94,32 +104,31 @@ impl ClusterEgressProbePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressFault {
     /// Fewer peers answered this node's participation question than a
-    /// quorum of `raft_group_id` needs: the node is cut off from its peers,
-    /// or on the minority side of a partition, and must not campaign.
-    Isolated {
-        raft_group_id: RaftGroupId,
-        answered: usize,
-        needed: usize,
-    },
+    /// quorum needs in every one of its group configs, `answered` of them:
+    /// the node is cut off from its peers, or on the minority side of a
+    /// partition, leads none of its groups and must not campaign. A node
+    /// that hears a quorum of one of its groups is not isolated, since it
+    /// stops campaigning in every group at once, and some group it can
+    /// lead would be left without a candidate.
+    Isolated { answered: usize },
     /// `peer` answers that its own last probe was clean: it reaches its
     /// quorums where this node does not.
     PeerDoesBetter { peer: u64 },
 }
 
 /// Whether a degraded probe under `plan` is a fault of this node, by its
-/// peers' `stances`: too few of them answered for a quorum of one of its
-/// groups ([`ClusterEgressProbePlan::degraded`] over the peers that
+/// peers' `stances`: too few of them answered for a quorum of any of its
+/// groups ([`ClusterEgressProbePlan::isolated`] over the peers that
 /// answered), or one of them reports a clean probe. `None` when every peer
 /// answered as degraded too: the delay or loss is on every node's path.
 pub(crate) fn egress_fault(
     plan: &ClusterEgressProbePlan,
     stances: &CampaignStances,
 ) -> Option<EgressFault> {
-    if let Some((group, answered)) = plan.degraded(&stances.answered_peers()) {
+    let answered = stances.answered_peers();
+    if plan.isolated(&answered) {
         return Some(EgressFault::Isolated {
-            raft_group_id: group.raft_group_id,
-            answered,
-            needed: group.needed_peers,
+            answered: answered.len(),
         });
     }
     stances
@@ -190,7 +199,7 @@ pub(crate) fn cluster_egress_probe_plan(
 /// ([`egress_fault`]), which the peers' answers decide. Each tick asks for
 /// them alongside its probes, and a degraded tick waits up to
 /// [`ursula_raft::PEER_ANSWER_TIMEOUT`] for them. One tick that hears too
-/// few peers for a quorum sheds ([`EgressFault::Isolated`]), and a peer
+/// few peers for a quorum of any of its groups sheds ([`EgressFault::Isolated`]), and a peer
 /// that does better sheds after `unhealthy_ticks` ticks. While it
 /// sheds, the gate hands every leadership it held when it shed to its
 /// peers at once, and plans again on every tick for the ones still
@@ -327,14 +336,9 @@ pub fn spawn_egress_gate(
                         (&degraded_probe, fault)
                     {
                         match fault {
-                            EgressFault::Isolated {
-                                raft_group_id,
-                                answered,
-                                needed,
-                            } => tracing::warn!(
-                                "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}), and {answered} peers answered where group {} needs {needed}; yielding leadership and elections",
+                            EgressFault::Isolated { answered } => tracing::warn!(
+                                "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}), and {answered} peers answered, too few for a quorum of any of its groups; yielding leadership and elections",
                                 group.0,
-                                raft_group_id.0,
                             ),
                             EgressFault::PeerDoesBetter { peer } => tracing::warn!(
                                 "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}) while node {peer} reports a clean probe; yielding leadership",
@@ -411,33 +415,32 @@ mod tests {
         CampaignStances::of_nodes(1, by_node).with_egress(answered)
     }
 
-    /// A node that some peers still answer, but too few for a quorum of one
-    /// of its groups, is isolated, and that comes before a peer that does
-    /// better: an isolated node must stop campaigning, which a peer's clean
-    /// probe alone would not say. Every peer answering degraded, with
-    /// enough of them for each quorum, is no fault of this node.
+    /// A node that too few peers answer for a quorum of any of its groups
+    /// is isolated, whatever their probes say: it must stop campaigning,
+    /// which a peer's clean probe alone would not say. A node that hears a
+    /// quorum of one group is not, since it stops campaigning in every
+    /// group at once and would leave that one without a candidate. Every
+    /// peer answering degraded, with enough of them for each quorum, is no
+    /// fault of this node.
     #[test]
-    fn too_few_answers_for_one_quorum_isolate_a_node_before_a_peer_does_better() {
+    fn only_too_few_answers_for_every_quorum_isolate_a_node() {
         use EgressProbeStatus::Clean;
         use EgressProbeStatus::Degraded;
 
         let plan = plan();
         assert_eq!(
-            egress_fault(&plan, &stances(&[(2, Clean)])),
-            Some(EgressFault::Isolated {
-                raft_group_id: RaftGroupId(1),
-                answered: 1,
-                needed: 2,
-            }),
-            "one answer is a quorum of group 0 but not of group 1"
+            egress_fault(&plan, &stances(&[(4, Clean)])),
+            Some(EgressFault::Isolated { answered: 1 }),
+            "node 4 is no quorum of group 0, and one answer none of group 1"
         );
         assert_eq!(
             egress_fault(&plan, &stances(&[])),
-            Some(EgressFault::Isolated {
-                raft_group_id: RaftGroupId(0),
-                answered: 0,
-                needed: 1,
-            })
+            Some(EgressFault::Isolated { answered: 0 })
+        );
+        assert_eq!(
+            egress_fault(&plan, &stances(&[(2, Degraded)])),
+            None,
+            "node 2 is a quorum of group 0, though not of group 1"
         );
         assert_eq!(
             egress_fault(&plan, &stances(&[(2, Degraded), (4, Clean)])),

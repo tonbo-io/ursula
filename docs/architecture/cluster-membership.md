@@ -96,8 +96,10 @@ replica that counts as a voter, when one of the configs lists the node
 A degraded probe sheds the node only for a fault of its own
 (`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): a peer's
 participation answer reports a clean probe, or fewer peers answer than a
-quorum of one of its configs needs, so a node cut off from its peers stops
-campaigning, while a delay on every node's path sheds none. Too few answers
+quorum of each of its configs needs, so a node cut off from its peers stops
+campaigning, while a delay on every node's path sheds none. A node that hears
+a quorum of one config keeps campaigning, since its elections stop in every
+group at once. Too few answers
 shed on the first tick that sees them, so a cut-off node campaigns at most once
 in each group it follows before its elections stop.
 
