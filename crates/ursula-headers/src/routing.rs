@@ -5,12 +5,21 @@
 //!
 //! The redirect's `Location` and the `503`'s `Retry-After` are standard
 //! HTTP headers that the caller handles; this module types Ursula's own.
+//!
+//! [`LIVENESS_PATH`] is the route on a node's client plane that the gateway
+//! probes to route around a node that does not answer.
 
 use std::fmt;
 
 use crate::error::HeaderError;
 use crate::fields;
 use crate::names;
+
+/// A node's liveness route on its client plane. `GET` answers `204` with no
+/// body and reads no node state, so any answer within a round trip shows
+/// that the node's HTTP front door serves. The gateway probes every upstream
+/// there.
+pub const LIVENESS_PATH: &str = "/__ursula/live";
 
 /// The id of a server node (`x-ursula-raft-leader-id`). Every `u64` is an
 /// id; ids are compared for equality only.

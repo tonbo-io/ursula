@@ -28,7 +28,8 @@ use crate::auth::Authorizer;
 use crate::auth::PrincipalResolver;
 use crate::auth::PrincipalResolverFuture;
 use crate::auth::VerifiedPrincipal;
-use crate::ejection::EJECTION_BASE;
+use crate::probe::PROBE_INTERVAL;
+use crate::probe::PROBE_TIMEOUT;
 
 #[test]
 fn header_forwarding_applies_proxy_rules() {
@@ -384,131 +385,175 @@ async fn gateway_leaves_an_upstream_that_failed_out_of_selection() {
     assert_eq!(metrics.upstream_ejected, 1);
 }
 
-/// When its window expires, the next request that selects the upstream
-/// probes it. Another failure ejects it for a doubled window.
+/// An ejected upstream stays out of selection however long ago it failed,
+/// until it answers: no request probes it.
 #[tokio::test(start_paused = true)]
-async fn gateway_probes_an_ejected_upstream_after_its_window() {
+async fn an_ejected_upstream_stays_out_until_it_answers() {
     let _frozen = FrozenClock::hold();
     let (gone, _refusing) = refusing_upstream().await;
     let live = answering_upstream().await;
     let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]));
     fail_once(&gateway, &gone).await;
-    all_answered(&gateway, "s", 20).await;
 
-    tokio::time::advance(EJECTION_BASE).await;
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
-    // The probe: a request along a cached route to it.
-    fail_once(&gateway, &gone).await;
-    let metrics = gateway.metrics_snapshot();
-    assert_eq!(metrics.upstream_ejections, 2);
-    assert_eq!(metrics.upstream_ejected, 1);
-
-    // The second window is twice the first.
-    let second_window = EJECTION_BASE.saturating_mul(2);
-    tokio::time::advance(second_window.saturating_sub(Duration::from_secs(1))).await;
-    all_answered(&gateway, "t", 20).await;
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 1);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
-}
-
-/// While one request probes an expired upstream, every other request skips
-/// it, through a cached route or at random, until the probe deadline.
-#[tokio::test(start_paused = true)]
-async fn gateway_sends_one_probe_at_a_time() {
-    let _frozen = FrozenClock::hold();
-    let (silent, mut arrivals) = silent_upstream().await;
-    let live = answering_upstream().await;
-    // A header timeout past the probe deadline, as a long-poll's is.
-    let mut config = test_config(vec![silent.url.clone(), live.url.clone()]);
-    config.response_header_timeout = Duration::from_secs(60);
-    let gateway = Arc::new(Gateway::new(config));
-    gateway.ejections.failed(&silent.url, Instant::now());
-    tokio::time::advance(EJECTION_BASE).await;
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
-
-    // The probe: a request along a cached route to the silent upstream.
-    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
-    let probe = tokio::spawn({
-        let gateway = Arc::clone(&gateway);
-        async move { gateway.handle(get_stream()).await }
-    });
-    arrivals
-        .recv()
-        .await
-        .expect("the probe reaches the upstream");
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 1);
-
-    all_answered(&gateway, "s", 40).await;
-    gateway.remember_leader("/bucket/other".to_owned(), silent.url.clone());
-    let response = gateway.handle(get_path("/bucket/other")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 1);
-
-    // The probe deadline is the 1 s connect timeout plus the 5 s user
-    // timeout. Past it, the probe no longer holds the others back.
-    tokio::time::advance(Duration::from_secs(6)).await;
-    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
-    // At its header timeout the probe ejects the silent upstream again, and
-    // the read goes on to the live one.
-    tokio::time::advance(Duration::from_secs(54)).await;
-    let probed = probe.await.expect("probe task");
-    assert_eq!(probed.status(), StatusCode::OK);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    all_answered(&gateway, "s", 60).await;
     let metrics = gateway.metrics_snapshot();
     assert_eq!(
         (metrics.upstream_ejections, metrics.upstream_ejected),
         (1, 1)
     );
-    assert!(arrivals.try_recv().is_err(), "one probe only");
+
+    // An answer, as to a probe, readmits it.
+    assert!(gateway.ejections.answered(&gone));
+    assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
 }
 
-/// A response clears an ejection. Here the leader answers the request that
-/// probes it after its window, along its cached route, which stays.
-#[tokio::test(start_paused = true)]
-async fn gateway_restores_an_upstream_that_answers_its_probe() {
-    let _frozen = FrozenClock::hold();
-    let (leader, follower) = spawn_raft_redirect_upstreams(answering_router()).await;
-    let gateway = Gateway::new(test_config(vec![follower.url.clone(), leader.url.clone()]));
-    gateway.ejections.failed(&leader.url, Instant::now());
-    tokio::time::advance(EJECTION_BASE).await;
-    gateway.remember_leader("/bucket/stream".to_owned(), leader.url.clone());
+/// The longest the probes take to eject an upstream that stops answering:
+/// a probe interval and a probe timeout, and a margin for a loaded runner.
+fn probes_eject_within() -> Duration {
+    PROBE_INTERVAL
+        .saturating_add(PROBE_TIMEOUT)
+        .saturating_add(Duration::from_secs(1))
+}
 
+/// A gateway's probes, running until dropped.
+struct Probing(tokio::task::JoinHandle<()>);
+
+impl Drop for Probing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn probing(gateway: &Arc<Gateway>) -> Probing {
+    let gateway = Arc::clone(gateway);
+    Probing(tokio::spawn(async move { gateway.probe_upstreams().await }))
+}
+
+/// Polls `gateway`'s metrics until `upstream_ejected` is `ejected`, for at
+/// most `within`.
+async fn until_ejected(gateway: &Gateway, ejected: usize, within: Duration) {
+    let started = std::time::Instant::now();
+    loop {
+        if gateway.metrics_snapshot().upstream_ejected == ejected {
+            return;
+        }
+        assert!(
+            started.elapsed() < within,
+            "upstream_ejected never {ejected} within {within:?}: {:?}",
+            gateway.metrics_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An upstream that accepts connections and never answers, as a stopped
+/// process does, is ejected by the probes within a probe interval and a
+/// probe timeout, with no request sent to it. A request along a cached
+/// route to it then goes to the live upstream at once.
+#[tokio::test]
+async fn the_probes_eject_a_silent_upstream_that_no_request_reached() {
+    let (silent, _arrivals) = silent_upstream().await;
+    let live = answering_upstream().await;
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        silent.url.clone(),
+        live.url.clone(),
+    ])));
+    let _probing = probing(&gateway);
+
+    until_ejected(&gateway, 1, probes_eject_within()).await;
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let started = std::time::Instant::now();
     let response = gateway.handle(get_stream()).await;
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(started.elapsed() < PROBE_TIMEOUT, "{:?}", started.elapsed());
     let metrics = gateway.metrics_snapshot();
-    // Unanswered, the probe would still count.
-    assert_eq!(metrics.upstream_ejected, 0);
-    assert_eq!(metrics.leader_cache_entries, 1);
-    assert_eq!(metrics.leader_cache_hits, 1);
-    assert_eq!(metrics.leader_redirects, 0);
+    assert_eq!(
+        (metrics.upstream_ejections, metrics.upstream_ejected),
+        (1, 1)
+    );
+    assert_eq!(metrics.leader_cache_entries, 0);
 }
 
-/// Inside its window an ejected leader is skipped, so a request lands on a
-/// follower. The follower's 307 re-learns the route to the leader, and the
-/// request that follows it acts as the leader's probe: its response clears
-/// the ejection.
-#[tokio::test(start_paused = true)]
-async fn gateway_follows_a_redirect_to_an_ejected_leader_as_its_probe() {
-    let _frozen = FrozenClock::hold();
+/// An upstream that the probes ejected while it was silent is back in
+/// selection once it answers a probe again.
+#[tokio::test]
+async fn the_probes_readmit_an_upstream_that_answers_again() {
+    let silent = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let upstream = spawn_upstream(Router::new().fallback({
+        let silent = Arc::clone(&silent);
+        move || {
+            let silent = silent.load(Ordering::Acquire);
+            async move {
+                if silent {
+                    std::future::pending::<()>().await;
+                }
+                StatusCode::NO_CONTENT
+            }
+        }
+    }))
+    .await;
+    let live = answering_upstream().await;
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        upstream.url.clone(),
+        live.url.clone(),
+    ])));
+    let _probing = probing(&gateway);
+    until_ejected(&gateway, 1, probes_eject_within()).await;
+
+    silent.store(false, Ordering::Release);
+    // A probe sent while it was silent still waits out its timeout.
+    until_ejected(&gateway, 0, probes_eject_within()).await;
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
+}
+
+/// A uniform delay ejects nothing: an upstream whose every answer takes
+/// 1 s, two round trips of 500 ms, stays in selection.
+#[tokio::test]
+async fn the_probes_keep_an_upstream_that_answers_slowly() {
+    let slow = spawn_upstream(Router::new().fallback(|| async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        StatusCode::NO_CONTENT
+    }))
+    .await;
+    let live = answering_upstream().await;
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        slow.url.clone(),
+        live.url.clone(),
+    ])));
+    let _probing = probing(&gateway);
+
+    tokio::time::sleep(probes_eject_within().saturating_mul(2)).await;
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
+}
+
+/// A leader redirect to an ejected upstream is not followed: the request
+/// searches the upstreams it has not tried, and with none left the client
+/// gets the retryable `503` of a group with no known leader. Once the
+/// leader answers a probe the redirect is followed again.
+#[tokio::test]
+async fn a_redirect_to_an_ejected_leader_is_not_followed() {
     let (leader, follower) = spawn_raft_redirect_upstreams(answering_router()).await;
     let gateway = Gateway::new(test_config(vec![follower.url.clone(), leader.url.clone()]));
-    gateway.ejections.failed(&leader.url, Instant::now());
+    assert!(gateway.ejections.failed(&leader.url));
+    gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
 
     let response = gateway.handle(get_stream()).await;
 
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code_of(response).await, ErrorCode::NoLeader);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!((metrics.leader_redirects, metrics.leader_not_found), (0, 1));
+    assert_eq!(metrics.upstream_ejected, 1);
+
+    assert!(gateway.ejections.answered(&leader.url));
+    gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
+    let response = gateway.handle(get_stream()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_redirects, 1);
-    assert_eq!(metrics.leader_cache_entries, 1);
-    assert_eq!(metrics.upstream_ejected, 0);
-
-    // The next request goes along the re-learned route.
-    let response = gateway.handle(get_stream()).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let metrics = gateway.metrics_snapshot();
-    assert_eq!(metrics.leader_cache_hits, 1);
-    assert_eq!(metrics.leader_redirects, 1);
+    assert_eq!(cached_route(&gateway), Some(leader.url.clone()));
 }
 
 /// The leader a follower redirects to is ejected when it fails, and the
@@ -574,9 +619,8 @@ fn gateway_keeps_the_cached_route_when_every_upstream_is_ejected() {
         "http://follower.test".to_owned(),
         "http://leader.test".to_owned(),
     ]));
-    let now = Instant::now();
-    gateway.ejections.failed("http://follower.test", now);
-    gateway.ejections.failed("http://leader.test", now);
+    gateway.ejections.failed("http://follower.test");
+    gateway.ejections.failed("http://leader.test");
     gateway.remember_leader("/bucket/stream".to_owned(), "http://leader.test".to_owned());
 
     let uri: Uri = "/bucket/stream".parse().expect("uri");
@@ -1992,7 +2036,7 @@ async fn a_redirect_to_an_unknown_address_searches_the_upstreams_not_yet_reached
     b.answers(unknown());
     leader.answers((StatusCode::OK, HeaderMap::new()));
     let gateway = gateway_starting_at(&[&a, &b, &leader]);
-    gateway.ejections.failed(&b.url(), Instant::now());
+    gateway.ejections.failed(&b.url());
     let before = b.hits();
     let response = gateway.handle(post_path("/bucket/stream")).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -2406,7 +2450,7 @@ async fn a_not_hosted_hint_that_cannot_connect_searches_on_to_the_host() {
 
 /// A blackholed host that `NotHosted` redirects keep naming costs one
 /// connect: it is ejected, and later hints to it go to an upstream not
-/// ejected instead, with no connect to it, while its window lasts.
+/// ejected instead, with no connect to it, while it stays ejected.
 #[tokio::test]
 async fn a_blackholed_not_hosted_hint_costs_one_connect_before_its_ejection() {
     let (blackholed, _blackholed) = blackholed_upstream().await;

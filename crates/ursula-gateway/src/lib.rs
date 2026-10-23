@@ -9,14 +9,15 @@
 //! never gets one: up to three hops after the first, none starting later than
 //! 5 s after the first redirect. A redirect to an address that is not one of
 //! the upstreams, or to an upstream the request already went to, sends the
-//! request to an upstream it has not tried yet instead. The host a
-//! non-hosting node's redirect names is a hint: the request goes there only
-//! while that upstream is not ejected, and when it cannot connect there the
-//! search goes on, as it does from a hop to an upstream no redirect named. A
-//! leader redirect's target that cannot connect ends the request. When no
-//! upstream answers without redirecting within those limits, the client gets a
-//! retryable `503`. This keeps internal node addresses from clients, and SSE
-//! live reads from looping when the first upstream is a follower. Other
+//! request to an upstream it has not tried yet instead, as does a redirect
+//! to an upstream that is ejected because it did not answer. The host a
+//! non-hosting node's redirect names is a hint, and when it cannot connect
+//! there the search goes on, as it does from a hop to an upstream no
+//! redirect named. A leader redirect's target that cannot connect ends the
+//! request. When no upstream answers without redirecting within those
+//! limits, the client gets a retryable `503`. This keeps internal node
+//! addresses from clients, and SSE live reads from looping when the first
+//! upstream is a follower. Other
 //! redirects stay visible to clients, with the upstream's address stripped
 //! from `Location` so that redirect-following clients keep talking to the
 //! gateway.
@@ -59,8 +60,10 @@
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 //! - [`uploads`]: the per-request limit and the node-wide budget for buffered
 //!   request bodies, and the pace a body must keep.
-//! - `ejection`: leaves upstreams that failed at the transport out of selection
-//!   for a backoff window, then lets one request at a time probe them (#454).
+//! - `ejection`: leaves upstreams that failed or did not answer in time out of
+//!   selection until they answer again (#454).
+//! - `probe`: [`Gateway::probe_upstreams`], the probes of every upstream that
+//!   eject one that stops answering and readmit it once it answers.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -107,6 +110,7 @@ pub mod admission;
 pub mod auth;
 pub mod cors;
 mod ejection;
+mod probe;
 pub mod refusal;
 pub mod service;
 pub mod uploads;
@@ -129,7 +133,6 @@ use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
 use crate::ejection::Ejections;
-use crate::ejection::Failed;
 use crate::refusal::EmbedderRefusal;
 use crate::uploads::BodyPermit;
 use crate::uploads::BudgetExhausted;
@@ -346,12 +349,7 @@ impl Gateway {
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
         let client = upstream_client(&config);
         let response_header_timeout = config.response_header_timeout;
-        // The longest a request to a dead upstream takes to fail at the
-        // transport, so a probe that has neither answered nor failed by then
-        // is not waiting on a dead node.
-        let probe_deadline = config.connect_timeout.saturating_add(Duration::from_secs(
-            config.upstream_tcp_user_timeout_secs.get(),
-        ));
+        let ejections = Arc::new(Ejections::new(&config.upstreams));
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         let uploads = Arc::new(Uploads::new(&config.uploads));
         Self {
@@ -365,7 +363,7 @@ impl Gateway {
             usage: None,
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
-            ejections: Arc::new(Ejections::new(probe_deadline)),
+            ejections,
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
         }
@@ -892,12 +890,9 @@ impl Gateway {
                 .get(key)
                 .cloned()
         });
-        let pick = self.ejections.pick(
-            cached.as_deref(),
-            &self.config.upstreams,
-            Instant::now(),
-            &mut rand::rng(),
-        )?;
+        let pick =
+            self.ejections
+                .pick(cached.as_deref(), &self.config.upstreams, &mut rand::rng())?;
         if pick.cached {
             self.metrics
                 .leader_cache_hits
@@ -911,12 +906,6 @@ impl Gateway {
                 self.forget_leader_if_matches(key, cached);
             }
         }
-        if pick.probe {
-            debug!(
-                upstream = pick.upstream,
-                "probing an upstream whose ejection window expired"
-            );
-        }
         Some(pick.upstream.to_owned())
     }
 
@@ -925,11 +914,13 @@ impl Gateway {
     ///
     /// - A leader redirect (`NotLeader`) sends the request to the upstream its
     ///   `Location` names, unless the request already went to that upstream in
-    ///   this chain.
+    ///   this chain or it is ejected ([`Ejections::admits`]): its peers name a
+    ///   stopped leader until they elect another, and the probes eject it
+    ///   before that.
     /// - A redirect from a node that hosts no replica of the group
     ///   (`NotHosted`) names a host only as a hint, often the dead node the
     ///   group moves away from. The request goes there only when the upstream
-    ///   is not ejected ([`Ejections::claim`]).
+    ///   is not ejected either.
     /// - Otherwise, and when the `Location` names no upstream (`--upstream`
     ///   names the nodes otherwise than their client URLs), the request goes to
     ///   an upstream it has not tried yet, the next after the one that
@@ -1067,11 +1058,13 @@ impl Gateway {
 
     /// Where a request goes after a redirect from the hop under way, and
     /// whether that is a search hop. `named` is the upstream the redirect's
-    /// `Location` names. It goes there unless the request already went to it,
-    /// else to an upstream it has not tried ([`Gateway::untried_upstream`]),
-    /// else back to `named`, unless `named` answered this request nothing
+    /// `Location` names. It goes there unless the request already went to it
+    /// or it is ejected ([`Ejections::admits`]), else to an upstream it has
+    /// not tried ([`Gateway::untried_upstream`]), else back to `named`,
+    /// unless it is ejected or answered this request nothing
     /// ([`Chain::answered_nothing`]). `None` when there is nowhere to go.
     fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
+        let named = named.filter(|leader| self.ejections.admits(leader));
         match named {
             Some(leader) if !chain.tried.contains(&leader) => Some((leader, Lead::Leader)),
             named => self
@@ -1087,16 +1080,15 @@ impl Gateway {
 
     /// Where a request goes after a `NotHosted` redirect, whose `Location`
     /// names `named`, a host as the redirecting node's view has it. It goes
-    /// there only when the request has not tried it and [`Ejections::claim`]
-    /// admits it, else to an upstream it has not tried
-    /// ([`Gateway::untried_upstream`]), else to `named` all the same, as
-    /// selection falls back to an ejected upstream rather than none, unless
+    /// there only when the request has not tried it and it is not ejected
+    /// ([`Ejections::admits`]), else to an upstream it has not tried
+    /// ([`Gateway::untried_upstream`]), else to `named` all the same, unless
     /// `named` answered this request nothing ([`Chain::answered_nothing`]).
     /// `None` when there is nowhere to go.
     fn next_hinted_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
         if let Some(host) = &named
             && !chain.tried.contains(host)
-            && self.ejections.claim(host, Instant::now())
+            && self.ejections.admits(host)
         {
             return named.map(|host| (host, Lead::Hint));
         }
@@ -1164,9 +1156,8 @@ impl Gateway {
     }
 
     /// The next upstream after the hop under way, in the configured order and
-    /// around, that the request has not tried yet and that selection does
-    /// not skip (see `ejection`). One whose ejection window has expired becomes
-    /// this request's probe. Where the gateway looks for the leader after a
+    /// around, that the request has not tried yet and that is not ejected
+    /// (see `ejection`). Where the gateway looks for the leader after a
     /// redirect it cannot follow. Starting after the redirecting upstream
     /// spreads the search over the upstreams.
     fn untried_upstream(&self, chain: &Chain) -> Option<String> {
@@ -1175,13 +1166,12 @@ impl Gateway {
             .iter()
             .position(|upstream| *upstream == chain.target)
             .map_or(0, |at| at.saturating_add(1));
-        let now = Instant::now();
         upstreams
             .iter()
             .cycle()
             .skip(after)
             .take(upstreams.len())
-            .find(|upstream| !chain.tried.contains(upstream) && self.ejections.claim(upstream, now))
+            .find(|upstream| !chain.tried.contains(upstream) && self.ejections.admits(upstream))
             .cloned()
     }
 
@@ -1210,47 +1200,27 @@ impl Gateway {
             upstream: upstream.to_owned(),
             timeout,
         })?
-        .map_err(|source| {
-            let upstream = upstream.to_owned();
-            // `is_connect` holds only for a failure before the request was
-            // handed to a connection: in the connector (DNS, TCP or TLS
-            // setup, or the connect timeout) or in the pool checkout. So this
-            // attempt wrote nothing of the request. Any later failure, such
-            // as an upstream that read the request and closed the connection
-            // without answering, is another error. Inside one `send`, hyper
-            // retries only a request that a pooled connection gave back
-            // unwritten, and reqwest only one that an HTTP/2 peer refused
-            // unprocessed (`REFUSED_STREAM`, or a graceful `GOAWAY`).
-            match (source.is_connect(), hop) {
-                (true, Hop::First) => GatewayError::UpstreamUnreachable { upstream, source },
-                (true, Hop::Followed) => GatewayError::LeaderUnreachable { upstream, source },
-                (false, _) => GatewayError::Upstream { upstream, source },
-            }
-        })
+        .map_err(|source| GatewayError::of_transport(upstream, hop, source))
     }
 
     /// An upstream whose request failed loses its cached route, so the next
     /// request learns the current leader instead of failing on the same node.
-    /// One that failed at the transport (down or gone) also leaves selection
-    /// for a window, so that request does not pick it again at random (#454).
+    /// One that failed at the transport (down or gone) or sent no headers in
+    /// time also leaves selection until it answers again, so that requests
+    /// do not pick it again (#454). A failed probe (`probe`) comes here too,
+    /// with no route.
     fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
         }
-        if !error.ejects_upstream() {
-            return;
-        }
-        if let Failed::Ejected { window, failures } =
-            self.ejections.failed(upstream, Instant::now())
-        {
+        if error.ejects_upstream() && self.ejections.failed(upstream) {
             self.metrics
                 .upstream_ejections
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 upstream,
-                window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
-                failures,
-                "upstream failed at the transport or sent no headers in time; leaving it out of selection"
+                %error,
+                "upstream failed at the transport or sent no headers in time; leaving it out of selection until it answers"
             );
         }
     }
@@ -1434,7 +1404,7 @@ impl Gateway {
             leader_not_found: self.metrics.leader_not_found.load(Ordering::Relaxed),
             leader_cache_entries,
             upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
-            upstream_ejected: self.ejections.active(Instant::now()),
+            upstream_ejected: self.ejections.ejected(),
             refusal_drains: self.metrics.refusal_drains.load(Ordering::Relaxed),
             refusal_drains_cut: self.metrics.refusal_drains_cut.load(Ordering::Relaxed),
             refusal_drain_bytes: self.metrics.refusal_drain_bytes.load(Ordering::Relaxed),
@@ -2567,16 +2537,36 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    /// The failure of a `send` to `upstream` on `hop`.
+    ///
+    /// `is_connect` holds only for a failure before the request was handed
+    /// to a connection: in the connector (DNS, TCP or TLS setup, or the
+    /// connect timeout) or in the pool checkout. So this attempt wrote
+    /// nothing of the request. Any later failure, such as an upstream that
+    /// read the request and closed the connection without answering, is
+    /// another error. Inside one `send`, hyper retries only a request that a
+    /// pooled connection gave back unwritten, and reqwest only one that an
+    /// HTTP/2 peer refused unprocessed (`REFUSED_STREAM`, or a graceful
+    /// `GOAWAY`).
+    fn of_transport(upstream: &str, hop: Hop, source: reqwest::Error) -> Self {
+        let upstream = upstream.to_owned();
+        match (source.is_connect(), hop) {
+            (true, Hop::First) => Self::UpstreamUnreachable { upstream, source },
+            (true, Hop::Followed) => Self::LeaderUnreachable { upstream, source },
+            (false, _) => Self::Upstream { upstream, source },
+        }
+    }
+
     /// Whether the upstream failed at the transport, or answered nothing
     /// within the response header timeout, so selection should leave it out
-    /// for a while (#454). A leader that lost its quorum answers a write
-    /// within its leader lease, so a missing answer mostly marks a node that
-    /// does not answer at all, such as a stopped process. A live node can
-    /// still hold a request longer (a write waiting for its group's first
-    /// open, a read forwarded to an unreachable leader, a snapshot commit of
-    /// many parts), and is then left out for one window although it is
-    /// healthy: it comes back with its next answer, a redirect's included. A
-    /// request that could not be built never left the gateway.
+    /// until it answers again (#454). A leader that lost its quorum answers a
+    /// write within its leader lease, so a missing answer mostly marks a
+    /// node that does not answer at all, such as a stopped process. A live
+    /// node can still hold a request longer (a write waiting for its group's
+    /// first open, a read forwarded to an unreachable leader, a snapshot
+    /// commit of many parts), and is then left out although it is healthy,
+    /// until it answers its next probe, within a probe interval. A request
+    /// that could not be built never left the gateway.
     fn ejects_upstream(&self) -> bool {
         match self {
             Self::UpstreamUnreachable { .. }

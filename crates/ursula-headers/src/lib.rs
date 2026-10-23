@@ -21,7 +21,7 @@
 //!   stream that holds as many staged snapshot parts as it may (Sections
 //!   2.2 and 10);
 //! - the routing answers a node sends before it reads the body (Section
-//!   5.7);
+//!   5.7), and the liveness route the gateway probes;
 //! - the `412` of the incarnation precondition, the `409` of a closed
 //!   stream, and the `409` of a `Stream-Seq` conflict, which echoes the
 //!   stream's last one;
@@ -81,7 +81,8 @@
 //!   [`StagedPartsLimit`], the staged-parts limit a `429` applied, and
 //!   [`lowered_request_limit`], the request limit an intermediary forwards.
 //! - [`routing`]: [`RoutingAnswer`], the `307` or `503` of a node that does
-//!   not lead the stream's group.
+//!   not lead the stream's group, and [`routing::LIVENESS_PATH`], the node
+//!   route the gateway probes.
 //! - [`refusal`]: [`IncarnationMismatch`] (`412`) and
 //!   [`StreamClosedConflict`] and [`StreamSeqConflict`] (`409`).
 //! - [`error_body`]: [`ErrorBody`], the body of every error answer, and its
