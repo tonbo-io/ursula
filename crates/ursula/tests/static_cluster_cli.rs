@@ -10145,8 +10145,8 @@ impl ProducerLoad {
 ///    writes for as long as it cannot reach a quorum fails it. No peer
 ///    answers the cut-off node, so it reports a degraded probe, sheds for
 ///    cluster egress and stops campaigning: its terms hold for longer than
-///    an election timeout while the cut lasts, and after the heal the new
-///    leader still leads in its term.
+///    an election timeout while the cut lasts, it never holds a term above
+///    the new leader's, and after the heal it follows the group's leader.
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
@@ -10280,28 +10280,51 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     })
     .await;
     let holder_term = terms_of(holder).await[&group_id];
+    // The healed node meets the new leader with the term it kept through
+    // the cut. Its first append from the leader brings it to the leader's
+    // term only while that term is not below its own: a term above the
+    // leader's deposes the leader at the heal.
+    let cut_term = terms_of(leader).await[&group_id];
+    assert!(
+        cut_term <= holder_term,
+        "node {leader} holds term {cut_term} of group {group_id}, above its new leader's \
+         {holder_term}"
+    );
     let healed = tokio::time::Instant::now();
     relays.heal(&planes);
     let direct_writes = direct_load.stop().await;
     let gateway_writes = gateway_load.stop().await;
-    // The healed node takes the new leader's term at its first append, not
-    // the other way round. A few heartbeats after the heal, while the healed
-    // node still sheds (its gate clears after six clean ticks) and so takes
-    // no leadership from the balancer, the new leader still leads the group
-    // in its term.
-    tokio::time::sleep_until(healed.checked_add(Duration::from_secs(2)).unwrap()).await;
-    let after_heal = try_node_metrics(&client, &client_url(holder))
-        .await
-        .unwrap_or_else(|err| panic!("node {holder}'s metrics: {err}"))
-        .groups
-        .into_iter()
-        .find(|replica| replica.raft_group_id == group_id)
-        .unwrap_or_else(|| panic!("node {holder} runs no replica of group {group_id}"));
-    assert_eq!(
-        (after_heal.current_leader, after_heal.current_term),
-        (Some(holder), holder_term),
-        "group {group_id} changed its leader or term after the heal"
-    );
+    // The healed node still sheds after the heal (its gate clears after six
+    // clean ticks), so it neither campaigns nor takes a leadership from the
+    // balancer, and it follows a leader among the other nodes at that
+    // leader's term. The balancer may still move the group between the
+    // other two nodes, which raises the term too, so the check names
+    // neither the leader nor the term.
+    let replica_of = async |id: u64| {
+        try_node_metrics(&client, &client_url(id))
+            .await?
+            .groups
+            .into_iter()
+            .find(|replica| replica.raft_group_id == group_id)
+            .ok_or_else(|| format!("node {id} runs no replica of group {group_id}"))
+    };
+    let what = format!("node {leader} follows the group's leader after the heal");
+    eventually(&mut procs, &what, async || {
+        let healed_replica = replica_of(leader).await?;
+        let new_leader = live_leader(&client, &planes, &others, group_id).await?;
+        let leading = replica_of(new_leader).await?;
+        if healed_replica.current_leader == Some(new_leader)
+            && healed_replica.current_term == leading.current_term
+            && leading.current_term >= holder_term
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "node {leader}: {healed_replica:?}, node {new_leader}: {leading:?}"
+            ))
+        }
+    })
+    .await;
     for (writes, via) in [
         (&direct_writes, "the cut-off leader"),
         (&gateway_writes, "the gateway"),
