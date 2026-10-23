@@ -238,6 +238,14 @@ impl RollingRestartValidator {
                                         rejoin.status() == ursula_raft::RecoveryGateStatus::Stalled
                                     },
                                 ),
+                                leader_acknowledgement: self.registry.rejoin(node_id).map_or(
+                                    ursula_proto::admin::LeaderAcknowledgement::Acknowledged,
+                                    |rejoin| {
+                                        rejoin.leader_acknowledgement(ursula_raft::leads_live(
+                                            &metrics,
+                                        ))
+                                    },
+                                ),
                             },
                             last_log_index: last_log.map(|id| id.index),
                             last_log_term: last_log.map(|id| id.leader_id.term),

@@ -223,12 +223,18 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         group: RaftTarget,
         request: AppendEntriesRequest<C>,
     ) -> Result<AppendEntriesResponse<C>, GroupEngineError> {
+        // Contact counts before any screen: a leader whose appends this
+        // replica refuses still holds its readiness back.
+        let append = self
+            .recovery
+            .as_ref()
+            .and_then(|rejoin| rejoin.observe_leader_contact(&request));
         if let Some(floor) = self.check_recovery_vote(group, request.vote)? {
             return Ok(AppendEntriesResponse::HigherVote(floor));
         }
         let raft = self.owner().clone();
         let rejoin = self.recovery.clone();
-        raft.call(move |raft| async move {
+        let response = raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
                 // A recovery plan may have closed the replica since the
                 // check above: an entry it acknowledged now would be cut, or
@@ -254,7 +260,11 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         .await
         .map_err(crate::owner::owner_stopped)?
         .map_err(GroupEngineError::Infra)?
-        .map_err(crate::owner::owner_raft_error)
+        .map_err(crate::owner::owner_raft_error)?;
+        if let (Some(rejoin), Some(append)) = (&self.recovery, append) {
+            rejoin.observe_append_answer(append, &response);
+        }
+        Ok(response)
     }
 
     /// An inbound vote for `group`, through the node fence's hold and the
@@ -428,6 +438,11 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                 membership_joint: membership.get_joint_config().len() != 1,
                 membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
                 stopped_for_operator: recovery.is_some_and(|rejoin| rejoin.status().is_stalled()),
+                // A replica without a recovery gate runs only in tests.
+                leader_acknowledgement: recovery.map_or(
+                    ursula_proto::admin::LeaderAcknowledgement::Acknowledged,
+                    |rejoin| rejoin.leader_acknowledgement(crate::rejoin::leads_live(&metrics)),
+                ),
             },
             log,
             history: self

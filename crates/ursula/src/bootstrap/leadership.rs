@@ -22,10 +22,12 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ursula_control::Cluster;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_raft::meta::status::MetaStatusReader;
 use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::health_gate::LeadershipShed;
@@ -264,22 +266,28 @@ pub(crate) async fn handoff_shutdown_leadership(
     remaining_leaders()
 }
 
-/// Config-driven leadership balancer.
-pub fn spawn_leadership_balancer(
-    registry: &RaftGroupHandleRegistry,
-    participation: &PeerParticipation,
+/// Config-driven leadership balancer, `None` when its interval is zero.
+///
+/// It moves only leaderships the meta group's placement allows, and only
+/// while meta answers: a tick with handoffs to make confirms the view by a
+/// meta read barrier first and plans again from the confirmed view. While
+/// the meta group has no live quorum no barrier passes, so no leadership
+/// moves by the balancer's choice and the layout stays as meta left it.
+/// Raft failover, the safety fences and a stopping node's handoff do not
+/// wait for meta.
+pub(crate) fn spawn_leadership_balancer(
+    registry: RaftGroupHandleRegistry,
+    participation: PeerParticipation,
+    meta: MetaStatusReader,
     lb_cfg: &ursula_config::LeadershipBalanceConfig,
-) {
-    let interval_ms = lb_cfg.interval.as_duration().as_millis() as usize;
-    if interval_ms == 0 {
-        return;
+) -> Option<JoinHandle<()>> {
+    let interval = lb_cfg.interval.as_duration();
+    if interval.is_zero() {
+        return None;
     }
     let max_per_tick = lb_cfg.max_per_tick;
-    let registry = registry.clone();
-    let participation = participation.clone();
     let my_id = participation.node_id();
-    tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(5_000));
+    Some(tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             let view = registry.placement_watch().current();
@@ -292,11 +300,31 @@ pub fn spawn_leadership_balancer(
                 continue;
             }
             let stances = participation.campaign_stances(&registry).await;
+            let planned = balance_inputs(&snaps, my_id, cluster, &stances)
+                .map(|inputs| plan_leadership_balance(&inputs, max_per_tick))
+                .unwrap_or_default();
+            if planned.is_empty() {
+                continue;
+            }
+            let confirmed = match meta.confirm_view().await {
+                Ok(confirmed) => confirmed,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "leadership-balance: node {my_id} moves nothing while the meta group does \
+                         not confirm its view"
+                    );
+                    continue;
+                }
+            };
+            let Some(cluster) = confirmed.view().cluster() else {
+                continue;
+            };
+            let snaps = registry.metrics_snapshot();
             let Some(inputs) = balance_inputs(&snaps, my_id, cluster, &stances) else {
                 continue;
             };
-            let actions = plan_leadership_balance(&inputs, max_per_tick);
-            for action in actions {
+            for action in plan_leadership_balance(&inputs, max_per_tick) {
                 if let Err(err) =
                     registry.check_handoff(RaftGroupId(action.group_id), action.target)
                 {
@@ -325,7 +353,7 @@ pub fn spawn_leadership_balancer(
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]

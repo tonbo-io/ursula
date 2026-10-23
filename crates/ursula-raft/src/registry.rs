@@ -1561,6 +1561,8 @@ impl RaftGroupHandleRegistry {
                             membership_joint: false,
                             membership_log_index: None,
                             stopped_for_operator: false,
+                            leader_acknowledgement:
+                                ursula_proto::admin::LeaderAcknowledgement::Awaiting,
                         },
                         apply_failure: Some(stopped.failure()),
                         log,

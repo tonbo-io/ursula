@@ -94,10 +94,14 @@ The egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
 A degraded probe sheds the node only for a fault of its own
-(`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): a peer's
-participation answer reports a clean probe, or fewer peers answer than a
-quorum of each of its configs needs, so a node cut off from its peers stops
-campaigning, while a delay on every node's path sheds none. A node that hears
+(`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): the
+participation answer of a voter of a config the probe found short of a
+quorum reports a clean probe, or fewer peers answer than a quorum of each of
+its configs needs, so a node cut off from its peers stops campaigning, while
+a delay on every node's path sheds none. A peer whose probe is clean over
+other groups says nothing of the short config, so stopped voters, whose
+groups keep no quorum on any node, move no leadership of the groups that
+still have one. A node that hears
 a quorum of one config keeps campaigning, since its elections stop in every
 group at once. Too few answers
 shed on the first tick that sees them, so a cut-off node campaigns at most once
@@ -332,6 +336,23 @@ role is `voter` or `incoming`, whether it may campaign or not, and the
 commit-stall watchdog, which escapes a leader whose log stopped committing,
 takes any other voter, a leaving one included.
 
+A meta outage leaves the layout as meta left it. While the meta group has no
+live quorum no meta read barrier passes, and every voter change and every
+leadership move by choice waits for one. A leader's reconcile shell holds a
+confirmation for `CONFIRMATION_LIFETIME` from the start of its barrier
+(`crates/ursula-raft/src/rejoin/reconcile.rs`, the 3 s window in which a
+leader is live), so within it the shell stops adding voters, promoting
+learners and handing leaderships toward a target. Only leaving a joint
+configuration, which adds no voter, goes on. The balancer confirms the view
+before each tick's handoffs and plans them again from the confirmed view, so
+it moves nothing during the outage. The hosting driver starts a teardown or
+creates a group only from a confirmation less than one plan interval old, and
+the decommission driver and the removed-node sweep act through meta writes and
+barriers. What goes on without meta is what keeps the data groups available:
+Raft failover when a leader is gone, the disk lease, the egress gate's shed
+for a fault of the node's own egress, an isolated node's included, and a
+stopping node's handoff, one pod at a time.
+
 A replica that lost its vote history, such as one on a wiped disk, answers
 errors until a quorum without it proves a vote. Two such replicas of three
 therefore never heal on their own. If the leader is among the replicas that
@@ -515,16 +536,35 @@ move or by leaving a joint configuration),
 a move of the group in the view (`move_in_progress`, for every role, a
 replica that does not count as a voter included), `joint_membership`,
 `apply_lag`, `apply_stopped` or `move_stalled` on the leader of a stalled
-move. A voter missing from an incomplete voter set comes back only under a
+move. A replica that counts as a voter also reports
+`leader_not_acknowledged` until it acknowledges its group's leader in this
+run (`crates/ursula-raft/src/rejoin/acknowledge.rs`): it accepted an append
+that took its log to the leader's commit index, or it leads with a live
+quorum. A restarted replica may know its leader from its persisted vote
+before the leader counts it, and a node ready in that gap would let a roll
+stop the group's next voter while the group has no live quorum. The wait
+ends without an acknowledgement once no leader's append reached the replica
+within `LEADER_CONTACT_GRACE` (10 s) of its open, nor within the last 3 s
+(`no_leader_contact`): its group has no leader that could count it. The
+acknowledgement holds for the run, so a leader lost later on other nodes
+never takes the node out of service. Each group's metrics carry it as
+`maintenance.leader_acknowledgement`. A voter missing from an incomplete voter set comes back only under a
 moving target that holds it, since the leader of a moving group adds every
 target voter its membership lacks as a learner. A node with no group is
 ready. `GET /__ursula/ready` uses
-`serving_ready()`, which ignores incomplete voter sets, members and replicas
-without a role, moves, joint membership, stopped apply and a stalled move, so
-healthy survivors keep serving while a peer catches up. Maintenance tooling
-uses `ready()`, which ignores only a meta group without a leader, a damaged
-meta replica and a removal, so a second disruption waits for full
-redundancy. The readiness body includes the full report.
+`serving_ready()`, which reads only the node's own state. It ignores
+incomplete voter sets, members and replicas without a role, moves, joint
+membership, stopped apply and a stalled move, so healthy survivors keep
+serving while a peer catches up. It also ignores what a group's quorum on
+other nodes decides: `leader_unknown`, `leader_outside_voters` and
+`membership_uncommitted` (an effective membership entry above the replica's
+commit index). A meta outage, or a group whose quorum is lost on other
+nodes, therefore never makes a node unready, and Kubernetes never replaces
+healthy pods for a remote fault. Maintenance tooling uses `ready()`, which
+ignores only a meta group without a leader, a damaged meta replica and a
+removal, so a second disruption waits for full redundancy. `ursulactl
+wait-ready` also reads every node's `GET /__ursula/ready`, so it waits for
+the same acknowledgements. The readiness body includes the full report.
 
 ## 4. Kubernetes integration
 

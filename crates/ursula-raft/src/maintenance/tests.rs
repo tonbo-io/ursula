@@ -17,6 +17,7 @@ use ursula_control::MetaRole;
 use ursula_control::PlacementStatus;
 use ursula_control::RegistrationStatus;
 use ursula_control::samples;
+use ursula_proto::admin::LeaderAcknowledgement;
 use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::MembershipAnswer;
@@ -85,6 +86,7 @@ fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
             membership_joint: false,
             membership_log_index: Some(10),
             stopped_for_operator: false,
+            leader_acknowledgement: LeaderAcknowledgement::Acknowledged,
         },
         log: Default::default(),
         history: None,
@@ -373,9 +375,9 @@ fn damaged_meta_keeps_only_the_voter_checks() {
     assert_eq!(report.node_issues, vec![Issue::MetaDamaged]);
     assert!(report.group_issues.is_empty(), "{report:?}");
     // The voter checks stay.
-    node.groups[0].current_leader = None;
+    node.groups[0].maintenance.leader_acknowledgement = LeaderAcknowledgement::Awaiting;
     let report = node.report();
-    assert_eq!(report.group_issues[&0], vec![Issue::LeaderUnknown]);
+    assert_eq!(report.group_issues[&0], vec![Issue::LeaderNotAcknowledged]);
     assert!(!report.serving_ready());
 }
 
@@ -769,13 +771,56 @@ fn a_new_ready_process_cannot_replace_a_voter_before_promotion_is_applied() {
     group.voter_configurations = vec![BTreeSet::from([1, 2, 3])];
     group.learner_ids.clear();
     group.maintenance.membership_log_index = Some(21);
-    assert!(node.report().group_issues[&1].contains(&Issue::MembershipNotApplied));
-    node.groups[1].last_applied = Some(RaftLogProgressSnapshot {
+    assert!(node.report().group_issues[&1].contains(&Issue::MembershipUncommitted));
+    assert!(!node.report().ready());
+    let entry = RaftLogProgressSnapshot {
         term: 1,
         index: 21,
         node_id: 1,
-    });
+    };
+    node.groups[1].committed = Some(entry);
+    assert!(node.report().group_issues[&1].contains(&Issue::MembershipNotApplied));
+    node.groups[1].last_applied = Some(entry);
     assert!(node.report().ready());
+}
+
+/// Serving readiness reads only this node's own state. A group whose leader
+/// or quorum is gone on other nodes, or whose newest membership entry its
+/// quorum has not committed, keeps the node serving and holds maintenance. A
+/// replica that has not acknowledged its leader since it opened holds the
+/// node unready, until it acknowledges or no leader contacts it within the
+/// grace.
+#[test]
+fn only_this_nodes_own_state_holds_serving_readiness() {
+    let mut node = Node::three();
+    node.groups[1].current_leader = None;
+    let report = node.report();
+    assert_eq!(report.group_issues[&1], vec![Issue::LeaderUnknown]);
+    assert!(report.serving_ready() && !report.ready(), "{report:?}");
+    node.groups[1].current_leader = Some(4);
+    let report = node.report();
+    assert_eq!(report.group_issues[&1], vec![Issue::LeaderOutsideVoters]);
+    assert!(report.serving_ready() && !report.ready(), "{report:?}");
+    node.groups[1].current_leader = Some(2);
+    node.groups[1].maintenance.membership_log_index = Some(21);
+    let report = node.report();
+    assert_eq!(report.group_issues[&1], vec![Issue::MembershipUncommitted]);
+    assert!(report.serving_ready() && !report.ready(), "{report:?}");
+    node.groups[1].maintenance.membership_log_index = Some(10);
+    for (acknowledgement, serves) in [
+        (LeaderAcknowledgement::Awaiting, false),
+        (LeaderAcknowledgement::NoLeaderContact, true),
+        (LeaderAcknowledgement::Acknowledged, true),
+    ] {
+        node.groups[1].maintenance.leader_acknowledgement = acknowledgement;
+        let report = node.report();
+        assert_eq!(report.serving_ready(), serves, "{report:?}");
+        assert_eq!(report.ready(), serves, "{report:?}");
+    }
+    // A replica that does not count as a voter is not waited for.
+    node.groups[1].maintenance.leader_acknowledgement = LeaderAcknowledgement::Awaiting;
+    node.not_voters.insert(1);
+    assert!(node.report().serving_ready());
 }
 
 #[test]

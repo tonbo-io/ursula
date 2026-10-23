@@ -383,6 +383,7 @@ mod tests {
             membership_joint: false,
             membership_log_index: Some(0),
             stopped_for_operator: false,
+            leader_acknowledgement: ursula_proto::admin::LeaderAcknowledgement::Acknowledged,
         };
         assert!(plan_drain(&snapshot, 1).is_empty());
         snapshot.per_node[1].groups[0].maintenance.recovery_ready = true;

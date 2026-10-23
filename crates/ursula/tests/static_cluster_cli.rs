@@ -4152,6 +4152,12 @@ impl Processes {
         sigterm_and_wait_for_clean_exit(&mut child).await;
     }
 
+    /// [`Self::stop`], waiting up to `budget` for the exit.
+    async fn stop_within(&mut self, id: u64, budget: Duration) {
+        let mut child = self.0.remove(&id).expect("the node runs");
+        sigterm_and_wait_for_clean_exit_within(&mut child, budget).await;
+    }
+
     /// Kills node `id`: it hands nothing off.
     fn kill(&mut self, id: u64) {
         drop(self.0.remove(&id).expect("the node runs"));
@@ -5141,6 +5147,293 @@ async fn cli_five_nodes_keep_their_placement_across_a_full_restart_and_serve_wit
         b"before-the-restart;while-meta-is-down;after-node-4-restarted;",
     )
     .await;
+}
+
+/// How long a meta outage test watches the layout stay as it is: longer
+/// than two ticks of the leadership balancer (5 s by default).
+const STATIC_LAYOUT_WINDOW: Duration = Duration::from_secs(12);
+
+/// The leader and term each live node's replica reports for each of
+/// `groups`, by node and group.
+async fn replica_leaders(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[&MetaNode],
+    groups: &BTreeSet<u64>,
+) -> BTreeMap<(u64, u64), (Option<u64>, u64)> {
+    let mut seen = BTreeMap::new();
+    for node in nodes {
+        let what = format!("node {} answers its metrics", node.id);
+        let metrics = eventually(procs, &what, async || {
+            try_node_metrics(client, &node.url()).await
+        })
+        .await;
+        for group in metrics.groups {
+            if groups.contains(&group.raft_group_id) {
+                seen.insert(
+                    (node.id, group.raft_group_id),
+                    (group.current_leader, group.current_term),
+                );
+            }
+        }
+    }
+    seen
+}
+
+/// Polls for [`STATIC_LAYOUT_WINDOW`] that every node of `nodes` answers
+/// `/__ursula/ready` with `200` and that each of `groups` keeps the
+/// leader and term every replica reported at the start, `leaders`.
+async fn assert_layout_static(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[&MetaNode],
+    groups: &BTreeSet<u64>,
+    leaders: &BTreeMap<(u64, u64), (Option<u64>, u64)>,
+) {
+    let deadline = std::time::Instant::now()
+        .checked_add(STATIC_LAYOUT_WINDOW)
+        .unwrap();
+    while std::time::Instant::now() < deadline {
+        if let Some(report) = procs.exited() {
+            panic!("a node exited during the meta outage:\n{report}");
+        }
+        for node in nodes {
+            let (status, ready) = readiness(client, node)
+                .await
+                .unwrap_or_else(|err| panic!("node {}'s readiness: {err}", node.id));
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "node {} turned unready during the meta outage: {ready:?}",
+                node.id
+            );
+        }
+        let now = replica_leaders(client, procs, nodes, groups).await;
+        assert_eq!(
+            &now, leaders,
+            "a leadership moved while the meta group had no quorum"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// A meta outage leaves the layout static, and readiness reads only a
+/// node's own state. Five nodes at replication factor 3 with meta voters 1
+/// to 3.
+///
+/// 1. Meta voters 2 and 3 are frozen (`SIGSTOP`), so the meta group and
+///    every group with two voters among them have no quorum. The groups
+///    with a live quorum elect leaders on nodes 1, 4 and 5, and those
+///    three nodes stay ready. For longer than two balancer ticks no
+///    leadership of those groups moves and no term changes: the balancer
+///    moves nothing without a meta read barrier.
+/// 2. A live node that is a voter of a group with a quorum and of one
+///    without restarts (`SIGTERM`, the normal handoff) while writes reach
+///    the group with a quorum. It turns ready only once its replica of
+///    that group holds what the group committed meanwhile and acknowledges
+///    its leader, and its replica of the group without a leader waits only
+///    the contact grace. No leadership moves to it, nor anywhere else, for
+///    longer than two balancer ticks.
+/// 3. Nodes 2 and 3 resume, and `ursulactl wait-ready` passes.
+///
+/// A node that turns unready because a group's quorum is lost on other
+/// nodes, a balancer that moves leaderships without meta, or a restarted
+/// node that turns ready before its replicas acknowledge their leaders
+/// fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_meta_outage_keeps_the_layout_and_readiness_reads_only_the_node() {
+    use ursula_proto::admin::LeaderAcknowledgement;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&formed[0]).expect("settled").clone();
+    let streams = stream_per_group("outage");
+    let url = |node: &MetaNode, stream: &str| format!("{}/outage/{stream}", node.url());
+    for stream in &streams {
+        put_until_created(&client, &url(&nodes[0], stream)).await;
+        post_until_no_content(&client, &url(&nodes[0], stream), "before-the-outage;").await;
+    }
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
+
+    // The groups that keep a quorum on nodes 1, 4 and 5, and the ones that
+    // lose it with nodes 2 and 3.
+    let frozen = BTreeSet::from([2, 3]);
+    let voters: BTreeMap<u64, BTreeSet<u64>> = current_voters(&cluster)
+        .into_iter()
+        .map(|(group, voters)| (u64::from(group.0), voters))
+        .collect();
+    let live_voters =
+        |voters: &BTreeSet<u64>, down: &BTreeSet<u64>| voters.difference(down).count();
+    let (with_quorum, without_quorum): (BTreeSet<u64>, BTreeSet<u64>) = voters
+        .keys()
+        .copied()
+        .partition(|group| live_voters(&voters[group], &frozen) >= 2);
+    assert!(
+        !with_quorum.is_empty() && !without_quorum.is_empty(),
+        "the seed placement {voters:?} gives groups of both kinds"
+    );
+    // A live node whose restart leaves every group with a quorum one, and
+    // that is a voter of a group of each kind.
+    let restarted = [1, 4, 5]
+        .into_iter()
+        .find(|node| {
+            let down = frozen.iter().copied().chain([*node]).collect();
+            with_quorum
+                .iter()
+                .all(|group| live_voters(&voters[group], &down) >= 2)
+                && with_quorum.iter().any(|group| voters[group].contains(node))
+                && without_quorum
+                    .iter()
+                    .any(|group| voters[group].contains(node))
+        })
+        .unwrap_or_else(|| panic!("no live node to restart in {voters:?}"));
+    let live: Vec<&MetaNode> = nodes
+        .iter()
+        .filter(|node| !frozen.contains(&node.id))
+        .collect();
+
+    // 1. Two of the three meta voters freeze.
+    for id in &frozen {
+        procs.signal(*id, "-STOP");
+    }
+    eventually(
+        &mut procs,
+        "every group with a quorum has a live leader and nodes 1, 4 and 5 are ready",
+        async || {
+            for node in &live {
+                let (status, ready) = readiness(&client, node).await?;
+                if status != reqwest::StatusCode::OK {
+                    return Err(format!("node {}: {status} {ready:?}", node.id));
+                }
+            }
+            let mut led = BTreeSet::new();
+            for node in &live {
+                for group in try_node_metrics(&client, &node.url()).await?.groups {
+                    if group.current_leader == Some(node.id) && group.leads_live {
+                        led.insert(group.raft_group_id);
+                    }
+                }
+            }
+            if !with_quorum.is_subset(&led) {
+                return Err(format!(
+                    "live leaders of {led:?}, not of all {with_quorum:?}"
+                ));
+            }
+            Ok(())
+        },
+    )
+    .await;
+    let leaders = replica_leaders(&client, &mut procs, &live, &with_quorum).await;
+    assert_layout_static(&client, &mut procs, &live, &with_quorum, &leaders).await;
+
+    // 2. A live node restarts during the outage while the groups with a
+    // quorum take writes.
+    // Its shutdown hands off what it can within the handoff grace, steps
+    // down from the rest and drains connections that the frozen peers never
+    // close for up to the drain bound, all within the 20 s shutdown grace.
+    procs.stop_within(restarted, Duration::from_secs(25)).await;
+    let others: Vec<&MetaNode> = live
+        .iter()
+        .copied()
+        .filter(|node| node.id != restarted)
+        .collect();
+    let mut committed: BTreeMap<u64, u64> = BTreeMap::new();
+    for group in &with_quorum {
+        let stream = &streams[usize::try_from(*group).unwrap()];
+        post_until_no_content(&client, &url(others[0], stream), "while-a-node-is-down;").await;
+    }
+    for node in &others {
+        let metrics = node_metrics(&client, &node.url()).await;
+        for group in metrics.groups {
+            if with_quorum.contains(&group.raft_group_id)
+                && let Some(index) = group.committed_index
+            {
+                let known = committed.entry(group.raft_group_id).or_default();
+                *known = (*known).max(index);
+            }
+        }
+    }
+    let node = node_of(&nodes, restarted);
+    procs.start(binary, node);
+    let first_ready = eventually(
+        &mut procs,
+        &format!("node {restarted} turns ready during the meta outage"),
+        async || {
+            let (status, ready) = readiness(&client, node).await?;
+            if status != reqwest::StatusCode::OK {
+                return Err(format!("{status} {ready:?}"));
+            }
+            try_node_metrics(&client, &node.url()).await
+        },
+    )
+    .await;
+    for group in &first_ready.groups {
+        let id = group.raft_group_id;
+        if !voters[&id].contains(&restarted) {
+            continue;
+        }
+        let acknowledgement = group.maintenance.leader_acknowledgement;
+        if with_quorum.contains(&id) {
+            assert_eq!(
+                acknowledgement,
+                LeaderAcknowledgement::Acknowledged,
+                "node {restarted} turned ready before its replica of group {id} acknowledged \
+                 its leader: {group:?}"
+            );
+            assert!(
+                group.last_log_index >= committed.get(&id).copied(),
+                "node {restarted} turned ready before its replica of group {id} held what the \
+                 group committed while it was down ({:?}): {group:?}",
+                committed.get(&id)
+            );
+        } else {
+            assert_eq!(
+                acknowledgement,
+                LeaderAcknowledgement::NoLeaderContact,
+                "group {id} has no leader to acknowledge: {group:?}"
+            );
+        }
+    }
+    let leaders = replica_leaders(&client, &mut procs, &live, &with_quorum).await;
+    assert!(
+        leaders
+            .values()
+            .all(|(leader, _term)| *leader != Some(restarted)),
+        "a leadership moved to the restarted node: {leaders:?}"
+    );
+    assert_layout_static(&client, &mut procs, &live, &with_quorum, &leaders).await;
+
+    // 3. The meta voters resume, and the cluster is ready again.
+    for id in &frozen {
+        procs.signal(*id, "-CONT");
+    }
+    let manifest = ctl_manifest(&nodes, &[]);
+    ursula_ctl::wait_ready(
+        &ctl_client(),
+        &manifest,
+        META_WAIT,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("the cluster is ready once meta has its quorum again");
 }
 
 /// Integration 7's single-node part (#768, design 12.1): a durable single
@@ -10537,15 +10830,18 @@ async fn leaders_committed(client: &reqwest::Client, nodes: &[MetaNode]) -> BTre
 }
 
 async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
+    sigterm_and_wait_for_clean_exit_within(child, Duration::from_secs(10)).await;
+}
+
+/// [`sigterm_and_wait_for_clean_exit`], failing after `budget`.
+async fn sigterm_and_wait_for_clean_exit_within(child: &mut ChildGuard, budget: Duration) {
     let status = Command::new("kill")
         .arg("-TERM")
         .arg(child.child.id().to_string())
         .status()
         .expect("send SIGTERM");
     assert!(status.success());
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(10))
-        .unwrap();
+    let deadline = std::time::Instant::now().checked_add(budget).unwrap();
     loop {
         if let Some(status) = child.child.try_wait().expect("poll child") {
             assert!(

@@ -27,7 +27,6 @@ use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
 use crate::bootstrap::egress;
 use crate::bootstrap::hosting::SpawnedHosting;
-use crate::bootstrap::leadership;
 use crate::bootstrap::meta;
 use crate::bootstrap::meta::SpawnedMeta;
 use crate::bootstrap::participation::ParticipationGates;
@@ -320,11 +319,6 @@ fn spawn_raft_node(
         cadence,
         Some(raft_wal.maintenance()),
         config.raft.snapshot_pressure_max_groups_per_tick,
-    );
-    leadership::spawn_leadership_balancer(
-        &registry,
-        &participation,
-        &config.governance.leadership_balance,
     );
     egress::spawn_egress_gate(&registry, &participation, &config.governance.cluster_probe);
     commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
