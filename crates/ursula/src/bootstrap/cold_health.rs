@@ -8,6 +8,7 @@ use crate::bootstrap::health_gate::CounterGrowth;
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::participation::PeerParticipation;
@@ -148,6 +149,7 @@ pub fn spawn_cold_health_gate(
             LeadershipShedReason::ColdHealth,
             node_id,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         loop {
             tokio::time::sleep(interval).await;

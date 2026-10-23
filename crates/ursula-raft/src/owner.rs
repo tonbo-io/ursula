@@ -217,6 +217,15 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
                             );
                             wait = retry;
                         }
+                        Ok(StepDown::LogAdvanced) => {
+                            tracing::debug!(
+                                target,
+                                %vote,
+                                "step-down from a stalled leadership transfer refused for an \
+                                 append after it read the log; retrying"
+                            );
+                            wait = retry;
+                        }
                         Err(StepDownError::Campaign(error)) => {
                             tracing::warn!(
                                 %error,
@@ -246,27 +255,32 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     }
 
     /// Steps this replica down from the leadership it holds, without
-    /// campaigning ([`step_down`]), to the lowest other voter of its
-    /// membership: the vote it grants itself names that voter, which still
-    /// has to win its own election. `None` when the replica does not lead,
-    /// or is its group's only voter, which no other voter could take over
-    /// from.
+    /// campaigning ([`step_down`]). The vote it grants itself names the
+    /// voter that matched the most of its log ([`step_down_target`]), which
+    /// still has to win its own election. An append that lands between the
+    /// step-down reading the last log id and its vote gets the vote refused
+    /// ([`StepDownVote::LogAdvanced`]), so it votes again, up to
+    /// [`STEP_DOWN_ATTEMPTS`] times, until the vote is granted or the
+    /// leadership moves. `None` when the replica does not lead, or is its
+    /// group's only voter, which no other voter could take over from.
     pub(crate) async fn step_down_leadership(&self) -> Option<Result<StepDownVote, StepDownError>> {
-        let metrics = self.metrics.borrow_watched().clone();
-        if metrics.current_leader != Some(metrics.id) {
-            return None;
-        }
-        let target = metrics
-            .membership_config
-            .voter_ids()
-            .find(|voter| *voter != metrics.id)?;
-        let vote = metrics.vote;
-        Some(
-            self.call(move |raft| async move { step_down(&raft, vote, target).await })
-                .await
-                .map_err(|stopped| StepDownError::Vote(RaftError::Fatal(stopped)))
-                .and_then(|stepped| stepped),
-        )
+        self.call(move |raft| async move {
+            let mut attempts = 0_usize;
+            loop {
+                let metrics = raft.metrics().borrow_watched().clone();
+                if metrics.current_leader != Some(metrics.id) {
+                    return None;
+                }
+                let target = step_down_target(&metrics)?;
+                attempts = attempts.saturating_add(1);
+                match step_down(&raft, metrics.vote, target).await {
+                    Ok(StepDownVote::LogAdvanced) if attempts < STEP_DOWN_ATTEMPTS => {}
+                    outcome => return Some(outcome),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|stopped| Some(Err(StepDownError::Vote(RaftError::Fatal(stopped)))))
     }
 
     /// Starts a new term with this leader's own campaign. It steps down
@@ -488,6 +502,30 @@ pub(crate) fn transfer_step_down(
     request
 }
 
+/// How often [`OwnerRaftHandle::step_down_leadership`] votes when an append
+/// keeps landing between its read of the last log id and its vote.
+const STEP_DOWN_ATTEMPTS: usize = 8;
+
+/// The voter a leader steps down to: the other voter that matched the most
+/// of its log, the lowest id among equals, so the vote names the voter most
+/// likely to win the next election. `None` for a group whose only voter is
+/// this node.
+fn step_down_target(metrics: &RaftMetrics<C>) -> Option<u64> {
+    let matched = |voter: u64| {
+        metrics
+            .replication
+            .as_ref()
+            .and_then(|replication| replication.get(&voter))
+            .and_then(|matched| matched.as_ref())
+            .map(|log_id| log_id.index())
+    };
+    metrics
+        .membership_config
+        .voter_ids()
+        .filter(|voter| *voter != metrics.id)
+        .max_by_key(|voter| (matched(*voter), std::cmp::Reverse(*voter)))
+}
+
 /// How a leader's [`step_down_and_campaign`] ended.
 #[derive(Debug)]
 pub enum StepDown {
@@ -497,6 +535,10 @@ pub enum StepDown {
     /// The node already holds a vote above the step-down vote: the
     /// leadership moved on without this step-down.
     Refused { by: UrsulaVote },
+    /// The leader refused the step-down vote by its own vote: it appended
+    /// an entry after the step-down read its last log id
+    /// ([`StepDownVote::LogAdvanced`]).
+    LogAdvanced,
 }
 
 /// How a leader's [`step_down`] vote went.
@@ -508,6 +550,11 @@ pub(crate) enum StepDownVote {
     /// The node already holds a vote above the step-down vote: the
     /// leadership moved on without this step-down.
     Refused { by: UrsulaVote },
+    /// The node still holds the vote the step-down was made from and
+    /// refused it for its log: the leader appended an entry after the
+    /// step-down read its last log id, and OpenRaft refuses a vote whose
+    /// last log id is below its own. It still leads.
+    LogAdvanced,
 }
 
 /// Why a leader's step-down ([`step_down`], [`step_down_and_campaign`]) did
@@ -537,17 +584,25 @@ pub(crate) async fn step_down<SM: RaftStateMachine<C>>(
     if raft.metrics().borrow_watched().id == target {
         return Err(StepDownError::TargetIsSelf { target });
     }
-    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+    // Read in the Raft core, so only the appends queued between this read
+    // and the vote can move the last log id past it.
+    let last_log_id = raft
+        .with_raft_state(|state| state.log_ids.last().cloned())
+        .await
+        .map_err(|stopped| StepDownError::Vote(RaftError::Fatal(stopped)))?;
     let stepped_down = raft
         .vote(transfer_step_down(vote, target, last_log_id))
         .await
         .map_err(StepDownError::Vote)?;
-    if !stepped_down.vote_granted {
-        return Ok(StepDownVote::Refused {
+    if stepped_down.vote_granted {
+        Ok(StepDownVote::Granted)
+    } else if stepped_down.vote == vote {
+        Ok(StepDownVote::LogAdvanced)
+    } else {
+        Ok(StepDownVote::Refused {
             by: stepped_down.vote,
-        });
+        })
     }
-    Ok(StepDownVote::Granted)
 }
 
 /// Steps the leader at `vote` down to `target`, then campaigns.
@@ -559,8 +614,10 @@ pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
     vote: UrsulaVote,
     target: u64,
 ) -> Result<StepDown, StepDownError> {
-    if let StepDownVote::Refused { by } = step_down(raft, vote, target).await? {
-        return Ok(StepDown::Refused { by });
+    match step_down(raft, vote, target).await? {
+        StepDownVote::Granted => {}
+        StepDownVote::Refused { by } => return Ok(StepDown::Refused { by }),
+        StepDownVote::LogAdvanced => return Ok(StepDown::LogAdvanced),
     }
     raft.trigger()
         .elect(false)

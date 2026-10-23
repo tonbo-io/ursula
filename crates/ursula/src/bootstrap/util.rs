@@ -29,7 +29,7 @@ pub(crate) fn handoff_targets(
     snap: &ursula_raft::RaftGroupMetricsSnapshot,
     me: u64,
     cluster: Option<&Cluster>,
-    admits: impl Fn(u64) -> bool,
+    mut admits: impl FnMut(u64) -> bool,
 ) -> Vec<u64> {
     let group = RaftGroupId(snap.raft_group_id);
     snap.voter_ids
@@ -52,7 +52,7 @@ pub(crate) fn prioritized_transfer_targets(
     snap: &ursula_raft::RaftGroupMetricsSnapshot,
     me: u64,
     cluster: Option<&Cluster>,
-    admits: impl Fn(u64) -> bool,
+    admits: impl FnMut(u64) -> bool,
     leader_count: &HashMap<u64, usize>,
 ) -> Vec<u64> {
     let mut targets = handoff_targets(snap, me, cluster, admits);

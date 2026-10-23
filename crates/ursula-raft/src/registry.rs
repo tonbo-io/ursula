@@ -732,47 +732,62 @@ impl RaftGroupHandleRegistry {
     /// once their election timeout passes. A shutdown calls it when its
     /// handoff ends: a node about to stop must not keep leaderships its
     /// peers would go on following while it drains its listeners. A group
-    /// whose only voter is this node keeps its leader. Answers how many
-    /// leaderships it stepped down from.
-    pub async fn step_down_leaderships(&self) -> usize {
+    /// whose only voter is this node keeps its leader.
+    ///
+    /// `bound` bounds each group's step-down: OpenRaft answers a vote only
+    /// once it is flushed, behind every queued log write, so a frozen WAL
+    /// disk would hold it forever. Answers the groups it stepped down from;
+    /// each one it could not step down from is logged with the reason.
+    pub async fn step_down_leaderships(&self, bound: std::time::Duration) -> Vec<RaftTarget> {
         let groups = self.groups.load();
-        let data =
-            groups
-                .iter()
-                .filter_map(|(id, entry)| {
-                    Some((RaftTarget::Data(RaftGroupId(*id)), entry.active()?))
-                })
-                .map(|(target, active)| async move {
-                    (target, active.raft().step_down_leadership().await)
-                })
-                .map(futures_util::FutureExt::boxed);
+        let data = groups
+            .iter()
+            .filter_map(|(id, entry)| Some((RaftTarget::Data(RaftGroupId(*id)), entry.active()?)))
+            .map(|(target, active)| async move {
+                let outcome =
+                    crate::rt::time::timeout(bound, active.raft().step_down_leadership()).await;
+                (target, outcome)
+            })
+            .map(futures_util::FutureExt::boxed);
         let meta = self.meta().map(|meta| {
             futures_util::FutureExt::boxed(async move {
-                (
-                    RaftTarget::Meta,
-                    meta.core.owner().step_down_leadership().await,
-                )
+                let outcome =
+                    crate::rt::time::timeout(bound, meta.core.owner().step_down_leadership()).await;
+                (RaftTarget::Meta, outcome)
             })
         });
         let outcomes = futures_util::future::join_all(data.chain(meta)).await;
-        let mut stepped_down = 0_usize;
+        let mut stepped_down = Vec::new();
         for (target, outcome) in outcomes {
+            let plane = target.plane().as_str_name();
+            let raft_group_id = target.wire_group_id();
             match outcome {
-                None => {}
-                Some(Ok(crate::owner::StepDownVote::Granted)) => {
-                    stepped_down = stepped_down.saturating_add(1);
-                }
-                Some(Ok(crate::owner::StepDownVote::Refused { by })) => tracing::debug!(
-                    plane = target.plane().as_str_name(),
-                    raft_group_id = target.wire_group_id(),
+                Ok(None) => {}
+                Ok(Some(Ok(crate::owner::StepDownVote::Granted))) => stepped_down.push(target),
+                Ok(Some(Ok(crate::owner::StepDownVote::Refused { by }))) => tracing::debug!(
+                    plane,
+                    raft_group_id,
                     refused_by = %by,
                     "step-down: the leadership moved on already"
                 ),
-                Some(Err(error)) => tracing::warn!(
-                    plane = target.plane().as_str_name(),
-                    raft_group_id = target.wire_group_id(),
+                Ok(Some(Ok(crate::owner::StepDownVote::LogAdvanced))) => tracing::warn!(
+                    plane,
+                    raft_group_id,
+                    "step-down: appends kept landing between the step-down's read of the log \
+                     and its vote; this node still leads the group"
+                ),
+                Ok(Some(Err(error))) => tracing::warn!(
+                    plane,
+                    raft_group_id,
                     %error,
                     "step-down: could not step down from a leadership"
+                ),
+                Err(_elapsed) => tracing::warn!(
+                    plane,
+                    raft_group_id,
+                    ?bound,
+                    "step-down: the step-down vote was not answered in time; this node may \
+                     still lead the group"
                 ),
             }
         }

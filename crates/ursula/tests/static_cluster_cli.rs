@@ -3984,9 +3984,10 @@ async fn cli_sigterm_steps_down_from_leaderships_it_could_not_hand_off() {
             .await
             .expect("undrain a peer");
     }
-    // Two election timeouts at most (3 s each), well inside the 10 s
-    // listener drain the live read holds open.
-    let elected_by = gave_up.checked_add(Duration::from_secs(6)).unwrap();
+    // An election timeout (1.5 to 3 s), a second election round and the
+    // undrain round trip, inside the 10 s listener drain the live read holds
+    // open, after which the stopping node's Raft stops anyway.
+    let elected_by = gave_up.checked_add(Duration::from_secs(8)).unwrap();
     loop {
         let snapshot = ctl.fetch_cluster(&peers_left).await.expect("fetch peers");
         let moved = led.iter().all(|group_id| {
@@ -4014,6 +4015,10 @@ async fn cli_sigterm_steps_down_from_leaderships_it_could_not_hand_off() {
     );
     assert!(
         log.contains("no peer can take over these leaderships now"),
+        "{log}"
+    );
+    assert!(
+        log.contains("these leaderships were not handed off"),
         "{log}"
     );
     let mut outgoing_child = children.remove(index);

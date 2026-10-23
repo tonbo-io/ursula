@@ -61,6 +61,11 @@ pub(crate) struct CampaignStances {
 }
 
 impl CampaignStances {
+    /// Each node's stance: this node's and every peer's it asked.
+    pub(crate) fn by_node(&self) -> &BTreeMap<u64, CampaignStance> {
+        &self.by_node
+    }
+
     /// The nodes known to be allowed to campaign.
     pub(crate) fn may_campaign(&self) -> HashSet<u64> {
         self.nodes(|stance| stance == CampaignStance::MayCampaign)

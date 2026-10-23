@@ -390,6 +390,11 @@ async fn notified(shutdown: Arc<Notify>) {
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// Leave most of the overall grace period for draining HTTP requests.
 const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
+/// Bound on stepping down from the leaderships the handoff did not move.
+/// OpenRaft answers the step-down vote only once it is flushed, behind every
+/// queued log write, so a frozen WAL disk would hold it until the forced
+/// exit and the listener drain would never start.
+const SHUTDOWN_STEP_DOWN_GRACE: Duration = Duration::from_secs(2);
 /// Bound on the listener drain, so stopping the groups and closing the WAL
 /// keep what is left of [`SHUTDOWN_GRACE`]. A connection from a peer that lost
 /// power never closes, even after transport shutdown ends its inbound append
@@ -401,11 +406,10 @@ const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// into a bounded leadership handoff followed by listener draining, after
 /// which `serve` stops the Raft groups and shuts the WAL down cleanly. A
 /// leadership the handoff did not move within [`SHUTDOWN_HANDOFF_GRACE`] is
-/// stepped down from before the drain, so the node leads nothing while its
-/// listeners close. A
-/// second signal, or the overall grace deadline expiring, exits immediately
-/// without recording a clean shutdown, so the next start treats the run as a
-/// crash.
+/// stepped down from before the drain, within [`SHUTDOWN_STEP_DOWN_GRACE`],
+/// so the node leads nothing while its listeners close. A second signal, or
+/// the overall grace deadline expiring, exits immediately without recording
+/// a clean shutdown, so the next start treats the run as a crash.
 fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
@@ -419,22 +423,22 @@ fn spawn_shutdown_signal_task(
         tokio::select! {
             () = async {
                 if let Some(registry) = raft_registry {
-                    let result = tokio::time::timeout(
+                    let remaining_leaders = crate::bootstrap::handoff_shutdown_leadership(
+                        &registry,
+                        node_id,
                         SHUTDOWN_HANDOFF_GRACE,
-                        crate::bootstrap::handoff_shutdown_leadership(&registry, node_id),
                     ).await;
-                    let remaining_leaders = registry.metrics_snapshot().iter()
-                        .filter(|snapshot| snapshot.current_leader == Some(node_id)).count();
-                    if matches!(result, Ok(0)) {
-                        tracing::info!(remaining_leaders, "shutdown leadership handoff complete");
+                    if remaining_leaders == 0 {
+                        tracing::info!("shutdown leadership handoff complete");
                     } else {
-                        tracing::warn!(remaining_leaders, timed_out = result.is_err(),
+                        tracing::warn!(remaining_leaders,
                             "shutdown leadership handoff incomplete; continuing bounded shutdown");
                         // The node is about to stop serving: what the handoff
                         // did not move it gives up, so its peers elect now
                         // rather than after the listener drain.
-                        let stepped_down = registry.step_down_leaderships().await;
-                        tracing::warn!(stepped_down,
+                        let stepped_down =
+                            registry.step_down_leaderships(SHUTDOWN_STEP_DOWN_GRACE).await;
+                        tracing::warn!(?stepped_down,
                             "shutdown: stepped down from the leaderships the handoff did not move");
                     }
                     registry.shutdown_transport();
@@ -464,7 +468,9 @@ mod tests {
 
     #[test]
     fn bounded_shutdown_phases_leave_time_to_close_the_wal() {
-        let phases = super::SHUTDOWN_HANDOFF_GRACE.saturating_add(super::SHUTDOWN_DRAIN_GRACE);
+        let phases = super::SHUTDOWN_HANDOFF_GRACE
+            .saturating_add(super::SHUTDOWN_STEP_DOWN_GRACE)
+            .saturating_add(super::SHUTDOWN_DRAIN_GRACE);
         assert!(phases < super::SHUTDOWN_GRACE, "{phases:?}");
     }
 

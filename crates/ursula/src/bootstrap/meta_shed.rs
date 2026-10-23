@@ -34,6 +34,7 @@ use ursula_raft::meta::runtime::MetaRuntimeState;
 use ursula_raft::meta::status::MetaStatusReader;
 
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::participation::PeerParticipation;
 
@@ -57,6 +58,7 @@ pub(crate) fn spawn_meta_shed(
             LeadershipShedReason::PlacementUnavailable,
             node_id,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         let mut placement_began: Option<Instant> = None;
         let mut meta_settles: Option<Instant> = None;

@@ -10,6 +10,7 @@ use ursula_shard::RaftGroupId;
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::participation::PeerParticipation;
@@ -178,6 +179,7 @@ pub fn spawn_egress_gate(
             LeadershipShedReason::ClusterEgress,
             node_id,
             ShedPace::AllAtOnce,
+            ShedMark::UntilEnd,
         );
         loop {
             tokio::time::sleep(interval).await;

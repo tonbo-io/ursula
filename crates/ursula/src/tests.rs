@@ -10215,6 +10215,7 @@ mod leadership_shed {
     use crate::bootstrap::LeadershipShed;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedHandoff;
+    use crate::bootstrap::ShedMark;
     use crate::bootstrap::ShedPace;
     use crate::bootstrap::ShedTargets;
     use crate::bootstrap::StoreGateInputs;
@@ -10678,6 +10679,7 @@ mod leadership_shed {
             LeadershipShedReason::SnapshotDriverS3,
             1,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         shed.begin();
         let mut submitted_per_step = Vec::new();
@@ -10740,6 +10742,7 @@ mod leadership_shed {
             LeadershipShedReason::SnapshotDriverS3,
             1,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         shed.begin();
 
