@@ -192,10 +192,19 @@ The node routes answer `{"lifecycle": L}`, the node's lifecycle after the change
 ### Graceful voter shutdown
 
 On the first SIGTERM or Ctrl-C, the voter marks itself maintenance-drained to
-prevent re-acquiring leadership. It keeps Raft transport available while attempting
-to hand off each leadership to an eligible voter (see the handoff rule under
-[Recovering after a host crash](#recovering-after-a-host-crash)). It waits for
-observed leadership changes for up to five seconds, then closes Raft transport and
+prevent re-acquiring leadership. It keeps Raft transport available while it
+hands off each leadership to an eligible voter (see the handoff rule under
+[Recovering after a host crash](#recovering-after-a-host-crash)). Every 50 ms it
+asks its peers again which of them may take a transfer, logs their answers when
+they change, and submits each leadership that no peer could take yet. A
+submitted transfer is not repeated within the handoff: it waits longer than
+five seconds to settle. It logs the groups no peer can take, with the reason
+the handoff check gave for each peer. It waits for observed leadership changes
+for up to five seconds and then logs each leadership it still holds. It steps
+down from those, without campaigning, for up to two seconds, so the other
+voters of those groups elect a leader within one election timeout (1.5 to 3
+seconds) instead of following a node whose listeners are closing. Then it
+closes Raft transport and
 drains HTTP listeners for up to ten seconds. Each listener stops accepting
 connections and marks every HTTP/1 answer it starts from then on
 `Connection: close`. A connection that was idle when the drain began stays

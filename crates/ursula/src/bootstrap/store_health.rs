@@ -19,6 +19,7 @@ use crate::bootstrap::health_gate::CounterGrowth;
 use crate::bootstrap::health_gate::HealthHysteresis;
 use crate::bootstrap::health_gate::HealthTransition;
 use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::health_gate::TickHealth;
 use crate::bootstrap::participation::PeerParticipation;
@@ -308,6 +309,7 @@ pub(crate) fn spawn_store_health_gate(
             LeadershipShedReason::SnapshotDriverS3,
             node_id,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         loop {
             let tick_started = Instant::now();

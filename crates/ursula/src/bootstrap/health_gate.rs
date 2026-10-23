@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use ursula_control::Cluster;
 use ursula_raft::LeadershipShedReason;
+use ursula_raft::LeadershipTransferError;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
@@ -273,7 +274,7 @@ pub(crate) fn plan_shed_handoffs(
     in_flight: &[ShedHandoff],
     limit: usize,
     targets: &ShedTargets,
-    can_take_over: impl Fn(RaftGroupId, u64) -> bool,
+    mut can_take_over: impl FnMut(RaftGroupId, u64) -> bool,
 ) -> ShedPlan {
     let by_group: HashMap<u32, &RaftGroupMetricsSnapshot> = snaps
         .iter()
@@ -380,6 +381,19 @@ impl ShedDrain {
         }
     }
 
+    /// Takes on the groups `node_id` leads in `snaps` that the drain does
+    /// not hold yet, queued for a first handoff. A shutdown's shed hands
+    /// off the leaderships the node gains while it runs too.
+    fn adopt_groups_led_by(&mut self, snaps: &[RaftGroupMetricsSnapshot], node_id: u64) {
+        for snap in snaps {
+            if snap.current_leader == Some(node_id) {
+                self.pending
+                    .entry(snap.raft_group_id)
+                    .or_insert(Pending::Queued { avoid: None });
+            }
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -412,7 +426,7 @@ impl ShedDrain {
         limit: usize,
         heat: &[u64],
         targets: &ShedTargets,
-        can_take_over: impl Fn(RaftGroupId, u64) -> bool,
+        can_take_over: impl FnMut(RaftGroupId, u64) -> bool,
     ) -> DrainTick {
         let leaders: HashMap<u32, Option<u64>> = snaps
             .iter()
@@ -559,33 +573,53 @@ impl ShedStep {
 /// gate shed. Leaderships the node gains later are left alone, so a shed does
 /// not fight the leadership balancer over a node that may still campaign.
 ///
-/// Dropping it clears the mark, so a gate that stops does not keep the node
-/// out of elections.
+/// A gate's shed clears the mark when it is dropped, so a gate that stops
+/// does not keep the node out of elections. A shutdown's keeps it
+/// ([`ShedMark::UntilExit`]).
 #[derive(Debug)]
 pub(crate) struct LeadershipShed {
     registry: RaftGroupHandleRegistry,
     reason: LeadershipShedReason,
     node_id: u64,
     pace: ShedPace,
+    mark: ShedMark,
     drain: ShedDrain,
     /// When each stranded group was last reported.
     stranded_reported: BTreeMap<u32, Instant>,
+    /// The handoff check's refusals of each pending group, from the last
+    /// step that looked for a target for it.
+    refusals: BTreeMap<u32, Vec<(u64, LeadershipTransferError)>>,
+}
+
+/// How long a shed's mark holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShedMark {
+    /// Until the shed ends or is dropped: a health gate's.
+    UntilEnd,
+    /// Until the process exits: a shutdown's, whose node must not campaign
+    /// again however its handoff ends. Its drain also takes on the
+    /// leaderships the node gains while it runs.
+    UntilExit,
 }
 
 impl LeadershipShed {
+    /// A shed of `reason`, whose mark holds as `mark` says.
     pub(crate) fn new(
         registry: &RaftGroupHandleRegistry,
         reason: LeadershipShedReason,
         node_id: u64,
         pace: ShedPace,
+        mark: ShedMark,
     ) -> Self {
         Self {
             registry: registry.clone(),
             reason,
             node_id,
             pace,
+            mark,
             drain: ShedDrain::default(),
             stranded_reported: BTreeMap::new(),
+            refusals: BTreeMap::new(),
         }
     }
 
@@ -594,6 +628,7 @@ impl LeadershipShed {
         self.registry.mark_leadership_shed(self.reason);
         self.drain = ShedDrain::of_groups_led_by(&self.registry.metrics_snapshot(), self.node_id);
         self.stranded_reported.clear();
+        self.refusals.clear();
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
@@ -607,6 +642,7 @@ impl LeadershipShed {
         self.registry.clear_leadership_shed(self.reason);
         self.drain = ShedDrain::default();
         self.stranded_reported.clear();
+        self.refusals.clear();
     }
 
     /// Whether leaderships are left to hand off. A gate asks its peers which
@@ -625,8 +661,14 @@ impl LeadershipShed {
     pub(crate) async fn step(&mut self, targets: &ShedTargets, heat: &[u64]) -> ShedStep {
         let now = Instant::now();
         let snaps = self.registry.metrics_snapshot();
+        if self.mark == ShedMark::UntilExit {
+            self.drain.adopt_groups_led_by(&snaps, self.node_id);
+        }
         let registry = &self.registry;
         let view = registry.placement_watch().current();
+        // Why the handoff check refused each target it was asked about, for
+        // the report of the groups no peer could take over.
+        let mut refusals = BTreeMap::<u32, Vec<(u64, LeadershipTransferError)>>::new();
         let tick = self.drain.tick(
             &snaps,
             self.node_id,
@@ -635,8 +677,21 @@ impl LeadershipShed {
             self.pace.handoffs_per_step(),
             heat,
             targets,
-            |group, target| registry.check_handoff(group, target).is_ok(),
+            |group, target| match registry.check_handoff(group, target) {
+                Ok(()) => true,
+                Err(refusal) => {
+                    refusals.entry(group.0).or_default().push((target, refusal));
+                    false
+                }
+            },
         );
+        let drain = &self.drain;
+        self.refusals
+            .retain(|group_id, _| drain.contains(*group_id));
+        for handoff in &tick.plan.handoffs {
+            self.refusals.remove(&handoff.group_id);
+        }
+        self.refusals.extend(refusals);
         for handoff in &tick.stalled {
             tracing::warn!(
                 reason = %self.reason,
@@ -687,8 +742,8 @@ impl LeadershipShed {
         self.report_stranded(&step.stranded, targets, now);
         if step.changed() {
             if self.drain.is_empty() {
-                // Leaderships the node gained after the shed began are left
-                // alone, so it can still lead some.
+                // A gate's shed leaves alone the leaderships the node gained
+                // after it began, so the node can still lead some.
                 let leaders = snaps
                     .iter()
                     .filter(|snap| snap.current_leader == Some(self.node_id))
@@ -714,7 +769,8 @@ impl LeadershipShed {
     }
 
     /// Reports the stranded groups in one line per step, each group at most
-    /// once per [`STRANDED_REPORT_INTERVAL`].
+    /// once per [`STRANDED_REPORT_INTERVAL`], with the handoff check's
+    /// refusal of each peer it asked about.
     fn report_stranded(&mut self, stranded: &[u32], targets: &ShedTargets, now: Instant) {
         let drain = &self.drain;
         self.stranded_reported
@@ -741,12 +797,14 @@ impl LeadershipShed {
                 .filter(|node| *node != self.node_id)
                 .collect()
         };
+        let refused = self.refusals_of(&due);
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
             groups = ?due,
             may_take_first_handoff = ?peers(&targets.first),
             may_take_retry = ?peers(&targets.retry),
+            handoff_check_refused = ?refused,
             "leadership-shed: no peer can take over these leaderships now, because each other \
              voter of these groups answered that it may not campaign, did not answer, or failed \
              the handoff check; they stay pending"
@@ -754,9 +812,56 @@ impl LeadershipShed {
     }
 }
 
+impl LeadershipShed {
+    /// The handoff check's last refusals of `groups`, each as the refused
+    /// target and the reason, for a report.
+    fn refusals_of(&self, groups: &[u32]) -> BTreeMap<u32, Vec<String>> {
+        groups
+            .iter()
+            .filter_map(|group_id| {
+                let refusals = self.refusals.get(group_id)?;
+                Some((
+                    *group_id,
+                    refusals
+                        .iter()
+                        .map(|(target, refusal)| format!("node {target}: {refusal}"))
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Reports every pending leadership this node still leads, with the
+    /// handoff check's last refusals of each, once: a shutdown's report of
+    /// what its handoff could not move before it steps down from it.
+    pub(crate) fn report_pending(&self) {
+        let snaps = self.registry.metrics_snapshot();
+        let still_led: Vec<u32> = snaps
+            .iter()
+            .filter(|snap| {
+                snap.current_leader == Some(self.node_id) && self.drain.contains(snap.raft_group_id)
+            })
+            .map(|snap| snap.raft_group_id)
+            .collect();
+        if still_led.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            reason = %self.reason,
+            node_id = self.node_id,
+            groups = ?still_led,
+            handoff_check_refused = ?self.refusals_of(&still_led),
+            "leadership-shed: these leaderships were not handed off"
+        );
+    }
+}
+
 impl Drop for LeadershipShed {
     fn drop(&mut self) {
-        self.registry.clear_leadership_shed(self.reason);
+        match self.mark {
+            ShedMark::UntilEnd => self.registry.clear_leadership_shed(self.reason),
+            ShedMark::UntilExit => {}
+        }
     }
 }
 

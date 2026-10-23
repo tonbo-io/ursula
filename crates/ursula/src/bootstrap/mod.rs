@@ -59,6 +59,7 @@ mod test_reexports {
     pub(crate) use super::health_gate::LeadershipShed;
     pub(crate) use super::health_gate::ShedDrain;
     pub(crate) use super::health_gate::ShedHandoff;
+    pub(crate) use super::health_gate::ShedMark;
     pub(crate) use super::health_gate::ShedPace;
     pub(crate) use super::health_gate::ShedPlan;
     pub(crate) use super::health_gate::ShedTargets;

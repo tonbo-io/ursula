@@ -10215,6 +10215,7 @@ mod leadership_shed {
     use crate::bootstrap::LeadershipShed;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedHandoff;
+    use crate::bootstrap::ShedMark;
     use crate::bootstrap::ShedPace;
     use crate::bootstrap::ShedTargets;
     use crate::bootstrap::StoreGateInputs;
@@ -10291,8 +10292,9 @@ mod leadership_shed {
             let participation = self.participation();
             loop {
                 let eligible = participation
-                    .campaign_eligible_nodes(&self.node_1().registry)
-                    .await;
+                    .campaign_stances(&self.node_1().registry)
+                    .await
+                    .may_campaign();
                 if eligible == expected {
                     return eligible;
                 }
@@ -10677,6 +10679,7 @@ mod leadership_shed {
             LeadershipShedReason::SnapshotDriverS3,
             1,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         shed.begin();
         let mut submitted_per_step = Vec::new();
@@ -10739,13 +10742,15 @@ mod leadership_shed {
             LeadershipShedReason::SnapshotDriverS3,
             1,
             ShedPace::Gradual,
+            ShedMark::UntilEnd,
         );
         shed.begin();
 
         // With no peer that may campaign, every leadership stays pending.
         let may_campaign = participation
-            .campaign_eligible_nodes(&node_1.registry)
-            .await;
+            .campaign_stances(&node_1.registry)
+            .await
+            .may_campaign();
         assert!(may_campaign.is_empty(), "{may_campaign:?}");
         let stranded = shed
             .step(&ShedTargets::for_every_handoff(may_campaign), &[])
@@ -10835,8 +10840,9 @@ mod leadership_shed {
             );
             steps.tick().await;
             let may_campaign = participation
-                .campaign_eligible_nodes(&node_1.registry)
-                .await;
+                .campaign_stances(&node_1.registry)
+                .await
+                .may_campaign();
             let step = shed
                 .step(&ShedTargets::for_every_handoff(may_campaign), &[])
                 .await;

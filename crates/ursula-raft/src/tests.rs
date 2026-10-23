@@ -4435,7 +4435,8 @@ async fn registry_handoff_abandons_a_transfer_nobody_takes_over() {
 /// A leader steps down from a stalled transfer through a vote it grants
 /// itself. The vote is marked a leadership transfer, so the leader's own
 /// lease, which runs for a maximum election timeout after its election,
-/// cannot refuse it.
+/// cannot refuse it. One whose last log id is behind the leader's log is
+/// refused by the leader's own vote.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
@@ -4478,6 +4479,21 @@ async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
         !refused.vote_granted,
         "the lease refuses a plain vote request"
     );
+    assert_eq!(raft.metrics().borrow_watched().vote, vote);
+
+    // A step-down whose last log id is behind the leader's log, as when an
+    // append lands between the read and the vote, is refused by the vote it
+    // was made from: what `StepDownVote::LogAdvanced` reads.
+    assert!(last_log_id.is_some(), "the fresh leader has a log");
+    let behind = raft
+        .vote(crate::owner::transfer_step_down(vote, target, None))
+        .await
+        .unwrap();
+    assert!(
+        !behind.vote_granted,
+        "a step-down behind the log is refused"
+    );
+    assert_eq!(behind.vote, vote);
     assert_eq!(raft.metrics().borrow_watched().vote, vote);
 
     let stepped_down = raft
