@@ -61,7 +61,9 @@
 //! - [`uploads`]: the per-request limit and the node-wide budget for buffered
 //!   request bodies, and the pace a body must keep.
 //! - `ejection`: leaves upstreams that failed at the transport or did not
-//!   answer a probe in time out of selection until they answer again (#454).
+//!   answer a probe in time out of selection until they answer again (#454),
+//!   with the cause: an upstream that stopped accepting connections still
+//!   answers the requests it accepted, one that stopped answering does not.
 //! - `probe`: the probes of every upstream, which every gateway runs while
 //!   it exists, that eject one that stops answering and readmit it once it
 //!   answers.
@@ -133,6 +135,7 @@ use crate::auth::AuthorizationError;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
+use crate::ejection::Ejection;
 use crate::ejection::Ejections;
 use crate::probe::Probes;
 use crate::refusal::EmbedderRefusal;
@@ -969,10 +972,15 @@ impl Gateway {
     ///   it and never answers, such as a stopped process. A request whose
     ///   repeat is safe ([`Replay`]) goes on, once, to an upstream it has not
     ///   tried, which answers or redirects to the current leader. It goes on
-    ///   as soon as the probes eject the upstream ([`Gateway::send_hop`]),
-    ///   within a probe interval and a probe timeout of the upstream's last
-    ///   answer, rather than at the timeout. Any other request ends with the
-    ///   timeout, whose outcome is unknown. Neither ejects the upstream.
+    ///   as soon as the upstream is ejected for a cause that ends its wait
+    ///   ([`Replay::leaves`], [`Gateway::send_hop`]), rather than at the
+    ///   timeout: a read at any ejection, a producer append once the
+    ///   upstream stopped answering, within a probe interval and a probe
+    ///   timeout of its last answer. A producer append in flight to an
+    ///   upstream that stopped accepting connections, as a draining node
+    ///   does, waits for its answer there, as that node still answers the
+    ///   requests it accepted. Any other request ends with the timeout,
+    ///   whose outcome is unknown. Neither ejects the upstream.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
     ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
     ///   redirect. When no upstream answers without redirecting within those
@@ -1026,9 +1034,9 @@ impl Gateway {
                         continue;
                     }
                     // A hop that may have delivered the request and answered
-                    // nothing, in time or before the probes ejected its
-                    // upstream: a request whose repeat is safe goes on, once,
-                    // to an upstream it has not tried.
+                    // nothing, in time or before an ejection of its upstream
+                    // it leaves at: a request whose repeat is safe goes on,
+                    // once, to an upstream it has not tried.
                     if error.unanswered_upstream().is_some()
                         && replay != Replay::Never
                         && let Some(next) = chain
@@ -1221,13 +1229,17 @@ impl Gateway {
     /// Sends the hop under way of `chain` to `url`, on its target. A hop of
     /// a request whose repeat is safe ([`Replay`]), and that may still be
     /// sent again ([`Chain::may_replay`]), ends without an answer as soon as
-    /// the probes eject its upstream and another upstream is left to send it
-    /// to ([`GatewayError::UpstreamEjected`]): an upstream that stopped
-    /// answering, such as a stopped process, never answers it, and the
-    /// probes tell so within a probe interval and a probe timeout, before
-    /// the response header timeout. Any other hop waits for its answer up to
-    /// that timeout, as an answer that comes then still settles a write
-    /// whose repeat is not safe.
+    /// its upstream is ejected for a cause it leaves at ([`Replay::leaves`])
+    /// and another upstream is left to send it to
+    /// ([`GatewayError::UpstreamEjected`]). An upstream that stopped
+    /// answering ([`Ejection::StoppedAnswering`]), a stopped process for one,
+    /// never answers, and the probes tell so within a probe interval and a
+    /// probe timeout, before the response header timeout. One that stopped
+    /// accepting ([`Ejection::StoppedAccepting`]) still answers what it
+    /// accepted, as a draining node does for its drain, so a producer append
+    /// waits for that answer, and a read goes on. Any other hop waits for
+    /// its answer up to that timeout, as an answer that comes then still
+    /// settles a write whose repeat is not safe.
     async fn send_hop(
         &self,
         chain: &Chain,
@@ -1246,7 +1258,8 @@ impl Gateway {
             biased;
             sent = &mut send => sent,
             () = self.ejections.until(|| {
-                !self.ejections.admits(target) && self.untried_upstream(chain).is_some()
+                self.ejections.cause(target).is_some_and(|cause| replay.leaves(cause))
+                    && self.untried_upstream(chain).is_some()
             }) => Err(GatewayError::UpstreamEjected {
                 upstream: target.to_owned(),
             }),
@@ -1283,14 +1296,15 @@ impl Gateway {
 
     /// An upstream whose request failed loses its cached route, so the next
     /// request learns the current leader instead of failing on the same node.
-    /// One that failed at the transport (down or gone) also leaves selection
-    /// until it answers again, so that requests do not pick it again (#454).
+    /// One that failed at the transport (draining, down or gone) also leaves
+    /// selection until it answers again, so that requests do not pick it
+    /// again (#454), for the cause its failure shows.
     fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
         }
-        if error.ejects_upstream() {
-            self.ejections.eject(upstream, error);
+        if let Some(cause) = error.ejection() {
+            self.ejections.eject(upstream, cause, error);
         }
     }
 
@@ -1651,6 +1665,23 @@ enum Replay {
 }
 
 impl Replay {
+    /// Whether a hop of this request in flight to an upstream ejected for
+    /// `cause` stops waiting for it and goes on to another upstream. A read
+    /// goes on at any ejection: a repeat changes nothing, and an upstream
+    /// that stopped accepting may not answer in time, such as a long-poll
+    /// held past the drain of its node. A producer append goes on only from
+    /// an upstream that stopped answering, which never settles it: one that
+    /// stopped accepting still answers it, and only that answer settles it
+    /// when the repeat is refused. Any other request waits for its answer.
+    fn leaves(self, cause: Ejection) -> bool {
+        match (self, cause) {
+            (Self::Read, Ejection::StoppedAccepting | Ejection::StoppedAnswering)
+            | (Self::Keyed, Ejection::StoppedAnswering) => true,
+            (Self::Keyed, Ejection::StoppedAccepting)
+            | (Self::Never, Ejection::StoppedAccepting | Ejection::StoppedAnswering) => false,
+        }
+    }
+
     fn of(parts: &axum::http::request::Parts) -> Self {
         if matches!(parts.method, Method::GET | Method::HEAD) {
             return Self::Read;
@@ -1742,9 +1773,10 @@ impl Chain {
     }
 
     /// Whether `upstream` got a hop of this request and answered nothing, in
-    /// time or before the probes ejected it. Its peers name it while they
-    /// have not yet elected a leader in its place, as for a stopped process,
-    /// and a hop back to it would only wait out the timeout again.
+    /// time or before an ejection the request leaves at. Its peers name it
+    /// while they have not yet elected a leader in its place, as for a
+    /// stopped process, and a hop back to it would only wait out the timeout
+    /// again.
     fn answered_nothing(&self, upstream: &str) -> bool {
         self.unanswered
             .as_ref()
@@ -2592,10 +2624,11 @@ pub enum GatewayError {
     /// upstream.
     #[error("upstream {upstream} sent no response headers within {timeout:?}")]
     UpstreamTimeout { upstream: String, timeout: Duration },
-    /// No response headers before the probes ejected the upstream, which
-    /// stopped answering them, while another upstream was left for a
-    /// request whose repeat is safe. The request may have reached it.
-    #[error("upstream {upstream} sent no response headers before its probes ejected it")]
+    /// No response headers before the upstream was ejected for a cause the
+    /// request leaves at ([`Replay::leaves`]), while another upstream was
+    /// left for a request whose repeat is safe. The request may have
+    /// reached it.
+    #[error("upstream {upstream} sent no response headers before it was ejected")]
     UpstreamEjected { upstream: String },
     /// The exchange failed after the request may have reached the upstream.
     #[error("upstream request to {upstream} failed")]
@@ -2629,28 +2662,34 @@ impl GatewayError {
         }
     }
 
-    /// Whether the upstream failed at the transport, so selection should
-    /// leave it out until it answers again (#454). A request that could not
+    /// Why selection should leave the upstream out until it answers again
+    /// (#454), when it failed at the transport ([`Ejection::of_transport`]):
+    /// a refused or closed connection says it stopped accepting, a timed out
+    /// connect or send that it stopped answering. A request that could not
     /// be built never left the gateway. A missing answer ejects nothing:
     /// the probes judge whether an upstream answers (see `ejection`), and a
     /// live node can hold one request past the response header timeout (a
     /// write on a leader elected over a slow link, a read forwarded to an
     /// unreachable leader, a snapshot commit of many parts) while it answers
     /// every probe.
-    fn ejects_upstream(&self) -> bool {
+    fn ejection(&self) -> Option<Ejection> {
         match self {
-            Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => true,
-            Self::Upstream { source, .. } => !source.is_builder(),
+            Self::UpstreamUnreachable { source, .. } | Self::LeaderUnreachable { source, .. } => {
+                Some(Ejection::of_transport(source))
+            }
+            Self::Upstream { source, .. } => {
+                (!source.is_builder()).then(|| Ejection::of_transport(source))
+            }
             Self::UpstreamTimeout { .. }
             | Self::UpstreamEjected { .. }
             | Self::LeaderNotFound { .. }
-            | Self::ResponseBuild(_) => false,
+            | Self::ResponseBuild(_) => None,
         }
     }
 
     /// The upstream of a hop that may have delivered the request and sent
-    /// no response headers, within the response header timeout or before
-    /// the probes ejected it: its outcome is unknown.
+    /// no response headers, within the response header timeout or before an
+    /// ejection the request leaves at: its outcome is unknown.
     fn unanswered_upstream(&self) -> Option<&str> {
         match self {
             Self::UpstreamTimeout { upstream, .. } | Self::UpstreamEjected { upstream } => {

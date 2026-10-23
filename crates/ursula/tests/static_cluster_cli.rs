@@ -6202,9 +6202,7 @@ impl GatewayLoad {
                         Err(_unanswered) => LoadAnswer::Unanswered,
                         Ok(response) => {
                             let status = response.status();
-                            let retry = response
-                                .headers()
-                                .contains_key(reqwest::header::RETRY_AFTER);
+                            let retry = is_retryable_refusal(status, response.headers());
                             let body = response.bytes().await.unwrap_or_default();
                             let code = ursula_headers::ErrorBody::parse(&body)
                                 .ok()
@@ -6245,6 +6243,14 @@ impl GatewayLoad {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         self.task.await.expect("the write load ends")
     }
+}
+
+/// Whether an answer of `status` with `headers` is the retryable refusal
+/// the gateway and the nodes answer a write that may be sent again: a `503`
+/// with `Retry-After`.
+fn is_retryable_refusal(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && headers.contains_key(reqwest::header::RETRY_AFTER)
 }
 
 /// Asserts that the gateway answered each of `writes` within the client's
@@ -7025,10 +7031,18 @@ async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
 ///    restarts behind `ursulactl wait`. The gateway answers every
 ///    write `204` or a `503` with `Retry-After`, and each stream holds every
 ///    acknowledged write once, in order, and no write whose `503` code
-///    proves it applied nothing. Then the leaderships settle: no leader
-///    changes for three balancer ticks. A restart that drops writes, a
-///    proven refusal that applied, or a balancer that never stops moving
-///    leaderships fails it.
+///    proves it applied nothing. A producer appends to a stream of every
+///    group through the gateway too, and the gateway answers each of its
+///    attempts with a receipt or a `503` with `Retry-After`, never its
+///    `504`: a stopping node
+///    refuses new connections once its listener closes, which ejects it,
+///    and still answers the appends it accepted, so the gateway waits for
+///    those answers rather than sending them again elsewhere. Each of those
+///    streams holds each seq once, in order. Then the leaderships settle: no
+///    leader changes for three balancer ticks. A restart that drops writes,
+///    a proven refusal that applied, an append cut short at a draining
+///    node's ejection, or a balancer that never stops moving leaderships
+///    fails it.
 /// 2. A group moves to {x, 4, 5}, x a meta voter, so meta keeps a quorum
 ///    when its three voters are killed and lose their run state. The group
 ///    stalls. A cutting plan whose `certified` floor names an entry above
@@ -7083,9 +7097,25 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
     for stream in &streams {
         create_stream(&client, &mut procs, stream).await;
     }
+    let keyed_streams: Vec<String> = stream_per_group("keyed")
+        .iter()
+        .map(|stream| format!("{gateway}/keyed/{stream}"))
+        .collect();
+    for stream in &keyed_streams {
+        create_stream(&client, &mut procs, stream).await;
+    }
 
     // 1. A rolling restart under write load.
     let load = GatewayLoad::start(streams.clone(), "rolling");
+    let keyed_loads: Vec<(String, ProducerLoad)> = keyed_streams
+        .iter()
+        .map(|stream| {
+            (
+                stream.clone(),
+                ProducerLoad::start(vec![stream.clone()], "keyed"),
+            )
+        })
+        .collect();
     let manifest = ctl_manifest(&nodes, &[]);
     for node in &nodes {
         // `verify-survivors` observes the others once the node is down. It
@@ -7132,6 +7162,23 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
     assert_only_retryable(&writes, false);
     for stream in &streams {
         check_load_read(&client, stream, &writes).await;
+    }
+    for (stream, keyed) in keyed_loads {
+        let attempts = keyed.stop().await;
+        let unsettled: Vec<&ProducerAttempt> = attempts
+            .iter()
+            .filter(|attempt| !attempt.outcome.holds() && !attempt.retryable)
+            .collect();
+        assert!(
+            unsettled.is_empty(),
+            "{stream}: attempts answered neither a receipt nor a 503 with Retry-After: {unsettled:?}"
+        );
+        let held = attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.outcome.holds())
+            .unwrap_or_else(|| panic!("{stream}: no append held: {attempts:?}"));
+        check_producer_read(&client, &stream, "keyed", held.seq).await;
     }
     wait_leaders_settle(&client, &mut procs, &nodes).await;
 
@@ -10970,6 +11017,9 @@ struct ProducerAttempt {
     seq: u64,
     sent: tokio::time::Instant,
     took: Duration,
+    /// Whether the answer was a retryable refusal
+    /// ([`is_retryable_refusal`]).
+    retryable: bool,
     outcome: ursula_headers::write_outcome::WriteOutcome,
 }
 
@@ -11012,20 +11062,23 @@ impl ProducerLoad {
                         .body(format!("{prefix}-{seq};"))
                         .send()
                         .await;
-                    let outcome = match answer {
-                        Err(_unanswered) => WriteOutcome::NO_ANSWER,
+                    let (retryable, outcome) = match answer {
+                        Err(_unanswered) => (false, WriteOutcome::NO_ANSWER),
                         Ok(response) => {
+                            let retryable =
+                                is_retryable_refusal(response.status(), response.headers());
                             let status = response.status().as_u16();
                             let headers = response.headers().clone();
                             let body = response.bytes().await.unwrap_or_default();
-                            classify(
+                            let outcome = classify(
                                 WriteKind::Producer,
                                 status,
                                 headers
                                     .iter()
                                     .map(|(name, value)| (name.as_str(), value.as_bytes())),
                                 &body,
-                            )
+                            );
+                            (retryable, outcome)
                         }
                     };
                     let holds = outcome.holds();
@@ -11033,6 +11086,7 @@ impl ProducerLoad {
                         seq,
                         sent,
                         took: sent.elapsed(),
+                        retryable,
                         outcome,
                     });
                     if holds {
@@ -11052,6 +11106,29 @@ impl ProducerLoad {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         self.task.await.expect("the producer load ends")
     }
+}
+
+/// Reads `stream`, which a [`ProducerLoad`] of `prefix` wrote to, until it
+/// holds every seq up to `held`, one the load acknowledged, and checks that
+/// it holds each seq once, in order, from 0. A write after `held` that the
+/// load sent but saw no receipt for may be held too.
+async fn check_producer_read(client: &reqwest::Client, stream: &str, prefix: &str, held: u64) {
+    let acknowledged: Vec<String> = (0..=held).map(|seq| format!("{prefix}-{seq};")).collect();
+    let read = read_until_holding(
+        client,
+        &format!("{stream}?offset=0&max_bytes=8388608"),
+        &acknowledged,
+    )
+    .await;
+    let held: Vec<String> = String::from_utf8_lossy(&read)
+        .split(';')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let in_order: Vec<String> = (0..held.len())
+        .map(|seq| format!("{prefix}-{seq}"))
+        .collect();
+    assert_eq!(held, in_order, "{stream} holds each seq once, in order");
 }
 
 /// A group's leader that its peers cannot reach, or that answers nothing at
@@ -11365,24 +11442,7 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
         .iter()
         .find(|attempt| attempt.sent >= stopped && attempt.outcome.holds())
         .unwrap_or_else(|| panic!("no write after node {leader} stopped holds: {attempts:?}"));
-    let acknowledged: Vec<String> = (0..=held.seq)
-        .map(|seq| format!("stopped-{seq};"))
-        .collect();
-    let read = read_until_holding(
-        &client,
-        &format!("{stream}?offset=0&max_bytes=8388608"),
-        &acknowledged,
-    )
-    .await;
-    let held: Vec<String> = String::from_utf8_lossy(&read)
-        .split(';')
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let in_order: Vec<String> = (0..held.len())
-        .map(|seq| format!("stopped-{seq}"))
-        .collect();
-    assert_eq!(held, in_order, "the stream holds each seq once, in order");
+    check_producer_read(&client, &stream, "stopped", held.seq).await;
 }
 
 /// The longest a gateway's probes take to eject a node that stops
@@ -11551,20 +11611,7 @@ async fn cli_every_gateway_ejects_a_stopped_node_and_a_retry_does_not_wait_for_i
     let continued = tokio::time::Instant::now();
     procs.signal(leader, "-CONT");
     wait_gateways_eject(&client, &[&a, &b, &c], 0, continued, PROBES_EJECT_WITHIN).await;
-    let acknowledged: Vec<String> = (0..=held_seq).map(|seq| format!("frozen-{seq};")).collect();
-    let read = read_until_holding(
-        &client,
-        &format!("{}?offset=0&max_bytes=8388608", through(&a)),
-        &acknowledged,
-    )
-    .await;
-    let held: Vec<String> = String::from_utf8_lossy(&read)
-        .split(';')
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let in_order: Vec<String> = (0..held.len()).map(|seq| format!("frozen-{seq}")).collect();
-    assert_eq!(held, in_order, "the stream holds each seq once, in order");
+    check_producer_read(&client, &through(&a), "frozen", held_seq).await;
 }
 
 /// Appends to a stream every 20 ms until stopped, keeping each write that
