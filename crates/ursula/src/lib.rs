@@ -1586,6 +1586,19 @@ pub(crate) fn readiness_reason(
 }
 
 async fn readiness(State(state): State<HttpState>) -> Response {
+    let readiness = serving_readiness(&state);
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, axum::Json(readiness)).into_response()
+}
+
+/// Whether this node is serving-ready, and why not, from its own state
+/// alone: what `GET /__ursula/ready` answers, and what its participation
+/// answer tells the peers' leadership balancers.
+fn serving_readiness(state: &HttpState) -> ursula_proto::admin::ServingReadiness {
     let disk = state.wal_disk.snapshot();
     // A node that saw a peer on another format epoch never becomes Ready
     // again, so a rolling update stops at it (format epoch 2, E8).
@@ -1635,53 +1648,45 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::stalled_recovery_groups)
         .unwrap_or_default();
-    let status = if ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (
-        status,
-        axum::Json(ursula_proto::admin::ServingReadiness {
-            ready,
-            reason: readiness_reason(ReadinessFacts {
-                superseded,
-                disk_lease_lost,
-                root_refused,
-                predecessor_wait,
-                format_epoch_mismatch,
-                wal_disk_pressure: disk.pressure,
-                recovery_stalled: !stalled_groups.is_empty(),
-                recovery_ready,
-                raft_ready,
-            }),
-            cluster_id: state.cluster_id().clone(),
-            // Configured peers refused for another cluster id. Reported
-            // beside the reason, never as one: one misconfigured node must
-            // not take its healthy peers out of service, nor hide why a node
-            // is unready.
-            peer_cluster_mismatches: state.peer_cluster_mismatches(),
+    ursula_proto::admin::ServingReadiness {
+        ready,
+        reason: readiness_reason(ReadinessFacts {
+            superseded,
+            disk_lease_lost,
+            root_refused,
+            predecessor_wait,
             format_epoch_mismatch,
-            recovery_barriers_ready: recovery_ready,
-            raft_maintenance,
-            recovery_stalled_groups: stalled_groups,
             wal_disk_pressure: disk.pressure,
-            wal_available_bytes: disk.available_bytes,
-            wal_min_available_bytes: disk.min_available_bytes,
-            wal_resume_available_bytes: disk.resume_available_bytes,
-            wal_disk_stat_errors: disk.stat_errors,
+            recovery_stalled: !stalled_groups.is_empty(),
+            recovery_ready,
+            raft_ready,
         }),
-    )
-        .into_response()
+        cluster_id: state.cluster_id().clone(),
+        // Configured peers refused for another cluster id. Reported
+        // beside the reason, never as one: one misconfigured node must
+        // not take its healthy peers out of service, nor hide why a node
+        // is unready.
+        peer_cluster_mismatches: state.peer_cluster_mismatches(),
+        format_epoch_mismatch,
+        recovery_barriers_ready: recovery_ready,
+        raft_maintenance,
+        recovery_stalled_groups: stalled_groups,
+        wal_disk_pressure: disk.pressure,
+        wal_available_bytes: disk.available_bytes,
+        wal_min_available_bytes: disk.min_available_bytes,
+        wal_resume_available_bytes: disk.resume_available_bytes,
+        wal_disk_stat_errors: disk.stat_errors,
+    }
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
+    let serving_ready = serving_readiness(&state).ready;
     axum::Json(
         state
             .raft_registry()
             .cloned()
             .unwrap_or_default()
-            .participation_status(state.cluster_id().clone()),
+            .participation_status(state.cluster_id().clone(), serving_ready),
     )
     .into_response()
 }
@@ -3230,7 +3235,8 @@ async fn request_raft_self_election(
         | SelfElectionError::Rejected { .. }
         | SelfElectionError::Transfer(
             IncomingTransferError::OwnCommittedVote { .. }
-            | IncomingTransferError::MayNotCampaign { .. },
+            | IncomingTransferError::MayNotCampaign { .. }
+            | IncomingTransferError::LeaderNotAcknowledged { .. },
         ) => StatusCode::CONFLICT,
         SelfElectionError::Transfer(IncomingTransferError::Group(group))
             if matches!(

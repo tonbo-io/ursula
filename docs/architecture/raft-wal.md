@@ -577,8 +577,16 @@ instead of being refused before the proposal.
 within one minimum election timeout (1.5 s) and holds every committed entry
 (`ElectionPolicy::validate_handoff`, used by every planner and the admin
 transfer endpoint). A follower the leader rewound is refused as lagging until
-it caught up. If the target has not taken over within two maximum election
-timeouts (6 s), the leader steps down and campaigns.
+it caught up. A target that refuses the transfer ends it at once, and one
+that took it has one minimum election timeout to win. A target that already
+holds another vote, or whose answer does not arrive, leaves the transfer one
+leader lease (3 s), since a newer election may be under way, and without any
+answer the transfer ends at two maximum election timeouts (6 s). The leader
+then steps down and campaigns with a pre-vote round, so it never raises the
+term past a leader a quorum follows, and repeats the round every minimum
+election timeout until a leader is known. A voter that handled the
+transfer's broadcast grants it at once, and the target that refused grants
+it once its lease of the leader lapsed.
 
 **Stall and accept-unsynced-loss.** A gated replica with no barrier and no
 apply for 30 s reports its group stalled: a majority may be gated, so the group
@@ -763,10 +771,13 @@ The data-group engine owns its recovery tasks and exposes the runtime's
 | `ursula-proto` | Shared admin requests, responses and recovery status. WAL metric samples live in `ursula-runtime`. |
 
 All server handoffs enter through the registry. The destination refuses a
-transfer to itself while it cannot campaign, and one carrying its own committed
-vote, because OpenRaft would start that election while still holding its old
-leader state. The check reads only the request's vote, and OpenRaft acts on a
-transfer only while the node holds that vote, so nothing slips in between.
+leader's transfer to itself while its replica may not take the leadership
+(`ElectionPolicy::may_take_leadership`: it cannot campaign, or it has not
+acknowledged a leader of its group since it started), a self-election while it
+cannot campaign, and either one carrying its own committed vote, because
+OpenRaft would start that election while still holding its old leader state.
+The check reads only the request's vote, and OpenRaft acts on a transfer only
+while the node holds that vote, so nothing slips in between.
 
 The bootstrap driver waits on server-state and gate notifications, the
 reconcile shell on every metrics change, so it sees a rewound follower's

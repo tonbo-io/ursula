@@ -1,19 +1,22 @@
-//! Which nodes may take over a leadership: the ones whose leadership-shed
-//! policy lets them campaign. This node reads its own policy and asks each
-//! peer for its state (`GET /__ursula/leadership-shed`). The leadership
-//! balancer, the shutdown handoff and the snapshot-store and cold-health
-//! gates hand leaderships only to the nodes known to be allowed to campaign.
-//! The same answers tell the meta leader each peer's WAL-disk state
-//! ([`ParticipationSheds`]) and the cluster-egress gate each peer's egress
-//! probe verdict ([`CampaignStances::peer_with_clean_egress`]) and which
-//! peers answer at all ([`CampaignStances::answered_peers`]). A peer that
-//! did not answer, or answered for another cluster (its `cluster_id`
-//! differs), has an unknown stance and is never handed a leadership: a node
-//! that may not campaign (under drain, behind its recovery gate, or shedding
-//! for its snapshot store, cluster egress or WAL disk) refuses a transfer
-//! without telling the leader, which then forwards writes to it until Raft
-//! abandons the transfer. Every question waits
-//! [`ursula_raft::PEER_ANSWER_TIMEOUT`] for its answer.
+//! Which replicas may take over a leadership: the ones their node answers
+//! may take their group's leadership now, by the one rule a replica checks
+//! a transfer against (`ElectionPolicy::may_take_leadership`: the node's
+//! leadership-shed policy lets it take a transfer, and the replica may
+//! campaign and acknowledged a leader of its group in this run). This node
+//! reads its own replicas and asks each peer for its state
+//! (`GET /__ursula/leadership-shed`). The leadership balancer, the shutdown
+//! handoff, the meta shed and the snapshot-store, cold-health and egress
+//! gates hand a leadership only to a replica its node answered may take
+//! it, and the balancer only to a node that also answered that it is
+//! serving-ready. The same answers tell the meta leader each peer's
+//! WAL-disk state ([`ParticipationSheds`]) and the cluster-egress gate each
+//! peer's egress probe verdict ([`CampaignStances::clean_egress_among`])
+//! and which peers answer at all ([`CampaignStances::answered_peers`]). A
+//! peer that did not answer, or answered for another cluster (its
+//! `cluster_id` differs), has an unknown stance and is never handed a
+//! leadership: a replica that may not take one refuses the transfer, and
+//! its leader leads again only once it learned of the refusal. Every
+//! question waits [`ursula_raft::PEER_ANSWER_TIMEOUT`] for its answer.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -55,6 +58,12 @@ pub(crate) struct CampaignStances {
     /// This node.
     node_id: u64,
     by_node: BTreeMap<u64, CampaignStance>,
+    /// The replicas of each node that may take their group's leadership
+    /// from a leader now: this node's from its own replicas, each peer's
+    /// from its answer. A peer that did not answer has none.
+    takers: BTreeMap<u64, BTreeSet<RaftTargetKey>>,
+    /// The peers that answered that they are serving-ready.
+    serving_ready: BTreeSet<u64>,
     /// How many data groups each node leads: this node's from its own
     /// replicas, each peer's from its answer. A peer that did not answer
     /// has none.
@@ -74,12 +83,34 @@ impl CampaignStances {
         self.nodes(|stance| stance == CampaignStance::MayCampaign)
     }
 
-    /// Where a shedding gate hands leaderships off: only to the nodes known
-    /// to be allowed to campaign. A peer that did not answer may refuse the
-    /// handoff without a word, which leaves the group without a leader until
-    /// Raft abandons the transfer, so it is never a target.
+    /// Whether `node`'s replica of `replica` may take its group's
+    /// leadership from a leader now, as the node answered: the one target
+    /// rule of every handoff. A peer that did not answer may refuse the
+    /// transfer, so it is never a target.
+    pub(crate) fn may_take(&self, node: u64, replica: RaftTargetKey) -> bool {
+        self.takers
+            .get(&node)
+            .is_some_and(|takers| takers.contains(&replica))
+    }
+
+    /// The nodes the leadership balancer may move leaderships to: this
+    /// node when it may campaign, and each peer that may campaign and
+    /// answered that it is serving-ready. A peer that restarted a moment
+    /// ago is not ready before each of its replicas acknowledges its leader
+    /// again, so the balancer, which moves leaderships by choice, pulls
+    /// none onto it before that.
+    pub(crate) fn balance_eligible(&self) -> HashSet<u64> {
+        self.may_campaign()
+            .into_iter()
+            .filter(|node| *node == self.node_id || self.serving_ready.contains(node))
+            .collect()
+    }
+
+    /// Where a shedding gate hands leaderships off: only to the replicas
+    /// their nodes answered may take their group's leadership
+    /// ([`Self::may_take`]).
     pub(crate) fn shed_targets(&self) -> ShedTargets {
-        ShedTargets::new(self.may_campaign())
+        ShedTargets::new(self.takers.clone())
     }
 
     /// The smallest of `peers` whose answer says its last egress probe was
@@ -126,7 +157,8 @@ impl CampaignStances {
     }
 
     /// The stances of `node_id` and its peers as given, none of which
-    /// answered a leader count.
+    /// answered a leader count, a replica that takes a leadership or its
+    /// readiness.
     #[cfg(test)]
     pub(crate) fn of_nodes(
         node_id: u64,
@@ -135,9 +167,30 @@ impl CampaignStances {
         Self {
             node_id,
             by_node: stances.into_iter().collect(),
+            takers: BTreeMap::new(),
+            serving_ready: BTreeSet::new(),
             leader_counts: BTreeMap::new(),
             egress: BTreeMap::new(),
         }
+    }
+
+    /// These stances with `takers` as the replicas each node answered may
+    /// take their group's leadership.
+    #[cfg(test)]
+    pub(crate) fn with_takers(
+        mut self,
+        takers: impl IntoIterator<Item = (u64, BTreeSet<RaftTargetKey>)>,
+    ) -> Self {
+        self.takers = takers.into_iter().collect();
+        self
+    }
+
+    /// These stances with `ready` as the peers that answered that they are
+    /// serving-ready.
+    #[cfg(test)]
+    pub(crate) fn with_serving_ready(mut self, ready: impl IntoIterator<Item = u64>) -> Self {
+        self.serving_ready = ready.into_iter().collect();
+        self
     }
 
     /// These stances with `counts` as the nodes' leader counts.
@@ -299,8 +352,9 @@ impl PeerParticipation {
         .await
     }
 
-    /// The campaign stance and leader count of this node and of each peer.
-    /// A node shedding for cold health may campaign, because that reason
+    /// The campaign stance, the replicas that may take a leadership and the
+    /// leader count of this node and of each peer, and which peers are
+    /// serving-ready. A node shedding for cold health may campaign, because that reason
     /// does not stop it from campaigning: cold-health backlogs are often
     /// cluster-wide, and leaving every hot node out could leave no node to
     /// lead.
@@ -310,6 +364,8 @@ impl PeerParticipation {
     ) -> CampaignStances {
         let answers = self.answers(registry, |_peer| true).await;
         let mut by_node = BTreeMap::new();
+        let mut takers = BTreeMap::new();
+        let mut serving_ready = BTreeSet::new();
         let mut leader_counts = BTreeMap::new();
         let mut egress = BTreeMap::new();
         for (peer_id, answer) in answers {
@@ -320,6 +376,10 @@ impl PeerParticipation {
             };
             by_node.insert(peer_id, stance);
             if let Some(status) = answer {
+                takers.insert(peer_id, status.takes_leadership);
+                if status.serving_ready {
+                    serving_ready.insert(peer_id);
+                }
                 leader_counts.insert(peer_id, status.leader_count);
                 egress.insert(peer_id, status.egress);
             }
@@ -330,10 +390,13 @@ impl PeerParticipation {
             CampaignStance::MayNotCampaign
         };
         by_node.insert(self.node_id, own);
+        takers.insert(self.node_id, registry.takes_leadership());
         leader_counts.insert(self.node_id, registry.leader_count());
         CampaignStances {
             node_id: self.node_id,
             by_node,
+            takers,
+            serving_ready,
             leader_counts,
             egress,
         }
@@ -491,9 +554,7 @@ mod tests {
     use ursula_shard::RaftTarget;
 
     use super::CampaignStance;
-    use super::CampaignStances;
     use super::PeerParticipation;
-    use crate::bootstrap::health_gate::ShedTargets;
     use crate::shared_peers;
 
     const THIS_CLUSTER: &str = "this-cluster";
@@ -539,8 +600,10 @@ mod tests {
             should_campaign,
             recovery_barriers_ready: true,
             should_shed_current_leaders: false,
+            takes_leadership: BTreeSet::new(),
             recovery_gates: BTreeMap::new(),
             leader_count: 0,
+            serving_ready: true,
             egress: EgressProbeStatus::Unprobed,
         }
     }
@@ -761,23 +824,61 @@ mod tests {
         }
     }
 
-    /// A shed hands leaderships only to the nodes that answered that they
-    /// may campaign: one that did not answer may be one that refuses a
-    /// transfer without a word.
-    #[test]
-    fn a_shed_hands_off_only_to_nodes_that_answered_that_they_may_campaign() {
-        let stances = CampaignStances::of_nodes(1, [
-            (1, CampaignStance::MayNotCampaign),
-            (2, CampaignStance::MayCampaign),
-            (3, CampaignStance::Unknown),
-            (4, CampaignStance::MayNotCampaign),
-        ]);
-        assert_eq!(stances.shed_targets(), ShedTargets::new(HashSet::from([2])));
-        let silent = CampaignStances::of_nodes(1, [
-            (1, CampaignStance::MayNotCampaign),
-            (2, CampaignStance::Unknown),
-            (3, CampaignStance::Unknown),
-        ]);
-        assert_eq!(silent.shed_targets(), ShedTargets::default());
+    /// A replica takes a leadership only as its node answered, for its own
+    /// cluster, and the balancer moves leaderships only to a node that
+    /// answered that it is serving-ready. The bugs it catches: a target
+    /// picked from the node's stance alone, which hands a leadership to a
+    /// replica that refuses it (one that restarted a moment ago, behind its
+    /// gate or before it acknowledged its leader), an answer of another
+    /// cluster trusted, a silent peer taken as willing, and a balancer that
+    /// pulls leaderships onto a node that is not ready.
+    #[tokio::test]
+    async fn a_replica_takes_a_leadership_only_as_its_node_answered() {
+        let takes =
+            |replicas: &[RaftTargetKey], ready: bool, cluster_id: &str| LeadershipShedStatus {
+                takes_leadership: replicas.iter().copied().collect(),
+                serving_ready: ready,
+                ..status(cluster_id, true)
+            };
+        let (ready, ready_task) = serving(takes(
+            &[RaftTargetKey::Data(7), RaftTargetKey::Meta],
+            true,
+            THIS_CLUSTER,
+        ))
+        .await;
+        let (unready, unready_task) =
+            serving(takes(&[RaftTargetKey::Data(8)], false, THIS_CLUSTER)).await;
+        let (foreign, foreign_task) =
+            serving(takes(&[RaftTargetKey::Data(7)], true, "other-cluster")).await;
+        let (silent, _listener) = silent_peer().await;
+        let participation = PeerParticipation::with_client(
+            1,
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(300))
+                .build()
+                .expect("client"),
+        );
+        let registry = this_registry(shared_peers([
+            (2, ready),
+            (3, unready),
+            (4, foreign),
+            (5, silent),
+        ]));
+        let stances = participation.campaign_stances(&registry).await;
+        assert!(stances.may_take(2, RaftTargetKey::Data(7)));
+        assert!(stances.may_take(2, RaftTargetKey::Meta));
+        assert!(!stances.may_take(2, RaftTargetKey::Data(8)));
+        assert!(stances.may_take(3, RaftTargetKey::Data(8)));
+        assert!(!stances.may_take(3, RaftTargetKey::Data(7)));
+        for other in [4, 5] {
+            assert!(!stances.may_take(other, RaftTargetKey::Data(7)));
+        }
+        // This node runs no replica, so none of its own takes one.
+        assert!(!stances.may_take(1, RaftTargetKey::Data(7)));
+        // Node 3 is not serving-ready: the balancer moves nothing to it.
+        assert_eq!(stances.balance_eligible(), HashSet::from([1, 2]));
+        for task in [ready_task, unready_task, foreign_task] {
+            task.abort();
+        }
     }
 }

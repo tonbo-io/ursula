@@ -173,17 +173,19 @@ The node routes answer `{"lifecycle": L}`, the node's lifecycle after the change
 
 ### Maintenance drain
 
-`POST /__ursula/leadership-shed/maintenance` marks the node as draining: it stops campaigning and accepting transfers until the mark is lifted with `DELETE`, so no handoff and no balancer moves a leadership to it. Both verbs return the node's leadership-shed state so tooling can confirm the transition took effect. The state also lists the recovery gate of each replica the node runs (`recovery_gates`, the meta replica's under `"meta"`) and how many data groups it leads (`leader_count`). A group's leader promotes a learner on the node only once its gate there is `open`, and the peers' leadership balancers read the count:
+`POST /__ursula/leadership-shed/maintenance` marks the node as draining: it stops campaigning and accepting transfers until the mark is lifted with `DELETE`, so no handoff and no balancer moves a leadership to it. Both verbs return the node's leadership-shed state so tooling can confirm the transition took effect. The state also lists the replicas whose group's leadership the node may take now (`takes_leadership`, the meta replica as `"meta"`), the recovery gate of each replica the node runs (`recovery_gates`), how many data groups it leads (`leader_count`) and whether it is serving-ready (`serving_ready`, as `/__ursula/ready` answers). A replica takes a leadership only while the node takes transfers, its gate lets it campaign and it acknowledged a leader of its group since the node started, and every planned handoff (the health gates' sheds, the leadership balancer and the shutdown handoff) goes only to a replica listed in `takes_leadership`. The commit-stall watchdog and the WAL-disk shed do not ask the peers: they hand a leadership to a voter the leader's own handoff check accepts, and a target that refuses costs the group one election. A group's leader promotes a learner on the node only once its gate there is `open`, and the peers' leadership balancers read the count and move leaderships only to a serving-ready node:
 
 ```json
 {
-  "bits": 1,
+  "bits": 8,
   "state": "maintenance-drain",
   "should_accept_transfer": false,
   "should_campaign": false,
   "should_shed_current_leaders": true,
+  "takes_leadership": [],
   "recovery_gates": { "7": "open", "meta": "open" },
-  "leader_count": 3
+  "leader_count": 3,
+  "serving_ready": true
 }
 ```
 
@@ -198,8 +200,8 @@ hands off each leadership to an eligible voter (see the handoff rule under
 asks its peers again which of them may take a transfer, waiting up to one
 minimum election timeout (1.5 seconds) for a peer's answer, logs their answers
 when they change, and submits each leadership that no peer could take yet,
-only to a peer that answered that it may campaign. A
-submitted transfer is not repeated within the handoff: it waits longer than
+only to a peer that answered that its replica of the group may take the
+leadership. A submitted transfer is not repeated within the handoff: it waits longer than
 five seconds to settle. It logs the groups no peer can take, with the reason
 the handoff check gave for each peer. It waits for observed leadership changes
 for up to five seconds and then logs each leadership it still holds. It steps
@@ -327,7 +329,7 @@ With `raft.wal.fsync = "never"`, the default for groups of three or more voters,
 - It asks the group's leader for a fresh ReadIndex barrier, applies the log up to the barrier's index and then opens the gate. Until then readiness answers `503` with reason `recovery_gate_closed`, and `recovery_gates` in `GET /__ursula/metrics` lists the gated groups.
 - The leader sees that the node lost entries it had acknowledged, rewinds its replication to the node and sends it its log again. The node stays a voter, and nothing is proposed to repair it. The node's answer still counts as its acknowledgement of the leader, so the leader keeps its quorum while the node catches up. The leader logs a warning naming the group and the node, and `ursula.raft.follower_log_reversions` counts it per node. A node that shows up there without a host crash or a lost disk may have a disk that drops synced writes.
 
-Leadership handoffs (draining, balancing, a node that sheds its leaderships, the commit-stall watchdog, the admin transfer endpoint) go only to a voter that acknowledged the leader within the last 1.5 seconds (the minimum election timeout) and holds every committed entry. A handoff whose target has not taken over within 6 seconds (two maximum election timeouts) is abandoned: the leader steps down and campaigns again.
+Leadership handoffs (draining, balancing, a node that sheds its leaderships, the commit-stall watchdog, the admin transfer endpoint) go only to a voter that acknowledged the leader within the last 1.5 seconds (the minimum election timeout) and holds every committed entry. A handoff whose target refuses it is abandoned at once, and one whose target took it but has not won within 1.5 seconds right after: the leader steps down and campaigns again with a pre-vote round. One whose target holds a newer vote or does not answer is abandoned the same way after 6 seconds (two maximum election timeouts).
 
 While at most a minority of a group's voters lost their tail, the other voters hold every acknowledged write and nothing is lost. Wait for every group to open the gate on a node before you stop another voter.
 

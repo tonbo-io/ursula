@@ -10,8 +10,9 @@
 //!   included, hands its meta leadership away too, for as long as that
 //!   reason holds. The data drain (`ShedDrain`) follows data group ids,
 //!   where meta's group 0 would meet data group 0, so meta's one
-//!   leadership is handed off here, to a meta voter that takes transfers,
-//!   by the registry's handoff check. A node that sheds only for cold
+//!   leadership is handed off here, to a meta voter whose node answered that
+//!   its meta replica may take the leadership, by the registry's handoff
+//!   check. A node that sheds only for cold
 //!   health still takes transfers and keeps meta: when every node sheds
 //!   for cold health (an object store outage), handing meta on would move
 //!   it from voter to voter once per settle time, and its writes and
@@ -21,13 +22,13 @@
 //! metrics, so meta never makes a node shed.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 // `tokio::time::Instant` so the deadlines follow tokio's clock, which
 // tests pause and madsim simulates.
 use tokio::time::Instant;
+use ursula_proto::admin::RaftTargetKey;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::meta::runtime::MetaRuntimeState;
@@ -36,6 +37,7 @@ use ursula_raft::meta::status::MetaStatusReader;
 use crate::bootstrap::health_gate::LeadershipShed;
 use crate::bootstrap::health_gate::ShedMark;
 use crate::bootstrap::health_gate::ShedPace;
+use crate::bootstrap::participation::CampaignStances;
 use crate::bootstrap::participation::PeerParticipation;
 
 /// How often the meta shed looks at the node's shed state and meta
@@ -84,8 +86,7 @@ pub(crate) fn spawn_meta_shed(
                 placement.step(&stances.shed_targets(), &[]).await;
             }
             if hand_off_meta
-                && let Some(settle) =
-                    hand_off_meta_leadership(&registry, node_id, &stances.may_campaign()).await
+                && let Some(settle) = hand_off_meta_leadership(&registry, node_id, &stances).await
             {
                 meta_settles = now.checked_add(settle);
             }
@@ -100,14 +101,15 @@ pub(crate) fn leads_meta(registry: &RaftGroupHandleRegistry, node_id: u64) -> bo
         .is_some_and(|meta| meta.current_leader == Some(node_id))
 }
 
-/// Hands node `node_id`'s meta leadership to the first meta voter in
-/// `eligible` that the registry's handoff check accepts, and returns how
-/// long the handoff may take to move it. `None` when this node does not
-/// lead meta or no voter took the handoff.
+/// Hands node `node_id`'s meta leadership to the first meta voter whose
+/// node answered that its meta replica may take the leadership
+/// ([`CampaignStances::may_take`]) and that the registry's handoff check
+/// accepts, and returns how long the handoff may take to move it. `None`
+/// when this node does not lead meta or no voter took the handoff.
 async fn hand_off_meta_leadership(
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
-    eligible: &HashSet<u64>,
+    stances: &CampaignStances,
 ) -> Option<Duration> {
     let meta = registry.meta_metrics_snapshot()?;
     if meta.current_leader != Some(node_id) {
@@ -118,7 +120,7 @@ async fn hand_off_meta_leadership(
         &meta,
         node_id,
         None,
-        |node| eligible.contains(&node),
+        |node| stances.may_take(node, RaftTargetKey::Meta),
         &HashMap::new(),
     );
     for target in targets {

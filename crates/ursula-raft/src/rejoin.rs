@@ -1491,6 +1491,16 @@ impl GroupRejoin {
         self.gate().campaigns() && !self.needs_vote_floor()
     }
 
+    /// Whether this replica may take its group's leadership from a leader
+    /// now, as far as the replica is concerned: it may campaign, and it
+    /// acknowledged a leader of its group in this run ([`acknowledge`]), so
+    /// it holds what that leader committed and its transfer can complete.
+    /// The node's shed policy is the other half
+    /// ([`crate::ElectionPolicy::may_take_leadership`]).
+    pub(crate) fn may_take_leadership(&self) -> bool {
+        self.may_campaign() && self.acknowledgements.acknowledged()
+    }
+
     /// Opens the gate, recording it first.
     async fn open(&self, why: GateOpening) -> Result<(), RecoveryGateError> {
         let store = self

@@ -19,8 +19,8 @@ pub(crate) fn leader_counts(
 
 /// The nodes `me` may hand the leadership of `snap`'s group to, the one
 /// exclusion of every leadership handoff (design 5.9): the other voters of
-/// the group's effective membership that `admits` takes, such as the nodes
-/// that may campaign. Under a bootstrapped view (`cluster`) a voter must
+/// the group's effective membership that `admits` takes, such as the
+/// replicas whose node answered that they may take the leadership. Under a bootstrapped view (`cluster`) a voter must
 /// also have a role in the group's placement that takes a leadership
 /// ([`ursula_proto::placement::ReplicaRole::takes_leadership`]), so no
 /// outgoing or abandoned replica, nor a member without a role, is handed

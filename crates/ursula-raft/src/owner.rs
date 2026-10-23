@@ -35,8 +35,11 @@ use ursula_runtime::NodeFence;
 use crate::leadership::GroupLeadership;
 use crate::leadership::LeaderContact;
 use crate::leadership::named_leader;
+use crate::openraft_work::TransferAnswer;
+use crate::openraft_work::TransferOutcome;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
+use crate::rt::sync::watch;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -184,46 +187,65 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     }
 
     /// Abandons the leadership transfer to `target` this leader submitted at
-    /// `vote` if it still leads at `vote` once the transfer deadline passed.
+    /// `vote` unless it moves the leadership: at once when the target
+    /// answers that it does not take it ([`TransferOutcome::Refused`] in
+    /// `answers`, subscribed before the transfer started), within one
+    /// minimum election timeout of a target's answer that it does, within
+    /// one leader lease of the transfer when the target already holds
+    /// another vote ([`TransferOutcome::Superseded`]) or its answer is lost,
+    /// which leaves a newer election or the target's own campaign that
+    /// long, and otherwise once the transfer deadline passed
+    /// ([`transfer_end`]).
     ///
     /// OpenRaft never abandons a transfer: until it sees a higher vote, the
     /// leader forwards every write to `target`, sends no heartbeats, never
     /// campaigns, and refuses a candidate with a shorter log without adopting
     /// its term. Its `elect` keeps that leader state behind a new candidacy.
     /// So the leader steps down as a follower would, which drops the leader
-    /// state, then campaigns, shed or not ([`step_down_and_campaign`]). A refused
-    /// step-down is retried every minimum election timeout until the
-    /// leadership or the vote changes.
-    pub(crate) fn abandon_stalled_transfer(&self, vote: UrsulaVote, target: u64) {
+    /// state, then campaigns with a pre-vote round, shed or not
+    /// ([`step_down_then_elect`]), so it never raises the term past a leader
+    /// a quorum already follows. A voter that handled the transfer's
+    /// broadcast dropped its lease of this leader and grants the round at
+    /// once. A target that refused the transfer never handed it to its Raft,
+    /// so it keeps that lease and refuses the round until the lease lapses,
+    /// one lease after this leader's last heartbeat. So the leader repeats
+    /// the round every minimum election timeout until a leader is known
+    /// ([`lead_again`]), whatever its election switch says: with a voter
+    /// that took the broadcast it leads again within a round, and otherwise
+    /// once the target's lease lapsed. A refused step-down is retried every
+    /// minimum election timeout until the leadership or the vote changes.
+    pub(crate) fn abandon_stalled_transfer(
+        &self,
+        vote: UrsulaVote,
+        target: u64,
+        answers: watch::Receiver<Option<TransferAnswer>>,
+    ) {
         let deadline = self.transfer_deadline;
         let retry = self.handoff_ack_window;
+        let lease = self.lease;
         let job: Job<SM> = Box::new(move |raft| {
             Box::pin(async move {
-                let mut wait = deadline;
+                let bounds = TransferBounds {
+                    deadline,
+                    retry,
+                    lease,
+                };
+                let end = transfer_end(&raft, vote, target, bounds, answers).await;
+                if end == TransferEnd::Moved {
+                    return;
+                }
                 loop {
-                    let settled = raft
-                        .wait(Some(wait))
-                        .metrics(
-                            |metrics| {
-                                metrics.vote != vote
-                                    || metrics.state != openraft::ServerState::Leader
-                            },
-                            "leadership transfer settles",
-                        )
-                        .await;
-                    if !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..))) {
-                        return;
-                    }
-                    match step_down_and_campaign(&raft, vote, target).await {
+                    match step_down_then_elect(&raft, vote, target, Candidacy::PreVote).await {
                         Ok(StepDown::Campaigned) => {
                             tracing::warn!(
                                 node_id = raft.metrics().borrow_watched().id,
                                 target,
                                 %vote,
-                                ?deadline,
+                                ?end,
                                 "leadership transfer did not complete; stepped down and \
                                  campaigned"
                             );
+                            lead_again(&raft, vote, target, retry, deadline).await;
                             return;
                         }
                         Ok(StepDown::Refused { by }) => {
@@ -233,7 +255,6 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
                                 refused_by = %by,
                                 "step-down from a stalled leadership transfer refused; retrying"
                             );
-                            wait = retry;
                         }
                         Ok(StepDown::LogAdvanced) => {
                             tracing::debug!(
@@ -242,7 +263,6 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
                                 "step-down from a stalled leadership transfer refused for an \
                                  append after it read the log; retrying"
                             );
-                            wait = retry;
                         }
                         Err(StepDownError::Campaign(error)) => {
                             tracing::warn!(
@@ -263,6 +283,9 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
                             );
                             return;
                         }
+                    }
+                    if settles_within(&raft, vote, retry).await {
+                        return;
                     }
                 }
             })
@@ -302,8 +325,9 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     }
 
     /// Starts a new term with this leader's own campaign. It steps down
-    /// first, to `target`, as [`Self::abandon_stalled_transfer`] does
-    /// ([`step_down_and_campaign`]). `target` must be another node. A
+    /// first, to `target`, as [`Self::abandon_stalled_transfer`] does, but
+    /// campaigns without a pre-vote round ([`step_down_and_campaign`]).
+    /// `target` must be another node. A
     /// single-voter group may name a node outside its membership, which
     /// never answers, so the leader wins its campaign alone.
     #[cfg(any(test, feature = "fault-injection"))]
@@ -551,11 +575,13 @@ fn step_down_target(metrics: &RaftMetrics<C>) -> Option<u64> {
         .max_by_key(|voter| (matched(*voter), std::cmp::Reverse(*voter)))
 }
 
-/// How a leader's [`step_down_and_campaign`] ended.
+/// How a leader's step-down and campaign ([`step_down_then_elect`])
+/// ended.
 #[derive(Debug)]
 pub enum StepDown {
     /// The leader granted itself the step-down vote, which dropped its
-    /// leader state, and then started a campaign.
+    /// leader state, and then started a campaign (with a pre-vote round,
+    /// that round).
     Campaigned,
     /// The node already holds a vote above the step-down vote: the
     /// leadership moved on without this step-down.
@@ -582,7 +608,7 @@ pub(crate) enum StepDownVote {
     LogAdvanced,
 }
 
-/// Why a leader's step-down ([`step_down`], [`step_down_and_campaign`]) did
+/// Why a leader's step-down ([`step_down`], [`step_down_then_elect`]) did
 /// not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum StepDownError {
@@ -630,14 +656,190 @@ pub(crate) async fn step_down<SM: RaftStateMachine<C>>(
     }
 }
 
-/// Steps the leader at `vote` down to `target`, then campaigns.
-///
-/// OpenRaft ignores `elect` on a leader (#721). So the leader first steps
-/// down ([`step_down`]) and campaigns only then.
+/// How a leadership transfer this leader submitted ended, as it sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferEnd {
+    /// The leadership or the vote changed: the transfer moved it, or
+    /// something else did.
+    Moved,
+    /// The target answered that it does not take the transfer.
+    Refused,
+    /// The leadership did not move in time.
+    Stalled,
+}
+
+/// How long a leader waits on a leadership transfer it submitted
+/// ([`transfer_end`]).
+#[derive(Debug, Clone, Copy)]
+struct TransferBounds {
+    /// The longest wait: the transfer deadline.
+    deadline: Duration,
+    /// The wait after the target answered that it takes the transfer: one
+    /// minimum election timeout, since it campaigns at once.
+    retry: Duration,
+    /// The wait, from the transfer's start, after the target answered that
+    /// it holds another vote or its answer was lost: one leader lease, which
+    /// a newer election or the target's own campaign needs at most.
+    lease: Duration,
+}
+
+/// Waits until the transfer to `target` submitted at `vote` ends
+/// ([`TransferEnd`]), as `bounds` says. A target's refusal ends it at once.
+/// A leader without the target's answers waits for the deadline.
+async fn transfer_end<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
+    vote: UrsulaVote,
+    target: u64,
+    bounds: TransferBounds,
+    mut answers: watch::Receiver<Option<TransferAnswer>>,
+) -> TransferEnd {
+    let start = crate::rt::time::Instant::now();
+    let mut bound = bounds.deadline;
+    loop {
+        let wait = bound.saturating_sub(start.elapsed());
+        crate::rt::select! {
+            biased;
+            moved = settles_within(raft, vote, wait) => {
+                return if moved { TransferEnd::Moved } else { TransferEnd::Stalled };
+            }
+            outcome = target_answer(&mut answers, vote, target) => match outcome {
+                Some(TransferOutcome::Refused) => return TransferEnd::Refused,
+                Some(TransferOutcome::Taken) => {
+                    bound = bound.min(start.elapsed().saturating_add(bounds.retry));
+                }
+                Some(TransferOutcome::Superseded | TransferOutcome::Unanswered) => {
+                    bound = bound.min(bounds.lease);
+                }
+                None => {
+                    let moved = settles_within(raft, vote, wait).await;
+                    return if moved { TransferEnd::Moved } else { TransferEnd::Stalled };
+                }
+            },
+        }
+    }
+}
+
+/// The next answer of `target` to the transfer this leader sent at `vote`.
+/// `None` once no client of the engine can answer any more.
+async fn target_answer(
+    answers: &mut watch::Receiver<Option<TransferAnswer>>,
+    vote: UrsulaVote,
+    target: u64,
+) -> Option<TransferOutcome> {
+    loop {
+        answers.changed().await.ok()?;
+        let answer = *answers.borrow_and_update();
+        if let Some(answer) = answer
+            && answer.from == vote
+            && answer.to == target
+        {
+            return Some(answer.outcome);
+        }
+    }
+}
+
+/// Repeats the pre-vote round of the leader at `vote` that stepped down
+/// from its transfer to `target` ([`OwnerRaftHandle::abandon_stalled_transfer`])
+/// every `retry` until a leader is known, for at most `budget`. A pre-vote
+/// round raises no term, so a repeated one cannot unseat a leader a quorum
+/// follows. The budget, one transfer deadline, outlasts the lease of the
+/// old leader every voter holds (one maximum election timeout), so a quorum
+/// that can reach this node grants a round within it. Past it, the voters'
+/// election ticks elect.
+async fn lead_again<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
+    vote: UrsulaVote,
+    target: u64,
+    retry: Duration,
+    budget: Duration,
+) {
+    let start = crate::rt::time::Instant::now();
+    loop {
+        // A leader under the transfer's vote is this node's stale view of
+        // itself before the step-down: the step-down raised the vote.
+        let known = raft
+            .wait(Some(retry))
+            .metrics(
+                |metrics| metrics.current_leader.is_some() && metrics.vote != vote,
+                "a leader is known after an abandoned leadership transfer",
+            )
+            .await;
+        if !matches!(known, Err(openraft::metrics::WaitError::Timeout(..))) {
+            return;
+        }
+        if start.elapsed() >= budget {
+            tracing::warn!(
+                node_id = raft.metrics().borrow_watched().id,
+                target,
+                %vote,
+                ?budget,
+                "no leader after an abandoned leadership transfer; leaving the election to the \
+                 election timers"
+            );
+            return;
+        }
+        if let Err(error) = raft.trigger().elect(true).await {
+            tracing::warn!(
+                %error,
+                target,
+                %vote,
+                "the campaign after an abandoned leadership transfer did not start"
+            );
+            return;
+        }
+    }
+}
+
+/// Whether the replica's vote changes from `vote`, or it stops leading,
+/// within `wait`.
+async fn settles_within<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
+    vote: UrsulaVote,
+    wait: Duration,
+) -> bool {
+    let settled = raft
+        .wait(Some(wait))
+        .metrics(
+            |metrics| metrics.vote != vote || metrics.state != openraft::ServerState::Leader,
+            "leadership transfer settles",
+        )
+        .await;
+    !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..)))
+}
+
+/// Steps the leader at `vote` down to `target`, then campaigns at once in
+/// the next term ([`step_down_then_elect`] with [`Candidacy::Immediate`]):
+/// a fault that ends a leadership without moving it.
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
     raft: &Raft<C, SM>,
     vote: UrsulaVote,
     target: u64,
+) -> Result<StepDown, StepDownError> {
+    step_down_then_elect(raft, vote, target, Candidacy::Immediate).await
+}
+
+/// How a leader that stepped down campaigns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Candidacy {
+    /// A pre-vote round first: the term moves only once a quorum would
+    /// grant the vote, so a leader a quorum already follows keeps leading.
+    PreVote,
+    /// In the next term at once, even against a leader its voters follow.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    Immediate,
+}
+
+/// Steps the leader at `vote` down to `target`, then campaigns as
+/// `candidacy` says.
+///
+/// OpenRaft ignores `elect` on a leader (#721). So the leader first steps
+/// down ([`step_down`]) and campaigns only then.
+async fn step_down_then_elect<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
+    vote: UrsulaVote,
+    target: u64,
+    candidacy: Candidacy,
 ) -> Result<StepDown, StepDownError> {
     match step_down(raft, vote, target).await? {
         StepDownVote::Granted => {}
@@ -645,7 +847,7 @@ pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
         StepDownVote::LogAdvanced => return Ok(StepDown::LogAdvanced),
     }
     raft.trigger()
-        .elect(false)
+        .elect(candidacy == Candidacy::PreVote)
         .await
         .map_err(StepDownError::Campaign)?;
     Ok(StepDown::Campaigned)

@@ -9967,7 +9967,7 @@ mod cluster_egress {
                 tokio::time::Instant::now(),
                 usize::MAX,
                 &[],
-                &ShedTargets::new(std::collections::HashSet::from([1, 2, 3, 4])),
+                &ShedTargets::taking_every_group([1, 2, 3, 4], 0..64),
                 can_take_over,
             )
             .plan
@@ -10198,6 +10198,7 @@ mod leadership_shed {
     use tokio::time::Instant;
     use ursula_proto::admin::EgressProbeStatus;
     use ursula_proto::admin::LeadershipShedStatus;
+    use ursula_proto::admin::RaftTargetKey;
     use ursula_raft::LeadershipShedReason;
     use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
@@ -10276,33 +10277,45 @@ mod leadership_shed {
             for group in 0..GROUPS {
                 cluster.move_leadership_to_node_1(group).await;
             }
-            // Every node's recovery gates open, so each may campaign and take
-            // over leaderships.
-            cluster.wait_until_may_campaign([1, 2, 3]).await;
+            // Every node's recovery gates open and its replicas acknowledge
+            // node 1, so each may campaign and take over leaderships.
+            cluster.wait_until_may_take_over([1, 2, 3]).await;
             cluster
         }
 
         /// Waits until node 1 sees exactly `nodes` as the nodes that may
-        /// campaign, and returns them. One answer can come late on a loaded
-        /// host, so a single query is not enough.
-        async fn wait_until_may_campaign(
+        /// campaign, each answering that its replica of every group it does
+        /// not lead may take the leadership, and returns where a shed may
+        /// hand leaderships then. One answer can come late on a loaded host, so a single query
+        /// is not enough.
+        async fn wait_until_may_take_over(
             &self,
             nodes: impl IntoIterator<Item = u64>,
-        ) -> HashSet<u64> {
+        ) -> ShedTargets {
             let expected: HashSet<u64> = nodes.into_iter().collect();
             let deadline = deadline(Duration::from_secs(60));
             let participation = self.participation();
             loop {
-                let eligible = participation
+                let stances = participation
                     .campaign_stances(&self.node_1().registry)
-                    .await
-                    .may_campaign();
-                if eligible == expected {
-                    return eligible;
+                    .await;
+                let eligible = stances.may_campaign();
+                // A replica that leads its group is never a handoff target,
+                // and one that has led since it opened acknowledged no other
+                // leader, so only the groups a node does not lead count.
+                let leaders = self.leaders();
+                let taking = expected.iter().all(|node| {
+                    (0..GROUPS)
+                        .filter(|group| leaders.get(group).copied().flatten() != Some(*node))
+                        .all(|group| stances.may_take(*node, RaftTargetKey::Data(group)))
+                });
+                if eligible == expected && taking {
+                    return stances.shed_targets();
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "only nodes {eligible:?} may campaign, not {expected:?}"
+                    "only nodes {eligible:?} may campaign, not {expected:?}, or a replica may not \
+                     take its leadership: {stances:?}"
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -10321,8 +10334,8 @@ mod leadership_shed {
         /// Checks that node 1 hands off nothing for 8 s while no peer
         /// qualifies. A handoff to a peer that may campaign moves the
         /// leadership. A handoff to a peer that may not is refused without
-        /// a word, and Raft abandons it after its 6 s transfer deadline:
-        /// node 1 then leads the group in a newer term.
+        /// a word to Raft, and node 1 abandons it once the peer answers:
+        /// it then leads the group in a newer term.
         async fn assert_node_1_hands_nothing_off(&self) {
             let terms = self.terms();
             tokio::time::sleep(Duration::from_secs(8)).await;
@@ -10664,8 +10677,8 @@ mod leadership_shed {
         while shed.is_draining() {
             assert!(Instant::now() < deadline, "the drain does not finish");
             // Node 1 sheds, and both peers may campaign.
-            let may_campaign = cluster.wait_until_may_campaign([2, 3]).await;
-            let step = shed.step(&ShedTargets::new(may_campaign), &[]).await;
+            let shed_targets = cluster.wait_until_may_take_over([2, 3]).await;
+            let step = shed.step(&shed_targets, &[]).await;
             assert!(step.submitted.len() <= PER_TICK, "{step:?}");
             for handoff in &step.submitted {
                 let count = targets.entry(handoff.target).or_default();
@@ -10704,7 +10717,7 @@ mod leadership_shed {
         let node_1 = cluster.node_1();
         let participation = cluster.participation();
         // Both peers drain: they may not campaign, so each refuses a
-        // transfer without telling node 1.
+        // transfer.
         for node_id in [2, 3] {
             cluster
                 .node(node_id)
@@ -10721,12 +10734,9 @@ mod leadership_shed {
         shed.begin();
 
         // With no peer that may campaign, every leadership stays pending.
-        let may_campaign = participation
-            .campaign_stances(&node_1.registry)
-            .await
-            .may_campaign();
-        assert!(may_campaign.is_empty(), "{may_campaign:?}");
-        let stranded = shed.step(&ShedTargets::new(may_campaign), &[]).await;
+        let stances = participation.campaign_stances(&node_1.registry).await;
+        assert!(stances.may_campaign().is_empty(), "{stances:?}");
+        let stranded = shed.step(&stances.shed_targets(), &[]).await;
         assert!(stranded.submitted.is_empty(), "{stranded:?}");
         assert_eq!(stranded.stranded.len(), usize::try_from(GROUPS).unwrap());
 
@@ -10740,7 +10750,7 @@ mod leadership_shed {
             .collect();
         let submitting = Instant::now();
         let first = shed
-            .step(&ShedTargets::new(HashSet::from([2, 3])), &[])
+            .step(&ShedTargets::taking_every_group([2, 3], 0..GROUPS), &[])
             .await;
         assert_eq!(first.submitted.len(), PER_TICK, "{first:?}");
         let settle = node_1
@@ -10749,11 +10759,43 @@ mod leadership_shed {
             .expect("registered group")
             .handoff_settle_time();
 
-        // Raft abandons each transfer at its deadline, and node 1, which its
-        // draining peers still vote for, leads the group again. The drain
-        // calls a handoff stalled only once its settle time has passed,
-        // so it does not send a second transfer while Raft may still be
-        // completing the first.
+        // Each target refuses its transfer at once, and node 1 abandons it
+        // at the refusal: it leads the group again in a newer term within
+        // one election, which node 3 grants once it handled the transfer's
+        // broadcast. At worst node 1's first pre-vote reaches node 3 before
+        // that broadcast did. Node 1 sheds, so its election timers are off,
+        // but it repeats the round itself one minimum election timeout
+        // (1.5 s) later, and that round wins. No peer campaigns, so without
+        // the refusal only the 6 s transfer deadline would end the
+        // transfer.
+        let reelected_within = Duration::from_millis(4_500);
+        assert!(
+            reelected_within < settle,
+            "{reelected_within:?} is not under the {settle:?} settle time"
+        );
+        for handoff in &first.submitted {
+            let raft = node_1
+                .registry
+                .get(RaftGroupId(handoff.group_id))
+                .expect("registered group");
+            let term = terms[&handoff.group_id];
+            raft.wait(Some(reelected_within.saturating_sub(submitting.elapsed())))
+                .metrics(
+                    move |metrics| metrics.current_leader == Some(1) && metrics.current_term > term,
+                    "node 1 leads again at the refusal",
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{handoff:?}: node 1 does not lead again within {reelected_within:?} of \
+                         the refused handoff: {err}"
+                    )
+                });
+        }
+
+        // The drain calls a handoff stalled only once its settle time has
+        // passed, so it does not send a second transfer while Raft may
+        // still be completing the first.
         let mut stalled: Vec<ShedHandoff> = Vec::new();
         let stall_deadline = deadline(settle.saturating_add(Duration::from_secs(30)));
         let mut steps = tokio::time::interval(Duration::from_millis(250));
@@ -10775,20 +10817,6 @@ mod leadership_shed {
                 );
             }
             stalled.extend(step.stalled);
-        }
-        for handoff in &first.submitted {
-            let raft = node_1
-                .registry
-                .get(RaftGroupId(handoff.group_id))
-                .expect("registered group");
-            let term = terms[&handoff.group_id];
-            raft.wait(Some(Duration::from_secs(30)))
-                .metrics(
-                    move |metrics| metrics.current_leader == Some(1) && metrics.current_term > term,
-                    "node 1 leads again after the abandoned transfer",
-                )
-                .await
-                .unwrap_or_else(|err| panic!("{handoff:?}: {err}"));
         }
 
         // Node 2 may campaign again. The drain hands the stalled groups off
@@ -10897,8 +10925,13 @@ mod leadership_shed {
                             should_campaign: true,
                             recovery_barriers_ready: true,
                             should_shed_current_leaders: false,
+                            // The real peer behind the stub may take every
+                            // group's leadership once the cluster is led by
+                            // node 1 (`Cluster::wait_until_may_take_over`).
+                            takes_leadership: (0..GROUPS).map(RaftTargetKey::Data).collect(),
                             recovery_gates: std::collections::BTreeMap::new(),
                             leader_count: 0,
+                            serving_ready: true,
                             egress,
                         })
                     }

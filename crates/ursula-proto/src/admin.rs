@@ -1030,6 +1030,14 @@ pub struct LeadershipShedStatus {
     pub should_campaign: bool,
     pub recovery_barriers_ready: bool,
     pub should_shed_current_leaders: bool,
+    /// The replicas whose group's leadership the node may take from a
+    /// leader now, the meta replica's as `"meta"`: each one the node's
+    /// policy and the replica's own state admit (it may campaign and
+    /// acknowledged a leader of its group in this run), none while the node
+    /// takes no planned handoff. A leader hands a leadership only to a
+    /// replica listed here, and the replica checks the same rule when the
+    /// transfer arrives.
+    pub takes_leadership: BTreeSet<RaftTargetKey>,
     /// The recovery gate of every replica the node runs with one, open
     /// gates included, the meta replica's under `"meta"`. A group the map
     /// leaves out has no running gated replica on the node. A leader
@@ -1038,6 +1046,11 @@ pub struct LeadershipShedStatus {
     /// How many data groups the node leads. The leadership balancer reads
     /// its peers' counts here.
     pub leader_count: u32,
+    /// Whether the node is serving-ready, as `GET /__ursula/ready` answers.
+    /// The leadership balancer moves leaderships only to serving-ready
+    /// nodes, so it pulls none onto a node that restarted before its
+    /// replicas caught up with their leaders.
+    pub serving_ready: bool,
     /// What the node's last cluster-egress probe found. A node whose own
     /// probe is degraded sheds its leaderships only while a peer answers
     /// `clean`, a node that can do better.

@@ -4105,11 +4105,16 @@ impl MetaNode {
     /// Writes the node's config with `peers` as its `raft.peers`. Each data
     /// group's seed initializer initializes it.
     fn write(&self, peers: &[(u64, String)], meta: MetaToml<'_>) {
+        self.write_with_groups(peers, meta, META_TEST_GROUPS);
+    }
+
+    /// [`Self::write`], with `groups` data groups.
+    fn write_with_groups(&self, peers: &[(u64, String)], meta: MetaToml<'_>, groups: usize) {
         NodeToml {
             port: self.port,
             admin_port: self.admin_port,
             node_id: self.id,
-            raft_group_count: META_TEST_GROUPS,
+            raft_group_count: groups,
             peers,
             wal_path: &self.wal,
             cold_backend: if self.cold_root.is_some() {
@@ -5665,9 +5670,14 @@ fn stream_per_group(bucket: &str) -> Vec<String> {
 
 /// [`stream_per_group`], by the data group each stream hashes to.
 fn streams_by_group(bucket: &str) -> BTreeMap<u32, String> {
+    streams_by_group_of(bucket, META_TEST_GROUPS)
+}
+
+/// [`streams_by_group`] in a cluster of `groups` data groups.
+fn streams_by_group_of(bucket: &str, groups: usize) -> BTreeMap<u32, String> {
     ursula_runtime::validate_bucket_id(bucket)
         .unwrap_or_else(|err| panic!("bucket {bucket:?}: {err}"));
-    let map = ursula_shard::StaticShardMap::new(1, META_TEST_GROUPS).expect("shard map");
+    let map = ursula_shard::StaticShardMap::new(1, groups).expect("shard map");
     let mut streams: BTreeMap<u32, String> = BTreeMap::new();
     for candidate in 0_u32.. {
         let stream = format!("s{candidate}");
@@ -5675,7 +5685,7 @@ fn streams_by_group(bucket: &str) -> BTreeMap<u32, String> {
             .locate(&ursula_shard::BucketStreamId::new(bucket, &stream))
             .raft_group_id;
         streams.entry(group.0).or_insert(stream);
-        if streams.len() == META_TEST_GROUPS {
+        if streams.len() == groups {
             break;
         }
     }
@@ -10131,6 +10141,137 @@ async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
         long.is_empty(),
         "groups without a leader for {CLEAN_RESTART_LEADERLESS_WITHIN:?} or longer in node \
          {restarting}'s restart: {long:?}"
+    );
+}
+
+/// The data groups of [`cli_the_balancer_hands_a_restarted_node_leaderships_it_can_take`]:
+/// two per node of three, so a node that restarts leaves both other nodes
+/// above their fair share, and the balancer moves leaderships back to it.
+const BALANCED_RESTART_GROUPS: usize = 6;
+
+/// How long a write may take from its first attempt until it holds, and how
+/// long a group may go without a leader, while a node restarts and the
+/// leadership balancer moves leaderships back to it. A handoff the target
+/// takes costs one election round. One the target refuses, or one that
+/// does not complete, used to leave its group without a serving leader for
+/// an election timeout and a pre-vote round (1.5 s or more).
+const BALANCED_RESTART_WITHIN: Duration = Duration::from_secs(1);
+
+/// A leadership balancer hands a restarted node only leaderships it can
+/// take, and a group whose handoff does not complete keeps a leader. Three
+/// nodes run [`BALANCED_RESTART_GROUPS`] groups with the balancer ticking
+/// every second, two leaderships each once it settled. Under a producer
+/// load to every group, sent to the two nodes that stay up, one node stops
+/// by SIGTERM, hands its leaderships off, and starts again. The other two
+/// then lead three groups each, above their share, and the balancer moves
+/// two back to the restarted node, which it may do only once that node is
+/// serving-ready and its replica of the group acknowledged its leader
+/// again. Throughout, no group goes without a leader for
+/// [`BALANCED_RESTART_WITHIN`], and every write holds within it of its
+/// first attempt. A balancer that hands a leadership to the node before its
+/// replica may take one leaves the group to its old leader, which waits
+/// for the transfer, and fails it, as does a leader that does not lead
+/// again at once when its target refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_the_balancer_hands_a_restarted_node_leaderships_it_can_take() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the balanced restart test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        leadership_balance_interval: Some("1s"),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write_with_groups(&peers_of(&nodes), meta, BALANCED_RESTART_GROUPS);
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let ctl = ctl_client();
+    let ctl_nodes: Vec<ursula_ctl::NodeInfo> = nodes.iter().map(MetaNode::ctl).collect();
+    let groups = u64::try_from(BALANCED_RESTART_GROUPS).unwrap();
+    wait_leadership_balanced(&ctl, &ctl_nodes, groups).await;
+
+    let restarting = &nodes[2];
+    let staying: Vec<&MetaNode> = nodes
+        .iter()
+        .filter(|node| node.id != restarting.id)
+        .collect();
+    let mut loads = Vec::new();
+    for (group, stream) in streams_by_group_of("balanced", BALANCED_RESTART_GROUPS) {
+        let urls: Vec<String> = staying
+            .iter()
+            .map(|node| format!("{}/balanced/{stream}", node.url()))
+            .collect();
+        create_stream(&client, &mut procs, &urls[0]).await;
+        loads.push((group, ProducerLoad::start(urls, "balanced")));
+    }
+    let sampler = LeaderlessSampler::start(&nodes);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    procs.stop(restarting.id).await;
+    procs.start(binary, restarting);
+    let fair = BALANCED_RESTART_GROUPS.div_ceil(nodes.len());
+    let what = format!("node {} leads its {fair} groups again", restarting.id);
+    eventually(&mut procs, &what, async || {
+        let metrics = try_node_metrics(&client, &restarting.url()).await?;
+        let led = leads(&metrics, restarting.id);
+        if led >= fair {
+            Ok(())
+        } else {
+            Err(format!("node {} leads {led} groups", restarting.id))
+        }
+    })
+    .await;
+    // The balancer settles, and any election it set off ends. A client
+    // pins each node's process incarnation, so the restarted node needs a
+    // new one.
+    let ctl = ctl_client();
+    wait_leadership_balanced(&ctl, &ctl_nodes, groups).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let leaderless = sampler.stop().await;
+    let mut slow = Vec::new();
+    for (group, load) in loads {
+        let attempts = load.stop().await;
+        let mut first_sent = BTreeMap::<u64, tokio::time::Instant>::new();
+        let mut held = 0_usize;
+        for attempt in &attempts {
+            let first = *first_sent.entry(attempt.seq).or_insert(attempt.sent);
+            if attempt.outcome.holds() {
+                held = held.saturating_add(1);
+                let took = attempt
+                    .sent
+                    .saturating_duration_since(first)
+                    .saturating_add(attempt.took);
+                if took >= BALANCED_RESTART_WITHIN {
+                    slow.push((group, attempt.seq, took));
+                }
+            }
+        }
+        assert!(held > 0, "no write of group {group} held: {attempts:?}");
+    }
+    assert!(
+        slow.is_empty(),
+        "writes held {BALANCED_RESTART_WITHIN:?} or longer after their first attempt (group, \
+         seq, took): {slow:?}\n{}",
+        procs.reports()
+    );
+    let long: Vec<(&ReplicatedGroup, &Duration)> = leaderless
+        .iter()
+        .filter(|(_, gap)| **gap >= BALANCED_RESTART_WITHIN)
+        .collect();
+    assert!(
+        long.is_empty(),
+        "groups without a leader for {BALANCED_RESTART_WITHIN:?} or longer while node {} \
+         restarted: {long:?}\n{}",
+        restarting.id,
+        procs.reports()
     );
 }
 

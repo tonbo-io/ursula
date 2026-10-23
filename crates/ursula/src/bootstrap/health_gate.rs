@@ -8,13 +8,13 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::time::Duration;
 
 // `tokio::time::Instant` so the drain's deadlines follow tokio's clock, which
 // tests pause and madsim simulates.
 use tokio::time::Instant;
 use ursula_control::Cluster;
+use ursula_proto::admin::RaftTargetKey;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::LeadershipTransferError;
 use ursula_raft::RaftGroupHandleRegistry;
@@ -216,22 +216,40 @@ impl ShedCandidate {
     }
 }
 
-/// The nodes a shed may hand a leadership to on one tick: the ones that
-/// answered that they may campaign
+/// The replicas a shed may hand a leadership to on one tick, by node: the
+/// ones their nodes answered may take their group's leadership
 /// ([`crate::bootstrap::participation::CampaignStances::shed_targets`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ShedTargets {
-    nodes: HashSet<u64>,
+    takers: BTreeMap<u64, BTreeSet<RaftTargetKey>>,
 }
 
 impl ShedTargets {
-    pub(crate) fn new(nodes: HashSet<u64>) -> Self {
-        Self { nodes }
+    pub(crate) fn new(takers: BTreeMap<u64, BTreeSet<RaftTargetKey>>) -> Self {
+        Self { takers }
     }
 
-    /// Whether `node` may take a handoff.
-    fn admit(&self, node: u64) -> bool {
-        self.nodes.contains(&node)
+    /// Targets whose `nodes` each answered that their replica of every
+    /// data group in `groups` may take a leadership.
+    #[cfg(test)]
+    pub(crate) fn taking_every_group(
+        nodes: impl IntoIterator<Item = u64>,
+        groups: std::ops::Range<u32>,
+    ) -> Self {
+        let takers: BTreeSet<RaftTargetKey> = groups.map(RaftTargetKey::Data).collect();
+        Self::new(
+            nodes
+                .into_iter()
+                .map(|node| (node, takers.clone()))
+                .collect(),
+        )
+    }
+
+    /// Whether `node`'s replica of data group `group` may take a handoff.
+    fn admit(&self, node: u64, group: RaftGroupId) -> bool {
+        self.takers
+            .get(&node)
+            .is_some_and(|takers| takers.contains(&RaftTargetKey::Data(group.0)))
     }
 }
 
@@ -286,7 +304,7 @@ pub(crate) fn plan_shed_handoffs(
         };
         let group = RaftGroupId(snap.raft_group_id);
         let qualifying = handoff_targets(snap, node_id, cluster, |voter| {
-            targets.admit(voter) && can_take_over(group, voter)
+            targets.admit(voter, group) && can_take_over(group, voter)
         });
         let preferred = qualifying
             .iter()
@@ -777,22 +795,30 @@ impl LeadershipShed {
         for group_id in &due {
             self.stranded_reported.insert(*group_id, now);
         }
-        let may_campaign: BTreeSet<u64> = targets
-            .nodes
+        // Which of these groups each answering peer's replica may take.
+        let takers: BTreeMap<u64, Vec<u32>> = targets
+            .takers
             .iter()
-            .copied()
-            .filter(|node| *node != self.node_id)
+            .filter(|(node, _)| **node != self.node_id)
+            .map(|(node, takers)| {
+                let groups = due
+                    .iter()
+                    .copied()
+                    .filter(|group_id| takers.contains(&RaftTargetKey::Data(*group_id)))
+                    .collect();
+                (*node, groups)
+            })
             .collect();
         let refused = self.refusals_of(&due);
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
             groups = ?due,
-            ?may_campaign,
+            ?takers,
             handoff_check_refused = ?refused,
             "leadership-shed: no peer can take over these leaderships now, because each other \
-             voter of these groups answered that it may not campaign, did not answer, or failed \
-             the handoff check; they stay pending"
+             voter of these groups answered that its replica may not take the leadership, did \
+             not answer, or failed the handoff check; they stay pending"
         );
     }
 }
@@ -908,9 +934,10 @@ mod tests {
         }
     }
 
-    /// Targets that admit `nodes` for every handoff.
+    /// Targets that admit `nodes` for every handoff: each of them answered
+    /// that its replica of every group the tests use takes a leadership.
     fn only(nodes: &[u64]) -> ShedTargets {
-        ShedTargets::new(nodes.iter().copied().collect())
+        ShedTargets::taking_every_group(nodes.iter().copied(), 0..64)
     }
 
     fn every_node() -> ShedTargets {
