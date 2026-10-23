@@ -57,9 +57,12 @@ identifies the Raft leader.
   answering, such as a stopped process (`SIGSTOP`) or a frozen host, is out
   of selection within 1.75 s of its last answer on every gateway, and back
   within 250 ms of answering again. A uniform delay ejects nothing: under a
-  500 ms round trip a probe takes one round trip, or two on a new connection.
-  Embedders of the library run `Gateway::probe_upstreams` beside
-  `Gateway::handle`.
+  500 ms round trip a probe takes one round trip on a pooled connection. A
+  probe past 1.5 s keeps waiting for its answer, up to
+  `--response-header-timeout`, and readmits the upstream when it comes, so
+  that the connection it opened goes into the pool even when a new
+  connection takes longer than 1.5 s. Every `Gateway` probes its upstreams
+  from its construction until its last clone is dropped.
 - **Ejection.** An upstream that fails at the transport (it refuses or times
   out the connection, or the exchange breaks) is ejected too, and so is one
   that sends no response headers within `--response-header-timeout`: a

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
@@ -148,12 +149,12 @@ fn set_body_limit(config: &mut GatewayConfig, bytes: usize) {
 }
 
 fn gateway_for_url(upstream_url: impl Into<String>) -> Arc<Gateway> {
-    Arc::new(Gateway::new(test_config(vec![upstream_url.into()])))
+    Arc::new(Gateway::unprobed(test_config(vec![upstream_url.into()])))
 }
 
 #[test]
 fn gateway_reuses_learned_stream_leader() {
-    let gateway = Gateway::new(test_config(vec![
+    let gateway = Gateway::unprobed(test_config(vec![
         "http://follower.test".to_owned(),
         "http://leader.test".to_owned(),
     ]));
@@ -182,7 +183,7 @@ async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
         }),
     ))
     .await;
-    let gateway = Gateway::new(test_config(vec![stale.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![stale.url.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), stale.url.clone());
 
     let req = Request::builder()
@@ -220,7 +221,7 @@ fn get_stream() -> Request<Body> {
 #[tokio::test]
 async fn gateway_drops_an_unreachable_cached_leader_and_answers_retryable_503() {
     let (gone, _refusing) = refusing_upstream().await;
-    let gateway = Gateway::new(test_config(vec![gone.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![gone.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), gone.clone());
 
     let response = gateway.handle(get_stream()).await;
@@ -371,7 +372,7 @@ async fn gateway_leaves_an_upstream_that_failed_out_of_selection() {
     let _frozen = FrozenClock::hold();
     let (gone, _refusing) = refusing_upstream().await;
     let live = [answering_upstream().await, answering_upstream().await];
-    let gateway = Gateway::new(test_config(vec![
+    let gateway = Gateway::unprobed(test_config(vec![
         gone.clone(),
         live[0].url.clone(),
         live[1].url.clone(),
@@ -392,7 +393,7 @@ async fn an_ejected_upstream_stays_out_until_it_answers() {
     let _frozen = FrozenClock::hold();
     let (gone, _refusing) = refusing_upstream().await;
     let live = answering_upstream().await;
-    let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![gone.clone(), live.url.clone()]));
     fail_once(&gateway, &gone).await;
 
     tokio::time::advance(Duration::from_secs(600)).await;
@@ -414,20 +415,6 @@ fn probes_eject_within() -> Duration {
     PROBE_INTERVAL
         .saturating_add(PROBE_TIMEOUT)
         .saturating_add(Duration::from_secs(1))
-}
-
-/// A gateway's probes, running until dropped.
-struct Probing(tokio::task::JoinHandle<()>);
-
-impl Drop for Probing {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-fn probing(gateway: &Arc<Gateway>) -> Probing {
-    let gateway = Arc::clone(gateway);
-    Probing(tokio::spawn(async move { gateway.probe_upstreams().await }))
 }
 
 /// Polls `gateway`'s metrics until `upstream_ejected` is `ejected`, for at
@@ -459,7 +446,6 @@ async fn the_probes_eject_a_silent_upstream_that_no_request_reached() {
         silent.url.clone(),
         live.url.clone(),
     ])));
-    let _probing = probing(&gateway);
 
     until_ejected(&gateway, 1, probes_eject_within()).await;
     gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
@@ -499,12 +485,15 @@ async fn the_probes_readmit_an_upstream_that_answers_again() {
         upstream.url.clone(),
         live.url.clone(),
     ])));
-    let _probing = probing(&gateway);
     until_ejected(&gateway, 1, probes_eject_within()).await;
 
     silent.store(false, Ordering::Release);
-    // A probe sent while it was silent still waits out its timeout.
-    until_ejected(&gateway, 0, probes_eject_within()).await;
+    // A probe sent while it was silent waits for its answer up to the
+    // response header timeout, and the next one is answered.
+    let readmitted_within = test_config(Vec::new())
+        .response_header_timeout
+        .saturating_add(probes_eject_within());
+    until_ejected(&gateway, 0, readmitted_within).await;
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
 }
 
@@ -522,10 +511,74 @@ async fn the_probes_keep_an_upstream_that_answers_slowly() {
         slow.url.clone(),
         live.url.clone(),
     ])));
-    let _probing = probing(&gateway);
 
     tokio::time::sleep(probes_eject_within().saturating_mul(2)).await;
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
+}
+
+/// A probe past its timeout keeps waiting for its answer, so that the
+/// connection it opened goes into the pool. Here only the first answer on
+/// each connection takes longer than the probe timeout, as every answer on
+/// a new connection does once a connect and a request take that long: the
+/// upstream is ejected once, readmitted by that probe's late answer, and
+/// stays in, its later probes answered at once on the same connection.
+#[tokio::test]
+async fn a_probe_past_its_timeout_readmits_an_upstream_slow_on_new_connections() {
+    let connections = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let app = Router::new().fallback({
+        let connections = Arc::clone(&connections);
+        move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+            let first = connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(peer);
+            async move {
+                if first {
+                    tokio::time::sleep(PROBE_TIMEOUT.saturating_add(Duration::from_millis(500)))
+                        .await;
+                }
+                StatusCode::NO_CONTENT
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("upstream address")
+    );
+    let slow_to_connect = TestUpstream {
+        url,
+        task: tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("serve upstream");
+        }),
+    };
+    let live = answering_upstream().await;
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        slow_to_connect.url.clone(),
+        live.url.clone(),
+    ])));
+
+    until_ejected(&gateway, 1, probes_eject_within()).await;
+    until_ejected(&gateway, 0, probes_eject_within()).await;
+    tokio::time::sleep(probes_eject_within().saturating_mul(2)).await;
+
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (metrics.upstream_ejections, metrics.upstream_ejected),
+        (1, 0)
+    );
+    let connections = connections
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    assert_eq!(connections, 1);
 }
 
 /// A leader redirect to an ejected upstream is not followed: the request
@@ -535,7 +588,7 @@ async fn the_probes_keep_an_upstream_that_answers_slowly() {
 #[tokio::test]
 async fn a_redirect_to_an_ejected_leader_is_not_followed() {
     let (leader, follower) = spawn_raft_redirect_upstreams(answering_router()).await;
-    let gateway = Gateway::new(test_config(vec![follower.url.clone(), leader.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![follower.url.clone(), leader.url.clone()]));
     assert!(gateway.ejections.failed(&leader.url));
     gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
 
@@ -580,7 +633,7 @@ async fn gateway_ejects_an_unreachable_redirect_leader() {
         }),
     ))
     .await;
-    let gateway = Gateway::new(test_config(vec![follower.url.clone(), gone.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![follower.url.clone(), gone.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
 
     let response = gateway.handle(get_stream()).await;
@@ -602,7 +655,7 @@ async fn gateway_ejects_an_unreachable_redirect_leader() {
 async fn gateway_still_sends_when_every_upstream_is_ejected() {
     let _frozen = FrozenClock::hold();
     let (gone, _refusing) = refusing_upstream().await;
-    let gateway = Gateway::new(test_config(vec![gone.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![gone.clone()]));
     fail_once(&gateway, &gone).await;
 
     let response = gateway.handle(get_path("/bucket/again")).await;
@@ -615,7 +668,7 @@ async fn gateway_still_sends_when_every_upstream_is_ejected() {
 /// than dropping it for a random pick.
 #[test]
 fn gateway_keeps_the_cached_route_when_every_upstream_is_ejected() {
-    let gateway = Gateway::new(test_config(vec![
+    let gateway = Gateway::unprobed(test_config(vec![
         "http://follower.test".to_owned(),
         "http://leader.test".to_owned(),
     ]));
@@ -641,7 +694,7 @@ async fn gateway_drops_a_cached_route_to_an_ejected_upstream() {
     let _frozen = FrozenClock::hold();
     let (gone, _refusing) = refusing_upstream().await;
     let live = answering_upstream().await;
-    let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![gone.clone(), live.url.clone()]));
     fail_once(&gateway, &gone).await;
     gateway.remember_leader("/bucket/stream".to_owned(), gone.clone());
 
@@ -657,7 +710,7 @@ async fn gateway_drops_a_cached_route_to_an_ejected_upstream() {
 /// upstream stays in selection.
 #[tokio::test]
 async fn gateway_does_not_eject_an_upstream_for_a_request_it_could_not_build() {
-    let gateway = Gateway::new(test_config(vec!["not a url".to_owned()]));
+    let gateway = Gateway::unprobed(test_config(vec!["not a url".to_owned()]));
 
     let response = gateway.handle(get_stream()).await;
 
@@ -754,7 +807,7 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
             None,
         ),
     ] {
-        let gateway = Arc::new(Gateway::new(config.clone()));
+        let gateway = Arc::new(Gateway::unprobed(config.clone()));
         gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
         let before = live.hits();
         let method = request.method().clone();
@@ -787,7 +840,7 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
     let (silent, mut arrivals) = silent_upstream().await;
     let refusing = Scripted::spawn().await;
     refusing.answers(refusal());
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         silent.url.clone(),
         refusing.url(),
     ])));
@@ -799,7 +852,7 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
 
     let (second, mut second_arrivals) = silent_upstream().await;
     let live = Scripted::spawn().await;
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         silent.url.clone(),
         second.url.clone(),
         live.url(),
@@ -843,7 +896,7 @@ async fn a_repeat_redirected_back_to_the_silent_upstream_ends_unknown_at_once() 
         &format!("{}/bucket/stream", silent.url),
         HeaderMap::new(),
     ));
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         silent.url.clone(),
         follower.url(),
     ])));
@@ -923,7 +976,7 @@ fn group_pin_key_is_shared_by_streams_in_the_same_group() {
         "http://leader.test".to_owned(),
     ]);
     config.raft_group_count = Some(16);
-    let gateway = Gateway::new(config);
+    let gateway = Gateway::unprobed(config);
     gateway.remember_leader(first_key, "http://leader.test".to_owned());
     assert_eq!(
         gateway.pick_upstream(&second).as_deref(),
@@ -938,7 +991,7 @@ fn gateway_with_response_header_timeout(
 ) -> Arc<Gateway> {
     let mut config = test_config(vec![upstream_url.into()]);
     config.response_header_timeout = response_header_timeout;
-    Arc::new(Gateway::new(config))
+    Arc::new(Gateway::unprobed(config))
 }
 
 #[derive(Debug)]
@@ -1007,7 +1060,7 @@ fn gateway_with_access_control(
     resolver: Arc<FixedPrincipalResolver>,
     authorizer: Arc<RecordingAuthorizer>,
 ) -> Gateway {
-    Gateway::with_access_control(
+    Gateway::unprobed_with_access_control(
         test_config(vec![upstream_url.into()]),
         AccessControl::new(resolver, authorizer),
     )
@@ -1159,7 +1212,7 @@ fn request_classifier_decodes_resource_path_segments() {
 
 #[tokio::test]
 async fn gateway_handle_returns_service_unavailable_without_upstreams() {
-    let gateway = Gateway::new(test_config(Vec::new()));
+    let gateway = Gateway::unprobed(test_config(Vec::new()));
     let req = Request::builder()
         .method("GET")
         .uri("/bucket/stream")
@@ -1184,7 +1237,7 @@ async fn gateway_without_access_control_preserves_existing_pass_through_behavior
         }),
     ))
     .await;
-    let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![upstream.url.clone()]));
     let request = Request::builder()
         .method("GET")
         .uri("/bucket/stream")
@@ -1441,7 +1494,7 @@ async fn served_metrics(response: AxumResponse) -> serde_json::Value {
 #[tokio::test]
 async fn gateway_without_access_control_serves_its_metrics() {
     let (upstream, hits) = counting_fallback_upstream().await;
-    let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![upstream.url.clone()]));
 
     let metrics = served_metrics(gateway.handle(metrics_request(Method::GET, None)).await).await;
 
@@ -1493,7 +1546,7 @@ async fn access_control_with_public_metrics_serves_them_to_any_caller() {
     let authorizer = Arc::new(RecordingAuthorizer::new(
         AuthorizationDecision::ConcealAsNotFound,
     ));
-    let gateway = Gateway::with_access_control(
+    let gateway = Gateway::unprobed_with_access_control(
         test_config(vec![upstream.url.clone()]),
         // `.clone()`: `Arc::clone(&resolver)` would take the trait object type
         // that `AccessControl::new` expects and refuse the concrete `Arc`.
@@ -1542,7 +1595,7 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
 
     let mut config = test_config(vec![upstream.url.clone()]);
     set_body_limit(&mut config, 4);
-    let gateway = Gateway::new(config);
+    let gateway = Gateway::unprobed(config);
     let req = Request::builder()
         .method("POST")
         .uri("/bucket/stream")
@@ -1602,7 +1655,7 @@ async fn gateway_lowers_the_request_limit_a_node_advertises() {
     .await;
     let mut config = test_config(vec![upstream.url.clone()]);
     set_body_limit(&mut config, 1_048_576);
-    let gateway = Gateway::new(config);
+    let gateway = Gateway::unprobed(config);
     for (path, expected) in [
         ("/bucket/head", Some("1048576")),
         ("/bucket/small", Some("2")),
@@ -1787,7 +1840,7 @@ async fn a_connect_failure_answers_503_on_the_first_hop_and_after_a_redirect() {
 
     let (status, headers) = raft_redirect(&format!("{gone}/bucket/stream"), HeaderMap::new());
     let follower = spawn_answering(status, headers).await;
-    let gateway = Gateway::new(test_config(vec![follower.url.clone(), gone.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![follower.url.clone(), gone.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
 
     let leader_hop = gateway.handle(post_path("/bucket/stream")).await;
@@ -1904,7 +1957,7 @@ fn gateway_starting_at(upstreams: &[&Scripted]) -> Gateway {
 /// A gateway with `config` whose first hop goes to `first`, the cached route
 /// of `/bucket/stream`.
 fn gateway_with(config: GatewayConfig, first: &Scripted) -> Gateway {
-    let gateway = Gateway::new(config);
+    let gateway = Gateway::unprobed(config);
     gateway.remember_leader("/bucket/stream".to_owned(), first.url());
     gateway
 }
@@ -2159,7 +2212,7 @@ async fn a_connect_failure_after_redirects_ejects_the_upstream() {
         &format!("{gone}/bucket/stream"),
         HeaderMap::new(),
     ));
-    let gateway = Gateway::new(test_config(vec![a.url(), b.url(), gone.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![a.url(), b.url(), gone.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), a.url());
 
     let response = gateway.handle(post_path("/bucket/stream")).await;
@@ -2539,7 +2592,7 @@ async fn a_redirect_back_to_an_upstream_already_reached_searches_instead() {
 /// in a slash.
 #[test]
 fn a_location_names_an_upstream_only_at_a_boundary() {
-    let gateway = Gateway::new(test_config(vec![
+    let gateway = Gateway::unprobed(test_config(vec![
         "http://127.0.0.1:1234".to_owned(),
         "http://node.test/".to_owned(),
     ]));
@@ -2643,7 +2696,7 @@ async fn a_failure_after_the_request_was_sent_is_a_502_after_redirects() {
         &format!("{}/bucket/stream", node.url),
         HeaderMap::new(),
     ));
-    let gateway = Gateway::new(test_config(vec![a.url(), b.url(), node.url.clone()]));
+    let gateway = Gateway::unprobed(test_config(vec![a.url(), b.url(), node.url.clone()]));
     gateway.remember_leader("/bucket/stream".to_owned(), a.url());
 
     let response = gateway.handle(post_path("/bucket/stream")).await;
@@ -2676,14 +2729,14 @@ async fn no_gateway_response_carries_a_not_applied_header() {
         ),
         (
             "own refusal",
-            Gateway::new(small_bodies)
+            Gateway::unprobed(small_bodies)
                 .handle(post_path("/bucket/ok"))
                 .await,
             StatusCode::PAYLOAD_TOO_LARGE,
         ),
         (
             "no upstream",
-            Gateway::new(test_config(Vec::new()))
+            Gateway::unprobed(test_config(Vec::new()))
                 .handle(post_path("/bucket/ok"))
                 .await,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2701,7 +2754,7 @@ async fn no_gateway_response_carries_a_not_applied_header() {
 async fn gateway_follows_leader_redirect_for_get_request() {
     let leader_app = Router::new().route("/bucket/stream", get(|| async { StatusCode::OK }));
     let (leader, follower) = spawn_raft_redirect_upstreams(leader_app).await;
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         follower.url.clone(),
         leader.url.clone(),
     ])));
@@ -2727,7 +2780,7 @@ async fn gateway_follows_leader_redirect_for_get_request() {
 async fn gateway_follows_leader_redirect_for_put_request() {
     let leader_app = Router::new().route("/bucket/stream", put(|| async { StatusCode::OK }));
     let (leader, follower) = spawn_raft_redirect_upstreams(leader_app).await;
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         follower.url.clone(),
         leader.url.clone(),
     ])));
@@ -2800,7 +2853,7 @@ async fn gateway_answers_503_when_a_redirect_names_no_upstream_and_none_is_left(
 async fn gateway_handle_follows_leader_redirect_through_random_pick() {
     let leader_app = Router::new().route("/bucket/stream", get(|| async { StatusCode::OK }));
     let (leader, follower) = spawn_raft_redirect_upstreams(leader_app).await;
-    let gateway = Arc::new(Gateway::new(test_config(vec![
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
         follower.url.clone(),
         leader.url.clone(),
     ])));
@@ -3104,7 +3157,7 @@ mod tenant_boundary {
     "#;
 
     fn policy_gateway(upstream_url: &str) -> Gateway {
-        Gateway::with_access_control(
+        Gateway::unprobed_with_access_control(
             test_config(vec![upstream_url.to_owned()]),
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver::valid()),
@@ -3258,7 +3311,7 @@ mod admission_and_usage {
     ) -> Gateway {
         let mut config = test_config(vec![upstream_url.to_owned()]);
         config.usage_chunk_bytes = usage_chunk_bytes;
-        Gateway::with_access_control(
+        Gateway::unprobed_with_access_control(
             config,
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver::valid()),
@@ -3489,7 +3542,7 @@ mod cors {
     fn gateway(origins: &[&str]) -> Gateway {
         let mut config = test_config(vec!["http://upstream.invalid".to_owned()]);
         config.cors_allowed_origins = origins.iter().map(|origin| (*origin).to_owned()).collect();
-        Gateway::new(config)
+        Gateway::unprobed(config)
     }
 
     fn preflight(uri: &str, origin: &str) -> Request<Body> {
@@ -3962,7 +4015,7 @@ mod refused_bodies {
         config: GatewayConfig,
         decision: Result<AuthorizationDecision, AuthorizationError>,
     ) -> Gateway {
-        Gateway::with_access_control(
+        Gateway::unprobed_with_access_control(
             config,
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver::valid()),
@@ -4082,7 +4135,7 @@ mod refused_bodies {
     /// A gateway with access control and `config` whose token issuer is
     /// unavailable, so that `valid-token` gets the issuer's `503`.
     fn issuer_down(config: GatewayConfig) -> Gateway {
-        Gateway::with_access_control(
+        Gateway::unprobed_with_access_control(
             config,
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver {
@@ -4405,7 +4458,7 @@ mod refused_bodies {
         let cases = [
             (
                 "forwarded",
-                Gateway::new(config.clone()),
+                Gateway::unprobed(config.clone()),
                 Announce::Chunked,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 (0_u64, 0_u64),
@@ -4792,7 +4845,7 @@ mod uploads {
     /// A gateway with access control that allows every request with
     /// `valid-token`, and the quota policy `quotas`.
     fn guarded(config: GatewayConfig, quotas: &str) -> Gateway {
-        Gateway::with_access_control(
+        Gateway::unprobed_with_access_control(
             config,
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver::valid()),
@@ -5085,7 +5138,7 @@ mod uploads {
     #[tokio::test]
     async fn upload_limits_apply_only_under_a_quota_policy() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, roomy())));
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, roomy())));
         let open: Vec<_> = (0..3)
             .map(|_| {
                 let (chunks, body) = declared(2 << 10);
@@ -5109,7 +5162,7 @@ mod uploads {
     #[tokio::test]
     async fn a_spent_budget_refuses_a_large_body_while_a_small_one_uses_the_headroom() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, tiny())));
         let (chunks, body) = declared(4 << 10);
         let large = send(&gateway, post("/tenant-a/orders", body));
         assert!(until_reserved(&gateway, 4 << 10).await);
@@ -5229,7 +5282,7 @@ mod uploads {
     #[tokio::test]
     async fn a_buffered_body_holds_no_chunk_and_only_its_share_of_the_budget() {
         let (upstream, mut arrivals) = silent_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, roomy())));
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, roomy())));
         let retained = Arc::new(AtomicUsize::new(0));
         let body = Body::new(Slices {
             parents: (0..2 << 10)
@@ -5254,7 +5307,7 @@ mod uploads {
     #[tokio::test]
     async fn a_request_that_gets_the_budget_within_the_wait_goes_through() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, UploadLimitsSpec {
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, UploadLimitsSpec {
             budget_wait: Duration::from_secs(5),
             ..tiny()
         })));
@@ -5389,7 +5442,7 @@ mod uploads {
     #[tokio::test]
     async fn the_budget_is_released_after_success_refusal_and_disconnect() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, tiny())));
         let whole_budget = || post("/tenant-a/orders", Body::from(vec![0_u8; 4 << 10]));
         let released = |gateway: &Gateway| gateway.metrics_snapshot().upload_reserved_bytes;
 
@@ -5445,7 +5498,7 @@ mod uploads {
     #[tokio::test]
     async fn an_undeclared_reservation_grows_as_the_body_arrives_and_shrinks_once_buffered() {
         let (upstream, mut arrivals) = silent_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
+        let gateway = Arc::new(Gateway::unprobed(config(&upstream.url, tiny())));
         let (chunks, body) = open_body(b"abc");
         let upload = send(&gateway, post("/tenant-a/orders", body));
         assert!(until_reserved(&gateway, 1 << 10).await);
@@ -5485,7 +5538,7 @@ mod uploads {
             },
         )))
         .await;
-        let gateway = Arc::new(Gateway::new(config(
+        let gateway = Arc::new(Gateway::unprobed(config(
             &upstream.url,
             UploadLimitsSpec::default(),
         )));
@@ -5553,7 +5606,7 @@ mod uploads {
                 Duration::from_secs(60),
             ),
         ] {
-            let gateway = Gateway::new(config(&upstream.url, UploadLimitsSpec {
+            let gateway = Gateway::unprobed(config(&upstream.url, UploadLimitsSpec {
                 min_bytes_per_sec,
                 ..UploadLimitsSpec::default()
             }));

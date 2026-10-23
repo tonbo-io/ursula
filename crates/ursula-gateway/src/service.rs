@@ -80,7 +80,10 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(log = %usage_path.display(), "gateway usage accounting enabled");
     }
 
-    let gateway = Arc::new(gateway);
+    // The gateway probes every upstream from its start until the router
+    // drops it, after the drain.
+    let app = router(Arc::new(gateway));
+
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
         listen = %config.listen,
@@ -88,21 +91,13 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         "Ursula gateway starting"
     );
 
-    // Probes every upstream for as long as the gateway serves, its drain
-    // included.
-    let prober = tokio::spawn({
-        let gateway = Arc::clone(&gateway);
-        async move { gateway.probe_upstreams().await }
-    });
-    let served = serve_until_shutdown(
+    serve_until_shutdown(
         listener,
-        router(gateway),
+        app,
         shutdown_signal(),
         Some(Duration::from_secs(args.graceful_shutdown_timeout)),
     )
-    .await;
-    prober.abort();
-    served?;
+    .await?;
 
     // Stop the exporter after the server drains so the final usage window is
     // flushed rather than stranded.

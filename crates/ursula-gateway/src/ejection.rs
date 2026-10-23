@@ -21,12 +21,15 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use rand::Rng;
 use rand::seq::IndexedRandom;
 use rand::seq::IteratorRandom;
+
+use crate::GatewayError;
 
 /// Where a request goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +89,8 @@ pub(crate) struct Ejections {
     /// it is 0, requests skip the lock. A request that reads it during a
     /// change acts as one that started before it.
     entries: AtomicUsize,
+    /// Times [`Ejections::eject`] ejected an upstream that was in selection.
+    ejections: AtomicU64,
 }
 
 impl Ejections {
@@ -95,6 +100,7 @@ impl Ejections {
             upstreams: upstreams.iter().collect::<HashSet<_>>().len(),
             ejected: Mutex::new(HashSet::new()),
             entries: AtomicUsize::new(0),
+            ejections: AtomicU64::new(0),
         }
     }
 
@@ -122,6 +128,27 @@ impl Ejections {
     pub(crate) fn answered(&self, upstream: &str) -> bool {
         self.entries.load(Ordering::Acquire) > 0
             && self.with_ejected(|ejected| ejected.remove(upstream))
+    }
+
+    /// Ejects `upstream` for `error`, a failed request's or probe's, and
+    /// counts and logs it if it was in selection.
+    pub(crate) fn eject(&self, upstream: &str, error: &GatewayError) {
+        if self.failed(upstream) {
+            self.ejections.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                upstream,
+                %error,
+                "upstream failed at the transport or sent no headers in time; leaving it out of selection until it answers"
+            );
+        }
+    }
+
+    /// Readmits `upstream`, which answered a request or a probe, and logs it
+    /// if it was ejected.
+    pub(crate) fn readmit(&self, upstream: &str) {
+        if self.answered(upstream) {
+            tracing::info!(upstream, "upstream answers again; back in selection");
+        }
     }
 
     /// Chooses where a request goes: `cached`, the leader route the gateway
@@ -156,5 +183,10 @@ impl Ejections {
     /// ejected.
     pub(crate) fn ejected(&self) -> usize {
         self.entries.load(Ordering::Acquire)
+    }
+
+    /// Times [`Ejections::eject`] ejected an upstream that was in selection.
+    pub(crate) fn ejections(&self) -> u64 {
+        self.ejections.load(Ordering::Relaxed)
     }
 }

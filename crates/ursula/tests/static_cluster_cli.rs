@@ -6101,10 +6101,10 @@ async fn wait_leaders_settle(
 ///    every write `204` or a `503` with `Retry-After`. With it stopped, the
 ///    gateway's probes eject it, and a write the gateway sends it before
 ///    that gets the gateway's `504` at its header timeout, well within the
-///    load's 10 s, and its outcome is unknown: no write goes unanswered. Each stream holds every acknowledged write
-///    once, in order, and no write whose `503` code proves it applied
-///    nothing. A leader that
-///    hands off only to the dead or stopped voter, or a proven refusal that
+///    load's 10 s, and its outcome is unknown: no write goes unanswered.
+///    Each stream holds every acknowledged write once, in order, and no
+///    write whose `503` code proves it applied nothing. A leader that hands
+///    off only to the dead or stopped voter, or a proven refusal that
 ///    applied, fails it.
 /// 5. Node 4, a meta learner, restarts with its meta snapshot record
 ///    corrupted and reports its meta damaged. The moved group's staying meta

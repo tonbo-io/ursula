@@ -62,8 +62,9 @@
 //!   request bodies, and the pace a body must keep.
 //! - `ejection`: leaves upstreams that failed or did not answer in time out of
 //!   selection until they answer again (#454).
-//! - `probe`: [`Gateway::probe_upstreams`], the probes of every upstream that
-//!   eject one that stops answering and readmit it once it answers.
+//! - `probe`: the probes of every upstream, which every gateway runs while
+//!   it exists, that eject one that stops answering and readmit it once it
+//!   answers.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -133,6 +134,7 @@ use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
 use crate::ejection::Ejections;
+use crate::probe::Probes;
 use crate::refusal::EmbedderRefusal;
 use crate::uploads::BodyPermit;
 use crate::uploads::BudgetExhausted;
@@ -193,7 +195,6 @@ struct GatewayMetrics {
     leader_redirect_ns: AtomicU64,
     leader_searches: AtomicU64,
     leader_not_found: AtomicU64,
-    upstream_ejections: AtomicU64,
     refusal_drains: AtomicU64,
     refusal_drains_cut: AtomicU64,
     refusal_drain_bytes: AtomicU64,
@@ -328,6 +329,8 @@ pub struct Gateway {
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     ejections: Arc<Ejections>,
+    /// The probes of every upstream, which stop with the last clone.
+    probes: Arc<Probes>,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
 }
@@ -343,7 +346,29 @@ impl std::fmt::Debug for Gateway {
 }
 
 impl Gateway {
+    /// A gateway to `config`'s upstreams, which probes each of them from
+    /// now until its last clone is dropped (see `probe`).
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as [`tokio::spawn`] does.
     pub fn new(config: GatewayConfig) -> Self {
+        let mut gateway = Self::unprobed(config);
+        gateway.probes = Arc::new(Probes::start(
+            &gateway.client,
+            &gateway.config.upstreams,
+            &gateway.ejections,
+            gateway.response_header_timeout,
+        ));
+        gateway
+    }
+
+    /// A gateway that does not probe its upstreams yet. [`Gateway::new`]
+    /// starts its probes. Tests of request handling serve with one, so that
+    /// what reaches their upstreams is their requests alone: an upstream it
+    /// ejects stays out until a request reaches it, which happens only once
+    /// every upstream is ejected.
+    fn unprobed(config: GatewayConfig) -> Self {
         let shard_map = config
             .raft_group_count
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
@@ -364,6 +389,7 @@ impl Gateway {
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
             ejections,
+            probes: Arc::new(Probes::default()),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
         }
@@ -379,6 +405,16 @@ impl Gateway {
         Self {
             access_control: Some(access_control),
             ..Self::new(config)
+        }
+    }
+
+    /// [`Gateway::with_access_control`] without probes (see
+    /// [`Gateway::unprobed`]).
+    #[cfg(test)]
+    fn unprobed_with_access_control(config: GatewayConfig, access_control: AccessControl) -> Self {
+        Self {
+            access_control: Some(access_control),
+            ..Self::unprobed(config)
         }
     }
 
@@ -901,7 +937,7 @@ impl Gateway {
             self.metrics
                 .leader_cache_misses
                 .fetch_add(1, Ordering::Relaxed);
-            // A route to an upstream that is ejected or being probed.
+            // A route to an upstream that is ejected.
             if let (Some(key), Some(cached)) = (&key, &cached) {
                 self.forget_leader_if_matches(key, cached);
             }
@@ -1079,16 +1115,17 @@ impl Gateway {
     }
 
     /// Where a request goes after a `NotHosted` redirect, whose `Location`
-    /// names `named`, a host as the redirecting node's view has it. It goes
-    /// there only when the request has not tried it and it is not ejected
-    /// ([`Ejections::admits`]), else to an upstream it has not tried
-    /// ([`Gateway::untried_upstream`]), else to `named` all the same, unless
-    /// `named` answered this request nothing ([`Chain::answered_nothing`]).
-    /// `None` when there is nowhere to go.
+    /// names `named`, a host as the redirecting node's view has it. As after
+    /// a leader redirect ([`Gateway::next_hop`]), it goes there unless the
+    /// request already went to it or it is ejected ([`Ejections::admits`]),
+    /// else to an upstream it has not tried ([`Gateway::untried_upstream`]),
+    /// else back to `named`, unless it is ejected or answered this request
+    /// nothing ([`Chain::answered_nothing`]). `None` when there is nowhere
+    /// to go.
     fn next_hinted_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
+        let named = named.filter(|host| self.ejections.admits(host));
         if let Some(host) = &named
             && !chain.tried.contains(host)
-            && self.ejections.admits(host)
         {
             return named.map(|host| (host, Lead::Hint));
         }
@@ -1207,29 +1244,19 @@ impl Gateway {
     /// request learns the current leader instead of failing on the same node.
     /// One that failed at the transport (down or gone) or sent no headers in
     /// time also leaves selection until it answers again, so that requests
-    /// do not pick it again (#454). A failed probe (`probe`) comes here too,
-    /// with no route.
+    /// do not pick it again (#454).
     fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
         }
-        if error.ejects_upstream() && self.ejections.failed(upstream) {
-            self.metrics
-                .upstream_ejections
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                upstream,
-                %error,
-                "upstream failed at the transport or sent no headers in time; leaving it out of selection until it answers"
-            );
+        if error.ejects_upstream() {
+            self.ejections.eject(upstream, error);
         }
     }
 
     /// Any response proves the upstream reachable again.
     fn upstream_answered(&self, upstream: &str) {
-        if self.ejections.answered(upstream) {
-            tracing::info!(upstream, "upstream answers again; back in selection");
-        }
+        self.ejections.readmit(upstream);
     }
 
     fn response_header_timeout_for_url(&self, url: &str) -> Duration {
@@ -1403,7 +1430,7 @@ impl Gateway {
             leader_searches: self.metrics.leader_searches.load(Ordering::Relaxed),
             leader_not_found: self.metrics.leader_not_found.load(Ordering::Relaxed),
             leader_cache_entries,
-            upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
+            upstream_ejections: self.ejections.ejections(),
             upstream_ejected: self.ejections.ejected(),
             refusal_drains: self.metrics.refusal_drains.load(Ordering::Relaxed),
             refusal_drains_cut: self.metrics.refusal_drains_cut.load(Ordering::Relaxed),
