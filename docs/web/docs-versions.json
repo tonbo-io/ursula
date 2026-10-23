@@ -1,6 +1,11 @@
 {
   "archived": [
     {
+      "id": "0.9",
+      "ref": "v0.9.0",
+      "upgrade": "/docs/operations/#upgrading-to-010"
+    },
+    {
       "id": "0.8",
       "ref": "v0.8.2",
       "upgrade": "/docs/operations/#upgrading-to-09"

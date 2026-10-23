@@ -154,6 +154,13 @@ See [Upgrading to 0.10](/docs/operations#upgrading-to-010).
 - **The leader predicate reads the lease.** `GroupLeadership::of` takes the group's leader lease, and `LeaderRole::Lapsed` names a replica that OpenRaft keeps as leader but that cannot commit: its fence does not admit it, or no quorum acknowledged it within the lease. A fenced leader was `LeaderRole::Unknown` in 0.9.
 - **The server.** `ursula::Topology` is `Development` or `Cluster`, `spawn_runtime` takes the config and the topology, and `HttpState::with_raft_cluster` and `router_with_raft_cluster` take the node's placement inputs.
 
+### Known issues
+
+[#461](https://github.com/tonbo-io/ursula/issues/461) is narrower: a restarted voter campaigns with a pre-vote, which its peers refuse while they hear their leader, and a group that knows no leader no longer makes a node unready. The other known issues of [0.9.0](#090) remain open: [#411](https://github.com/tonbo-io/ursula/issues/411), [#465](https://github.com/tonbo-io/ursula/issues/465), [#496](https://github.com/tonbo-io/ursula/issues/496), [#517](https://github.com/tonbo-io/ursula/issues/517), [#518](https://github.com/tonbo-io/ursula/issues/518), [#561](https://github.com/tonbo-io/ursula/issues/561), [#735](https://github.com/tonbo-io/ursula/issues/735), [#753](https://github.com/tonbo-io/ursula/issues/753) and [#754](https://github.com/tonbo-io/ursula/issues/754). These are new in 0.10.0:
+
+- [#769](https://github.com/tonbo-io/ursula/issues/769): a successful local read (`consistency=local`, and the default catch-up and `offset=now` reads) on a voter that no longer receives appends, such as a follower cut off from its leader, answers from the prefix the replica holds, with no bound on how stale it is. A learner, and a replica that a confirmed placement no longer counts as a voter, answer such a read as a leader-only read. The issue predates 0.10.
+- [#862](https://github.com/tonbo-io/ursula/issues/862): a `SIGTERM` handoff that its target refuses is not offered to another peer within the 5 s grace. The stopping node leads the group again at once and steps down at the end of the grace, and the group elects a new leader about 3 s later.
+
 ## 0.9.0
 
 **0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. It also moves the backup format to 5. 0.9 does not restore 0.8 backups. There is no in-place upgrade, no rolling upgrade, no backup migration and no rollback.
