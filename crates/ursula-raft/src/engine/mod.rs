@@ -22,6 +22,7 @@ pub use factory::PEER_ANSWER_TIMEOUT;
 pub use factory::PlacedRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
 pub(crate) use factory::cluster_raft_config;
+pub use factory::with_group_election_protocol;
 use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
@@ -522,6 +523,12 @@ impl RaftGroupEngine {
     /// The node fence this replica's leadership reads.
     pub(crate) fn fence(&self) -> &ursula_runtime::NodeFence {
         self.read_barrier.owner().fence()
+    }
+
+    /// This replica's last contact with its leader, which its leadership
+    /// reads too.
+    pub(crate) fn contact(&self) -> &crate::LeaderContact {
+        self.read_barrier.owner().contact()
     }
 
     /// This replica's view of its group's leadership, by the one leader
@@ -1111,7 +1118,7 @@ impl RaftGroupEngine {
         let command = RaftCommand::Stream(command);
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
-        crate::forward::refuse_unless_leader(&self.raft, self.fence())?;
+        crate::forward::refuse_unless_leader(&self.raft, self.fence(), self.contact())?;
         let expected_leader = crate::forward::proposal_leader(&command, fence)?;
         let expected = crate::forward::answer_kind(&command);
         let (responder, complete) = ProgressResponder::<UrsulaRaftTypeConfig, _>::complete_only();
@@ -1150,7 +1157,7 @@ impl RaftGroupEngine {
         &self,
         _command: StreamCommand,
     ) -> Result<Option<GroupWriteResponse>, GroupEngineError> {
-        crate::forward::refuse_unless_leader(&self.raft, self.fence())?;
+        crate::forward::refuse_unless_leader(&self.raft, self.fence(), self.contact())?;
         Ok(None)
     }
 
@@ -1331,7 +1338,7 @@ impl RaftGroupEngine {
         leadership_refusal(
             leadership.refusal_reason(),
             Proposal::NotProposed,
-            self.raft.current_leader().await,
+            self.read_barrier.owner().current_leader(),
             &leadership,
         )
     }
@@ -1402,20 +1409,20 @@ impl RaftGroupEngine {
             .map_or(0, |log_id| log_id.index())
     }
 
-    /// Where this follower forwards a leader RPC, when it knows the leader
-    /// and `raft.peers` lists it. A leader that `raft.peers` does not list
-    /// gets nothing forwarded and no redirect. A replica that names itself
-    /// leader but does not lead, a lapsed leader ([`LeaderRole::Lapsed`]),
-    /// forwards nowhere: the RPC would come back to it.
+    /// Where this follower forwards a leader RPC, when it follows a live
+    /// leader ([`LeaderRole::Follows`]) and `raft.peers` lists it. A leader
+    /// that `raft.peers` does not list gets nothing forwarded and no
+    /// redirect. A replica that names itself leader but does not lead, a
+    /// lapsed leader ([`LeaderRole::Lapsed`]), forwards nowhere: the RPC
+    /// would come back to it. Nor does a follower that no longer hears its
+    /// leader: a forward to a leader cut off from it would only wait.
     ///
+    /// [`LeaderRole::Follows`]: crate::LeaderRole::Follows
     /// [`LeaderRole::Lapsed`]: crate::LeaderRole::Lapsed
     pub(crate) async fn leader_route(&self) -> Option<LeaderRoute> {
-        let own = self.raft.metrics().borrow_watched().id;
-        let leader_id = self
-            .raft
-            .current_leader()
-            .await
-            .filter(|leader_id| *leader_id != own)?;
+        let crate::LeaderRole::Follows { leader_id } = self.leadership().role else {
+            return None;
+        };
         let peer_cluster = self.peer_cluster.clone()?;
         let address = peer_cluster.cluster_url(leader_id)?;
         Some(LeaderRoute {
@@ -2201,7 +2208,7 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
             if !self.leads() {
-                let leader_id = self.raft.current_leader().await;
+                let leader_id = self.read_barrier.owner().current_leader();
                 let route = self.leader_route().await;
                 let leadership = self.leadership();
                 let Some(route) = route else {
@@ -2419,6 +2426,7 @@ impl GroupEngine for RaftGroupEngine {
             let responses = crate::forward::write_commands_on_raft(
                 self.raft.clone(),
                 self.fence(),
+                self.contact(),
                 &self.history,
                 commands,
             )

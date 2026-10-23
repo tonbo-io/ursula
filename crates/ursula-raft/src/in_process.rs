@@ -1219,6 +1219,15 @@ pub enum InProcessRaftRpcKind {
     TransferLeader,
 }
 
+impl From<VoteRound> for InProcessRaftRpcKind {
+    fn from(round: VoteRound) -> Self {
+        match round {
+            VoteRound::Vote => Self::Vote,
+            VoteRound::PreVote => Self::PreVote,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum InProcessRaftNetworkPolicyEvent {
     SetDelay(Option<Duration>),
@@ -1827,10 +1836,7 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
         round: VoteRound,
         rpc: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let kind = match round {
-            VoteRound::Vote => InProcessRaftRpcKind::Vote,
-            VoteRound::PreVote => InProcessRaftRpcKind::PreVote,
-        };
+        let kind = InProcessRaftRpcKind::from(round);
         self.before_rpc(kind).await.map_err(RPCError::Unreachable)?;
         let target = self
             .target_endpoint()
@@ -1852,11 +1858,10 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
         self.deliver(Some(&target)).map_err(RPCError::Unreachable)?;
         let target_gate = SM::gate(&target);
         let response = SM::vote(&target, round, rpc).await.map_err(|err| {
-            let rpc = match round {
-                VoteRound::Vote => "vote",
-                VoteRound::PreVote => "pre-vote",
-            };
-            RPCError::Network(NetworkError::from_string(format!("remote {rpc}: {err}")))
+            RPCError::Network(NetworkError::from_string(format!(
+                "remote {}: {err}",
+                round.rpc()
+            )))
         })?;
         let saved = round == VoteRound::Vote && response.vote_granted;
         self.answer(Some(&target), saved)

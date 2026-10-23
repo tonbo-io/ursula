@@ -440,10 +440,12 @@ impl ActiveMeta {
         self.core.apply_health.check(RaftTarget::Meta)?;
         let history = Arc::clone(&self.core.history);
         let fence = self.core.owner().fence().clone();
+        let contact = self.core.owner().contact().clone();
         self.core
             .owner()
             .call(move |raft| async move {
-                crate::forward::write_commands_on_raft(raft, &fence, &history, commands).await
+                crate::forward::write_commands_on_raft(raft, &fence, &contact, &history, commands)
+                    .await
             })
             .await
             .map_err(crate::owner::owner_stopped)?

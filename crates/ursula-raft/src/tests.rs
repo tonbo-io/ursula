@@ -1962,6 +1962,7 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     let batch = crate::forward::write_commands_on_raft(
         follower.raft_handle(),
         follower.fence(),
+        follower.contact(),
         &follower.history,
         vec![
             append_command(stream_id.clone(), b"a"),

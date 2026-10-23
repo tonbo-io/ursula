@@ -345,7 +345,8 @@ impl MetaStatusReader {
             }
             (MetaRuntimeState::Running, None) => (MetaReplicaStatus::Absent, false),
             (MetaRuntimeState::Running, Some(active)) => {
-                let watched = active.core.owner().metrics();
+                let owner = active.core.owner();
+                let watched = owner.metrics();
                 let metrics = watched.borrow_watched();
                 let membership = metrics.membership_config.membership();
                 let me = self.node.get();
@@ -356,7 +357,8 @@ impl MetaStatusReader {
                 } else {
                     MetaRole::NotMember
                 };
-                let leader = metrics.current_leader.map(NodeId::new);
+                let leader =
+                    crate::leadership::named_leader(&metrics, owner.contact()).map(NodeId::new);
                 let formed = leader.is_some() || metrics.current_term > 0;
                 (MetaReplicaStatus::Running { role, leader }, formed)
             }

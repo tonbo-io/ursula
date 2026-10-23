@@ -218,7 +218,7 @@ const META_LEADER_RECHECK: Duration = Duration::from_millis(500);
 
 /// Follows this node's running meta replica and publishes on `leaderless`
 /// since when it has known no live meta leader
-/// ([`crate::GroupRejoin::knows_live_leader`]): one it leads with a recent
+/// ([`crate::leadership::knows_live_leader`]): one it leads with a recent
 /// quorum, or follows and heard from recently. A follower that hears its
 /// leader no more keeps naming it in OpenRaft's metrics, since with
 /// pre-vote it raises no term of its own, so the tracker reads the
@@ -259,14 +259,10 @@ pub(crate) async fn track_meta_leader(
         };
         let current = Arc::downgrade(&active);
         let mut metrics = active.core.owner().metrics();
-        let gate = active.core.recovery.clone();
+        let contact = active.core.owner().contact().clone();
         drop(active);
         loop {
-            let live = {
-                let metrics = metrics.borrow_watched();
-                gate.as_deref()
-                    .is_some_and(|gate| gate.knows_live_leader(&metrics))
-            };
+            let live = crate::leadership::knows_live_leader(&metrics.borrow_watched(), &contact);
             if live {
                 leaderless.send_if_modified(|since| since.take().is_some());
             } else {

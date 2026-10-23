@@ -1015,6 +1015,7 @@ pub(crate) fn proposal_leader(
 pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachine>(
     raft: Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
+    contact: &crate::LeaderContact,
     history: &crate::history::GroupHistory,
     commands: Vec<RaftCommand>,
 ) -> Result<Vec<Result<SM::Answer, GroupEngineError>>, GroupEngineError> {
@@ -1035,7 +1036,7 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
     await_first_quorum_ack(&raft).await;
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
-    if let Err(refused) = refuse_unless_leader(&raft, fence) {
+    if let Err(refused) = refuse_unless_leader(&raft, fence, contact) {
         return Ok((0..expected_responses)
             .map(|_| Err(refused.clone()))
             .collect());
@@ -1058,7 +1059,7 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
             .map(|(result, expected)| {
                 result.map(|result| {
                     crate::openraft_error::batch_write_result::<SM>(result, expected, || {
-                        GroupLeadership::of_raft(&raft, fence)
+                        GroupLeadership::of_raft(&raft, fence, contact)
                     })
                 })
             });
@@ -1125,6 +1126,7 @@ pub(crate) fn refuse_unless_leader<
 >(
     raft: &Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
+    contact: &crate::LeaderContact,
 ) -> Result<(), GroupEngineError> {
     let receiver = raft.metrics();
     let metrics = receiver.borrow_watched();
@@ -1132,6 +1134,7 @@ pub(crate) fn refuse_unless_leader<
         &metrics,
         fence,
         crate::leadership::leader_lease(raft.config()),
+        contact,
     );
     if leadership.leads() {
         return Ok(());

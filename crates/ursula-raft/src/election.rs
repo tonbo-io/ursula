@@ -304,6 +304,14 @@ impl ElectionPolicy {
     /// and a switch set then would stay set after it joins a group of more
     /// voters. A replica without a gate, or whose gate holds no node sets
     /// yet, gets no exemption.
+    ///
+    /// The switch gates the election tick, where each election starts with
+    /// a pre-vote round. OpenRaft does not read the switch again when that
+    /// round's grants arrive: a round started just before the switch turns
+    /// off (a drain, a shed, a closed gate) can still start its election,
+    /// up to `election_timeout_min` later. A voter that screens votes
+    /// refuses it as it refuses any vote, and a stopping node's handoff
+    /// steps down from a leadership it gains so.
     pub(crate) fn refresh<SM>(&self, raft: &OwnerRaftHandle<SM>, gate: Option<Arc<GroupRejoin>>)
     where SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData> {
         let policy = self.clone();

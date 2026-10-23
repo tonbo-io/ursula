@@ -210,6 +210,9 @@ pub struct RaftGroupMetricsSnapshot {
     pub raft_group_id: u32,
     pub node_id: u64,
     pub current_term: u64,
+    /// The leader the replica names ([`crate::leadership::named_leader`]):
+    /// itself, or another node only while that node's AppendEntries reach
+    /// it. `None` for a stopped replica.
     pub current_leader: Option<u64>,
     /// The replica's last log id, `None` for an empty log.
     pub last_log: Option<RaftLogProgressSnapshot>,

@@ -115,6 +115,7 @@ use ursula_proto::admin::ReplicaLogView;
 use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
 
+use crate::leadership::LeaderContact;
 use crate::log_store::CoreJournalError;
 use crate::log_store::GroupLogState;
 use crate::log_store::HeldLogState;
@@ -987,6 +988,8 @@ pub(crate) trait PlanCore: Sync {
     /// The core's vote term, committed entry and server state, read through
     /// the core.
     fn state(&self) -> futures_util::future::BoxFuture<'_, Result<CoreState, RecoveryGateError>>;
+    /// The live leader replica `own` follows ([`LeaderContact::live_leader`]).
+    fn live_leader(&self, own: u64) -> Option<u64>;
 }
 
 /// A Raft core's vote term, committed entry and server state.
@@ -1002,11 +1005,17 @@ pub(crate) struct CoreState {
 pub(crate) struct RaftPlanCore<'a, SM: RaftStateMachine<UrsulaRaftTypeConfig>> {
     pub(crate) raft: &'a Raft<UrsulaRaftTypeConfig, SM>,
     pub(crate) group: RaftTarget,
+    /// The replica's contact with its leader, from its owner handle.
+    pub(crate) contact: &'a LeaderContact,
 }
 
 impl<SM: RaftStateMachine<UrsulaRaftTypeConfig>> PlanCore for RaftPlanCore<'_, SM> {
     fn disable_elections(&self) {
         self.raft.runtime_config().elect(false);
+    }
+
+    fn live_leader(&self, own: u64) -> Option<u64> {
+        self.contact.live_leader(own)
     }
 
     fn state(&self) -> futures_util::future::BoxFuture<'_, Result<CoreState, RecoveryGateError>> {
@@ -1057,14 +1066,6 @@ pub struct GroupRejoin {
         Option<(
             Option<LogIdOf<UrsulaRaftTypeConfig>>,
             ursula_runtime::GroupInfraError,
-        )>,
-    >,
-    /// The committed leader whose AppendEntries reached this replica last,
-    /// and when.
-    last_leader_append: Mutex<
-        Option<(
-            UrsulaVote,
-            openraft::type_config::alias::InstantOf<UrsulaRaftTypeConfig>,
         )>,
     >,
     /// The cut of the plan this replica took could not run at its start:
@@ -1283,7 +1284,6 @@ impl GroupRejoin {
             vote_floor: Mutex::new(store.vote()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
-            last_leader_append: Mutex::new(None),
             refused_snapshot: Mutex::new(None),
             cut_refused,
             stall_after: OnceLock::new(),
@@ -1649,31 +1649,6 @@ impl GroupRejoin {
         self.cut_refused
     }
 
-    /// Whether the replica whose metrics are `metrics`, behind this gate,
-    /// knows a live leader of its group: it leads live ([`leads_live`]) or
-    /// follows a live leader ([`Self::follows_live_leader`]). OpenRaft's
-    /// `current_leader` is not that: with pre-vote, a follower that no
-    /// longer hears its leader keeps naming it, since it raises no term of
-    /// its own, until another leader's append reaches it.
-    pub(crate) fn knows_live_leader(&self, metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
-        leads_live(metrics) || self.follows_live_leader().is_some()
-    }
-
-    /// The live leader this replica follows: a committed leader whose
-    /// AppendEntries reached it within [`LIVE_LEADER_QUORUM_ACK`] (m2, #581
-    /// review: an append may reach the replica before its metrics show the
-    /// leader).
-    fn follows_live_leader(&self) -> Option<u64> {
-        let last = *self
-            .last_leader_append
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let (vote, at) = last?;
-        let leader = *vote.leader_id().node_id();
-        (leader != self.node_id && vote.is_committed() && at.elapsed() < LIVE_LEADER_QUORUM_ACK)
-            .then_some(leader)
-    }
-
     /// This replica's commit marker as the commit screen reads it (B1 of
     /// the fifth #613 review): the greatest of the store's marker, OpenRaft's
     /// committed index and its applied one. OpenRaft raises its committed
@@ -2011,7 +1986,7 @@ impl GroupRejoin {
         if leads_live(&metrics) {
             return Err(RecoveryGateError::LeadsLive { group });
         }
-        if let Some(leader) = self.follows_live_leader() {
+        if let Some(leader) = core.live_leader(self.node_id) {
             return Err(RecoveryGateError::FollowsLeader { group, leader });
         }
         // #613: only the plan's leader checks membership, against the one
@@ -2591,25 +2566,21 @@ impl GroupRejoin {
         self.acknowledgements.status(leads_live)
     }
 
-    /// Follower side: record an inbound AppendEntries. A committed vote
-    /// also reaches the group's left mark, which an append of at least the
-    /// mark's vote clears.
+    /// Follower side: record an inbound AppendEntries in the gate. A
+    /// committed vote also reaches the group's left mark, which an append
+    /// of at least the mark's vote clears. The replica's contact with its
+    /// leader is its owner's ([`LeaderContact`]).
     pub fn observe_inbound_append(&self, request: &UrsulaAppendEntriesRequest) {
         self.gate()
             .observe_append(log_index(request.leader_commit.as_ref()));
-        if request.vote.is_committed() {
-            *self
-                .last_leader_append
+        if request.vote.is_committed()
+            && let Some(placed) = self.placed.get()
+        {
+            placed
+                .left
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) =
-                Some((request.vote, UrsulaRaftTypeConfig::now()));
-            if let Some(placed) = self.placed.get() {
-                placed
-                    .left
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .appended(request.vote);
-            }
+                .unwrap_or_else(PoisonError::into_inner)
+                .appended(request.vote);
         }
     }
 
@@ -3230,6 +3201,9 @@ mod tests {
                 &self,
             ) -> futures_util::future::BoxFuture<'_, Result<super::CoreState, RecoveryGateError>>
             {
+                unreachable!("refused before the core is asked")
+            }
+            fn live_leader(&self, _own: u64) -> Option<u64> {
                 unreachable!("refused before the core is asked")
             }
         }

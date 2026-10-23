@@ -102,6 +102,7 @@ pub mod raft_internal_proto {
 mod leadership;
 mod owner;
 pub use leadership::GroupLeadership;
+pub use leadership::LeaderContact;
 pub use leadership::LeaderRole;
 pub use owner::OwnerRaftHandle;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
@@ -156,6 +157,7 @@ pub use engine::PlacedRaftGroupEngineFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineOptions;
+pub use engine::with_group_election_protocol;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
 pub use format_epoch::probe_peer_format_epoch;

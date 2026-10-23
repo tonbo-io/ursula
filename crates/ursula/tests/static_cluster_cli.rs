@@ -5660,6 +5660,11 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
 /// groups of a meta test cluster. `bucket` must be a valid bucket ID, or
 /// every create in it answers `400`.
 fn stream_per_group(bucket: &str) -> Vec<String> {
+    streams_by_group(bucket).into_values().collect()
+}
+
+/// [`stream_per_group`], by the data group each stream hashes to.
+fn streams_by_group(bucket: &str) -> BTreeMap<u32, String> {
     ursula_runtime::validate_bucket_id(bucket)
         .unwrap_or_else(|err| panic!("bucket {bucket:?}: {err}"));
     let map = ursula_shard::StaticShardMap::new(1, META_TEST_GROUPS).expect("shard map");
@@ -5674,7 +5679,7 @@ fn stream_per_group(bucket: &str) -> Vec<String> {
             break;
         }
     }
-    streams.into_values().collect()
+    streams
 }
 
 /// Node `node`'s usage report, from its client listener.
@@ -9977,11 +9982,13 @@ const CLEAN_RESTART_LEADERLESS_WITHIN: Duration = Duration::from_secs(3);
 /// [`CLEAN_RESTART_LEADERLESS_WITHIN`].
 ///
 /// The restarted replicas' election timers may fire before their leaders'
-/// first heartbeats reach them. Each then runs a pre-vote, which its peers
-/// refuse, as they still hold their leader's lease, and leaves the term
-/// alone. Without pre-vote it raises its term, its leader steps down at
-/// its next append to it, and the group elects again: two terms more in
-/// each group the node follows, with no leader in between.
+/// first heartbeats reach them. The test makes sure they do: its peers
+/// reach the restarted node through relays, and the node's relay holds
+/// every connection until the node has sent pre-votes. Each restarted
+/// replica's pre-vote is refused by its peers, which still hold their
+/// leader's lease, and leaves the term alone. Without pre-vote it raises
+/// its term, its leader steps down at its next append to it, and the
+/// group elects again: two terms more in each group the node follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9991,7 +9998,24 @@ async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
     };
     let root = tempfile::tempdir().expect("temp root");
     let nodes = MetaNode::cluster(root.path(), 3);
-    let peers = peers_of(&nodes);
+    // Each node reaches its peers through their relays, and itself
+    // directly.
+    let mut relays = BTreeMap::new();
+    for node in &nodes {
+        relays.insert(node.id, Relay::start(node.port).await);
+    }
+    let peers_for = |me: &MetaNode| -> Vec<(u64, String)> {
+        nodes
+            .iter()
+            .map(|node| {
+                if node.id == me.id {
+                    node.peer()
+                } else {
+                    (node.id, relays[&node.id].url())
+                }
+            })
+            .collect()
+    };
     let meta = MetaToml {
         meta_voters: Some(META_VOTERS),
         leadership_balance_interval: Some("0s"),
@@ -10000,7 +10024,7 @@ async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
     let client = reqwest::Client::new();
     let mut procs = Processes::default();
     for node in &nodes {
-        node.write(&peers, meta);
+        node.write(&peers_for(node), meta);
         procs.start(binary, node);
     }
     wait_bootstrapped(&client, &mut procs, &nodes).await;
@@ -10042,8 +10066,26 @@ async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
         "node {restarting} did not hand off every leadership: {log}"
     );
     drop(outgoing);
+    // No append of its leaders reaches the restarted node until it has
+    // sent pre-votes, which go out through its peers' relays.
+    let sink = Sink::start().await;
+    relays[&restarting].point(sink.port, Open::Closed);
     tokio::time::sleep(Duration::from_millis(500)).await;
     procs.start(binary, &nodes[index]);
+    eventually(
+        &mut procs,
+        "the restarted node sends pre-votes while no leader reaches it",
+        async || {
+            let sent = pre_votes_sent(&client, &nodes[index]).await?;
+            if sent > 0 {
+                Ok(())
+            } else {
+                Err("no pre-vote sent yet".to_owned())
+            }
+        },
+    )
+    .await;
+    relays[&restarting].point(nodes[index].port, Open::Closed);
     wait_readiness_reason(&client, &mut procs, &nodes[index], None).await;
     // Two election timeouts more: a restarted replica that campaigns has
     // done so by then.
@@ -10090,6 +10132,184 @@ async fn cli_a_clean_restart_costs_no_election_beyond_its_handoff() {
         "groups without a leader for {CLEAN_RESTART_LEADERLESS_WITHIN:?} or longer in node \
          {restarting}'s restart: {long:?}"
     );
+}
+
+/// How long a follower may keep naming a leader it no longer hears: the
+/// 3 s a leader's last append counts as live, with a margin for a loaded
+/// runner.
+const SILENT_LEADER_FORGOTTEN_WITHIN: Duration = Duration::from_secs(10);
+
+/// A follower names only a leader it hears. A node of a 3-node cluster
+/// that follows some data group outlives the group's leader and the third
+/// node, both killed. Its pre-votes reach no peer, so it never raises a
+/// term, and OpenRaft keeps naming the killed leader for as long as the
+/// node hears no other. Within [`SILENT_LEADER_FORGOTTEN_WITHIN`] the node
+/// answers a write of every group `503 NO_LEADER` with `Retry-After`, never
+/// a redirect to a killed node: a group a killed node led knows no leader,
+/// and one it led itself has lapsed. Its metrics name no leader of a group
+/// a killed node led, and its maintenance report lists `LeaderUnknown` for
+/// each. It stays so while the quorum is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_follower_whose_leader_and_quorum_are_gone_names_no_leader() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the lost quorum test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        leadership_balance_interval: Some("0s"),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let streams = streams_by_group("quorumless");
+    let url = |node: &MetaNode, stream: &str| format!("{}/quorumless/{stream}", node.url());
+    for stream in streams.values() {
+        put_until_created(&client, &url(&nodes[0], stream)).await;
+        post_until_no_content(&client, &url(&nodes[0], stream), "before;").await;
+    }
+    let before = settled_leaders_and_terms(&client, &mut procs, &nodes).await;
+    let led_by = |group: u32| before[&ReplicatedGroup::Data(u64::from(group))].0;
+    // A data group's leader goes, and so does one more node: the node left
+    // follows that group.
+    let (_, gone_leader) = streams
+        .keys()
+        .map(|group| (*group, led_by(*group)))
+        .next()
+        .expect("a data group");
+    let survivor = nodes
+        .iter()
+        .find(|node| node.id != gone_leader)
+        .expect("a node besides the leader");
+    let followed: BTreeSet<u32> = streams
+        .keys()
+        .copied()
+        .filter(|group| led_by(*group) != survivor.id)
+        .collect();
+    let killed: Vec<u64> = nodes
+        .iter()
+        .map(|node| node.id)
+        .filter(|id| *id != survivor.id)
+        .collect();
+    for id in &killed {
+        procs.kill(*id);
+    }
+
+    let direct = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("HTTP client");
+    let names_no_leader = async || {
+        quorumless_follower_names_no_leader(&client, &direct, survivor, &streams, &followed, &url)
+            .await
+    };
+    eventually_for(
+        &mut procs,
+        "the survivor names no leader it does not hear",
+        SILENT_LEADER_FORGOTTEN_WITHIN,
+        names_no_leader,
+    )
+    .await;
+    // Longer than an election timeout: a node that still named a killed
+    // leader, or campaigned, would show it by now.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    if let Err(found) =
+        quorumless_follower_names_no_leader(&client, &direct, survivor, &streams, &followed, &url)
+            .await
+    {
+        panic!(
+            "node {} named a leader it does not hear once nodes {killed:?} were killed: {found}",
+            survivor.id
+        );
+    }
+}
+
+/// Whether `node`, alone of its cluster, answers a write of each of
+/// `streams` `503 NO_LEADER` with `Retry-After` (through `direct`, which
+/// follows no redirect), names no leader of the `followed` groups in its
+/// metrics, and lists `LeaderUnknown` for each of them in its maintenance
+/// report.
+async fn quorumless_follower_names_no_leader(
+    client: &reqwest::Client,
+    direct: &reqwest::Client,
+    node: &MetaNode,
+    streams: &BTreeMap<u32, String>,
+    followed: &BTreeSet<u32>,
+    url: &impl Fn(&MetaNode, &str) -> String,
+) -> Result<(), String> {
+    for (group, stream) in streams {
+        let response = direct
+            .post(url(node, stream))
+            .header("content-type", "text/plain")
+            .body("after;")
+            .send()
+            .await
+            .map_err(|err| format!("group {group}: {err}"))?;
+        let status = response.status();
+        let retry = response
+            .headers()
+            .contains_key(reqwest::header::RETRY_AFTER);
+        let body = response.bytes().await.unwrap_or_default();
+        let code = ursula_headers::ErrorBody::parse(&body)
+            .ok()
+            .map(|body| body.code);
+        if status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || !retry
+            || code != Some(ursula_headers::ErrorCode::NoLeader)
+        {
+            return Err(format!(
+                "group {group}: a write answered {status}, Retry-After {retry}, {code:?}"
+            ));
+        }
+    }
+    let metrics = try_node_metrics(client, &node.url()).await?;
+    for replica in &metrics.groups {
+        let group = u32::try_from(replica.raft_group_id).expect("a group id");
+        if followed.contains(&group) && replica.current_leader.is_some() {
+            return Err(format!("group {group}: names leader {replica:?}"));
+        }
+    }
+    let (_, ready) = readiness(client, node).await?;
+    let report = ready
+        .raft_maintenance
+        .ok_or_else(|| "no maintenance report".to_owned())?;
+    for group in followed {
+        let issues = report.group_issues.get(group);
+        if !issues.is_some_and(|issues| {
+            issues.contains(&ursula_proto::admin::RaftMaintenanceIssue::LeaderUnknown)
+        }) {
+            return Err(format!("group {group}: issues {issues:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// How many PreVote RPCs node `node` sent in this run
+/// (`raft_grpc_pre_vote_requests`).
+async fn pre_votes_sent(client: &reqwest::Client, node: &MetaNode) -> Result<u64, String> {
+    let url = format!("{}/__ursula/metrics", node.url());
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    let metrics: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    metrics["raft_grpc_pre_vote_requests"]
+        .as_u64()
+        .ok_or_else(|| format!("GET {url}: no pre-vote counter"))
 }
 
 /// A Raft group of a meta test cluster: the meta group or a data group.

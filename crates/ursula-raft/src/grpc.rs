@@ -1438,6 +1438,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .receive(admitted.as_ref(), Rpc::Forward)?;
                     let raft = entry.raft().clone();
                     let fence = raft.fence().clone();
+                    let contact = raft.contact().clone();
                     let history = entry.core.history.clone();
                     let commands = commands(&request)?;
                     let count = commands.len();
@@ -1446,7 +1447,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     // pending history, an unknown outcome).
                     let results = raft
                         .call(move |raft| async move {
-                            write_commands_on_raft(raft, &fence, &history, commands).await
+                            write_commands_on_raft(raft, &fence, &contact, &history, commands).await
                         })
                         .await
                         .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?

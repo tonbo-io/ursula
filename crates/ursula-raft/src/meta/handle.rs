@@ -191,14 +191,16 @@ impl<T: RecoveryTransport> MetaHandle<T> {
     pub async fn submit(&self, command: ControlCommand) -> Result<ControlApplied, MetaWriteError> {
         let active = self.registry.meta().ok_or(MetaWriteError::Stopped)?;
         let (leader, membership) = {
-            let watched = active.core.owner().metrics();
+            let owner = active.core.owner();
+            let watched = owner.metrics();
             let metrics = watched.borrow_watched();
             let membership = membership_config(
                 &metrics.committed_membership_config,
                 MembershipKind::Committed,
             )
             .ok();
-            (metrics.current_leader.map(NodeId::new), membership)
+            let leader = crate::leadership::named_leader(&metrics, owner.contact());
+            (leader.map(NodeId::new), membership)
         };
         if let Some(leader) = leader {
             return self.forward(&active, leader, command).await;
@@ -287,9 +289,7 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         let leader = active
             .core
             .owner()
-            .metrics()
-            .borrow_watched()
-            .current_leader
+            .current_leader()
             .map(NodeId::new)
             .ok_or(MetaBarrierError::NoLeader)?;
         let answer = if leader == self.me {

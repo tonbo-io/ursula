@@ -314,6 +314,7 @@ async fn an_upload_command_without_a_fence_is_refused() {
     let batch = crate::forward::write_commands_on_raft(
         engine.raft_handle(),
         engine.fence(),
+        engine.contact(),
         &engine.history,
         vec![RaftCommand::Stream(command)],
     )
