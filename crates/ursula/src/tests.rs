@@ -10998,6 +10998,38 @@ mod leadership_shed {
         cluster.shutdown().await;
     }
 
+    /// Node 1's probes fail and neither peer answers its participation
+    /// question, as when node 1 is cut off from both: too few peers answer
+    /// for a quorum of its groups, so node 1 sheds and stops campaigning,
+    /// though no peer reported a clean probe. A gate that shed only for a
+    /// peer that does better would leave a cut-off node campaigning on
+    /// every election timeout, and the term it raised would depose its
+    /// groups' leaders once the cut heals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_egress_gate_sheds_when_too_few_peers_answer() {
+        let cluster = Cluster::led_by_node_1().await;
+        let node_1 = cluster.node_1();
+        let stub_2 = ShedStateStub::serve(true, EgressProbeStatus::Degraded).await;
+        let stub_3 = ShedStateStub::serve(true, EgressProbeStatus::Degraded).await;
+        crate::bootstrap::spawn_egress_gate(
+            &node_1.registry,
+            &participation_through(&cluster, [&stub_2, &stub_3]),
+            &ursula_config::ClusterProbeConfig {
+                unhealthy_ticks: 1,
+                ..ursula_config::ClusterProbeConfig::default()
+            },
+        );
+        cluster
+            .wait_until_node_1_sheds(LeadershipShedReason::ClusterEgress)
+            .await;
+        assert!(
+            !node_1.registry.should_campaign(),
+            "node 1 campaigns while no peer answers it"
+        );
+        assert_eq!(node_1.registry.egress_probe(), EgressProbeStatus::Degraded);
+        cluster.shutdown().await;
+    }
+
     /// Node 1's egress fails while node 2 answers that its own probe is
     /// clean and that it may campaign. Node 3 never answers, as over a lost
     /// path: it may be shedding too and refuse a transfer without a word,

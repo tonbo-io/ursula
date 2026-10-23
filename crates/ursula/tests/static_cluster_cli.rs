@@ -367,9 +367,11 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
     .await;
     assert_eq!(payload, b"split-plane-payload");
 
-    // The egress gate sheds after two failed 500 ms ticks. Give it several,
-    // then every node must still be allowed to campaign: its peers answered
-    // the probe on their cluster ports.
+    // The egress gate probes every 500 ms. Give it several ticks, then every
+    // node's last probe must be clean: its peers answered the probe on their
+    // cluster ports. A probe sent to the wrong port fails on every node, and
+    // since no node then does better, none would shed, so the node's own
+    // verdict is what shows it.
     tokio::time::sleep(Duration::from_secs(3)).await;
     for plane in &planes {
         let status: ursula_proto::admin::LeadershipShedStatus = client
@@ -382,6 +384,12 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
             .json()
             .await
             .expect("decode leadership-shed state");
+        assert_eq!(
+            status.egress,
+            ursula_proto::admin::EgressProbeStatus::Clean,
+            "node {}'s egress probe: {status:?}",
+            plane.node_id
+        );
         assert!(
             status.should_campaign,
             "node {} sheds: {status:?}",
@@ -4451,10 +4459,90 @@ async fn leadership_shed(
         .expect("leadership-shed JSON")
 }
 
-fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus) -> bool {
+/// Whether `shed` lists `reason` among the reasons its node sheds for.
+fn sheds(
+    shed: &ursula_proto::admin::LeadershipShedStatus,
+    reason: ursula_raft::LeadershipShedReason,
+) -> bool {
     shed.state
         .split('|')
-        .any(|reason| reason == ursula_raft::LeadershipShedReason::PlacementUnavailable.as_str())
+        .any(|listed| listed == reason.as_str())
+}
+
+fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus) -> bool {
+    sheds(
+        shed,
+        ursula_raft::LeadershipShedReason::PlacementUnavailable,
+    )
+}
+
+/// Each node's participation, sampled every 500 ms from its own listener
+/// while a phase of a test runs.
+struct ParticipationSampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<(u64, ursula_proto::admin::LeadershipShedStatus)>>,
+}
+
+impl ParticipationSampler {
+    fn start(client: &reqwest::Client, nodes: &[MetaNode]) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let urls: Vec<(u64, String)> = nodes
+            .iter()
+            .map(|node| (node.id, format!("{}/__ursula/leadership-shed", node.url())))
+            .collect();
+        let task = {
+            let client = client.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut samples = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    for (id, url) in &urls {
+                        let Ok(response) = client.get(url).send().await else {
+                            continue;
+                        };
+                        if let Ok(shed) = response.json().await {
+                            samples.push((*id, shed));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                samples
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops sampling, and answers every sample with the node it is of.
+    async fn stop(self) -> Vec<(u64, ursula_proto::admin::LeadershipShedStatus)> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the sampler ends")
+    }
+}
+
+/// Asserts that over a uniform delay on every node's path, as `samples`
+/// show it, every node of `nodes` reported a degraded egress probe and no
+/// node ever shed for cluster egress: no peer does better, and every peer
+/// still answers.
+fn assert_degraded_without_egress_shed(
+    nodes: &[MetaNode],
+    samples: &[(u64, ursula_proto::admin::LeadershipShedStatus)],
+) {
+    for node in nodes {
+        assert!(
+            samples.iter().any(|(id, shed)| *id == node.id
+                && shed.egress == ursula_proto::admin::EgressProbeStatus::Degraded),
+            "node {} never reported a degraded egress probe over the delay: {samples:?}",
+            node.id
+        );
+    }
+    let shedding: Vec<&(u64, ursula_proto::admin::LeadershipShedStatus)> = samples
+        .iter()
+        .filter(|(_, shed)| sheds(shed, ursula_raft::LeadershipShedReason::ClusterEgress))
+        .collect();
+    assert!(
+        shedding.is_empty(),
+        "nodes shed for cluster egress over a uniform delay: {shedding:?}"
+    );
 }
 
 /// S1 (#768): three nodes form the meta group over gRPC and bootstrap the
@@ -9141,10 +9229,11 @@ fn check_slow_append(
 ///
 /// Linearizable reads, back at the first delay, return every write.
 ///
-/// The nodes' cluster-egress gates run at their defaults, so every node's
-/// probe fails in both phases. No node sheds, since no peer does better: a
-/// gate that shed on its own probe alone would move every leadership off
-/// every node, and each would refuse the others' handoffs.
+/// The nodes' cluster-egress gates run at their defaults, so every node
+/// reports a failed probe in both phases. No node sheds at any sample, since
+/// no peer does better and every peer still answers: a gate that shed on
+/// its own probe alone would move every leadership off every node, and each
+/// would refuse the others' handoffs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9191,6 +9280,7 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     for link in &links {
         link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
     }
+    let sampler = ParticipationSampler::start(&client, &nodes);
     tokio::time::sleep(
         SLOW_LINK_LEADER_LEASE
             .checked_add(Duration::from_secs(1))
@@ -9229,6 +9319,7 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
             panic!("{err}\n{}", procs.reports());
         }
     }
+    assert_degraded_without_egress_shed(&nodes, &sampler.stop().await);
     assert_eq!(
         group_leaders_and_terms(&client, &mut procs, &nodes).await,
         settled_leaders,
@@ -9275,8 +9366,9 @@ const SLOW_MOVE_WRITERS: usize = 16;
 /// - Each participation answer, the learner's recovery gate among them,
 ///   takes a round trip of 500 ms or 800 ms, which a peer query that gave
 ///   up after 500 ms never gets.
-/// - The cluster-egress gates run at their defaults, so every node's probe
-///   fails. No node sheds for it, since no peer does better.
+/// - The cluster-egress gates run at their defaults, so every node reports
+///   a failed probe. No node sheds for it at any sample through the move,
+///   since no peer does better and every peer still answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9341,6 +9433,7 @@ async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
             SLOW_MOVE_ONE_WAY
         });
     }
+    let sampler = ParticipationSampler::start(&client, &nodes);
     let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut writers = tokio::task::JoinSet::new();
     for _ in 0..SLOW_MOVE_WRITERS {
@@ -9372,6 +9465,7 @@ async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
     )
     .await;
     writing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let samples = sampler.stop().await;
     let mut acknowledged = 0_u64;
     while let Some(writer) = writers.join_next().await {
         let writer = writer.expect("a writer task");
@@ -9395,17 +9489,7 @@ async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
         }
     })
     .await;
-    for node in &nodes {
-        let shed = leadership_shed(&client, node).await;
-        assert!(
-            !shed
-                .state
-                .split('|')
-                .any(|reason| reason == ursula_raft::LeadershipShedReason::ClusterEgress.as_str()),
-            "node {} sheds for cluster egress over a uniform delay: {shed:?}",
-            node.id
-        );
-    }
+    assert_degraded_without_egress_shed(&nodes, &samples);
     tracing::info!(
         acknowledged,
         "slow move: appends acknowledged during the move"
@@ -10058,7 +10142,11 @@ impl ProducerLoad {
 ///    and the new leader acknowledges writes while the cut lasts. Once it
 ///    heals, each stream holds every acknowledged write once, in order, and
 ///    no write whose `503` proves it applied nothing. A leader that holds
-///    writes for as long as it cannot reach a quorum fails it.
+///    writes for as long as it cannot reach a quorum fails it. No peer
+///    answers the cut-off node, so it reports a degraded probe, sheds for
+///    cluster egress and stops campaigning: its terms hold for longer than
+///    an election timeout while the cut lasts, and after the heal the new
+///    leader still leads in its term.
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
@@ -10135,11 +10223,85 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     })
     .await;
     let elected = tokio::time::Instant::now();
+    // No peer answers the cut-off node, so its egress gate sheds and stops
+    // its elections. It must not campaign while the cut lasts: without
+    // pre-vote, each election raises its term, which deposes the group's
+    // leader once the cut heals.
+    let cut_plane = planes
+        .iter()
+        .find(|plane| plane.node_id == leader)
+        .expect("a node of the cluster");
+    let what = format!("node {leader} sheds for cluster egress while cut off");
+    eventually(&mut procs, &what, async || {
+        let shed: ursula_proto::admin::LeadershipShedStatus = client
+            .get(format!(
+                "{}/__ursula/leadership-shed",
+                cut_plane.cluster_url()
+            ))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .json()
+            .await
+            .map_err(|err| err.to_string())?;
+        if shed.egress == ursula_proto::admin::EgressProbeStatus::Degraded
+            && sheds(&shed, ursula_raft::LeadershipShedReason::ClusterEgress)
+            && !shed.should_campaign
+        {
+            Ok(())
+        } else {
+            Err(format!("{shed:?}"))
+        }
+    })
+    .await;
+    let terms_of = async |id: u64| -> BTreeMap<u64, u64> {
+        let metrics = try_node_metrics(&client, &client_url(id))
+            .await
+            .unwrap_or_else(|err| panic!("node {id}'s metrics: {err}"));
+        metrics
+            .groups
+            .iter()
+            .map(|group| (group.raft_group_id, group.current_term))
+            .collect()
+    };
+    let shed_terms = terms_of(leader).await;
+    // Longer than the 3 s maximum election timeout: a node that still
+    // campaigned would raise the term of every group it follows.
     tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        terms_of(leader).await,
+        shed_terms,
+        "node {leader} raised a group's term while cut off and shedding"
+    );
+    // The balancer may have moved the group between the other two nodes
+    // since the election.
+    let holder = eventually(&mut procs, "the other nodes lead the group", async || {
+        live_leader(&client, &planes, &others, group_id).await
+    })
+    .await;
+    let holder_term = terms_of(holder).await[&group_id];
     let healed = tokio::time::Instant::now();
     relays.heal(&planes);
     let direct_writes = direct_load.stop().await;
     let gateway_writes = gateway_load.stop().await;
+    // The healed node takes the new leader's term at its first append, not
+    // the other way round. A few heartbeats after the heal, while the healed
+    // node still sheds (its gate clears after six clean ticks) and so takes
+    // no leadership from the balancer, the new leader still leads the group
+    // in its term.
+    tokio::time::sleep_until(healed.checked_add(Duration::from_secs(2)).unwrap()).await;
+    let after_heal = try_node_metrics(&client, &client_url(holder))
+        .await
+        .unwrap_or_else(|err| panic!("node {holder}'s metrics: {err}"))
+        .groups
+        .into_iter()
+        .find(|replica| replica.raft_group_id == group_id)
+        .unwrap_or_else(|| panic!("node {holder} runs no replica of group {group_id}"));
+    assert_eq!(
+        (after_heal.current_leader, after_heal.current_term),
+        (Some(holder), holder_term),
+        "group {group_id} changed its leader or term after the heal"
+    );
     for (writes, via) in [
         (&direct_writes, "the cut-off leader"),
         (&gateway_writes, "the gateway"),

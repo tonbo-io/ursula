@@ -599,6 +599,16 @@ struct ShellState {
 
 /// The catch-up rounds ([`CatchUpRounds`]) of the learners of one
 /// leadership: a new vote starts every learner's rounds again.
+///
+/// A round is measured between two observations, so it ends no earlier
+/// than the observation after the learner matched its index, and a learner
+/// catches up only while the shell observes more often than the bound: on
+/// a server every 500 ms plus a recovery-gate query of up to
+/// [`crate::PEER_ANSWER_TIMEOUT`], against the 3 s lease. In the
+/// simulation the driver interval and lease are shorter (50 ms against
+/// 100 ms), and an observation held behind a pending view confirmation
+/// makes a round end late, which delays a move without promoting a learner
+/// that did not keep up.
 struct LeaderCatchUp {
     /// The time the rounds count from.
     origin: crate::rt::time::Instant,

@@ -21,13 +21,20 @@ use crate::bootstrap::participation::PeerParticipation;
 /// deadline, sized so 15% loss / added delay fails it while a healthy link
 /// passes trivially — a heartbeat-sized probe would mask loss). A node
 /// that cannot push to a quorum of peers cannot replicate, so it sheds
-/// leadership and disables elections, but only while some peer can do
-/// better: a peer whose own last probe was clean, as its participation
-/// answer reports. A delay or loss on every node's path is no fault of this
-/// node, and handing its leaderships to nodes no better off would only
-/// leave groups without a leader while each refuses them. The node clears
-/// this reason once its egress is clean, or no peer does better, and
-/// re-enables elections only if no other shed reason remains.
+/// leadership and disables elections, but only while that is a fault of
+/// this node ([`EgressFault`]): some peer can do better, a peer whose own
+/// last probe was clean, as its participation answer reports, or too few
+/// peers answer this node at all for a quorum of one of its groups, as when
+/// it is cut off or on the minority side of a partition. A delay or loss on
+/// every node's path is no fault of this node: every peer still answers
+/// within the bound a Raft append gets, and handing its leaderships to
+/// nodes no better off would only leave groups without a leader while each
+/// refuses them. A node that cannot reach a quorum must stop campaigning,
+/// though: Ursula runs without pre-vote, so each of its elections raises
+/// the group's term, and once the cut heals that term deposes the group's
+/// leader. The node clears this reason once its egress is clean, or the
+/// fault is gone, and re-enables elections only if no other shed reason
+/// remains.
 ///
 /// Unlike inferring health from commit progress (load-dependent, and gone once
 /// the client gives up), this probe is role-independent: a yielded follower
@@ -71,6 +78,44 @@ impl ClusterEgressProbePlan {
             (healthy < group.needed_peers).then_some((group, healthy))
         })
     }
+}
+
+/// Why this node's degraded probe is a fault of its own, which sheds its
+/// leaderships ([`egress_fault`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressFault {
+    /// Fewer peers answered this node's participation question than a
+    /// quorum of `raft_group_id` needs: the node is cut off from its peers,
+    /// or on the minority side of a partition, and must not campaign.
+    Isolated {
+        raft_group_id: RaftGroupId,
+        answered: usize,
+        needed: usize,
+    },
+    /// `peer` answers that its own last probe was clean: it reaches its
+    /// quorums where this node does not.
+    PeerDoesBetter { peer: u64 },
+}
+
+/// Whether a degraded probe under `plan` is a fault of this node, by its
+/// peers' `stances`: too few of them answered for a quorum of one of its
+/// groups ([`ClusterEgressProbePlan::degraded`] over the peers that
+/// answered), or one of them reports a clean probe. `None` when every peer
+/// answered as degraded too: the delay or loss is on every node's path.
+pub(crate) fn egress_fault(
+    plan: &ClusterEgressProbePlan,
+    stances: &CampaignStances,
+) -> Option<EgressFault> {
+    if let Some((group, answered)) = plan.degraded(&stances.answered_peers()) {
+        return Some(EgressFault::Isolated {
+            raft_group_id: group.raft_group_id,
+            answered,
+            needed: group.needed_peers,
+        });
+    }
+    stances
+        .peer_with_clean_egress()
+        .map(|peer| EgressFault::PeerDoesBetter { peer })
 }
 
 /// The other voters a quorum of `voters` needs besides `node_id`: a
@@ -132,8 +177,9 @@ pub(crate) fn cluster_egress_probe_plan(
 /// that are voters of the groups whose replica on this node counts as a
 /// voter ([`cluster_egress_probe_plan`]), and records the verdict in the
 /// registry, which this node's participation answer reports. A degraded
-/// tick counts against the node only while a peer answers that its own
-/// probe was clean ([`CampaignStances::peer_with_clean_egress`]). While it
+/// tick counts against the node only while that is its own fault
+/// ([`egress_fault`]), which the peers' answers decide, so such a tick
+/// also waits up to [`ursula_raft::PEER_ANSWER_TIMEOUT`] for them. While it
 /// sheds, the gate hands every leadership it held when it shed to its
 /// peers at once, and plans again on every tick for the ones still
 /// pending, each only to a peer that answered that it may campaign
@@ -166,6 +212,7 @@ pub fn spawn_egress_gate(
     tokio::spawn(async move {
         let payload = vec![0u8; probe_bytes];
         let mut hysteresis = HealthHysteresis::new(unhealthy_ticks, heal_ticks);
+        let mut degraded_without_fault = false;
         // A node that cannot reach a quorum cannot replicate, so its
         // leaderships stall where they are: hand them all off at once. The
         // shed ends when the task does, however it stops.
@@ -211,32 +258,53 @@ pub fn spawn_egress_gate(
                 EgressProbeStatus::Clean
             });
             // The peers' answers are asked only when they decide something:
-            // whether a peer does better than a degraded probe, and where a
-            // shed hands its leaderships.
+            // whether a degraded probe is this node's fault, and where a shed
+            // hands its leaderships.
             let stances = if degraded_probe.is_some() || shed.is_draining() {
                 Some(participation.campaign_stances(&registry).await)
             } else {
                 None
             };
-            let better = degraded_probe.and(
+            let fault = degraded_probe.and(
                 stances
                     .as_ref()
-                    .and_then(CampaignStances::peer_with_clean_egress),
+                    .and_then(|stances| egress_fault(&plan, stances)),
             );
-            let tick = if better.is_some() {
+            // A degraded probe that is no fault of this node turns the gate
+            // off for it: say so once per such stretch, since a probe that
+            // fails on every node turns it off for the whole cluster.
+            let unattributed = degraded_probe.is_some() && fault.is_none();
+            if unattributed && !degraded_without_fault {
+                tracing::warn!(
+                    "cluster-egress: node {node_id} egress degraded, but enough peers answer for its quorums and none reports a clean probe; keeping leadership"
+                );
+            }
+            degraded_without_fault = unattributed;
+            let tick = if fault.is_some() {
                 TickHealth::Bad
             } else {
                 TickHealth::Good
             };
             match hysteresis.observe(tick) {
                 HealthTransition::Shed => {
-                    if let (Some((group, healthy_peers, peer_count, needed_peers)), Some(better)) =
-                        (&degraded_probe, better)
+                    if let (Some((group, healthy_peers, peer_count, needed_peers)), Some(fault)) =
+                        (&degraded_probe, fault)
                     {
-                        tracing::warn!(
-                            "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}) while node {better} reaches its quorums; yielding leadership",
-                            group.0,
-                        );
+                        match fault {
+                            EgressFault::Isolated {
+                                raft_group_id,
+                                answered,
+                                needed,
+                            } => tracing::warn!(
+                                "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}), and {answered} peers answered where group {} needs {needed}; yielding leadership and elections",
+                                group.0,
+                                raft_group_id.0,
+                            ),
+                            EgressFault::PeerDoesBetter { peer } => tracing::warn!(
+                                "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}) while node {peer} reports a clean probe; yielding leadership",
+                                group.0,
+                            ),
+                        }
                     }
                     shed.begin();
                 }

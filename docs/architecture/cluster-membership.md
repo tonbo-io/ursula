@@ -93,6 +93,11 @@ streams are not counted in `removed_streams`.
 The egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
+A degraded probe sheds the node only for a fault of its own
+(`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): a peer's
+participation answer reports a clean probe, or fewer peers answer than a
+quorum of one of its configs needs, so a node cut off from its peers stops
+campaigning, while a delay on every node's path sheds none.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. The server builds one `PeerDirectory` from `raft.peers` at config

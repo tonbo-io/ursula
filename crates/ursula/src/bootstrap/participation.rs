@@ -5,7 +5,8 @@
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
 //! The same answers tell the meta leader each peer's WAL-disk state
 //! ([`ParticipationSheds`]) and the cluster-egress gate each peer's egress
-//! probe verdict ([`CampaignStances::peer_with_clean_egress`]). A peer that
+//! probe verdict ([`CampaignStances::peer_with_clean_egress`]) and which
+//! peers answer at all ([`CampaignStances::answered_peers`]). A peer that
 //! did not answer, or answered for another cluster (its `cluster_id`
 //! differs), has an unknown stance and is never handed a leadership: a node
 //! that may not campaign (under drain, behind its recovery gate, or shedding
@@ -91,6 +92,19 @@ impl CampaignStances {
                 **node_id != self.node_id && **egress == EgressProbeStatus::Clean
             })
             .map(|(node_id, _)| *node_id)
+    }
+
+    /// The peers whose answer arrived, within
+    /// [`ursula_raft::PEER_ANSWER_TIMEOUT`] and for this node's cluster:
+    /// the ones this node still hears from over the cluster plane.
+    pub(crate) fn answered_peers(&self) -> BTreeSet<u64> {
+        self.by_node
+            .iter()
+            .filter(|(node_id, stance)| {
+                **node_id != self.node_id && **stance != CampaignStance::Unknown
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect()
     }
 
     fn nodes(&self, keep: impl Fn(CampaignStance) -> bool) -> HashSet<u64> {
