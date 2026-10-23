@@ -93,6 +93,15 @@ streams are not counted in `removed_streams`.
 The egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
+A degraded probe sheds the node only for a fault of its own
+(`EgressFault` in `crates/ursula/src/bootstrap/egress.rs`): a peer's
+participation answer reports a clean probe, or fewer peers answer than a
+quorum of each of its configs needs, so a node cut off from its peers stops
+campaigning, while a delay on every node's path sheds none. A node that hears
+a quorum of one config keeps campaigning, since its elections stop in every
+group at once. Too few answers
+shed on the first tick that sees them, so a cut-off node campaigns at most once
+in each group it follows before its elections stop.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. The server builds one `PeerDirectory` from `raft.peers` at config
@@ -278,12 +287,29 @@ read. The status also carries `progress_ms`, when the shell last made
 progress: a new state, or in a `catching_up` wait a learner gap that shrinks
 below its smallest since then or a snapshot being sent to one of its
 learners. The leader of a moving group whose progress is five minutes old
-reports `move_stalled`. A caught-up learner is promoted only once its gate is
+reports `move_stalled`. A learner catches up in rounds, the rule of the Raft
+thesis (section 4.2.1, `crates/ursula-control/src/placement/reconcile/catch_up.rs`).
+Each round asks it to match the leader's commit index as it stood when the
+round started. The learner is caught up once a round ends within the group's
+leader lease (`election_timeout_max`, 3 s) of its start, and stays so while
+the round after it has not run longer. Under steady writes the commit index
+moves on while the learner replicates, so the commit index of the moment may
+stay ahead of the learner over a long round trip, while a round's fixed index
+is matched one round trip later. A learner that cannot match an index within
+one lease of its commit never catches up, since a voter that answers later
+than that does not keep its leader's lease either. The rounds start again
+under a new leadership. A caught-up learner is promoted only once its gate is
 open, since a promoted learner whose gate is closed refuses the votes a new
 leader would need. Right before it decides, the shell asks each such
 learner's node for its participation answer (`GET
 /__ursula/leadership-shed`), which lists the recovery gate of every replica
-the node runs. A learner whose answer shows a gated state waits as
+the node runs. It waits one minimum election timeout for the answer
+(`ursula_raft::PEER_ANSWER_TIMEOUT`, 1.5 s), as every question a node asks
+its peers does and as a Raft append call does. A question over a fresh
+connection takes a handshake round trip more than an append on an open gRPC
+stream, so from round trips of about half that wait the control plane may give
+up on a peer that Raft still keeps a leader with. A learner whose
+answer shows a gated state waits as
 `gate_closed`, and one that does not answer, answers for another cluster or
 lists no gate of the group waits as `gate_unknown`. A group placed by hand in
 tests and the simulation (`FixedPlacement`) has no target, and its shell only

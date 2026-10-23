@@ -245,6 +245,9 @@ pub struct RaftGroupHandleRegistry {
     removed: Arc<std::sync::atomic::AtomicBool>,
     /// This node process's one pause registry ([`crate::meta::pause`]).
     pauses: crate::meta::pause::MetaPauses,
+    /// What this node's last cluster-egress probe found
+    /// ([`Self::record_egress_probe`]).
+    egress_probe: Arc<Mutex<ursula_proto::admin::EgressProbeStatus>>,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -277,6 +280,7 @@ impl Default for RaftGroupHandleRegistry {
             left_marks: crate::LeftMarks::default(),
             removed: Arc::default(),
             pauses: crate::meta::pause::MetaPauses::default(),
+            egress_probe: Arc::new(Mutex::new(ursula_proto::admin::EgressProbeStatus::Unprobed)),
         }
     }
 }
@@ -1178,6 +1182,23 @@ impl RaftGroupHandleRegistry {
         self.election.state()
     }
 
+    /// Records what this node's cluster-egress probe found, which its
+    /// participation answer reports to its peers.
+    pub fn record_egress_probe(&self, status: ursula_proto::admin::EgressProbeStatus) {
+        *self
+            .egress_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+    }
+
+    /// What this node's last cluster-egress probe found.
+    pub fn egress_probe(&self) -> ursula_proto::admin::EgressProbeStatus {
+        *self
+            .egress_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn mark_leadership_shed(&self, reason: LeadershipShedReason) {
         let previous = self
             .election
@@ -1352,7 +1373,8 @@ impl RaftGroupHandleRegistry {
     /// recovery gate ([`Self::recovery_gates`]), which a group's leader
     /// reads before it promotes this node's learner, and how many data
     /// groups the node leads ([`Self::leader_count`]), which the peers'
-    /// leadership balancers read.
+    /// leadership balancers read, and what its last cluster-egress probe
+    /// found ([`Self::egress_probe`]), which the peers' egress gates read.
     pub fn participation_status(
         &self,
         cluster_id: ursula_headers::ClusterId,
@@ -1368,6 +1390,7 @@ impl RaftGroupHandleRegistry {
             should_shed_current_leaders: state.should_shed_current_leaders(),
             recovery_gates: self.recovery_gates(),
             leader_count: self.leader_count(),
+            egress: self.egress_probe(),
         }
     }
 

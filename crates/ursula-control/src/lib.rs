@@ -27,6 +27,7 @@ pub use placement::BlockReason;
 pub use placement::BlockedMove;
 pub use placement::BootstrapProblem;
 pub use placement::CandidatesOf;
+pub use placement::CatchUpRounds;
 pub use placement::Cluster;
 pub use placement::ClusterParams;
 pub use placement::ClusterView;

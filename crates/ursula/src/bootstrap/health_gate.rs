@@ -65,6 +65,9 @@ pub(crate) enum TickHealth {
     Inconclusive,
     /// A signal fails.
     Bad,
+    /// A signal fails that rules out serving by itself: the tick sheds at
+    /// once, without the streak of `unhealthy_ticks` a bad tick waits for.
+    Disqualifying,
 }
 
 impl TickHealth {
@@ -101,8 +104,9 @@ enum Stance {
 }
 
 /// The hysteresis of every leadership health gate: shed after
-/// `unhealthy_ticks` bad ticks with no good tick between them, and heal
-/// after `heal_ticks` good ticks in a row. A count of 0 acts as 1.
+/// `unhealthy_ticks` bad ticks with no good tick between them, or on one
+/// disqualifying tick, and heal after `heal_ticks` good ticks in a row. A
+/// count of 0 acts as 1.
 #[derive(Debug, Clone)]
 pub(crate) struct HealthHysteresis {
     unhealthy_ticks: usize,
@@ -129,6 +133,9 @@ impl HealthHysteresis {
                     (Stance::Serving { bad_ticks }, HealthTransition::Hold)
                 }
             }
+            (Stance::Serving { .. }, TickHealth::Disqualifying) => {
+                (Stance::Shedding { good_ticks: 0 }, HealthTransition::Shed)
+            }
             (Stance::Serving { bad_ticks }, TickHealth::Inconclusive) => {
                 (Stance::Serving { bad_ticks }, HealthTransition::Hold)
             }
@@ -143,9 +150,10 @@ impl HealthHysteresis {
                     (Stance::Shedding { good_ticks }, HealthTransition::Hold)
                 }
             }
-            (Stance::Shedding { .. }, TickHealth::Inconclusive | TickHealth::Bad) => {
-                (Stance::Shedding { good_ticks: 0 }, HealthTransition::Hold)
-            }
+            (
+                Stance::Shedding { .. },
+                TickHealth::Inconclusive | TickHealth::Bad | TickHealth::Disqualifying,
+            ) => (Stance::Shedding { good_ticks: 0 }, HealthTransition::Hold),
         };
         self.stance = stance;
         transition
@@ -184,8 +192,7 @@ pub(crate) struct ShedHandoff {
 pub(crate) struct ShedCandidate {
     pub group_id: u32,
     /// The target of an earlier handoff that did not move this leadership.
-    /// The planner passes it over while another target qualifies, and takes
-    /// the targets from [`ShedTargets`]' retry nodes.
+    /// The planner passes it over while another target qualifies.
     pub avoid: Option<u64>,
 }
 
@@ -209,41 +216,22 @@ impl ShedCandidate {
     }
 }
 
-/// The nodes a shed may hand a leadership to on one tick, from what the
-/// peers answered about their campaign policy
-/// ([`crate::bootstrap::participation::CampaignStances`]). A leadership's
-/// first handoff of the shed and a leadership whose earlier handoff did not
-/// move it can have different targets: a peer that did not answer may be
-/// worth one try, but not a second one.
+/// The nodes a shed may hand a leadership to on one tick: the ones that
+/// answered that they may campaign
+/// ([`crate::bootstrap::participation::CampaignStances::shed_targets`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ShedTargets {
-    /// The nodes that may take a leadership's first handoff.
-    first: HashSet<u64>,
-    /// The nodes that may take a leadership whose earlier handoff did not
-    /// move it.
-    retry: HashSet<u64>,
+    nodes: HashSet<u64>,
 }
 
 impl ShedTargets {
-    pub(crate) fn new(first: HashSet<u64>, retry: HashSet<u64>) -> Self {
-        Self { first, retry }
+    pub(crate) fn new(nodes: HashSet<u64>) -> Self {
+        Self { nodes }
     }
 
-    /// `nodes` may take every handoff.
-    pub(crate) fn for_every_handoff(nodes: HashSet<u64>) -> Self {
-        Self {
-            first: nodes.clone(),
-            retry: nodes,
-        }
-    }
-
-    /// Whether `node` may take `candidate`'s handoff. A candidate with a
-    /// target to avoid is one whose earlier handoff did not move it.
-    fn admit(&self, candidate: &ShedCandidate, node: u64) -> bool {
-        match candidate.avoid {
-            None => self.first.contains(&node),
-            Some(_) => self.retry.contains(&node),
-        }
+    /// Whether `node` may take a handoff.
+    fn admit(&self, node: u64) -> bool {
+        self.nodes.contains(&node)
     }
 }
 
@@ -298,7 +286,7 @@ pub(crate) fn plan_shed_handoffs(
         };
         let group = RaftGroupId(snap.raft_group_id);
         let qualifying = handoff_targets(snap, node_id, cluster, |voter| {
-            targets.admit(&candidate, voter) && can_take_over(group, voter)
+            targets.admit(voter) && can_take_over(group, voter)
         });
         let preferred = qualifying
             .iter()
@@ -415,8 +403,7 @@ impl ShedDrain {
     /// A group another node leads, or that this node no longer hosts, has
     /// moved and leaves the drain. A group no node leads stays as it is
     /// until an election settles. A submitted group this node still leads
-    /// after its deadline is queued again, and from then on only
-    /// `targets`' retry nodes may take it.
+    /// after its deadline is queued again.
     pub(crate) fn tick(
         &mut self,
         snaps: &[RaftGroupMetricsSnapshot],
@@ -656,8 +643,8 @@ impl LeadershipShed {
     /// (`heat` holds the node's hot bytes by group id), each to a voter that
     /// `targets` admits and the registry's handoff check accepts. A submitted
     /// handoff stays pending until another node leads the group, and is
-    /// submitted again, to a retry target, if this node still leads it after
-    /// Raft gave up on the transfer.
+    /// submitted again, to another target while one qualifies, if this node
+    /// still leads it after Raft gave up on the transfer.
     pub(crate) async fn step(&mut self, targets: &ShedTargets, heat: &[u64]) -> ShedStep {
         let now = Instant::now();
         let snaps = self.registry.metrics_snapshot();
@@ -790,20 +777,18 @@ impl LeadershipShed {
         for group_id in &due {
             self.stranded_reported.insert(*group_id, now);
         }
-        let peers = |nodes: &HashSet<u64>| -> BTreeSet<u64> {
-            nodes
-                .iter()
-                .copied()
-                .filter(|node| *node != self.node_id)
-                .collect()
-        };
+        let may_campaign: BTreeSet<u64> = targets
+            .nodes
+            .iter()
+            .copied()
+            .filter(|node| *node != self.node_id)
+            .collect();
         let refused = self.refusals_of(&due);
         tracing::warn!(
             reason = %self.reason,
             node_id = self.node_id,
             groups = ?due,
-            may_take_first_handoff = ?peers(&targets.first),
-            may_take_retry = ?peers(&targets.retry),
+            ?may_campaign,
             handoff_check_refused = ?refused,
             "leadership-shed: no peer can take over these leaderships now, because each other \
              voter of these groups answered that it may not campaign, did not answer, or failed \
@@ -867,7 +852,6 @@ impl Drop for LeadershipShed {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::time::Duration;
 
     use proptest::prelude::ProptestConfig;
@@ -926,7 +910,7 @@ mod tests {
 
     /// Targets that admit `nodes` for every handoff.
     fn only(nodes: &[u64]) -> ShedTargets {
-        ShedTargets::for_every_handoff(nodes.iter().copied().collect())
+        ShedTargets::new(nodes.iter().copied().collect())
     }
 
     fn every_node() -> ShedTargets {
@@ -976,10 +960,10 @@ mod tests {
         ticks.iter().map(|tick| hysteresis.observe(*tick)).collect()
     }
 
-    /// The hysteresis spelled out over the tick history: shed once the ticks
-    /// since the last good tick (and since the last heal) hold
-    /// `unhealthy_ticks` bad ones, heal once the ticks since the shed end in
-    /// `heal_ticks` good ones.
+    /// The hysteresis spelled out over the tick history: shed on a
+    /// disqualifying tick, or once the ticks since the last good tick (and
+    /// since the last heal) hold `unhealthy_ticks` bad ones, heal once the
+    /// ticks since the shed end in `heal_ticks` good ones.
     fn reference(
         ticks: &[TickHealth],
         unhealthy_ticks: usize,
@@ -1011,7 +995,7 @@ mod tests {
                     .iter()
                     .filter(|tick| **tick == TickHealth::Bad)
                     .count();
-                if bad >= unhealthy_ticks {
+                if bad >= unhealthy_ticks || ticks[now] == TickHealth::Disqualifying {
                     HealthTransition::Shed
                 } else {
                     HealthTransition::Hold
@@ -1031,6 +1015,7 @@ mod tests {
             Just(TickHealth::Good),
             Just(TickHealth::Inconclusive),
             Just(TickHealth::Bad),
+            Just(TickHealth::Disqualifying),
         ]
     }
 
@@ -1072,6 +1057,28 @@ mod tests {
             vec![Hold, Hold, Hold, Hold, Heal, Hold],
         );
         assert!(!hysteresis.is_shedding());
+    }
+
+    /// A disqualifying tick sheds without a streak, and breaks a good one
+    /// as a bad tick does.
+    #[test]
+    fn a_disqualifying_tick_sheds_at_once() {
+        use HealthTransition::Heal;
+        use HealthTransition::Hold;
+        use HealthTransition::Shed;
+        use TickHealth::Bad;
+        use TickHealth::Disqualifying;
+        use TickHealth::Good;
+
+        let mut hysteresis = HealthHysteresis::new(3, 2);
+        assert_eq!(transitions(&mut hysteresis, &[Bad, Disqualifying]), vec![
+            Hold, Shed
+        ]);
+        assert_eq!(
+            transitions(&mut hysteresis, &[Good, Disqualifying, Good, Good]),
+            vec![Hold, Hold, Hold, Heal],
+        );
+        assert_eq!(transitions(&mut hysteresis, &[Disqualifying]), vec![Shed]);
     }
 
     #[test]
@@ -1331,48 +1338,6 @@ mod tests {
         );
         assert_eq!(only_three.stalled, vec![handoff(0, 3)]);
         assert_eq!(only_three.plan.handoffs, vec![handoff(0, 3)]);
-    }
-
-    #[test]
-    fn a_handoff_that_did_not_move_goes_only_to_a_retry_target() {
-        let snaps = vec![snap(0, Some(ME)), snap(1, Some(ME))];
-        let mut drain = ShedDrain::of_groups_led_by(&snaps, ME);
-        let start = Instant::now();
-        // Nodes 2 and 3 did not answer: either may take a first handoff, and
-        // none may take a second one.
-        let unanswered = ShedTargets::new(HashSet::from([2, 3]), HashSet::new());
-        let plan = |drain: &mut ShedDrain, now: Instant, targets: &ShedTargets| {
-            drain.tick(
-                &snaps,
-                ME,
-                None,
-                now,
-                SHED_HANDOFFS_PER_TICK,
-                &[],
-                targets,
-                |_, _| true,
-            )
-        };
-
-        let first = plan(&mut drain, start, &unanswered);
-        assert_eq!(first.plan.handoffs, vec![handoff(0, 2), handoff(1, 3)]);
-        // Group 0's transfer is refused outright, so it was never handed
-        // off and keeps its first-handoff targets. Group 1's is accepted
-        // and does not move the leadership.
-        drain.record(handoff(0, 2), &Err("refused"), start, SETTLE);
-        drain.record(handoff(1, 3), &Ok::<(), &str>(()), start, SETTLE);
-
-        let stalled = plan(&mut drain, at(start, 8), &unanswered);
-        assert_eq!(stalled.stalled, vec![handoff(1, 3)]);
-        assert_eq!(stalled.plan.handoffs, vec![handoff(0, 2)]);
-        assert_eq!(stalled.plan.stranded, vec![1]);
-        drain.record(handoff(0, 2), &Ok::<(), &str>(()), at(start, 8), SETTLE);
-
-        // Node 2 answers that it may campaign: the stalled group goes to it.
-        let answered = ShedTargets::new(HashSet::from([2, 3]), HashSet::from([2]));
-        let retried = plan(&mut drain, at(start, 9), &answered);
-        assert!(retried.stalled.is_empty());
-        assert_eq!(retried.plan.handoffs, vec![handoff(1, 2)]);
     }
 
     #[test]

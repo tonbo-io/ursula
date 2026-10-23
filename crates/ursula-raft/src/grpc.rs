@@ -829,8 +829,8 @@ const RAFT_GRPC_APPEND_STREAM_WIRE_FRAMES: usize = 4;
 /// A session with calls outstanding and no response for this long is closed (its calls fail as
 /// `Unavailable`); the next call opens a fresh stream.
 const RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long one Append call (a replication batch or a heartbeat) waits for its answer: the
-/// minimum election timeout of a cluster group ([`crate::engine::cluster_raft_config`]).
+/// How long one Append call (a replication batch or a heartbeat) waits for its answer: a peer's
+/// answer time, the minimum election timeout of a cluster group ([`crate::PEER_ANSWER_TIMEOUT`]).
 ///
 /// OpenRaft gives each Append its heartbeat interval as the RPC's TTL. Held to that, every append
 /// fails once a round trip is longer than the heartbeat interval, and nothing commits. The
@@ -840,8 +840,7 @@ const RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// own deadline is then only the wait a peer that is slow but answers gets, and the election
 /// timeout is the slowest link a group keeps a leader over. OpenRaft still bounds each heartbeat
 /// by the heartbeat interval itself.
-const RAFT_GRPC_APPEND_TIMEOUT: Duration =
-    Duration::from_millis(crate::engine::GROUP_ELECTION_TIMEOUT_MIN_MS);
+const RAFT_GRPC_APPEND_TIMEOUT: Duration = crate::PEER_ANSWER_TIMEOUT;
 const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
 
 #[derive(Debug)]

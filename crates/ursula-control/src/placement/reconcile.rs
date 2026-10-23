@@ -21,7 +21,8 @@
 //!    Under a moving target the leader adds the missing targets as
 //!    learners, confirms its view, and then changes one voter per step:
 //!    the dropped voter is never itself (it hands off instead), and the
-//!    promoted one is a caught-up, listed learner with an open gate.
+//!    promoted one is a caught-up, listed learner with an open gate. A
+//!    learner is caught up by the round rule of [`CatchUpRounds`].
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -40,6 +41,10 @@ use super::rules::Rule;
 use super::rules::enforced;
 use super::state::GroupPlacement;
 use super::state::Target;
+
+mod catch_up;
+
+pub use catch_up::CatchUpRounds;
 
 /// Whether the leader's placement view is confirmed within its current data
 /// leadership and meta history.
@@ -172,6 +177,8 @@ pub struct LeaderView {
     pub committed_index: u64,
     /// Each member's matched log index, `None` when it matches nothing.
     pub matched: BTreeMap<NodeId, Option<u64>>,
+    /// The learners that caught up ([`CatchUpRounds`]).
+    pub caught_up: BTreeSet<NodeId>,
     /// Members that acknowledged within the handoff ack window. The leader
     /// counts as live whether listed or not.
     pub live: BTreeSet<NodeId>,
@@ -185,9 +192,9 @@ pub struct LeaderView {
 }
 
 impl LeaderView {
-    /// Whether `node` matched the committed index.
+    /// Whether the learner `node` caught up.
     fn caught_up(&self, node: NodeId) -> bool {
-        matches!(self.matched.get(&node), Some(Some(index)) if *index >= self.committed_index)
+        self.caught_up.contains(&node)
     }
 
     /// The learners whose gates a promotion toward `target` reads: under a

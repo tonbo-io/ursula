@@ -75,6 +75,7 @@ fn leader(me: u64, config: MembershipConfig) -> LeaderView {
             .filter(|member| **member != node(me))
             .map(|member| (*member, Some(10)))
             .collect(),
+        caught_up: config.learners().clone(),
         live: members.clone(),
         handoff_ready: config
             .voters()
@@ -414,6 +415,7 @@ fn a_voter_change_waits_for_a_confirmed_view_and_a_ready_learner() {
     // The reasons, by precedence.
     let mut blocked = view.clone();
     blocked.matched.insert(node(4), Some(9));
+    blocked.caught_up.remove(&node(4));
     assert_eq!(
         plan(1, blocked.clone(), &target),
         MembershipStep::Wait(WaitReason::CatchingUp {

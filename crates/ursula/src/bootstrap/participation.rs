@@ -4,16 +4,16 @@
 //! balancer, the shutdown handoff and the snapshot-store and cold-health
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
 //! The same answers tell the meta leader each peer's WAL-disk state
-//! ([`ParticipationSheds`]).
-//! The cluster-egress gate, whose questions travel the path it judges
-//! impaired, may also try a peer that did not answer, once per leadership
-//! ([`CampaignStances::shed_targets_over_impaired_path`]). An answer from a
-//! node of another cluster (its `cluster_id` differs) is an unknown stance.
-//! A node that may
-//! not campaign (under drain, behind its recovery gate, or shedding for its
-//! snapshot store, cluster egress or WAL disk) refuses a transfer without
-//! telling the leader, which then forwards writes to it until Raft abandons
-//! the transfer.
+//! ([`ParticipationSheds`]) and the cluster-egress gate each peer's egress
+//! probe verdict ([`CampaignStances::peer_with_clean_egress`]) and which
+//! peers answer at all ([`CampaignStances::answered_peers`]). A peer that
+//! did not answer, or answered for another cluster (its `cluster_id`
+//! differs), has an unknown stance and is never handed a leadership: a node
+//! that may not campaign (under drain, behind its recovery gate, or shedding
+//! for its snapshot store, cluster egress or WAL disk) refuses a transfer
+//! without telling the leader, which then forwards writes to it until Raft
+//! abandons the transfer. Every question waits
+//! [`ursula_raft::PEER_ANSWER_TIMEOUT`] for its answer.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use futures_util::future::BoxFuture;
 use futures_util::future::join_all;
 use ursula_control::PeerGate;
+use ursula_proto::admin::EgressProbeStatus;
 use ursula_proto::admin::LeadershipShedStatus;
 use ursula_proto::admin::RaftTargetKey;
 use ursula_proto::placement::NodeId;
@@ -58,6 +59,8 @@ pub(crate) struct CampaignStances {
     /// replicas, each peer's from its answer. A peer that did not answer
     /// has none.
     leader_counts: BTreeMap<u64, u32>,
+    /// Each answering peer's egress probe verdict.
+    egress: BTreeMap<u64, EgressProbeStatus>,
 }
 
 impl CampaignStances {
@@ -71,36 +74,37 @@ impl CampaignStances {
         self.nodes(|stance| stance == CampaignStance::MayCampaign)
     }
 
-    /// Where a gate that asks its peers over a healthy path hands leaderships
-    /// off: only to the nodes known to be allowed to campaign, on every
-    /// handoff.
+    /// Where a shedding gate hands leaderships off: only to the nodes known
+    /// to be allowed to campaign. A peer that did not answer may refuse the
+    /// handoff without a word, which leaves the group without a leader until
+    /// Raft abandons the transfer, so it is never a target.
     pub(crate) fn shed_targets(&self) -> ShedTargets {
-        ShedTargets::for_every_handoff(self.may_campaign())
+        ShedTargets::new(self.may_campaign())
     }
 
-    /// Where a gate whose questions travel the path it judges impaired, the
-    /// cluster-egress gate, hands leaderships off. A lost answer there says
-    /// little about the peer, so a leadership's first handoff may also go to
-    /// a peer that did not answer, and the registry's handoff check, whose
-    /// Raft acks are fresher evidence than a lost request, decides. A peer
-    /// that may not campaign still refuses that handoff without a word, so a
-    /// leadership whose handoff did not move goes only to a peer that
-    /// answered that it may campaign. A peer that never answers thus costs
-    /// each leadership at most one stalled handoff per shed. And on a tick
-    /// when a peer answered that it may not campaign, the shed may be
-    /// cluster-wide, so first handoffs pass over the peers that did not
-    /// answer too.
-    pub(crate) fn shed_targets_over_impaired_path(&self) -> ShedTargets {
-        let may_campaign = self.may_campaign();
-        let a_peer_refuses = self.by_node.iter().any(|(node_id, stance)| {
-            *node_id != self.node_id && *stance == CampaignStance::MayNotCampaign
-        });
-        let first = if a_peer_refuses {
-            may_campaign.clone()
-        } else {
-            self.nodes(|stance| stance != CampaignStance::MayNotCampaign)
-        };
-        ShedTargets::new(first, may_campaign)
+    /// The smallest peer whose answer says its last egress probe was clean:
+    /// a node that reaches a quorum of its groups where this node, whose
+    /// probe is degraded, does not.
+    pub(crate) fn peer_with_clean_egress(&self) -> Option<u64> {
+        self.egress
+            .iter()
+            .find(|(node_id, egress)| {
+                **node_id != self.node_id && **egress == EgressProbeStatus::Clean
+            })
+            .map(|(node_id, _)| *node_id)
+    }
+
+    /// The peers whose answer arrived, within
+    /// [`ursula_raft::PEER_ANSWER_TIMEOUT`] and for this node's cluster:
+    /// the ones this node still hears from over the cluster plane.
+    pub(crate) fn answered_peers(&self) -> BTreeSet<u64> {
+        self.by_node
+            .iter()
+            .filter(|(node_id, stance)| {
+                **node_id != self.node_id && **stance != CampaignStance::Unknown
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect()
     }
 
     fn nodes(&self, keep: impl Fn(CampaignStance) -> bool) -> HashSet<u64> {
@@ -131,6 +135,7 @@ impl CampaignStances {
             node_id,
             by_node: stances.into_iter().collect(),
             leader_counts: BTreeMap::new(),
+            egress: BTreeMap::new(),
         }
     }
 
@@ -141,6 +146,16 @@ impl CampaignStances {
         counts: impl IntoIterator<Item = (u64, u32)>,
     ) -> Self {
         self.leader_counts = counts.into_iter().collect();
+        self
+    }
+
+    /// These stances with `egress` as the peers' egress probe verdicts.
+    #[cfg(test)]
+    pub(crate) fn with_egress(
+        mut self,
+        egress: impl IntoIterator<Item = (u64, EgressProbeStatus)>,
+    ) -> Self {
+        self.egress = egress.into_iter().collect();
         self
     }
 
@@ -205,14 +220,29 @@ pub(crate) struct PeerParticipation {
 }
 
 impl PeerParticipation {
-    /// `client` bounds each peer's answer.
-    pub(crate) fn new(node_id: u64, client: reqwest::Client) -> Self {
+    /// The participation client of `node_id`, which waits
+    /// [`ursula_raft::PEER_ANSWER_TIMEOUT`] for each peer's answer.
+    pub(crate) fn new(node_id: u64) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .timeout(ursula_raft::PEER_ANSWER_TIMEOUT)
+            .build()?;
+        Ok(Self::of_client(node_id, client))
+    }
+
+    fn of_client(node_id: u64, client: reqwest::Client) -> Self {
         Self {
             node_id,
             client,
             #[cfg(test)]
             addresses: None,
         }
+    }
+
+    /// A test's participation client, whose `client` bounds each peer's
+    /// answer.
+    #[cfg(test)]
+    pub(crate) fn with_client(node_id: u64, client: reqwest::Client) -> Self {
+        Self::of_client(node_id, client)
     }
 
     /// Polls and probes `addresses` instead of the bound peers, for a test
@@ -225,7 +255,7 @@ impl PeerParticipation {
     ) -> Self {
         Self {
             addresses: Some(std::sync::Arc::new(addresses)),
-            ..Self::new(node_id, client)
+            ..Self::of_client(node_id, client)
         }
     }
 
@@ -280,6 +310,7 @@ impl PeerParticipation {
         let answers = self.answers(registry, |_peer| true).await;
         let mut by_node = BTreeMap::new();
         let mut leader_counts = BTreeMap::new();
+        let mut egress = BTreeMap::new();
         for (peer_id, answer) in answers {
             let stance = match &answer {
                 Some(status) if status.should_accept_transfer => CampaignStance::MayCampaign,
@@ -289,6 +320,7 @@ impl PeerParticipation {
             by_node.insert(peer_id, stance);
             if let Some(status) = answer {
                 leader_counts.insert(peer_id, status.leader_count);
+                egress.insert(peer_id, status.egress);
             }
         }
         let own = if registry.should_accept_transfer() {
@@ -302,6 +334,7 @@ impl PeerParticipation {
             node_id: self.node_id,
             by_node,
             leader_counts,
+            egress,
         }
     }
 
@@ -446,6 +479,7 @@ mod tests {
     use axum::Router;
     use axum::routing::get;
     use ursula_control::PeerGate;
+    use ursula_proto::admin::EgressProbeStatus;
     use ursula_proto::admin::LeadershipShedStatus;
     use ursula_proto::admin::RaftTargetKey;
     use ursula_proto::admin::RecoveryGateStatus;
@@ -506,6 +540,7 @@ mod tests {
             should_shed_current_leaders: false,
             recovery_gates: BTreeMap::new(),
             leader_count: 0,
+            egress: EgressProbeStatus::Unprobed,
         }
     }
 
@@ -546,7 +581,7 @@ mod tests {
     async fn a_shed_answer_of_another_cluster_is_an_unknown_stance() {
         let (willing, willing_task) = answering_peer(true).await;
         let (foreign, foreign_task) = answering_peer_in("other-cluster", true).await;
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_client(
             1,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
@@ -572,7 +607,7 @@ mod tests {
         let (willing, willing_task) = answering_peer(true).await;
         let (refusing, refusing_task) = answering_peer(false).await;
         let (silent, _listener) = silent_peer().await;
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_client(
             1,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
@@ -608,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_url_with_a_trailing_slash_is_polled_at_its_route() {
         let (willing, willing_task) = answering_peer(true).await;
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_client(
             1,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
@@ -627,22 +662,25 @@ mod tests {
     /// (left out) when it does not answer, answers for another cluster or
     /// lists no gate of the group. The bugs it catches: a missing gate read
     /// as open, which promotes a learner that refuses votes, and an answer
-    /// of another group or cluster trusted. Each peer's leader count comes
-    /// from its answer.
+    /// of another group or cluster trusted. Each peer's leader count and
+    /// egress probe verdict come from its answer.
     #[tokio::test]
     async fn a_learner_gate_and_a_leader_count_come_from_the_peer_answer() {
         let group = RaftGroupId(7);
-        let answer = |gates: &[(RaftTargetKey, RecoveryGateStatus)], leads| LeadershipShedStatus {
-            recovery_gates: gates.iter().copied().collect(),
-            leader_count: leads,
-            ..status(THIS_CLUSTER, true)
-        };
+        let answer =
+            |gates: &[(RaftTargetKey, RecoveryGateStatus)], leads, egress| LeadershipShedStatus {
+                recovery_gates: gates.iter().copied().collect(),
+                leader_count: leads,
+                egress,
+                ..status(THIS_CLUSTER, true)
+            };
         let (open, open_task) = serving(answer(
             &[
                 (RaftTargetKey::Data(7), RecoveryGateStatus::Open),
                 (RaftTargetKey::Data(8), RecoveryGateStatus::CatchingUp),
             ],
             5,
+            EgressProbeStatus::Degraded,
         ))
         .await;
         let (closed, closed_task) = serving(answer(
@@ -651,20 +689,23 @@ mod tests {
                 (RaftTargetKey::Meta, RecoveryGateStatus::Open),
             ],
             2,
+            EgressProbeStatus::Clean,
         ))
         .await;
         let (other_group, other_task) = serving(answer(
             &[(RaftTargetKey::Data(8), RecoveryGateStatus::Open)],
             3,
+            EgressProbeStatus::Clean,
         ))
         .await;
         let (foreign, foreign_task) = serving(LeadershipShedStatus {
             recovery_gates: BTreeMap::from([(RaftTargetKey::Data(7), RecoveryGateStatus::Open)]),
+            egress: EgressProbeStatus::Clean,
             ..status("other-cluster", true)
         })
         .await;
         let (silent, _listener) = silent_peer().await;
-        let participation = PeerParticipation::new(
+        let participation = PeerParticipation::with_client(
             1,
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
@@ -702,76 +743,36 @@ mod tests {
             BTreeMap::from([(NodeId::new(3), PeerGate::Open)])
         );
 
-        let counts = participation
-            .campaign_stances(&registry)
-            .await
-            .leader_counts();
-        assert_eq!(counts, BTreeMap::from([(1, 0), (2, 5), (3, 2), (4, 3)]));
+        let stances = participation.campaign_stances(&registry).await;
+        assert_eq!(
+            stances.leader_counts(),
+            BTreeMap::from([(1, 0), (2, 5), (3, 2), (4, 3)])
+        );
+        // Node 3 is the smallest clean one: node 2 is degraded, and node 5
+        // answered for another cluster.
+        assert_eq!(stances.peer_with_clean_egress(), Some(3));
         for task in [open_task, closed_task, other_task, foreign_task] {
             task.abort();
         }
     }
 
+    /// A shed hands leaderships only to the nodes that answered that they
+    /// may campaign: one that did not answer may be one that refuses a
+    /// transfer without a word.
     #[test]
-    fn a_gate_that_asks_over_a_healthy_path_hands_off_only_to_nodes_that_may_campaign() {
+    fn a_shed_hands_off_only_to_nodes_that_answered_that_they_may_campaign() {
         let stances = CampaignStances::of_nodes(1, [
             (1, CampaignStance::MayNotCampaign),
             (2, CampaignStance::MayCampaign),
             (3, CampaignStance::Unknown),
             (4, CampaignStance::MayNotCampaign),
         ]);
-        assert_eq!(
-            stances.shed_targets(),
-            ShedTargets::for_every_handoff(HashSet::from([2]))
-        );
-    }
-
-    #[test]
-    fn over_an_impaired_path_a_peer_that_did_not_answer_takes_only_first_handoffs() {
-        // This node sheds, so it may not campaign. That is no sign that the
-        // shed is cluster-wide.
-        let stances = CampaignStances::of_nodes(1, [
-            (1, CampaignStance::MayNotCampaign),
-            (2, CampaignStance::MayCampaign),
-            (3, CampaignStance::Unknown),
-        ]);
-        assert_eq!(
-            stances.shed_targets_over_impaired_path(),
-            ShedTargets::new(HashSet::from([2, 3]), HashSet::from([2]))
-        );
-
+        assert_eq!(stances.shed_targets(), ShedTargets::new(HashSet::from([2])));
         let silent = CampaignStances::of_nodes(1, [
             (1, CampaignStance::MayNotCampaign),
             (2, CampaignStance::Unknown),
             (3, CampaignStance::Unknown),
         ]);
-        assert_eq!(
-            silent.shed_targets_over_impaired_path(),
-            ShedTargets::new(HashSet::from([2, 3]), HashSet::new())
-        );
-    }
-
-    #[test]
-    fn over_an_impaired_path_a_peer_that_refuses_rules_out_the_ones_that_did_not_answer() {
-        let stances = CampaignStances::of_nodes(1, [
-            (1, CampaignStance::MayNotCampaign),
-            (2, CampaignStance::MayNotCampaign),
-            (3, CampaignStance::Unknown),
-            (4, CampaignStance::MayCampaign),
-        ]);
-        assert_eq!(
-            stances.shed_targets_over_impaired_path(),
-            ShedTargets::for_every_handoff(HashSet::from([4]))
-        );
-
-        let refused = CampaignStances::of_nodes(1, [
-            (1, CampaignStance::MayNotCampaign),
-            (2, CampaignStance::MayNotCampaign),
-            (3, CampaignStance::Unknown),
-        ]);
-        assert_eq!(
-            refused.shed_targets_over_impaired_path(),
-            ShedTargets::default()
-        );
+        assert_eq!(silent.shed_targets(), ShedTargets::default());
     }
 }

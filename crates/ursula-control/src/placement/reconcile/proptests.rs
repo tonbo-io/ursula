@@ -224,10 +224,18 @@ fn build(raw: &Raw) -> (MembershipView, MembershipTarget) {
             config,
         }
     };
+    // A learner that matched the committed index caught up, as the round
+    // rule judges an idle one.
+    let caught_up = matched
+        .iter()
+        .filter(|(_, matched)| matches!(matched, Some(index) if *index >= 8))
+        .map(|(member, _)| *member)
+        .collect();
     let view = LeaderView {
         membership,
         committed_index: 8,
         matched,
+        caught_up,
         live: set_of(raw.live),
         handoff_ready: set_of(raw.ready),
         gates,
@@ -312,7 +320,7 @@ fn check_step(
     }
     let mut live = leader.live.clone();
     live.insert(me);
-    let caught_up = |node: NodeId| matches!(leader.matched.get(&node), Some(Some(index)) if *index >= leader.committed_index);
+    let caught_up = |node: NodeId| leader.caught_up.contains(&node);
     match step {
         MembershipStep::AddLearners { expected, nodes } => {
             // R3, R5.

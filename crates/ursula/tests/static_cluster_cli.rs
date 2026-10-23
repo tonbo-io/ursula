@@ -367,9 +367,11 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
     .await;
     assert_eq!(payload, b"split-plane-payload");
 
-    // The egress gate sheds after two failed 500 ms ticks. Give it several,
-    // then every node must still be allowed to campaign: its peers answered
-    // the probe on their cluster ports.
+    // The egress gate probes every 500 ms. Give it several ticks, then every
+    // node's last probe must be clean: its peers answered the probe on their
+    // cluster ports. A probe sent to the wrong port fails on every node, and
+    // since no node then does better, none would shed, so the node's own
+    // verdict is what shows it.
     tokio::time::sleep(Duration::from_secs(3)).await;
     for plane in &planes {
         let status: ursula_proto::admin::LeadershipShedStatus = client
@@ -382,6 +384,12 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
             .json()
             .await
             .expect("decode leadership-shed state");
+        assert_eq!(
+            status.egress,
+            ursula_proto::admin::EgressProbeStatus::Clean,
+            "node {}'s egress probe: {status:?}",
+            plane.node_id
+        );
         assert!(
             status.should_campaign,
             "node {} sheds: {status:?}",
@@ -4451,10 +4459,90 @@ async fn leadership_shed(
         .expect("leadership-shed JSON")
 }
 
-fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus) -> bool {
+/// Whether `shed` lists `reason` among the reasons its node sheds for.
+fn sheds(
+    shed: &ursula_proto::admin::LeadershipShedStatus,
+    reason: ursula_raft::LeadershipShedReason,
+) -> bool {
     shed.state
         .split('|')
-        .any(|reason| reason == ursula_raft::LeadershipShedReason::PlacementUnavailable.as_str())
+        .any(|listed| listed == reason.as_str())
+}
+
+fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus) -> bool {
+    sheds(
+        shed,
+        ursula_raft::LeadershipShedReason::PlacementUnavailable,
+    )
+}
+
+/// Each node's participation, sampled every 500 ms from its own listener
+/// while a phase of a test runs.
+struct ParticipationSampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<(u64, ursula_proto::admin::LeadershipShedStatus)>>,
+}
+
+impl ParticipationSampler {
+    fn start(client: &reqwest::Client, nodes: &[MetaNode]) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let urls: Vec<(u64, String)> = nodes
+            .iter()
+            .map(|node| (node.id, format!("{}/__ursula/leadership-shed", node.url())))
+            .collect();
+        let task = {
+            let client = client.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut samples = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    for (id, url) in &urls {
+                        let Ok(response) = client.get(url).send().await else {
+                            continue;
+                        };
+                        if let Ok(shed) = response.json().await {
+                            samples.push((*id, shed));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                samples
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops sampling, and answers every sample with the node it is of.
+    async fn stop(self) -> Vec<(u64, ursula_proto::admin::LeadershipShedStatus)> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the sampler ends")
+    }
+}
+
+/// Asserts that over a uniform delay on every node's path, as `samples`
+/// show it, every node of `nodes` reported a degraded egress probe and no
+/// node ever shed for cluster egress: no peer does better, and every peer
+/// still answers.
+fn assert_degraded_without_egress_shed(
+    nodes: &[MetaNode],
+    samples: &[(u64, ursula_proto::admin::LeadershipShedStatus)],
+) {
+    for node in nodes {
+        assert!(
+            samples.iter().any(|(id, shed)| *id == node.id
+                && shed.egress == ursula_proto::admin::EgressProbeStatus::Degraded),
+            "node {} never reported a degraded egress probe over the delay: {samples:?}",
+            node.id
+        );
+    }
+    let shedding: Vec<&(u64, ursula_proto::admin::LeadershipShedStatus)> = samples
+        .iter()
+        .filter(|(_, shed)| sheds(shed, ursula_raft::LeadershipShedReason::ClusterEgress))
+        .collect();
+    assert!(
+        shedding.is_empty(),
+        "nodes shed for cluster egress over a uniform delay: {shedding:?}"
+    );
 }
 
 /// S1 (#768): three nodes form the meta group over gRPC and bootstrap the
@@ -8958,10 +9046,6 @@ const SLOW_LINK_IDLE_ONE_WAY: Duration = Duration::from_millis(200);
 const SLOW_LINK_BUSY_ONE_WAY: Duration = Duration::from_millis(400);
 /// A cluster group's leader lease, its `election_timeout_max`.
 const SLOW_LINK_LEADER_LEASE: Duration = Duration::from_secs(3);
-/// The cluster-egress probe timeout of the slow-link test, in milliseconds:
-/// longer than either phase's round trip, plus a window update for the
-/// probe's payload.
-const SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS: u64 = 5000;
 
 /// A TCP link in front of a node's listener that holds every byte it
 /// carries for the same one-way delay in each direction, as a `netem delay`
@@ -9145,10 +9229,11 @@ fn check_slow_append(
 ///
 /// Linearizable reads, back at the first delay, return every write.
 ///
-/// The nodes' cluster-egress probes wait [`SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS`]
-/// instead of the default 200 ms. The egress gate judges added delay as
-/// impaired egress by design and would shed every node's leaderships, which
-/// is not what this test pins.
+/// The nodes' cluster-egress gates run at their defaults, so every node
+/// reports a failed probe in both phases. No node sheds at any sample, since
+/// no peer does better and every peer still answers: a gate that shed on
+/// its own probe alone would move every leadership off every node, and each
+/// would refuse the others' handoffs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -9169,7 +9254,6 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
         .collect::<Vec<_>>();
     let meta = MetaToml {
         meta_voters: Some(META_VOTERS),
-        egress_probe_timeout_ms: Some(SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS),
         ..MetaToml::default()
     };
     let client = bounded_client();
@@ -9196,6 +9280,7 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     for link in &links {
         link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
     }
+    let sampler = ParticipationSampler::start(&client, &nodes);
     tokio::time::sleep(
         SLOW_LINK_LEADER_LEASE
             .checked_add(Duration::from_secs(1))
@@ -9234,6 +9319,7 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
             panic!("{err}\n{}", procs.reports());
         }
     }
+    assert_degraded_without_egress_shed(&nodes, &sampler.stop().await);
     assert_eq!(
         group_leaders_and_terms(&client, &mut procs, &nodes).await,
         settled_leaders,
@@ -9252,6 +9338,162 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
         )
         .await;
     }
+}
+
+/// One-way delay of every link but the incoming learner's in
+/// [`cli_a_move_over_slow_links_converges_under_steady_writes`]: a round
+/// trip of 500 ms, under the 600 ms heartbeat interval.
+const SLOW_MOVE_ONE_WAY: Duration = Duration::from_millis(250);
+/// One-way delay of the incoming learner's own link: it acknowledges each
+/// entry 300 ms after the voters do, so under steady writes the commit index
+/// is ahead of its matched index at nearly every sample.
+const SLOW_MOVE_LEARNER_ONE_WAY: Duration = Duration::from_millis(400);
+/// Writers that append back to back to the moving group, so its commit
+/// index moves every few tens of milliseconds.
+const SLOW_MOVE_WRITERS: usize = 16;
+
+/// A move finishes over a slow cluster plane under steady writes. Four
+/// nodes at replication factor 3 settle, every link then holds each byte
+/// for [`SLOW_MOVE_ONE_WAY`] and the link of the one node outside a group
+/// for [`SLOW_MOVE_LEARNER_ONE_WAY`], and that node replaces a follower of
+/// the group while [`SLOW_MOVE_WRITERS`] writers append to it. The move
+/// converges and the node serves the group as a voter.
+///
+/// - The learner's matched index trails the commit index at nearly every
+///   sample, so a leader that promotes only a learner that matched the
+///   commit index of the moment never promotes it. Each round of the
+///   catch-up rule ends one learner round trip after it starts.
+/// - Each participation answer, the learner's recovery gate among them,
+///   takes a round trip of 500 ms or 800 ms, which a peer query that gave
+///   up after 500 ms never gets.
+/// - The cluster-egress gates run at their defaults, so every node reports
+///   a failed probe. No node sheds for it at any sample through the move,
+///   since no peer does better and every peer still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_move_over_slow_links_converges_under_steady_writes() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the slow move test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 4);
+    let mut links = Vec::new();
+    for node in &nodes {
+        links.push(DelayedLink::start(&node.url()).await);
+    }
+    let peers = nodes
+        .iter()
+        .zip(&links)
+        .map(|(node, link)| (node.id, link.url.clone()))
+        .collect::<Vec<_>>();
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let (group, from) = current_voters(&cluster)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no group: {cluster:?}"));
+    let learner = nodes
+        .iter()
+        .map(|node| node.id)
+        .find(|id| !from.contains(id))
+        .unwrap_or_else(|| panic!("group {group:?} is placed on every node: {cluster:?}"));
+    let stream = stream_per_group("slowmove").swap_remove(usize::try_from(group.0).unwrap());
+    let url = |node: &MetaNode| format!("{}/slowmove/{stream}", node.url());
+    put_until_created(&client, &url(&nodes[0])).await;
+    post_until_no_content(&client, &url(&nodes[0]), "fast;").await;
+    let leaders = wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let leader = leaders[&u64::from(group.0)];
+    let source = *from
+        .iter()
+        .find(|id| **id != leader)
+        .expect("a follower to replace");
+    let to: BTreeSet<u64> = from
+        .iter()
+        .copied()
+        .filter(|id| *id != source)
+        .chain([learner])
+        .collect();
+
+    for (node, link) in nodes.iter().zip(&links) {
+        link.set_delay(if node.id == learner {
+            SLOW_MOVE_LEARNER_ONE_WAY
+        } else {
+            SLOW_MOVE_ONE_WAY
+        });
+    }
+    let sampler = ParticipationSampler::start(&client, &nodes);
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut writers = tokio::task::JoinSet::new();
+    for _ in 0..SLOW_MOVE_WRITERS {
+        let client = client.clone();
+        let url = url(node_of(&nodes, leader));
+        let writing = writing.clone();
+        writers.spawn(async move {
+            let mut acknowledged = 0_u64;
+            while writing.load(std::sync::atomic::Ordering::SeqCst) {
+                if append_once(&client, &url, "steady;").await.is_ok() {
+                    acknowledged = acknowledged.checked_add(1).unwrap();
+                } else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            acknowledged
+        });
+    }
+    // The learner may not be listed live yet when the move is asked: the
+    // meta leader's report trails the delay, and the move's own liveness
+    // check is not what this test pins.
+    let (end, out) = placement_move(
+        &nodes,
+        &[],
+        group,
+        replace(source, learner),
+        NewVoters::MayBeDown,
+        true,
+    )
+    .await;
+    writing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let samples = sampler.stop().await;
+    let mut acknowledged = 0_u64;
+    while let Some(writer) = writers.join_next().await {
+        let writer = writer.expect("a writer task");
+        assert!(writer > 0, "a writer had no append acknowledged\n{out}");
+        acknowledged = acknowledged.checked_add(writer).unwrap();
+    }
+    assert_eq!(
+        end,
+        GroupEnd::Converged { to: voter_set(&to) },
+        "{out}\n{}",
+        procs.reports()
+    );
+    let target = node_of(&nodes, learner);
+    let what = format!("node {learner} is a voter of group {}", group.0);
+    eventually(&mut procs, &what, async || {
+        let replica = replica_of(&client, target, group).await?;
+        if replica.voter_configs == vec![to.clone()] {
+            Ok(())
+        } else {
+            Err(format!("{replica:?}"))
+        }
+    })
+    .await;
+    assert_degraded_without_egress_shed(&nodes, &samples);
+    tracing::info!(
+        acknowledged,
+        "slow move: appends acknowledged during the move"
+    );
 }
 
 /// IT-4 (#768): a WAL root opens only under the node id that created it.
@@ -9900,7 +10142,16 @@ impl ProducerLoad {
 ///    and the new leader acknowledges writes while the cut lasts. Once it
 ///    heals, each stream holds every acknowledged write once, in order, and
 ///    no write whose `503` proves it applied nothing. A leader that holds
-///    writes for as long as it cannot reach a quorum fails it.
+///    writes for as long as it cannot reach a quorum fails it. No peer
+///    answers the cut-off node, so it reports a degraded probe, sheds for
+///    cluster egress on its first such tick and stops campaigning. Before
+///    the shed it may campaign once in each group it follows, never twice,
+///    so no term of it is more than one above its term at the cut, and
+///    none of the group it led is above the new leader's. Its terms then
+///    hold for longer than an election timeout while the cut lasts, and
+///    after the heal it follows each group's leader. A gate that waited out
+///    a streak of bad ticks, or a tick that waited for its probes and its
+///    peers' answers one after the other, lets it campaign twice.
 /// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
 ///    through the gateway. A write sent to it gets no answer within the
 ///    gateway's 5 s header timeout, and the gateway sends it again, with
@@ -9969,6 +10220,17 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     let direct_load = GatewayLoad::start(vec![direct.clone()], "direct");
     let gateway_load = GatewayLoad::start(vec![through.clone()], "gateway");
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let terms_of = async |id: u64| -> BTreeMap<u64, u64> {
+        let metrics = try_node_metrics(&client, &client_url(id))
+            .await
+            .unwrap_or_else(|err| panic!("node {id}'s metrics: {err}"));
+        metrics
+            .groups
+            .iter()
+            .map(|group| (group.raft_group_id, group.current_term))
+            .collect()
+    };
+    let cut_terms = terms_of(leader).await;
     let cut = tokio::time::Instant::now();
     relays.cut(leader, &sink);
     let others: Vec<u64> = all.iter().copied().filter(|id| *id != leader).collect();
@@ -9977,11 +10239,113 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
     })
     .await;
     let elected = tokio::time::Instant::now();
+    // No peer answers the cut-off node, so its egress gate sheds and stops
+    // its elections. It must not campaign while the cut lasts: without
+    // pre-vote, each election raises its term, which deposes the group's
+    // leader once the cut heals.
+    let cut_plane = planes
+        .iter()
+        .find(|plane| plane.node_id == leader)
+        .expect("a node of the cluster");
+    let what = format!("node {leader} sheds for cluster egress while cut off");
+    eventually(&mut procs, &what, async || {
+        let shed: ursula_proto::admin::LeadershipShedStatus = client
+            .get(format!(
+                "{}/__ursula/leadership-shed",
+                cut_plane.cluster_url()
+            ))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .json()
+            .await
+            .map_err(|err| err.to_string())?;
+        if shed.egress == ursula_proto::admin::EgressProbeStatus::Degraded
+            && sheds(&shed, ursula_raft::LeadershipShedReason::ClusterEgress)
+            && !shed.should_campaign
+        {
+            Ok(())
+        } else {
+            Err(format!("{shed:?}"))
+        }
+    })
+    .await;
+    let shed_terms = terms_of(leader).await;
+    // A follower campaigns at the earliest 779 ms after the cut and again
+    // 1.5 s later, while the gate sheds at most 2 s after the cut: once.
+    let raised: Vec<(u64, u64, u64)> = shed_terms
+        .iter()
+        .map(|(group, term)| (*group, cut_terms[group], *term))
+        .filter(|(_, at_cut, shed)| *shed > at_cut.saturating_add(1))
+        .collect();
+    assert!(
+        raised.is_empty(),
+        "node {leader} campaigned more than once in a group before it shed (group, term at \
+         the cut, term at the shed): {raised:?}"
+    );
+    // Longer than the 3 s maximum election timeout: a node that still
+    // campaigned would raise the term of every group it follows.
     tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        terms_of(leader).await,
+        shed_terms,
+        "node {leader} raised a group's term while cut off and shedding"
+    );
+    // The balancer may have moved the group between the other two nodes
+    // since the election.
+    let holder = eventually(&mut procs, "the other nodes lead the group", async || {
+        live_leader(&client, &planes, &others, group_id).await
+    })
+    .await;
+    let holder_term = terms_of(holder).await[&group_id];
+    // The healed node meets the new leader with the term it kept through
+    // the cut. Its first append from the leader brings it to the leader's
+    // term only while that term is not below its own: a term above the
+    // leader's deposes the leader at the heal.
+    let cut_term = terms_of(leader).await[&group_id];
+    assert!(
+        cut_term <= holder_term,
+        "node {leader} holds term {cut_term} of group {group_id}, above its new leader's \
+         {holder_term}"
+    );
     let healed = tokio::time::Instant::now();
     relays.heal(&planes);
     let direct_writes = direct_load.stop().await;
     let gateway_writes = gateway_load.stop().await;
+    // The healed node still sheds after the heal (its gate clears after six
+    // clean ticks), so it neither campaigns nor takes a leadership from the
+    // balancer, and in every group it follows a leader among the other
+    // nodes at that leader's term: a group whose term it raised by its one
+    // election elects again among them. The balancer may still move a group
+    // between the other two nodes, which raises the term too, so the check
+    // names neither the leader nor the term.
+    let replica_of = async |id: u64, group: u64| {
+        try_node_metrics(&client, &client_url(id))
+            .await?
+            .groups
+            .into_iter()
+            .find(|replica| replica.raft_group_id == group)
+            .ok_or_else(|| format!("node {id} runs no replica of group {group}"))
+    };
+    for group in shed_terms.keys().copied() {
+        let what = format!("node {leader} follows group {group}'s leader after the heal");
+        eventually(&mut procs, &what, async || {
+            let healed_replica = replica_of(leader, group).await?;
+            let new_leader = live_leader(&client, &planes, &others, group).await?;
+            let leading = replica_of(new_leader, group).await?;
+            if healed_replica.current_leader == Some(new_leader)
+                && healed_replica.current_term == leading.current_term
+                && (group != group_id || leading.current_term >= holder_term)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "node {leader}: {healed_replica:?}, node {new_leader}: {leading:?}"
+                ))
+            }
+        })
+        .await;
+    }
     for (writes, via) in [
         (&direct_writes, "the cut-off leader"),
         (&gateway_writes, "the gateway"),
@@ -10298,7 +10662,7 @@ fn write_node_toml(
     admin_port
 }
 
-/// The meta, placement, cold-flush and egress-probe keys of a node config.
+/// The meta, placement and cold-flush keys of a node config.
 /// `None` leaves a key out, so the server's default applies.
 #[derive(Debug, Clone, Copy, Default)]
 struct MetaToml<'a> {
@@ -10308,8 +10672,6 @@ struct MetaToml<'a> {
     replication_factor: Option<u8>,
     /// `storage.cold.flush_min_hot_size`, in bytes.
     flush_min_hot_bytes: Option<u64>,
-    /// `governance.cluster_probe.timeout`, in milliseconds.
-    egress_probe_timeout_ms: Option<u64>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -10442,14 +10804,6 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
-        }
-
-        if let Some(timeout_ms) = meta.egress_probe_timeout_ms {
-            writeln!(
-                config,
-                "\n[governance.cluster_probe]\ntimeout = \"{timeout_ms}ms\""
-            )
-            .unwrap();
         }
 
         std::fs::write(path, config).expect("write node toml config");

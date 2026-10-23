@@ -91,6 +91,7 @@ pub use hosting::leader_candidates;
 pub use hosting::plan_hosting;
 pub use hosting::seed_role;
 pub use hosting::shown_seed_role;
+pub use reconcile::CatchUpRounds;
 pub use reconcile::EffectiveMembership;
 pub use reconcile::LeaderView;
 pub use reconcile::Leadership;

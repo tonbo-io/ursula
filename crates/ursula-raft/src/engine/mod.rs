@@ -18,7 +18,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) use factory::GROUP_ELECTION_TIMEOUT_MIN_MS;
+pub use factory::PEER_ANSWER_TIMEOUT;
 pub use factory::PlacedRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
 pub(crate) use factory::cluster_raft_config;

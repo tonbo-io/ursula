@@ -315,7 +315,6 @@ backend = "auto"
 # [governance.leadership_balance]
 # interval      = "5s"      # balancer tick interval
 # max_per_tick  = 4         # max leader handoffs per tick
-# peer_timeout  = "500ms"   # wait for a peer's shed state, balancer and health gates (non-zero)
 
 # [governance.cluster_probe]
 # interval        = "500ms"  # probe tick interval
