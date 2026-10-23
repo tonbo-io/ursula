@@ -6202,9 +6202,7 @@ impl GatewayLoad {
                         Err(_unanswered) => LoadAnswer::Unanswered,
                         Ok(response) => {
                             let status = response.status();
-                            let retry = response
-                                .headers()
-                                .contains_key(reqwest::header::RETRY_AFTER);
+                            let retry = is_retryable_refusal(status, response.headers());
                             let body = response.bytes().await.unwrap_or_default();
                             let code = ursula_headers::ErrorBody::parse(&body)
                                 .ok()
@@ -6245,6 +6243,14 @@ impl GatewayLoad {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         self.task.await.expect("the write load ends")
     }
+}
+
+/// Whether an answer of `status` with `headers` is the retryable refusal
+/// the gateway and the nodes answer a write that may be sent again: a `503`
+/// with `Retry-After`.
+fn is_retryable_refusal(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && headers.contains_key(reqwest::header::RETRY_AFTER)
 }
 
 /// Asserts that the gateway answered each of `writes` within the client's
@@ -7027,7 +7033,8 @@ async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
 ///    acknowledged write once, in order, and no write whose `503` code
 ///    proves it applied nothing. A producer appends to a stream of every
 ///    group through the gateway too, and the gateway answers each of its
-///    attempts with a receipt or a `503`, never its `504`: a stopping node
+///    attempts with a receipt or a `503` with `Retry-After`, never its
+///    `504`: a stopping node
 ///    refuses new connections once its listener closes, which ejects it,
 ///    and still answers the appends it accepted, so the gateway waits for
 ///    those answers rather than sending them again elsewhere. Each of those
@@ -7160,11 +7167,11 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
         let attempts = keyed.stop().await;
         let unsettled: Vec<&ProducerAttempt> = attempts
             .iter()
-            .filter(|attempt| !attempt.outcome.holds() && attempt.status != Some(503))
+            .filter(|attempt| !attempt.outcome.holds() && !attempt.retryable)
             .collect();
         assert!(
             unsettled.is_empty(),
-            "{stream}: attempts answered neither a receipt nor a 503: {unsettled:?}"
+            "{stream}: attempts answered neither a receipt nor a 503 with Retry-After: {unsettled:?}"
         );
         let held = attempts
             .iter()
@@ -11010,8 +11017,9 @@ struct ProducerAttempt {
     seq: u64,
     sent: tokio::time::Instant,
     took: Duration,
-    /// The answer's status, `None` without an answer.
-    status: Option<u16>,
+    /// Whether the answer was a retryable refusal
+    /// ([`is_retryable_refusal`]).
+    retryable: bool,
     outcome: ursula_headers::write_outcome::WriteOutcome,
 }
 
@@ -11054,9 +11062,11 @@ impl ProducerLoad {
                         .body(format!("{prefix}-{seq};"))
                         .send()
                         .await;
-                    let (status, outcome) = match answer {
-                        Err(_unanswered) => (None, WriteOutcome::NO_ANSWER),
+                    let (retryable, outcome) = match answer {
+                        Err(_unanswered) => (false, WriteOutcome::NO_ANSWER),
                         Ok(response) => {
+                            let retryable =
+                                is_retryable_refusal(response.status(), response.headers());
                             let status = response.status().as_u16();
                             let headers = response.headers().clone();
                             let body = response.bytes().await.unwrap_or_default();
@@ -11068,7 +11078,7 @@ impl ProducerLoad {
                                     .map(|(name, value)| (name.as_str(), value.as_bytes())),
                                 &body,
                             );
-                            (Some(status), outcome)
+                            (retryable, outcome)
                         }
                     };
                     let holds = outcome.holds();
@@ -11076,7 +11086,7 @@ impl ProducerLoad {
                         seq,
                         sent,
                         took: sent.elapsed(),
-                        status,
+                        retryable,
                         outcome,
                     });
                     if holds {

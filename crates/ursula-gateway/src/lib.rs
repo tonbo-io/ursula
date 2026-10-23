@@ -972,13 +972,15 @@ impl Gateway {
     ///   it and never answers, such as a stopped process. A request whose
     ///   repeat is safe ([`Replay`]) goes on, once, to an upstream it has not
     ///   tried, which answers or redirects to the current leader. It goes on
-    ///   as soon as the upstream is ejected because it stopped answering
-    ///   ([`Gateway::send_hop`]), within a probe interval and a probe timeout
-    ///   of the upstream's last answer, rather than at the timeout. Any other
-    ///   request ends with the timeout, whose outcome is unknown. Neither
-    ///   ejects the upstream. An upstream ejected because it stopped
-    ///   accepting connections, as a draining node is, still answers the
-    ///   requests it accepted, so every request waits for its answer there.
+    ///   as soon as the upstream is ejected for a cause that ends its wait
+    ///   ([`Replay::leaves`], [`Gateway::send_hop`]), rather than at the
+    ///   timeout: a read at any ejection, a producer append once the
+    ///   upstream stopped answering, within a probe interval and a probe
+    ///   timeout of its last answer. A producer append in flight to an
+    ///   upstream that stopped accepting connections, as a draining node
+    ///   does, waits for its answer there, as that node still answers the
+    ///   requests it accepted. Any other request ends with the timeout,
+    ///   whose outcome is unknown. Neither ejects the upstream.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
     ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
     ///   redirect. When no upstream answers without redirecting within those
@@ -1032,8 +1034,8 @@ impl Gateway {
                         continue;
                     }
                     // A hop that may have delivered the request and answered
-                    // nothing, in time or before its upstream was ejected for
-                    // not answering: a request whose repeat is safe goes on,
+                    // nothing, in time or before an ejection of its upstream
+                    // it leaves at: a request whose repeat is safe goes on,
                     // once, to an upstream it has not tried.
                     if error.unanswered_upstream().is_some()
                         && replay != Replay::Never
@@ -1227,17 +1229,17 @@ impl Gateway {
     /// Sends the hop under way of `chain` to `url`, on its target. A hop of
     /// a request whose repeat is safe ([`Replay`]), and that may still be
     /// sent again ([`Chain::may_replay`]), ends without an answer as soon as
-    /// its upstream is ejected because it stopped answering
-    /// ([`Ejection::StoppedAnswering`]) and another upstream is left to send
-    /// it to ([`GatewayError::UpstreamEjected`]): such an upstream, a stopped
-    /// process for one, never answers it, and the probes tell so within a
-    /// probe interval and a probe timeout, before the response header
-    /// timeout. An upstream ejected because it stopped accepting
-    /// ([`Ejection::StoppedAccepting`]) still answers what it accepted, as a
-    /// draining node does for its drain, so the hop waits for that answer.
-    /// Any other hop waits for its answer up to that timeout too, as an
-    /// answer that comes then still settles a write whose repeat is not
-    /// safe.
+    /// its upstream is ejected for a cause it leaves at ([`Replay::leaves`])
+    /// and another upstream is left to send it to
+    /// ([`GatewayError::UpstreamEjected`]). An upstream that stopped
+    /// answering ([`Ejection::StoppedAnswering`]), a stopped process for one,
+    /// never answers, and the probes tell so within a probe interval and a
+    /// probe timeout, before the response header timeout. One that stopped
+    /// accepting ([`Ejection::StoppedAccepting`]) still answers what it
+    /// accepted, as a draining node does for its drain, so a producer append
+    /// waits for that answer, and a read goes on. Any other hop waits for
+    /// its answer up to that timeout, as an answer that comes then still
+    /// settles a write whose repeat is not safe.
     async fn send_hop(
         &self,
         chain: &Chain,
@@ -1256,7 +1258,8 @@ impl Gateway {
             biased;
             sent = &mut send => sent,
             () = self.ejections.until(|| {
-                self.ejections.stopped_answering(target) && self.untried_upstream(chain).is_some()
+                self.ejections.cause(target).is_some_and(|cause| replay.leaves(cause))
+                    && self.untried_upstream(chain).is_some()
             }) => Err(GatewayError::UpstreamEjected {
                 upstream: target.to_owned(),
             }),
@@ -1662,6 +1665,23 @@ enum Replay {
 }
 
 impl Replay {
+    /// Whether a hop of this request in flight to an upstream ejected for
+    /// `cause` stops waiting for it and goes on to another upstream. A read
+    /// goes on at any ejection: a repeat changes nothing, and an upstream
+    /// that stopped accepting may not answer in time, such as a long-poll
+    /// held past the drain of its node. A producer append goes on only from
+    /// an upstream that stopped answering, which never settles it: one that
+    /// stopped accepting still answers it, and only that answer settles it
+    /// when the repeat is refused. Any other request waits for its answer.
+    fn leaves(self, cause: Ejection) -> bool {
+        match (self, cause) {
+            (Self::Read, Ejection::StoppedAccepting | Ejection::StoppedAnswering)
+            | (Self::Keyed, Ejection::StoppedAnswering) => true,
+            (Self::Keyed, Ejection::StoppedAccepting)
+            | (Self::Never, Ejection::StoppedAccepting | Ejection::StoppedAnswering) => false,
+        }
+    }
+
     fn of(parts: &axum::http::request::Parts) -> Self {
         if matches!(parts.method, Method::GET | Method::HEAD) {
             return Self::Read;
@@ -1753,9 +1773,10 @@ impl Chain {
     }
 
     /// Whether `upstream` got a hop of this request and answered nothing, in
-    /// time or before it was ejected for not answering. Its peers name it while they
-    /// have not yet elected a leader in its place, as for a stopped process,
-    /// and a hop back to it would only wait out the timeout again.
+    /// time or before an ejection the request leaves at. Its peers name it
+    /// while they have not yet elected a leader in its place, as for a
+    /// stopped process, and a hop back to it would only wait out the timeout
+    /// again.
     fn answered_nothing(&self, upstream: &str) -> bool {
         self.unanswered
             .as_ref()
@@ -2603,11 +2624,11 @@ pub enum GatewayError {
     /// upstream.
     #[error("upstream {upstream} sent no response headers within {timeout:?}")]
     UpstreamTimeout { upstream: String, timeout: Duration },
-    /// No response headers before the upstream was ejected because it
-    /// stopped answering ([`Ejection::StoppedAnswering`]), while another
-    /// upstream was left for a request whose repeat is safe. The request may
-    /// have reached it.
-    #[error("upstream {upstream} sent no response headers before it was ejected for not answering")]
+    /// No response headers before the upstream was ejected for a cause the
+    /// request leaves at ([`Replay::leaves`]), while another upstream was
+    /// left for a request whose repeat is safe. The request may have
+    /// reached it.
+    #[error("upstream {upstream} sent no response headers before it was ejected")]
     UpstreamEjected { upstream: String },
     /// The exchange failed after the request may have reached the upstream.
     #[error("upstream request to {upstream} failed")]
@@ -2667,8 +2688,8 @@ impl GatewayError {
     }
 
     /// The upstream of a hop that may have delivered the request and sent
-    /// no response headers, within the response header timeout or before it
-    /// was ejected for not answering: its outcome is unknown.
+    /// no response headers, within the response header timeout or before an
+    /// ejection the request leaves at: its outcome is unknown.
     fn unanswered_upstream(&self) -> Option<&str> {
         match self {
             Self::UpstreamTimeout { upstream, .. } | Self::UpstreamEjected { upstream } => {

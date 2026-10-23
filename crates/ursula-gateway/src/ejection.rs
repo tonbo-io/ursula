@@ -14,8 +14,17 @@
 //! closes its listener and still answers every request it accepted. One
 //! whose probe got no answer in time stopped answering: a stopped process or
 //! a frozen host answers nothing, the requests it accepted included. Both
-//! leave selection, but only an upstream that stopped answering ends the
-//! wait of a request in flight to it ([`Ejections::stopped_answering`]).
+//! leave selection. What a request in flight to an ejected upstream does
+//! depends on the cause ([`Ejections::cause`]): a read goes on at either, as
+//! it has no outcome to wait for, and a producer append goes on only at an
+//! upstream that stopped answering, as one that stopped accepting still
+//! settles it.
+//!
+//! An upstream that refuses new connections and stays silent on the ones it
+//! holds stays ejected as one that stopped accepting when the probes hold no
+//! pooled connection to it: a node frozen during its drain, or one whose new
+//! connections are refused while its established ones are black-holed. Its
+//! producer appends in flight then wait for the response header timeout.
 //!
 //! A request that gets no response headers within the response header
 //! timeout ejects nothing. The probes eject a silent node sooner, and a live
@@ -29,7 +38,7 @@
 //! included. When every upstream is ejected, none is: requests choose among
 //! all of them, as if nothing were ejected, rather than among none. A
 //! request waiting on an upstream can stop waiting once requests skip it
-//! because it stopped answering ([`Ejections::until`]).
+//! ([`Ejections::until`]), for the cause it was ejected for.
 //!
 //! [`Ejections`] holds the ejected upstreams and their causes under a lock
 //! shared by every request, with a count that lets requests skip the lock
@@ -56,7 +65,7 @@ use crate::GatewayError;
 pub(crate) enum Ejection {
     /// It failed at the transport without a timeout: it refused a
     /// connection, as a draining node does once its listener closed, or it
-    /// closed one. It may still answer the requests it accepted, so a request
+    /// closed one. It may still answer the requests it accepted, so a write
     /// in flight to it waits for its answer.
     StoppedAccepting,
     /// It sent nothing in time: a probe of it got no response headers within
@@ -293,14 +302,13 @@ impl Ejections {
         !self.skipping() || self.with_ejected(|ejected| !ejected.contains_key(upstream))
     }
 
-    /// Whether requests skip `upstream` because it stopped answering
-    /// ([`Ejection::StoppedAnswering`]): a request in flight to it gets no
-    /// answer. False while every upstream is ejected, as nothing is skipped
-    /// then.
-    pub(crate) fn stopped_answering(&self, upstream: &str) -> bool {
-        self.skipping()
-            && self
-                .with_ejected(|ejected| ejected.get(upstream) == Some(&Ejection::StoppedAnswering))
+    /// Why requests skip `upstream`, if they do. `None` while every
+    /// upstream is ejected, as nothing is skipped then.
+    pub(crate) fn cause(&self, upstream: &str) -> Option<Ejection> {
+        if !self.skipping() {
+            return None;
+        }
+        self.with_ejected(|ejected| ejected.get(upstream).copied())
     }
 
     /// Upstreams ejected now. Requests skip them unless every upstream is

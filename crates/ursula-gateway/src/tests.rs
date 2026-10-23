@@ -732,19 +732,94 @@ async fn draining_upstream(
 /// upstream that stopped accepting: no request goes there any more, but the
 /// append it accepted is not sent again elsewhere, where a refusal (`503`,
 /// as from a group whose new leader is not known yet) would leave the
-/// first hop's outcome unknown and answer the client `504`.
+/// first hop's outcome unknown and answer the client `504`. A read in
+/// flight there goes on at the ejection, as a long-poll may outlast the
+/// drain and a repeat of a read changes nothing.
 #[tokio::test]
 async fn a_request_in_flight_to_a_draining_upstream_gets_its_answer() {
-    let drain = Arc::new(tokio::sync::Notify::new());
+    let header_timeout = test_config(Vec::new()).response_header_timeout;
+    for (request, elsewhere, body, hits) in [
+        (producer_post(), refusal(), &b"drained"[..], 0),
+        (
+            get_stream(),
+            (StatusCode::OK, HeaderMap::new()),
+            &b"scripted"[..],
+            1,
+        ),
+    ] {
+        let method = request.method().clone();
+        let drain = Arc::new(tokio::sync::Notify::new());
+        let answer = Arc::new(tokio::sync::Notify::new());
+        let (draining, mut arrivals) =
+            draining_upstream(Arc::clone(&drain), Arc::clone(&answer)).await;
+        let live = Scripted::spawn().await;
+        live.answers(elsewhere);
+        let gateway = Arc::new(Gateway::new(test_config(vec![
+            draining.url.clone(),
+            live.url(),
+        ])));
+        gateway.remember_leader("/bucket/stream".to_owned(), draining.url.clone());
+        let mut sent = send(&gateway, request);
+        until_reached(
+            async {
+                arrivals.recv().await.expect("the upstream is up");
+            },
+            &mut sent,
+        )
+        .await;
+
+        let drained = std::time::Instant::now();
+        drain.notify_one();
+        until_ejected(&gateway, 1, probes_eject_within()).await;
+        assert_eq!(
+            gateway.ejections.cause(&draining.url),
+            Some(Ejection::StoppedAccepting),
+            "{method}"
+        );
+        if hits == 0 {
+            // Past the ejection, the append still waits for the draining
+            // node.
+            tokio::time::sleep(PROBE_INTERVAL.saturating_mul(2)).await;
+            assert!(!sent.is_finished(), "the append ended at the ejection");
+            assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
+            // Its answer readmits the node, which a later probe may eject
+            // again.
+            answer.notify_one();
+        }
+        let response = sent.await.expect("request task");
+
+        assert!(drained.elapsed() < header_timeout, "{method}");
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        let read = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        assert_eq!(&read[..], body, "{method}");
+        assert_eq!(live.hits(), hits, "{method}");
+        // The read left a request held at the draining node.
+        answer.notify_one();
+    }
+}
+
+/// A producer append in flight to an upstream ejected because it stopped
+/// accepting waits for its answer there, and goes on at once when the
+/// upstream is ejected again because it stopped answering, as a node that
+/// refused a connection and then froze is.
+#[tokio::test]
+async fn an_append_waiting_on_an_upstream_that_stopped_accepting_goes_on_when_it_stops_answering() {
+    let header_timeout = test_config(Vec::new()).response_header_timeout;
     let answer = Arc::new(tokio::sync::Notify::new());
-    let (draining, mut arrivals) = draining_upstream(Arc::clone(&drain), Arc::clone(&answer)).await;
-    let refusing = Scripted::spawn().await;
-    refusing.answers(refusal());
-    let gateway = Arc::new(Gateway::new(test_config(vec![
-        draining.url.clone(),
-        refusing.url(),
+    let (held, mut arrivals) =
+        draining_upstream(Arc::new(tokio::sync::Notify::new()), Arc::clone(&answer)).await;
+    let live = Scripted::spawn().await;
+    let gateway = Arc::new(Gateway::unprobed(test_config(vec![
+        held.url.clone(),
+        live.url(),
     ])));
-    gateway.remember_leader("/bucket/stream".to_owned(), draining.url.clone());
+    gateway.remember_leader("/bucket/stream".to_owned(), held.url.clone());
+    let started = std::time::Instant::now();
     let mut sent = send(&gateway, producer_post());
     until_reached(
         async {
@@ -754,25 +829,26 @@ async fn a_request_in_flight_to_a_draining_upstream_gets_its_answer() {
     )
     .await;
 
-    drain.notify_one();
-    until_ejected(&gateway, 1, probes_eject_within()).await;
-    // Past the ejection, the request still waits for the draining node.
+    assert_eq!(
+        gateway
+            .ejections
+            .failed(&held.url, Ejection::StoppedAccepting),
+        EjectionChange::Ejected
+    );
     tokio::time::sleep(PROBE_INTERVAL.saturating_mul(2)).await;
-    assert!(!sent.is_finished(), "the request ended at the ejection");
-    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
-    // Its answer readmits the node, which a later probe may eject again.
-    answer.notify_one();
+    assert!(!sent.is_finished(), "the append ended at a refused connect");
+    assert_eq!(
+        gateway
+            .ejections
+            .failed(&held.url, Ejection::StoppedAnswering),
+        EjectionChange::Escalated
+    );
     let response = sent.await.expect("request task");
 
+    assert!(started.elapsed() < header_timeout);
     assert_eq!(response.status(), StatusCode::OK);
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("response body")
-        .to_bytes();
-    assert_eq!(&body[..], b"drained");
-    assert_eq!(refusing.hits(), 0);
+    assert_eq!(live.hits(), 1);
+    answer.notify_one();
 }
 
 /// A probe past its timeout keeps waiting for its answer, so that the

@@ -67,8 +67,8 @@ identifies the Raft leader.
   out the connection, or the exchange breaks) is ejected too. A refused or
   broken connection says the upstream stopped accepting requests, as a
   draining node does once its listener closes, while it still answers the
-  ones it accepted. A probe or transport timeout says it stopped answering. A request that
-  gets no response headers within `--response-header-timeout` ejects
+  ones it accepted. A probe or transport timeout says it stopped answering.
+  A request that gets no response headers within `--response-header-timeout` ejects
   nothing: the probes eject a node that stops answering sooner, and a live
   node can hold one request longer (a write on a leader elected over a slow
   link, a read forwarded to an unreachable leader, a snapshot commit of many
@@ -77,15 +77,15 @@ identifies the Raft leader.
   cached route, at random, and on every hop after a redirect, a leader
   redirect's included. A node that vanished fails within
   `--upstream-tcp-user-timeout`.
-- **In-flight requests.** A read or a producer append waiting on an upstream
-  when it is ejected for not answering goes on at once to an upstream it has
-  not tried, as it does when the upstream sends nothing within
-  `--response-header-timeout`, so a write in flight to a stopped node waits
-  about 1.75 s for it rather than the whole timeout. Any other write waits
-  for its answer up to the timeout and then gets `504`, since its outcome is
-  unknown. A request waiting on an upstream ejected for refusing
+- **In-flight requests.** A read waiting on an upstream when it is ejected,
+  and a producer append waiting on one when it is ejected for not answering,
+  go on at once to an upstream they have not tried, as they do when the
+  upstream sends nothing within `--response-header-timeout`, so a write in
+  flight to a stopped node waits about 1.75 s for it rather than the whole
+  timeout. A producer append waiting on an upstream ejected for refusing
   connections, such as a node in its drain, waits for that upstream's
-  answer.
+  answer, which settles it. Any other write waits for its answer up to the
+  timeout and then gets `504`, since its outcome is unknown.
 - **Fallback.** If every upstream is ejected, none is: requests go along
   their cached route, or else to any upstream, and follow every redirect, as
   if nothing were ejected.
