@@ -661,9 +661,19 @@ pub enum RaftMaintenanceIssue {
     /// only by a move or by leaving a joint configuration.
     UnplacedMember,
     LocalReplicaNotVoter,
+    /// The replica has not applied the membership entry it holds committed.
     MembershipNotApplied,
+    /// The replica's effective membership is an entry its group has not
+    /// committed yet: the group's quorum decides it, not this node.
+    MembershipUncommitted,
+    /// The replica knows no leader of its group.
     LeaderUnknown,
     LeaderOutsideVoters,
+    /// The replica has not acknowledged a leader of its group since it
+    /// opened in this run, and a leader's append reached it lately or it
+    /// opened less than the contact grace ago
+    /// ([`LeaderAcknowledgement::Awaiting`]).
+    LeaderNotAcknowledged,
     NotApplied,
     ApplyLag,
     /// The node leads a moving group whose reconciler made no progress
@@ -690,8 +700,7 @@ impl RaftMaintenanceIssue {
             | Self::StoppedForOperator
             | Self::LocalReplicaNotVoter
             | Self::MembershipNotApplied
-            | Self::LeaderUnknown
-            | Self::LeaderOutsideVoters
+            | Self::LeaderNotAcknowledged
             | Self::NotApplied
             | Self::ApplyLag
             | Self::Unknown => true,
@@ -712,6 +721,10 @@ impl RaftMaintenanceIssue {
             | Self::UnplacedMember
             | Self::MoveStalled
             | Self::ApplyStopped => false,
+            // The group's state, decided by its quorum on other nodes: a
+            // group whose quorum is lost elsewhere never takes a node out of
+            // service. They block maintenance.
+            Self::MembershipUncommitted | Self::LeaderUnknown | Self::LeaderOutsideVoters => false,
         }
     }
 
@@ -826,6 +839,29 @@ pub struct RaftGroupMaintenanceState {
     #[serde(deserialize_with = "Option::deserialize")]
     pub membership_log_index: Option<u64>,
     pub stopped_for_operator: bool,
+    /// Whether the replica acknowledges its group's leader again since it
+    /// opened in this run.
+    pub leader_acknowledgement: LeaderAcknowledgement,
+}
+
+/// Whether a replica acknowledges its group's leader since it opened in
+/// this run: the restart half of serving readiness. A node is ready only
+/// once none of its replicas that count as voters is `awaiting`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderAcknowledgement {
+    /// The replica has not acknowledged a leader in this run, and a
+    /// leader's append reached it lately or it opened a short while ago.
+    #[default]
+    Awaiting,
+    /// In this run the replica accepted a leader's append that took its log
+    /// to the leader's commit index, so the leader counts it toward its
+    /// quorum, or it leads with a live quorum.
+    Acknowledged,
+    /// The replica has not acknowledged a leader in this run, and for the
+    /// contact grace since it opened no leader's append reached it: its
+    /// group has no leader that could count it.
+    NoLeaderContact,
 }
 
 /// One fresh, outbound ReadIndex confirmation bound to its committed leader.
@@ -1220,6 +1256,7 @@ mod metrics_contract_tests {
                     membership_joint: false,
                     membership_log_index: Some(0),
                     stopped_for_operator: false,
+                    leader_acknowledgement: LeaderAcknowledgement::Acknowledged,
                 },
                 last_log_index: Some(5),
                 last_log_term: Some(1),

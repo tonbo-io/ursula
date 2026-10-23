@@ -1093,6 +1093,9 @@ pub struct GroupRejoin {
     /// This replica ran `Initialize` for its group: its bootstrap driver
     /// found every voter empty.
     initialized: AtomicBool,
+    /// Whether the replica acknowledges its group's leader again since it
+    /// opened ([`acknowledge`]).
+    acknowledgements: acknowledge::Acknowledgements,
 }
 
 /// The Raft a gate is bound to ([`GroupRejoin::bind`]).
@@ -1290,6 +1293,7 @@ impl GroupRejoin {
             plan_in_flight: AtomicBool::new(false),
             placed: OnceLock::new(),
             initialized: AtomicBool::new(false),
+            acknowledgements: acknowledge::Acknowledgements::new(),
         })
     }
 
@@ -2548,6 +2552,35 @@ impl GroupRejoin {
         self.store.upgrade()?.last_log_id()
     }
 
+    /// Records that a leader's append `request` reached this replica,
+    /// before any screen, and returns what it proves once OpenRaft accepts
+    /// it ([`Self::observe_append_answer`]).
+    pub(crate) fn observe_leader_contact(
+        &self,
+        request: &UrsulaAppendEntriesRequest,
+    ) -> Option<acknowledge::LeaderAppend> {
+        self.acknowledgements.contacted(request)
+    }
+
+    /// Records OpenRaft's answer to the append `append` describes.
+    pub(crate) fn observe_append_answer(
+        &self,
+        append: acknowledge::LeaderAppend,
+        response: &openraft::raft::AppendEntriesResponse<UrsulaRaftTypeConfig>,
+    ) {
+        self.acknowledgements.answered(append, response);
+    }
+
+    /// Whether this replica acknowledges its group's leader again since it
+    /// opened ([`acknowledge`]); `leads_live` when it leads with a live
+    /// quorum.
+    pub fn leader_acknowledgement(
+        &self,
+        leads_live: bool,
+    ) -> ursula_proto::admin::LeaderAcknowledgement {
+        self.acknowledgements.status(leads_live)
+    }
+
     /// Follower side: record an inbound AppendEntries. A committed vote
     /// also reaches the group's left mark, which an append of at least the
     /// mark's vote clears.
@@ -3533,11 +3566,13 @@ mod tests {
     }
 }
 
+mod acknowledge;
 mod attach;
 mod barrier;
 mod bootstrap;
 mod leader_tick;
 mod reconcile;
+pub use acknowledge::LEADER_CONTACT_GRACE;
 pub(crate) use attach::GateProbe;
 pub use attach::RecoveryConfig;
 pub use attach::RecoveryGate;

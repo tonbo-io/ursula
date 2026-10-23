@@ -48,13 +48,16 @@ pub struct SpawnedMeta {
     registry: RaftGroupHandleRegistry,
     config: MetaRuntimeConfig,
     participation: PeerParticipation,
+    /// The leadership balancer's tuning: it starts with the meta runtime,
+    /// whose read barriers its handoffs wait for.
+    balance: ursula_config::LeadershipBalanceConfig,
     /// The meta journal's WAL counters.
     wal_metrics: ursula_runtime::RuntimeMetrics,
 }
 
 impl SpawnedMeta {
-    /// Starts the meta runtime over gRPC on the prepared journal, and its
-    /// meta shed.
+    /// Starts the meta runtime over gRPC on the prepared journal, its meta
+    /// shed and the leadership balancer.
     pub(crate) async fn start(self) -> MetaSlot {
         let node_id = self.config.node;
         let registry = self.registry.clone();
@@ -66,6 +69,12 @@ impl SpawnedMeta {
             self.identity,
         )
         .await;
+        let balancer = super::leadership::spawn_leadership_balancer(
+            registry.clone(),
+            self.participation.clone(),
+            runtime.status_reader().clone(),
+            &self.balance,
+        );
         let shed = super::meta_shed::spawn_meta_shed(
             registry,
             self.participation,
@@ -75,18 +84,21 @@ impl SpawnedMeta {
         MetaSlot(Arc::new(Mutex::new(Some(ServerMeta {
             runtime,
             shed,
+            balancer,
             hosting: None,
             wal_metrics: self.wal_metrics,
         }))))
     }
 }
 
-/// The meta runtime, the meta shed task and the hosting driver of a server
-/// node.
+/// The meta runtime, the meta shed and leadership balancer tasks and the
+/// hosting driver of a server node.
 #[derive(Debug)]
 struct ServerMeta {
     runtime: GrpcMetaRuntime,
     shed: tokio::task::JoinHandle<()>,
+    /// `None` when the balancer's interval is zero.
+    balancer: Option<tokio::task::JoinHandle<()>>,
     /// The hosting driver, once [`MetaSlot::start_hosting`] started it.
     hosting: Option<HostingTask>,
     wal_metrics: ursula_runtime::RuntimeMetrics,
@@ -107,7 +119,7 @@ pub struct MetaSlot(Arc<Mutex<Option<ServerMeta>>>);
 
 impl MetaSlot {
     /// The meta runtime and the hosting driver, once: shutdown stops them.
-    /// The meta shed stops here.
+    /// The meta shed and the leadership balancer stop here.
     pub(crate) fn take(&self) -> Option<TakenMeta> {
         let meta = self
             .0
@@ -115,6 +127,9 @@ impl MetaSlot {
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
         meta.shed.abort();
+        if let Some(balancer) = &meta.balancer {
+            balancer.abort();
+        }
         Some(TakenMeta {
             runtime: meta.runtime,
             hosting: meta.hosting,
@@ -261,5 +276,6 @@ pub(crate) fn open_meta(
             }),
         },
         participation,
+        balance: config.governance.leadership_balance.clone(),
     })
 }

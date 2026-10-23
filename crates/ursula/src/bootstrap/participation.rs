@@ -82,14 +82,15 @@ impl CampaignStances {
         ShedTargets::new(self.may_campaign())
     }
 
-    /// The smallest peer whose answer says its last egress probe was clean:
-    /// a node that reaches a quorum of its groups where this node, whose
-    /// probe is degraded, does not.
-    pub(crate) fn peer_with_clean_egress(&self) -> Option<u64> {
+    /// The smallest of `peers` whose answer says its last egress probe was
+    /// clean: a node that reaches a quorum of each of its groups.
+    pub(crate) fn clean_egress_among(&self, peers: &BTreeSet<u64>) -> Option<u64> {
         self.egress
             .iter()
             .find(|(node_id, egress)| {
-                **node_id != self.node_id && **egress == EgressProbeStatus::Clean
+                **node_id != self.node_id
+                    && peers.contains(node_id)
+                    && **egress == EgressProbeStatus::Clean
             })
             .map(|(node_id, _)| *node_id)
     }
@@ -750,7 +751,11 @@ mod tests {
         );
         // Node 3 is the smallest clean one: node 2 is degraded, and node 5
         // answered for another cluster.
-        assert_eq!(stances.peer_with_clean_egress(), Some(3));
+        assert_eq!(
+            stances.clean_egress_among(&BTreeSet::from([2, 3, 4, 5])),
+            Some(3)
+        );
+        assert_eq!(stances.clean_egress_among(&BTreeSet::from([2, 5])), None);
         for task in [open_task, closed_task, other_task, foreign_task] {
             task.abort();
         }

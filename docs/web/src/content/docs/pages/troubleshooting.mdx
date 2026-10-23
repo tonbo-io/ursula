@@ -76,20 +76,23 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 | `replication_factor_mismatch` | | blocks | `raft.placement.replication_factor`, capped at the `[[raft.peers]]` count, differs from the cluster's. A cluster that formed with fewer nodes than the factor recorded its node count: set the factor to that on every node before it grows ([Adding a node](/docs/operations#adding-a-node)) |
 | `node_removed` | | | The view shows the node removed, or the meta group refused its registration as removed. It replaces every other node issue. The node has no expected group, so each replica it still runs is `unplaced_replica` and keeps its voter checks. Stop the node ([Cordon and decommission](/docs/operations#cordon-and-decommission)) |
 
-Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner), [`unplaced_member`](#unplaced_member), `move_in_progress` (the view shows a move of the group, reported for every role in it, a replica that does not count as a voter included) and `move_stalled` (on the leader of a moving group whose reconciler made no progress for five minutes) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `leader_unknown` or `apply_lag`, block both.
+Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner), [`unplaced_member`](#unplaced_member), `move_in_progress` (the view shows a move of the group, reported for every role in it, a replica that does not count as a voter included) and `move_stalled` (on the leader of a moving group whose reconciler made no progress for five minutes) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `membership_not_applied` or `apply_lag`, block both. So does `leader_not_acknowledged`: since it opened in this run, the replica has not accepted an append that took its log to its leader's commit index, and a leader's append reached it in the last 3 seconds or it opened less than 10 seconds ago. Once no leader contacts it for that long its group has no leader that could count it, and the issue ends. The checks that a group's quorum on other nodes decides, `leader_unknown`, `leader_outside_voters` and `membership_uncommitted` (the replica's newest membership entry is not committed), block maintenance only, so a meta outage or a group that lost its quorum elsewhere never makes a node unready.
 
 ### Serving while a replica catches up
 
 `raft_replica_unready` means local Raft participation is not safe for serving.
 Inspect `raft_maintenance.group_issues` for `local_replica_not_voter`,
-`membership_not_applied`, `not_applied`, `apply_lag` or `leader_unknown`. A
-wiped replica stays 503 while its recovery gate is closed and it catches up.
-It stays a voter throughout. Healthy surviving voters can return 200 during
-the repair. A voter
-leaving a joint membership also stays unready once any configuration excludes
-it. A replica whose own gate is open reports `leader_unknown` for a group that
-has no leader, for example a group stalled because a majority of its voters
-are gated.
+`membership_not_applied`, `not_applied`, `apply_lag` or
+`leader_not_acknowledged`. A restarted node reports `leader_not_acknowledged`
+until each of its replicas has caught up with its group's leader, so a rolling
+restart stops the next pod only once the restarted one counts toward its
+groups' quorums again. A wiped replica stays 503 while its recovery gate is
+closed and it catches up. It stays a voter throughout. Healthy surviving
+voters can return 200 during the repair. A voter leaving a joint membership
+also stays unready once any configuration excludes it. A replica whose own
+gate is open reports `leader_unknown` for a group that has no leader, for
+example a group stalled because a majority of its voters are gated, and the
+node stays ready.
 
 A 200 response does not certify full redundancy. Keep maintenance blocked until
 `ursulactl wait-ready` succeeds. Alert separately on incomplete voter sets in
@@ -278,7 +281,7 @@ leader's plan term (`ursulactl recover-group --accept-loss` does both). Recover 
 (`--target meta`): a data group's plan needs a confirmed meta view. A stalled meta gate shows as `"meta"` under `recovery_gates.stalled` in the metrics and in the `ursula.raft.recovery_gates` gauge, never in `recovery_stalled_groups` or readiness. The plan starts a new history of
 the group, so every stream of the group gets a new `Stream-Incarnation`. A
 voter of the group that was never gated does not report `recovery_stalled`. It
-answers `raft_replica_unready` with `leader_unknown` for the group. See
+stays ready and reports `leader_unknown` for the group. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### `accept-unsynced-loss` answers `409 Conflict`

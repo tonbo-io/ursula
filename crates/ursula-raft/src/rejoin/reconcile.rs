@@ -16,10 +16,15 @@
 //!   is truncated, so a stopped shell leaves its step to finish.
 //! - **Transfers** go through the replica's one handoff policy, and a target
 //!   whose transfer did not move the leadership is skipped for one plan.
-//! - **Confirmations**: a voter change from a uniform config needs a view
-//!   the target source confirmed within the current leadership. The shell
-//!   keeps a confirmation only while its vote is unchanged and every view it
-//!   reads carries its stamp.
+//! - **Confirmations**: a voter change from a uniform config, and a
+//!   leadership transfer toward the target, need a view the target source
+//!   confirmed within the current leadership. The shell keeps a
+//!   confirmation only while its vote is unchanged, every view it reads
+//!   carries its stamp and its barrier started less than
+//!   [`CONFIRMATION_LIFETIME`] ago. So a meta group that lost its quorum
+//!   freezes every group's voters and placement-driven leaderships within
+//!   that lifetime: only leaving a joint config, which adds no voter, goes
+//!   on without one.
 //! - **Reports** (design 5.7): a `Converged` step under a seeded or moving
 //!   target at `since` proves the leadership with a fresh quorum barrier,
 //!   re-reads the vote and the committed uniform membership, and reports
@@ -299,8 +304,12 @@ pub(super) fn openraft_log_id(log_id: MembershipLogId) -> LogIdOf<C> {
 enum StepOutcome {
     /// The change committed, or the transfer was submitted.
     Done,
-    /// The target source confirmed a view at this stamp.
-    Confirmed(ConfirmedStamp),
+    /// The target source confirmed a view at `stamp`, by a barrier that
+    /// started `at`.
+    Confirmed {
+        stamp: ConfirmedStamp,
+        at: crate::rt::time::Instant,
+    },
     /// The second entry of a voter change found its guard moved: the joint
     /// entry committed, and the next plan flattens it.
     JointCommitted,
@@ -347,7 +356,7 @@ impl StepOutcome {
     fn name(&self) -> &'static str {
         match self {
             Self::Done => "done",
-            Self::Confirmed(_) => "confirmed",
+            Self::Confirmed { .. } => "confirmed",
             Self::JointCommitted => "joint_committed",
             Self::Replan { .. } => "replan",
             Self::NotLeader => "not_leader",
@@ -369,7 +378,7 @@ impl StepOutcome {
     fn failure(&self) -> Option<StepFailureKind> {
         match self {
             Self::Done
-            | Self::Confirmed(_)
+            | Self::Confirmed { .. }
             | Self::JointCommitted
             | Self::Reported { .. }
             | Self::Stopped => None,
@@ -398,7 +407,7 @@ impl StepOutcome {
             Self::StalePlacement { .. } | Self::ReportUnknown(_) => true,
             Self::ReportRefused(error) => error.requeue() == Requeue::ConfirmView,
             Self::Done
-            | Self::Confirmed(_)
+            | Self::Confirmed { .. }
             | Self::JointCommitted
             | Self::Replan { .. }
             | Self::NotLeader
@@ -517,12 +526,21 @@ impl ReconcileSteps {
     }
 }
 
-/// A confirmation the shell holds: the stamp, and the vote it was taken
-/// under on both sides of the barrier.
+/// How long a confirmation authorizes the shell's steps, counted from the
+/// start of its barrier: the window in which a leader whose quorum
+/// acknowledged it is live. While the meta group has no live quorum no new
+/// barrier passes, so within this window of losing it the shell stops
+/// changing voters and moving leaderships, and the layout stays as meta
+/// left it.
+const CONFIRMATION_LIFETIME: std::time::Duration = super::LIVE_LEADER_QUORUM_ACK;
+
+/// A confirmation the shell holds: the stamp, the vote it was taken under
+/// on both sides of the barrier, and when its barrier started.
 #[derive(Debug, Clone, Copy)]
 struct Confirmation {
     vote: UrsulaVote,
     stamp: ConfirmedStamp,
+    at: crate::rt::time::Instant,
 }
 
 /// A transfer the shell submitted, until it settles.
@@ -841,7 +859,9 @@ where
             return;
         };
         state.confirmed = state.confirmed.filter(|confirmed| {
-            confirmed.vote == metrics.vote && confirmed.stamp.covers(read.view)
+            confirmed.vote == metrics.vote
+                && confirmed.stamp.covers(read.view)
+                && confirmed.at.elapsed() < CONFIRMATION_LIFETIME
         });
         // A view the meta group said is behind, or a report that may have
         // applied, is confirmed before anything is planned from it. The
@@ -1057,8 +1077,9 @@ where
             (MembershipStep::ConfirmView, _) => {
                 let source = self.source.clone();
                 Box::pin(async move {
+                    let at = crate::rt::time::Instant::now();
                     match source.confirm().await {
-                        Ok(stamp) => StepOutcome::Confirmed(stamp),
+                        Ok(stamp) => StepOutcome::Confirmed { stamp, at },
                         Err(error) => StepOutcome::ConfirmFailed(error),
                     }
                 })
@@ -1195,7 +1216,7 @@ where
                     });
                 }
             }
-            StepOutcome::Confirmed(stamp) => {
+            StepOutcome::Confirmed { stamp, at } => {
                 // The view was read again, whichever leadership the barrier
                 // ran in.
                 state.reread = false;
@@ -1206,6 +1227,7 @@ where
                     state.confirmed = Some(Confirmation {
                         vote: pending.vote,
                         stamp: *stamp,
+                        at: *at,
                     });
                 }
             }

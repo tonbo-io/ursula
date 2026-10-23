@@ -594,6 +594,7 @@ pub(crate) fn test_group(
             membership_joint: false,
             membership_log_index: Some(0),
             stopped_for_operator: false,
+            leader_acknowledgement: ursula_proto::admin::LeaderAcknowledgement::Acknowledged,
         },
         last_log_index: committed_index.max(last_applied_index),
         last_log_term: committed_index

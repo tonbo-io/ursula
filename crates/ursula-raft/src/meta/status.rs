@@ -156,8 +156,8 @@ impl MetaStatusReader {
 
     /// This node's view, confirmed by a meta read barrier
     /// ([`MetaHandle::confirm_view`]).
-    pub(crate) fn confirm_view(&self) -> Confirmation<'_> {
-        self.meta.confirm_view()
+    pub async fn confirm_view(&self) -> Result<ConfirmedView, MetaBarrierError> {
+        self.meta.confirm_view().await
     }
 
     /// Asks `leader` for a fresh quorum barrier of `target`, answered with

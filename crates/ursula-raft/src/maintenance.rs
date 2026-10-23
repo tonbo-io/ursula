@@ -24,6 +24,7 @@ use ursula_control::MetaReplicaStatus;
 use ursula_control::PlacementStatus;
 use ursula_control::RegistrationStatus;
 use ursula_control::Standing;
+use ursula_proto::admin::LeaderAcknowledgement;
 use ursula_proto::admin::NodePlacementReport;
 pub use ursula_proto::admin::RaftMaintenanceIssue;
 pub use ursula_proto::admin::RaftMaintenanceReport;
@@ -419,15 +420,22 @@ fn voter_checks(
         }
     }
     let applied = group.last_applied.map(|id| id.index);
-    if group.maintenance.membership_log_index.is_none()
-        || applied < group.maintenance.membership_log_index
-    {
-        issues.push(Issue::MembershipNotApplied);
+    let committed = group.committed.map(|id| id.index);
+    match group.maintenance.membership_log_index {
+        None => issues.push(Issue::MembershipNotApplied),
+        Some(membership) if committed < Some(membership) => {
+            issues.push(Issue::MembershipUncommitted)
+        }
+        Some(membership) if applied < Some(membership) => issues.push(Issue::MembershipNotApplied),
+        Some(_) => {}
     }
     match group.current_leader {
         None => issues.push(Issue::LeaderUnknown),
         Some(leader) if !voters.contains(&leader) => issues.push(Issue::LeaderOutsideVoters),
         Some(_) => {}
+    }
+    if group.maintenance.leader_acknowledgement == LeaderAcknowledgement::Awaiting {
+        issues.push(Issue::LeaderNotAcknowledged);
     }
     match (group.committed, applied) {
         (Some(committed), Some(applied))

@@ -88,6 +88,16 @@ impl ClusterEgressProbePlan {
         })
     }
 
+    /// The peers of every group config that fewer of its peers answered
+    /// than its quorum needs.
+    fn short_voters(&self, answered: &BTreeSet<u64>) -> BTreeSet<u64> {
+        self.groups
+            .iter()
+            .filter(|group| group.peers.intersection(answered).count() < group.needed_peers)
+            .flat_map(|group| group.peers.iter().copied())
+            .collect()
+    }
+
     /// Whether fewer of its peers `answered` than a quorum needs in every
     /// group config of the plan: this node could lead none of its groups.
     pub(crate) fn isolated(&self, answered: &BTreeSet<u64>) -> bool {
@@ -111,18 +121,25 @@ pub(crate) enum EgressFault {
     /// stops campaigning in every group at once, and some group it can
     /// lead would be left without a candidate.
     Isolated { answered: usize },
-    /// `peer` answers that its own last probe was clean: it reaches its
-    /// quorums where this node does not.
+    /// `peer`, a voter of a group config this node's probe found short of
+    /// a quorum, answers that its own last probe was clean: it reaches a
+    /// quorum of that config where this node does not.
     PeerDoesBetter { peer: u64 },
 }
 
-/// Whether a degraded probe under `plan` is a fault of this node, by its
-/// peers' `stances`: too few of them answered for a quorum of any of its
-/// groups ([`ClusterEgressProbePlan::isolated`] over the peers that
-/// answered), or one of them reports a clean probe. `None` when every peer
-/// answered as degraded too: the delay or loss is on every node's path.
+/// Whether a probe under `plan` that reached `probed` is a fault of this
+/// node, by its peers' `stances`: too few of them answered for a quorum of
+/// any of its groups ([`ClusterEgressProbePlan::isolated`] over the peers
+/// that answered), or a voter of a group config the probe found short of a
+/// quorum reports a clean probe. `None` when no such voter does: the delay
+/// or loss is on every node's path, or the voters this node misses are the
+/// ones no node reaches, stopped or cut off, whose groups keep no quorum on
+/// any node. A peer that is clean over other groups proves nothing of
+/// those, and handing it the node's leaderships of groups that still have
+/// their quorum would move them for another node's fault.
 pub(crate) fn egress_fault(
     plan: &ClusterEgressProbePlan,
+    probed: &BTreeSet<u64>,
     stances: &CampaignStances,
 ) -> Option<EgressFault> {
     let answered = stances.answered_peers();
@@ -132,7 +149,7 @@ pub(crate) fn egress_fault(
         });
     }
     stances
-        .peer_with_clean_egress()
+        .clean_egress_among(&plan.short_voters(probed))
         .map(|peer| EgressFault::PeerDoesBetter { peer })
 }
 
@@ -310,7 +327,7 @@ pub fn spawn_egress_gate(
             let fault = degraded_probe.and(
                 stances
                     .as_ref()
-                    .and_then(|stances| egress_fault(&plan, stances)),
+                    .and_then(|stances| egress_fault(&plan, &answered, stances)),
             );
             // A degraded probe that is no fault of this node turns the gate
             // off for it: say so once per such stretch, since a probe that
@@ -428,30 +445,58 @@ mod tests {
         use EgressProbeStatus::Degraded;
 
         let plan = plan();
+        // The probe reached node 2 only: group 1 is short of its quorum.
+        let probed = BTreeSet::from([2]);
         assert_eq!(
-            egress_fault(&plan, &stances(&[(4, Clean)])),
+            egress_fault(&plan, &probed, &stances(&[(4, Clean)])),
             Some(EgressFault::Isolated { answered: 1 }),
             "node 4 is no quorum of group 0, and one answer none of group 1"
         );
         assert_eq!(
-            egress_fault(&plan, &stances(&[])),
+            egress_fault(&plan, &probed, &stances(&[])),
             Some(EgressFault::Isolated { answered: 0 })
         );
         assert_eq!(
-            egress_fault(&plan, &stances(&[(2, Degraded)])),
+            egress_fault(&plan, &probed, &stances(&[(2, Degraded)])),
             None,
             "node 2 is a quorum of group 0, though not of group 1"
         );
         assert_eq!(
-            egress_fault(&plan, &stances(&[(2, Degraded), (4, Clean)])),
+            egress_fault(&plan, &probed, &stances(&[(2, Degraded), (4, Clean)])),
             Some(EgressFault::PeerDoesBetter { peer: 4 })
         );
         assert_eq!(
             egress_fault(
                 &plan,
+                &probed,
                 &stances(&[(2, Degraded), (3, Degraded), (5, Degraded)])
             ),
             None
+        );
+    }
+
+    /// Nodes 2 and 3 are stopped, so group 0 of voters {1, 2, 3} has no
+    /// quorum on any node, while group 1 keeps one through nodes 4 and 5.
+    /// Their clean probes cover other groups and say nothing of group 0, so
+    /// node 1 keeps its leaderships. A voter of the short config that
+    /// reports clean is this node's fault.
+    #[test]
+    fn a_clean_peer_outside_the_short_configs_is_no_fault_of_this_node() {
+        use EgressProbeStatus::Clean;
+
+        let plan = plan();
+        let probed = BTreeSet::from([4, 5]);
+        assert_eq!(
+            egress_fault(&plan, &probed, &stances(&[(4, Clean), (5, Clean)])),
+            None
+        );
+        assert_eq!(
+            egress_fault(
+                &plan,
+                &probed,
+                &stances(&[(2, Clean), (4, Clean), (5, Clean)])
+            ),
+            Some(EgressFault::PeerDoesBetter { peer: 2 })
         );
     }
 }

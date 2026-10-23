@@ -306,6 +306,7 @@ pub use rejoin::Convergence;
 pub use rejoin::GateOpenError;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
+pub use rejoin::LEADER_CONTACT_GRACE;
 pub use rejoin::MembershipTargetSource;
 pub use rejoin::NoPeerGates;
 pub use rejoin::PeerGates;

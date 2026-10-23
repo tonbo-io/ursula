@@ -564,6 +564,7 @@ mod tests {
                 membership_joint: false,
                 membership_log_index: Some(0),
                 stopped_for_operator: false,
+                leader_acknowledgement: ursula_proto::admin::LeaderAcknowledgement::Acknowledged,
             },
             last_log_index: Some(100),
             last_log_term: Some(1),
