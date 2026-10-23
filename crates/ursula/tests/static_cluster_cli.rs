@@ -11308,11 +11308,13 @@ async fn wait_gateways_eject(
 /// 2. The group's leader is stopped (`SIGSTOP`). Each of the three gateways
 ///    reports it ejected within [`PROBES_EJECT_WITHIN`] of the stop, C
 ///    included, and the other nodes elect a leader.
-/// 3. At most one attempt of each seq waits out the gateway's header
-///    timeout, and no attempt sent once the gateways ejected the node does.
-///    A write after the stop holds. A gateway that ejects a node only once
-///    a request to it timed out makes the retry on the other gateway wait
-///    again, and fails it.
+/// 3. No attempt waits out the gateway's header timeout: an attempt in
+///    flight to the stopped node when a gateway's probes eject it goes on at
+///    once to another node, and an attempt sent once the gateways ejected
+///    the node never goes there. A write after the stop holds. A gateway
+///    that ejects a node only once a request to it timed out, or that waits
+///    out the timeout of an attempt in flight to a node its probes ejected,
+///    fails it.
 /// 4. Once the node continues (`SIGCONT`), every gateway readmits it within
 ///    [`PROBES_EJECT_WITHIN`]. The stream holds each seq once, in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11360,9 +11362,6 @@ async fn cli_every_gateway_ejects_a_stopped_node_and_a_retry_does_not_wait_for_i
     procs.signal(leader, "-STOP");
     let ejected =
         wait_gateways_eject(&client, &[&a, &b, &c], 1, stopped, PROBES_EJECT_WITHIN).await;
-    let ejected_by = stopped
-        .checked_add(ejected.iter().copied().max().unwrap())
-        .unwrap();
     let others: Vec<&MetaNode> = nodes.iter().filter(|node| node.id != leader).collect();
     eventually(&mut procs, "the other nodes elect a leader", async || {
         for node in &others {
@@ -11386,27 +11385,15 @@ async fn cli_every_gateway_ejects_a_stopped_node_and_a_retry_does_not_wait_for_i
     tokio::time::sleep(Duration::from_secs(3)).await;
     let attempts = load.stop().await;
 
-    // 3. No attempt waits for the stopped node twice.
+    // 3. No attempt waits out the header timeout for the stopped node.
     let waited: Vec<&ProducerAttempt> = attempts
         .iter()
         .filter(|attempt| attempt.took >= GATEWAY_HEADER_TIMEOUT)
         .collect();
-    let late: Vec<&&ProducerAttempt> = waited
-        .iter()
-        .filter(|attempt| attempt.sent >= ejected_by)
-        .collect();
     assert!(
-        late.is_empty(),
-        "attempts sent after every gateway ejected node {leader} (within {ejected:?}) waited for it: {late:?}"
-    );
-    let mut waits_per_seq: BTreeMap<u64, usize> = BTreeMap::new();
-    for attempt in &waited {
-        let waits = waits_per_seq.entry(attempt.seq).or_default();
-        *waits = waits.saturating_add(1);
-    }
-    assert!(
-        waits_per_seq.values().all(|waits| *waits <= 1),
-        "a write waited for the stopped node more than once: {waited:?}"
+        waited.is_empty(),
+        "attempts waited out the header timeout though every gateway ejected node {leader} \
+         within {ejected:?} of its stop: {waited:?}"
     );
     let slow: Vec<&ProducerAttempt> = attempts
         .iter()

@@ -1,18 +1,27 @@
 //! Ejection of upstreams that do not answer (#454).
 //!
-//! An upstream leaves selection when a request to it fails at the transport
-//! or gets no response headers within the response header timeout, and when
-//! a probe of it fails or gets no answer within the probe timeout (`probe`).
-//! It comes back with its next answer, to a probe or to a request, whatever
-//! its status. The gateway probes every upstream several times a second, so
-//! an upstream that stops answering leaves selection within a probe interval
-//! and a probe timeout, whether requests reach it or not, and one that
-//! answers again is back within a probe interval.
+//! The probes (`probe`) are the one judge of whether an upstream answers:
+//! an upstream leaves selection when a probe of it fails at the transport or
+//! gets no answer within the probe timeout, and when a request to it fails
+//! at the transport. It comes back with its next answer, to a probe or to a
+//! request, whatever its status. The gateway probes every upstream several
+//! times a second, so an upstream that stops answering leaves selection
+//! within a probe interval and a probe timeout, whether requests reach it or
+//! not, and one that answers again is back within a probe interval.
+//!
+//! A request that gets no response headers within the response header
+//! timeout ejects nothing. The probes eject a silent node sooner, and a live
+//! node can hold one request longer than the timeout (a write on a leader
+//! elected over a slow link, a read forwarded to an unreachable leader, a
+//! snapshot commit of many parts) while it answers every probe: ejecting it
+//! would refuse every redirect to it until its next probe.
 //!
 //! Requests skip an ejected upstream: along a cached route, at random, and
 //! on every hop after a redirect, a hop that follows a leader redirect
 //! included. When every upstream is ejected, none is: requests choose among
-//! all of them, as if nothing were ejected, rather than among none.
+//! all of them, as if nothing were ejected, rather than among none. A
+//! request waiting on an upstream can stop waiting once requests skip it
+//! ([`Ejections::until`]).
 //!
 //! [`Ejections`] holds the ejected upstreams under a lock shared by every
 //! request, with a count that lets requests skip the lock while nothing is
@@ -28,6 +37,7 @@ use std::sync::atomic::Ordering;
 use rand::Rng;
 use rand::seq::IndexedRandom;
 use rand::seq::IteratorRandom;
+use tokio::sync::watch;
 
 use crate::GatewayError;
 
@@ -91,6 +101,9 @@ pub(crate) struct Ejections {
     entries: AtomicUsize,
     /// Times [`Ejections::eject`] ejected an upstream that was in selection.
     ejections: AtomicU64,
+    /// Marked changed whenever an upstream is ejected or readmitted, after
+    /// the change, so that [`Ejections::until`] looks again.
+    changes: watch::Sender<()>,
 }
 
 impl Ejections {
@@ -101,6 +114,7 @@ impl Ejections {
             ejected: Mutex::new(HashSet::new()),
             entries: AtomicUsize::new(0),
             ejections: AtomicU64::new(0),
+            changes: watch::Sender::new(()),
         }
     }
 
@@ -121,33 +135,59 @@ impl Ejections {
     /// Ejects `upstream`, which failed or did not answer in time. Returns
     /// whether it was in selection before.
     pub(crate) fn failed(&self, upstream: &str) -> bool {
-        self.with_ejected(|ejected| ejected.insert(upstream.to_owned()))
+        let ejected = self.with_ejected(|ejected| ejected.insert(upstream.to_owned()));
+        if ejected {
+            self.changes.send_replace(());
+        }
+        ejected
     }
 
     /// Readmits `upstream`, which answered. Returns whether it was ejected.
     pub(crate) fn answered(&self, upstream: &str) -> bool {
-        self.entries.load(Ordering::Acquire) > 0
-            && self.with_ejected(|ejected| ejected.remove(upstream))
+        let readmitted = self.entries.load(Ordering::Acquire) > 0
+            && self.with_ejected(|ejected| ejected.remove(upstream));
+        if readmitted {
+            self.changes.send_replace(());
+        }
+        readmitted
     }
 
-    /// Ejects `upstream` for `error`, a failed request's or probe's, and
-    /// counts and logs it if it was in selection.
+    /// Ejects `upstream` for `error`, a probe's or a request's transport
+    /// failure, or a probe's timeout, and counts and logs it if it was in
+    /// selection.
     pub(crate) fn eject(&self, upstream: &str, error: &GatewayError) {
         if self.failed(upstream) {
             self.ejections.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 upstream,
                 %error,
-                "upstream failed at the transport or sent no headers in time; leaving it out of selection until it answers"
+                "upstream failed at the transport or did not answer its probe in time; leaving it out of selection until it answers"
             );
         }
     }
 
-    /// Readmits `upstream`, which answered a request or a probe, and logs it
-    /// if it was ejected.
+    /// Readmits `upstream`, which answered a request or a probe. Logged at
+    /// debug: an upstream whose new connections take about the probe
+    /// timeout goes out and back in on every such connection, and its
+    /// ejection is logged already.
     pub(crate) fn readmit(&self, upstream: &str) {
         if self.answered(upstream) {
-            tracing::info!(upstream, "upstream answers again; back in selection");
+            tracing::debug!(upstream, "upstream answers again; back in selection");
+        }
+    }
+
+    /// Resolves once `holds`, a condition on the ejected upstreams, does:
+    /// at once if it holds now, else at the first ejection or readmission
+    /// after which it does.
+    pub(crate) async fn until(&self, holds: impl Fn() -> bool) {
+        // Subscribed before the first look, so a change after it wakes the
+        // wait.
+        let mut changes = self.changes.subscribe();
+        while !holds() {
+            if changes.changed().await.is_err() {
+                // Unreachable: `self` holds the sender while this waits.
+                std::future::pending::<()>().await;
+            }
         }
     }
 

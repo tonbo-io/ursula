@@ -516,6 +516,168 @@ async fn the_probes_keep_an_upstream_that_answers_slowly() {
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
 }
 
+/// A live upstream that answers its probes at once but holds one request
+/// past the response header timeout, as a leader elected over a slow link
+/// can hold a write, stays in selection. The request gets its `504`, and a redirect to
+/// the upstream is still followed.
+#[tokio::test]
+async fn a_request_past_the_header_timeout_ejects_nothing() {
+    let timeout = Duration::from_millis(500);
+    let slow = spawn_upstream(
+        Router::new()
+            .route(
+                "/bucket/slow",
+                any(move || async move {
+                    tokio::time::sleep(timeout.saturating_mul(2)).await;
+                    "late"
+                }),
+            )
+            .route("/bucket/stream", any(|| async { "ok" }))
+            .route(
+                ursula_headers::routing::LIVENESS_PATH,
+                get(|| async { StatusCode::NO_CONTENT }),
+            ),
+    )
+    .await;
+    let follower = Scripted::spawn().await;
+    follower.answers(raft_redirect(
+        &format!("{}/bucket/stream", slow.url),
+        HeaderMap::new(),
+    ));
+    let mut config = test_config(vec![follower.url(), slow.url.clone()]);
+    config.response_header_timeout = timeout;
+    let gateway = Arc::new(Gateway::new(config));
+    gateway.remember_leader("/bucket/slow".to_owned(), slow.url.clone());
+
+    let response = gateway.handle(post_path("/bucket/slow")).await;
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (metrics.upstream_ejections, metrics.upstream_ejected),
+        (0, 0)
+    );
+    // The redirect to it is followed: its `/bucket/stream` answers at once.
+    gateway.remember_leader("/bucket/stream".to_owned(), follower.url());
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(cached_route(&gateway), Some(slow.url.clone()));
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
+}
+
+/// An upstream that stops answering everything at once, probes and
+/// requests, as a stopped process (`SIGSTOP`) does, with every request that
+/// reached it still open. Answers normally until `stop` is set. Each
+/// arrival of a stream request is sent on the returned channel.
+async fn stoppable_upstream() -> (
+    TestUpstream,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = spawn_upstream(
+        Router::new()
+            .route(
+                "/{bucket}/{stream}",
+                any({
+                    let stop = Arc::clone(&stop);
+                    move || {
+                        let stopped = stop.load(Ordering::Acquire);
+                        if stopped {
+                            arrived.send(()).expect("the test awaits arrivals");
+                        }
+                        async move {
+                            if stopped {
+                                std::future::pending::<()>().await;
+                            }
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .route(
+                ursula_headers::routing::LIVENESS_PATH,
+                get({
+                    let stop = Arc::clone(&stop);
+                    move || {
+                        let stopped = stop.load(Ordering::Acquire);
+                        async move {
+                            if stopped {
+                                std::future::pending::<()>().await;
+                            }
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            ),
+    )
+    .await;
+    (upstream, stop, arrivals)
+}
+
+/// A read or a producer append in flight to an upstream when it stops, as a
+/// `SIGSTOP`ped node does, goes on to an upstream it has not tried as soon
+/// as the probes eject the stopped one, well before the response header
+/// timeout, and that upstream's answer reaches the client. A write without
+/// a key waits for its answer up to the timeout and gets the `504`, since a
+/// repeat could apply it twice.
+#[tokio::test]
+async fn a_request_in_flight_to_an_upstream_the_probes_eject_goes_on_at_once() {
+    let header_timeout = test_config(Vec::new()).response_header_timeout;
+    let (stopping, stop, mut arrivals) = stoppable_upstream().await;
+    let live = Scripted::spawn().await;
+    for (request, status, hits, route) in [
+        (producer_post(), StatusCode::OK, 1, Some(live.url())),
+        (get_stream(), StatusCode::OK, 1, Some(live.url())),
+        (
+            post_path("/bucket/stream"),
+            StatusCode::GATEWAY_TIMEOUT,
+            0,
+            None,
+        ),
+    ] {
+        stop.store(false, Ordering::Release);
+        let gateway = Arc::new(Gateway::new(test_config(vec![
+            stopping.url.clone(),
+            live.url(),
+        ])));
+        gateway.remember_leader("/bucket/stream".to_owned(), stopping.url.clone());
+        let before = live.hits();
+        let method = request.method().clone();
+        stop.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        let mut sent = send(&gateway, request);
+        until_reached(
+            async {
+                arrivals.recv().await.expect("the upstream is up");
+            },
+            &mut sent,
+        )
+        .await;
+
+        let response = sent.await.expect("request task");
+
+        let took = started.elapsed();
+        assert_eq!(response.status(), status, "{method}");
+        if status == StatusCode::OK {
+            assert!(took < header_timeout, "{method} took {took:?}");
+        } else {
+            assert!(took >= header_timeout, "{method} took {took:?}");
+            assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+        }
+        assert_eq!(live.hits().saturating_sub(before), hits, "{method}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(
+            (metrics.upstream_ejections, metrics.upstream_ejected),
+            (1, 1),
+            "{method}"
+        );
+        assert_eq!(cached_route(&gateway), route, "{method}");
+    }
+}
+
 /// A probe past its timeout keeps waiting for its answer, so that the
 /// connection it opened goes into the pool. Here only the first answer on
 /// each connection takes longer than the probe timeout, as every answer on
@@ -721,9 +883,9 @@ async fn gateway_does_not_eject_an_upstream_for_a_request_it_could_not_build() {
 }
 
 /// A cached leader that accepts the request and never answers is dropped
-/// too, and leaves selection as a node that does not answer. The request
-/// may have reached it, and no other upstream is left to send it to, so the
-/// answer is a 504, not a retry invitation.
+/// too, but stays in selection: only the probes eject an upstream that does
+/// not answer. The request may have reached it, and no other upstream is
+/// left to send it to, so the answer is a 504, not a retry invitation.
 #[tokio::test]
 async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let silent = spawn_upstream(
@@ -739,8 +901,8 @@ async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_cache_evictions, 1);
     assert_eq!(metrics.leader_cache_entries, 0);
-    assert_eq!(metrics.upstream_ejections, 1);
-    assert_eq!(metrics.upstream_ejected, 1);
+    assert_eq!(metrics.upstream_ejections, 0);
+    assert_eq!(metrics.upstream_ejected, 0);
 }
 
 /// `POST /bucket/stream` with a producer key.
@@ -778,9 +940,9 @@ async fn through_one_timeout(
 /// A cached leader that accepts a request and never answers, as a stopped
 /// process does: a read and a producer write go on to an upstream they have
 /// not tried, which answers them and becomes the cached route. The silent
-/// one leaves selection. A write without a key may have reached it and
-/// applies twice if sent again, so it gets the `504`, reaches no other
-/// upstream and teaches no route.
+/// one stays in selection: the timeout ejects nothing. A write without a key
+/// may have reached it and applies twice if sent again, so it gets the
+/// `504`, reaches no other upstream and teaches no route.
 #[tokio::test(start_paused = true)]
 async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() {
     let _frozen = FrozenClock::hold();
@@ -824,7 +986,7 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
         }
         assert_eq!(live.hits().saturating_sub(before), hits, "{method}");
         let metrics = gateway.metrics_snapshot();
-        assert_eq!(metrics.upstream_ejections, 1, "{method}");
+        assert_eq!(metrics.upstream_ejections, 0, "{method}");
         assert_eq!(cached_route(&gateway), route, "{method}");
     }
 }
@@ -879,7 +1041,7 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
     assert_eq!(live.hits(), 0);
-    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 2);
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
 }
 
 /// A keyed write sent again to a node that still names the silent upstream

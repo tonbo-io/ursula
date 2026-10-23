@@ -368,10 +368,11 @@ gateway:
   rustLog: "ursula_gateway=info"
   # TCP connect timeout per upstream attempt in seconds.
   connectTimeoutSeconds: 5
-  # Timeout for upstream response headers in seconds. An upstream that answers
-  # nothing within it is ejected, and a read or a producer append goes on to
-  # another upstream. Keep it under the clients' timeouts and above a node's
-  # 3 s leader lease.
+  # Timeout for upstream response headers in seconds. A read or a producer
+  # append that gets no answer within it goes on to another upstream, and any
+  # other write is answered 504. A missing answer ejects nothing: the probes
+  # decide which upstreams answer. Keep it under the clients' timeouts and
+  # above a node's 3 s leader lease.
   responseHeaderTimeoutSeconds: 5
   # Seconds data sent to an upstream may stay unacknowledged before the
   # connection closes and its request fails with 502 (Linux TCP_USER_TIMEOUT).

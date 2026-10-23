@@ -60,8 +60,8 @@
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 //! - [`uploads`]: the per-request limit and the node-wide budget for buffered
 //!   request bodies, and the pace a body must keep.
-//! - `ejection`: leaves upstreams that failed or did not answer in time out of
-//!   selection until they answer again (#454).
+//! - `ejection`: leaves upstreams that failed at the transport or did not
+//!   answer a probe in time out of selection until they answer again (#454).
 //! - `probe`: the probes of every upstream, which every gateway runs while
 //!   it exists, that eject one that stops answering and readmit it once it
 //!   answers.
@@ -968,8 +968,11 @@ impl Gateway {
     ///   timeout may have delivered the request to an upstream that accepted
     ///   it and never answers, such as a stopped process. A request whose
     ///   repeat is safe ([`Replay`]) goes on, once, to an upstream it has not
-    ///   tried, which answers or redirects to the current leader. Any other
-    ///   request ends with the timeout, whose outcome is unknown.
+    ///   tried, which answers or redirects to the current leader. It goes on
+    ///   as soon as the probes eject the upstream ([`Gateway::send_hop`]),
+    ///   within a probe interval and a probe timeout of the upstream's last
+    ///   answer, rather than at the timeout. Any other request ends with the
+    ///   timeout, whose outcome is unknown. Neither ejects the upstream.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
     ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
     ///   redirect. When no upstream answers without redirecting within those
@@ -1002,7 +1005,7 @@ impl Gateway {
             let target = chain.target.clone();
             let target_url = format!("{}{}", target.trim_end_matches('/'), path_and_query);
             let sent = self
-                .send_request(chain.hop(), &target, &target_url, parts, body.clone())
+                .send_hop(&chain, replay, &target_url, parts, body.clone())
                 .await;
             let response = match sent {
                 Ok(response) => response,
@@ -1023,9 +1026,10 @@ impl Gateway {
                         continue;
                     }
                     // A hop that may have delivered the request and answered
-                    // nothing in time: a request whose repeat is safe goes
-                    // on, once, to an upstream it has not tried.
-                    if matches!(error, GatewayError::UpstreamTimeout { .. })
+                    // nothing, in time or before the probes ejected its
+                    // upstream: a request whose repeat is safe goes on, once,
+                    // to an upstream it has not tried.
+                    if error.unanswered_upstream().is_some()
                         && replay != Replay::Never
                         && let Some(next) = chain
                             .may_replay()
@@ -1034,7 +1038,9 @@ impl Gateway {
                     {
                         debug!(
                             upstream = target,
-                            next, "no answer in time; sending the request to another upstream"
+                            next,
+                            %error,
+                            "no answer; sending the request to another upstream"
                         );
                         self.followed(&target, &next, Lead::Search);
                         chain.replay(next, error);
@@ -1212,6 +1218,41 @@ impl Gateway {
             .cloned()
     }
 
+    /// Sends the hop under way of `chain` to `url`, on its target. A hop of
+    /// a request whose repeat is safe ([`Replay`]), and that may still be
+    /// sent again ([`Chain::may_replay`]), ends without an answer as soon as
+    /// the probes eject its upstream and another upstream is left to send it
+    /// to ([`GatewayError::UpstreamEjected`]): an upstream that stopped
+    /// answering, such as a stopped process, never answers it, and the
+    /// probes tell so within a probe interval and a probe timeout, before
+    /// the response header timeout. Any other hop waits for its answer up to
+    /// that timeout, as an answer that comes then still settles a write
+    /// whose repeat is not safe.
+    async fn send_hop(
+        &self,
+        chain: &Chain,
+        replay: Replay,
+        url: &str,
+        parts: &axum::http::request::Parts,
+        body: bytes::Bytes,
+    ) -> Result<reqwest::Response, GatewayError> {
+        let target = chain.target.as_str();
+        let send = self.send_request(chain.hop(), target, url, parts, body);
+        if replay == Replay::Never || !chain.may_replay() {
+            return send.await;
+        }
+        tokio::pin!(send);
+        tokio::select! {
+            biased;
+            sent = &mut send => sent,
+            () = self.ejections.until(|| {
+                !self.ejections.admits(target) && self.untried_upstream(chain).is_some()
+            }) => Err(GatewayError::UpstreamEjected {
+                upstream: target.to_owned(),
+            }),
+        }
+    }
+
     /// Covers only response headers so SSE bodies stay open.
     async fn send_request(
         &self,
@@ -1242,9 +1283,8 @@ impl Gateway {
 
     /// An upstream whose request failed loses its cached route, so the next
     /// request learns the current leader instead of failing on the same node.
-    /// One that failed at the transport (down or gone) or sent no headers in
-    /// time also leaves selection until it answers again, so that requests
-    /// do not pick it again (#454).
+    /// One that failed at the transport (down or gone) also leaves selection
+    /// until it answers again, so that requests do not pick it again (#454).
     fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
@@ -1701,15 +1741,15 @@ impl Chain {
         self.follow(next, Lead::Search);
     }
 
-    /// Whether `upstream` got a hop of this request and answered nothing in
-    /// time. Its peers name it while they have not yet elected a leader in
-    /// its place, as for a stopped process, and a hop back to it would only
-    /// wait out the timeout again.
+    /// Whether `upstream` got a hop of this request and answered nothing, in
+    /// time or before the probes ejected it. Its peers name it while they
+    /// have not yet elected a leader in its place, as for a stopped process,
+    /// and a hop back to it would only wait out the timeout again.
     fn answered_nothing(&self, upstream: &str) -> bool {
-        matches!(
-            &self.unanswered,
-            Some(GatewayError::UpstreamTimeout { upstream: silent, .. }) if silent == upstream
-        )
+        self.unanswered
+            .as_ref()
+            .and_then(GatewayError::unanswered_upstream)
+            == Some(upstream)
     }
 
     /// The error a request of `replay` ends with when its last hop ended
@@ -2552,6 +2592,11 @@ pub enum GatewayError {
     /// upstream.
     #[error("upstream {upstream} sent no response headers within {timeout:?}")]
     UpstreamTimeout { upstream: String, timeout: Duration },
+    /// No response headers before the probes ejected the upstream, which
+    /// stopped answering them, while another upstream was left for a
+    /// request whose repeat is safe. The request may have reached it.
+    #[error("upstream {upstream} sent no response headers before its probes ejected it")]
+    UpstreamEjected { upstream: String },
     /// The exchange failed after the request may have reached the upstream.
     #[error("upstream request to {upstream} failed")]
     Upstream {
@@ -2584,23 +2629,38 @@ impl GatewayError {
         }
     }
 
-    /// Whether the upstream failed at the transport, or answered nothing
-    /// within the response header timeout, so selection should leave it out
-    /// until it answers again (#454). A leader that lost its quorum answers a
-    /// write within its leader lease, so a missing answer mostly marks a
-    /// node that does not answer at all, such as a stopped process. A live
-    /// node can still hold a request longer (a write waiting for its group's
-    /// first open, a read forwarded to an unreachable leader, a snapshot
-    /// commit of many parts), and is then left out although it is healthy,
-    /// until it answers its next probe, within a probe interval. A request
-    /// that could not be built never left the gateway.
+    /// Whether the upstream failed at the transport, so selection should
+    /// leave it out until it answers again (#454). A request that could not
+    /// be built never left the gateway. A missing answer ejects nothing:
+    /// the probes judge whether an upstream answers (see `ejection`), and a
+    /// live node can hold one request past the response header timeout (a
+    /// write on a leader elected over a slow link, a read forwarded to an
+    /// unreachable leader, a snapshot commit of many parts) while it answers
+    /// every probe.
     fn ejects_upstream(&self) -> bool {
         match self {
+            Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => true,
+            Self::Upstream { source, .. } => !source.is_builder(),
+            Self::UpstreamTimeout { .. }
+            | Self::UpstreamEjected { .. }
+            | Self::LeaderNotFound { .. }
+            | Self::ResponseBuild(_) => false,
+        }
+    }
+
+    /// The upstream of a hop that may have delivered the request and sent
+    /// no response headers, within the response header timeout or before
+    /// the probes ejected it: its outcome is unknown.
+    fn unanswered_upstream(&self) -> Option<&str> {
+        match self {
+            Self::UpstreamTimeout { upstream, .. } | Self::UpstreamEjected { upstream } => {
+                Some(upstream)
+            }
             Self::UpstreamUnreachable { .. }
             | Self::LeaderUnreachable { .. }
-            | Self::UpstreamTimeout { .. } => true,
-            Self::Upstream { source, .. } => !source.is_builder(),
-            Self::LeaderNotFound { .. } | Self::ResponseBuild(_) => false,
+            | Self::LeaderNotFound { .. }
+            | Self::Upstream { .. }
+            | Self::ResponseBuild(_) => None,
         }
     }
 
@@ -2618,7 +2678,7 @@ impl GatewayError {
             Self::LeaderNotFound { .. } => {
                 retry_answer(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
             }
-            Self::UpstreamTimeout { .. } => error_answer(
+            Self::UpstreamTimeout { .. } | Self::UpstreamEjected { .. } => error_answer(
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorBody::fixed(ErrorCode::UpstreamTimeout),
                 HeaderMap::new(),

@@ -21,7 +21,7 @@ reqwest = { workspace = true, features = ["http2", "json", "rustls-tls", "stream
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 ursula-headers = { workspace = true }

@@ -1075,6 +1075,19 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
 /// watches the metrics, so a leader that steps down meanwhile goes on at
 /// once. A leader that no quorum acknowledges in time, or a replica that does
 /// not lead, goes on to be refused before proposal.
+///
+/// A write runs the history fence ([`crate::history::GroupHistory::admit`])
+/// first. On a leader whose history is pending it lets the write on only
+/// once the leader applied the history event, which a quorum acknowledged,
+/// so this wait then returns at once: the two hold a write before its
+/// proposal for [`crate::history::HISTORY_PENDING_WAIT`] at most, not for
+/// their sum. What a just-elected leader's first write takes beyond them is
+/// its commit: the round trips of the leader's first appends to its
+/// followers, one at least, more where a follower's log diverges from the
+/// leader's, as a former leader's uncommitted tail does. Over a slow link
+/// that is several of its round trips, inherent to a leader change, and a
+/// gateway whose header timeout is shorter answers the write `504` with its
+/// outcome unknown.
 pub(crate) async fn await_first_quorum_ack<
     SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig>,
 >(
