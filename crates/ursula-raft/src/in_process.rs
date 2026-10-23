@@ -2060,6 +2060,9 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         self.before_rpc(InProcessRaftRpcKind::TransferLeader)
             .await
             .map_err(RPCError::Unreachable)?;
+        // A target that runs no Raft is a peer nothing listens for: the
+        // transfer never left this node, as a gRPC dial that fails, so it
+        // fails as `Network` (`crate::grpc::Delivery::Unsent`).
         let target = self
             .target_raft()
             .map_err(RPCError::Unreachable)?
@@ -2070,7 +2073,7 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                         target: self.target,
                         kind: InProcessRaftRpcKind::TransferLeader,
                     });
-                RPCError::Unreachable(self.missing_target_error())
+                RPCError::Network(NetworkError::new(&self.missing_target_error()))
             })?;
         self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
             source: self.source,

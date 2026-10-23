@@ -1952,6 +1952,18 @@ pub(crate) enum RaftChannelError {
     },
     #[error("the raft gRPC channel pool for {endpoint} is poisoned")]
     PoolPoisoned { endpoint: String },
+    #[error("the raft append session pool for {endpoint} is poisoned")]
+    SessionPoolPoisoned { endpoint: String },
+}
+
+/// A call that finds no channel fails before it sends anything, as an
+/// unreachable peer does.
+impl From<RaftChannelError> for tonic::Status {
+    fn from(error: RaftChannelError) -> Self {
+        let mut status = Self::unavailable(error.to_string());
+        status.set_source(Arc::new(error));
+        status
+    }
 }
 
 /// Why a peer refused an outbound Raft call before it ran.
@@ -1965,6 +1977,103 @@ pub(crate) enum PeerRefusal {
     /// The peer's process fence refused the call, or its stamp names a
     /// process the table refuses ([`crate::incarnation::Effect`]).
     Fence { effect: crate::incarnation::Effect },
+}
+
+/// Whether the request of a failed outbound Raft call can have reached its
+/// peer, and whether the peer answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// Nothing of the request left this node: the client has no channel, or
+    /// its channel had no connection and dialing one failed (the name did
+    /// not resolve, the TCP connect was refused or timed out). A lazy tonic
+    /// channel dials when a call finds it unconnected and hands a failed
+    /// dial to the next call it takes, before it sends anything, dropping
+    /// that call's request. A dial that hangs (a dropped SYN) is no answer
+    /// either: OpenRaft drops a transfer call after one minimum election
+    /// timeout, before the connect timeout fails the dial, so that transfer
+    /// reads as unanswered.
+    Unsent,
+    /// The peer answered with an error of its own: a status tonic read from
+    /// the peer's `grpc-status`, which carries no source error. An answer
+    /// tonic cannot decode has none either and reads as answered: the peer
+    /// sent it. So does the sender's own fence refusal
+    /// ([`crate::peer_cluster::SenderFenced`]), with the unreachable error it
+    /// maps to.
+    Answered,
+    /// The request was written to a connection, or may have been, and no
+    /// answer of the peer arrived: the call failed on an open connection (a
+    /// reset, a broken pipe, an HTTP/2 error, a lost keepalive) or its
+    /// deadline passed. Tonic builds each such status here and keeps the
+    /// transport error as its source. An answer whose responder this node
+    /// discards is lost too.
+    Lost,
+}
+
+impl Delivery {
+    /// The delivery of a call that failed with `status`. Tonic reports a
+    /// failed dial as a [`tonic::ConnectError`] in the status's source
+    /// chain, and nothing else as one: the failures of a call sent on a
+    /// connection come from its HTTP/2 stream. Every other status it builds
+    /// for a transport failure keeps that failure as its source, and a
+    /// status read from the peer's answer has none.
+    fn of(status: &tonic::Status) -> Self {
+        let Some(first) = std::error::Error::source(status) else {
+            return Self::Answered;
+        };
+        let mut source = Some(first);
+        while let Some(error) = source {
+            if error.is::<tonic::ConnectError>() {
+                return Self::Unsent;
+            }
+            source = error.source();
+        }
+        Self::Lost
+    }
+}
+
+/// An outbound Raft call that failed: OpenRaft's error for it, and whether
+/// its request can have reached the peer.
+#[derive(Debug)]
+pub(crate) struct FailedCall {
+    error: RPCError<UrsulaRaftTypeConfig>,
+    delivery: Delivery,
+}
+
+impl FailedCall {
+    /// A call that failed before its request left this node.
+    fn unsent(error: RPCError<UrsulaRaftTypeConfig>) -> Self {
+        Self {
+            error,
+            delivery: Delivery::Unsent,
+        }
+    }
+
+    /// The error a failed leadership transfer returns to OpenRaft, which the
+    /// leader's transfer bound reads ([`crate::openraft_work::TransferOutcome`]).
+    /// One whose request never left this node fails as
+    /// [`RPCError::Network`], OpenRaft's error for a request it failed to
+    /// send: its target cannot have taken it, so the bound reads it as the
+    /// target's refusal and the old leader leads again at once instead of
+    /// waiting out a lease. One that may have arrived and got no answer
+    /// fails as [`RPCError::Unreachable`], whatever the status code tonic
+    /// gave the transport failure: the target may have taken it, so the
+    /// bound gives the target one lease. The peer's own error answer keeps
+    /// its error.
+    fn into_transfer_error(self) -> RPCError<UrsulaRaftTypeConfig> {
+        match (self.delivery, self.error) {
+            (Delivery::Unsent, error) => RPCError::Network(NetworkError::new(&error)),
+            (Delivery::Lost, error @ RPCError::Unreachable(_)) | (Delivery::Answered, error) => {
+                error
+            }
+            (Delivery::Lost, error) => RPCError::Unreachable(Unreachable::new(&error)),
+        }
+    }
+}
+
+impl From<FailedCall> for RPCError<UrsulaRaftTypeConfig> {
+    fn from(failed: FailedCall) -> Self {
+        failed.error
+    }
 }
 
 /// The owner-core channel a [`GrpcRaftNetwork`] sends on.
@@ -1989,7 +2098,8 @@ pub struct GrpcRaftNetwork {
     /// with a status, not Append calls that went unanswered or were refused
     /// as backpressure ([`AppendCallError::breaks_channel`]). Reset to 0 on
     /// the next successful RPC. When it crosses `reconnect_threshold` we
-    /// replace the owner-core HTTP/2 channel generation — tonic's
+    /// replace the owner-core HTTP/2 channel generation, unless an append
+    /// session is open on it ([`GrpcRaftNetwork::note_failure`]) — tonic's
     /// `connect_lazy` keeps a stuck channel forever otherwise (the TCP socket
     /// stays open, the HTTP/2 streams stay borked, no auto-heal).
     consecutive_failures: u32,
@@ -2082,7 +2192,11 @@ impl GrpcRaftNetwork {
     /// Increment the failure streak. If we cross the threshold, drop the
     /// stuck shared channel and build a fresh one — the next RPC call gets a
     /// new HTTP/2 connection. If another group already rebuilt this endpoint,
-    /// adopt that newer generation instead of creating another connection.
+    /// adopt that newer generation instead of creating another connection,
+    /// and while an append session is open on the channel keep it: a fresh
+    /// channel would make the next unary call dial again while the session
+    /// stays on the old connection. The session's own end, a failed or
+    /// stalled stream, frees the channel for the next rebuild.
     /// We also reset the counter so the replacement channel gets a full grace
     /// period before any further rebuild.
     fn note_failure(&mut self, route: &str) {
@@ -2096,22 +2210,33 @@ impl GrpcRaftNetwork {
         let Ok(channel) = &self.channel else {
             return;
         };
-        tracing::warn!(
-            "raft-grpc: rebuilding channel to node {} ({}) after {} consecutive {} failures",
-            self.target,
-            channel.endpoint,
-            self.reconnect_threshold,
-            route,
-        );
         let endpoint = channel.endpoint.clone();
         let generation = channel.generation;
         self.channel = shared_raft_client(&self.transport, &endpoint, Some(generation)).map(
             |(client, generation)| PeerChannel {
-                endpoint,
+                endpoint: endpoint.clone(),
                 client,
                 generation,
             },
         );
+        if matches!(&self.channel, Ok(kept) if kept.generation == generation) {
+            tracing::debug!(
+                "raft-grpc: keeping channel to node {} ({}) after {} consecutive {} failures: \
+                 an append stream lives on it",
+                self.target,
+                endpoint,
+                self.reconnect_threshold,
+                route,
+            );
+        } else {
+            tracing::warn!(
+                "raft-grpc: rebuilding channel to node {} ({}) after {} consecutive {} failures",
+                self.target,
+                endpoint,
+                self.reconnect_threshold,
+                route,
+            );
+        }
     }
 
     fn note_success(&mut self) {
@@ -2330,14 +2455,15 @@ impl GrpcRaftNetwork {
 
     /// Shared client-call path for every outbound raft RPC: build the tonic
     /// request, apply the RPC timeout, send via `send`, and track the
-    /// success/failure streak for channel rebuilds.
+    /// success/failure streak for channel rebuilds. A failed call says
+    /// whether its request can have reached the peer ([`FailedCall`]).
     async fn call<Req, Resp, Fut>(
         &mut self,
         route: &'static str,
         request: Req,
         option: RPCOption,
         send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
-    ) -> Result<Resp, RPCError<UrsulaRaftTypeConfig>>
+    ) -> Result<Resp, FailedCall>
     where
         Req: Message,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
@@ -2348,7 +2474,7 @@ impl GrpcRaftNetwork {
         self.transport
             .peer_cluster
             .stamp_target(self.target, request.metadata_mut());
-        let mut client = self.client()?;
+        let mut client = self.client().map_err(FailedCall::unsent)?;
         if use_zstd {
             client = client.send_compressed(CompressionEncoding::Zstd);
         }
@@ -2362,12 +2488,16 @@ impl GrpcRaftNetwork {
                     .accept_responder(self.target, stamp)
                 {
                     self.discarded(discarded);
-                    return Err(RPCError::Unreachable(Unreachable::new(&discarded)));
+                    return Err(FailedCall {
+                        error: RPCError::Unreachable(Unreachable::new(&discarded)),
+                        delivery: Delivery::Lost,
+                    });
                 }
                 self.note_success();
                 Ok(response.into_inner())
             }
             Err(err) => {
+                let delivery = Delivery::of(&err);
                 let (mapped, refusal) = self.map_tonic_status(route, err);
                 match refusal {
                     None => self.note_failure(route),
@@ -2381,7 +2511,10 @@ impl GrpcRaftNetwork {
                     // A fence refusal is an answer over a working channel.
                     Some(PeerRefusal::Fence { effect }) => self.fence_effect(effect),
                 }
-                Err(mapped)
+                Err(FailedCall {
+                    error: mapped,
+                    delivery,
+                })
             }
         }
     }
@@ -2396,16 +2529,14 @@ impl GrpcRaftNetwork {
         let channel = self
             .channel
             .as_ref()
-            .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
+            .map_err(|err| tonic::Status::from(err.clone()))?;
         let session = shared_append_session(
             &self.transport,
             &channel.endpoint,
             self.target,
             self.raft_target(),
-            channel.client.clone(),
-            channel.generation,
         )
-        .map_err(tonic::Status::unavailable)?;
+        .map_err(tonic::Status::from)?;
         let charge = append_budget_charge(envelope.encoded_len(), self.transport.budget.bytes);
         // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
         // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
@@ -2546,31 +2677,54 @@ fn raft_client(channel: Channel, identity: &PeerIdentity) -> RaftClient {
 /// `observed_generation` is `None` for a new group, which always adopts the
 /// current shared channel. A reconnect passes the generation it was using: if
 /// another group has already replaced that generation, it adopts the newer
-/// channel; otherwise it performs exactly one replacement within this core.
+/// channel, and while an append session is open on that generation it keeps
+/// it, so every call to the peer rides the session's connection
+/// ([`shared_append_session`]); otherwise it performs exactly one
+/// replacement within this core.
 fn shared_raft_client(
     transport: &CoreRaftTransport,
     endpoint: &str,
     observed_generation: Option<u64>,
 ) -> Result<(RaftClient, u64), RaftChannelError> {
-    let parsed = peer_endpoint(endpoint).map_err(|source| RaftChannelError::InvalidEndpoint {
-        endpoint: endpoint.to_owned(),
-        source: Arc::new(source),
-    })?;
-    let mut channels =
-        transport
-            .channels
-            .lock()
-            .map_err(|_poisoned| RaftChannelError::PoolPoisoned {
-                endpoint: endpoint.to_owned(),
-            })?;
+    let mut channels = lock_channels(transport, endpoint)?;
+    pooled_raft_client(transport, &mut channels, endpoint, observed_generation)
+}
+
+fn lock_channels<'t>(
+    transport: &'t CoreRaftTransport,
+    endpoint: &str,
+) -> Result<std::sync::MutexGuard<'t, BTreeMap<String, SharedRaftChannel>>, RaftChannelError> {
+    transport
+        .channels
+        .lock()
+        .map_err(|_poisoned| RaftChannelError::PoolPoisoned {
+            endpoint: endpoint.to_owned(),
+        })
+}
+
+/// [`shared_raft_client`] on the locked pool `channels`. A reconnect reads
+/// the append sessions under that lock, so the pool is always locked before
+/// the sessions, never the other way round. A new group reads no session.
+fn pooled_raft_client(
+    transport: &CoreRaftTransport,
+    channels: &mut BTreeMap<String, SharedRaftChannel>,
+    endpoint: &str,
+    observed_generation: Option<u64>,
+) -> Result<(RaftClient, u64), RaftChannelError> {
     if let Some(shared) = channels.get(endpoint)
-        && observed_generation.is_none_or(|generation| generation != shared.generation)
+        && observed_generation.is_none_or(|generation| {
+            generation != shared.generation || streams_on(transport, endpoint, generation)
+        })
     {
         return Ok((
             raft_client(shared.channel.clone(), &transport.identity),
             shared.generation,
         ));
     }
+    let parsed = peer_endpoint(endpoint).map_err(|source| RaftChannelError::InvalidEndpoint {
+        endpoint: endpoint.to_owned(),
+        source: Arc::new(source),
+    })?;
     let generation = channels
         .get(endpoint)
         .map_or(1, |shared| shared.generation.saturating_add(1));
@@ -2580,6 +2734,19 @@ fn shared_raft_client(
         channel: channel.clone(),
     });
     Ok((raft_client(channel, &transport.identity), generation))
+}
+
+/// Whether an append session to `endpoint` is open on pooled channel
+/// generation `generation`: opened and not yet ended. That is no proof the
+/// connection works: a session still opening or stalled counts until it
+/// ends, at its open timeout or its stall timeout.
+fn streams_on(transport: &CoreRaftTransport, endpoint: &str, generation: u64) -> bool {
+    transport
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(endpoint)
+        .is_some_and(|session| session.generation == generation && !session.sender.is_closed())
 }
 
 /// The pooled channel to the peer at `address`.
@@ -2631,14 +2798,23 @@ fn redial_misdelivered(
     })
 }
 
-/// Return the one healthy Append stream for this peer endpoint.
+/// Return the one healthy Append stream for this peer endpoint, opened on
+/// the pooled channel ([`shared_raft_client`]).
 ///
-/// The stream lifetime is intentionally independent of the unary channel
-/// generation. OpenRaft keeps one network object per group, so after any
-/// channel rebuild those objects temporarily observe different generations.
-/// Keying the stream by each object's generation makes them replace one
-/// another on nearly every Append call. A live stream is already proof that
-/// its underlying channel works; replace it only after its sender closes.
+/// Every call to the peer goes over the connection the stream rides: the
+/// unary calls of a client that adopted the pooled channel, every vote round
+/// and leadership transfer among them, as OpenRaft makes a new client for
+/// each. So a leader that hears its follower's appends reaches it with a
+/// transfer too, without a new dial and its name lookup, which can still
+/// fail for a peer that restarted a moment ago.
+///
+/// The stream lifetime is independent of the generation each client holds.
+/// OpenRaft keeps one network object per group, so after any channel
+/// rebuild those objects temporarily observe different generations. Keying
+/// the stream by each object's generation makes them replace one another on
+/// nearly every Append call. So a session is replaced only after its sender
+/// closes, which a failed or stalled stream does, and the pooled channel is
+/// not replaced while the session is open on it.
 ///
 /// One exception: a misdelivery refusal shows that the live stream reaches
 /// the wrong node, so [`retire_append_session`] drops it before its sender
@@ -2661,19 +2837,22 @@ fn shared_append_session(
     endpoint: &str,
     target: u64,
     raft_target: RaftTarget,
-    client: RaftClient,
-    generation: u64,
-) -> Result<SharedAppendSession, String> {
-    let sessions = &transport.sessions;
-    let mut sessions = sessions
-        .lock()
-        .map_err(|err| format!("raft append session pool lock poisoned for {endpoint}: {err}"))?;
+) -> Result<SharedAppendSession, RaftChannelError> {
+    let mut channels = lock_channels(transport, endpoint)?;
+    let mut sessions =
+        transport
+            .sessions
+            .lock()
+            .map_err(|_poisoned| RaftChannelError::SessionPoolPoisoned {
+                endpoint: endpoint.to_owned(),
+            })?;
     if let Some(session) = sessions.get(endpoint)
         && !session.sender.is_closed()
     {
         return Ok(session.clone());
     }
-
+    // A new group's adoption reads no session, which are locked here.
+    let (client, generation) = pooled_raft_client(transport, &mut channels, endpoint, None)?;
     let (sender, receiver) = mpsc::unbounded_channel();
     let refusals = PeerRefusals {
         peer_cluster: transport.peer_cluster.clone(),
@@ -3110,7 +3289,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         let ack = crate::rt::select! {
             biased;
             closed = cancel => return Err(StreamingError::Closed(closed)),
-            ack = sent => ack.map_err(StreamingError::from)?,
+            ack = sent => ack.map_err(|failed| StreamingError::from(RPCError::from(failed)))?,
         };
         GRPC_SNAPSHOT_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         self.decode_rpc_ack("FullSnapshot", &ack.response)
@@ -3133,7 +3312,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 option,
                 |mut client, request| async move { client.transfer_leader(request).await },
             )
-            .await?;
+            .await
+            .map_err(FailedCall::into_transfer_error)?;
         self.decode_rpc_ack("TransferLeader", &ack.response)
     }
 }
@@ -3232,18 +3412,21 @@ mod reconnect_tests {
         let a = CoreRaftTransport::default();
         let b = CoreRaftTransport::default();
         let endpoint = "http://127.0.0.1:9";
-        let (client_a, _) = shared_raft_client(&a, endpoint, None).unwrap();
-        let (client_b, _) = shared_raft_client(&b, endpoint, None).unwrap();
-        let data = RaftTarget::Data(RaftGroupId(1));
-        let first = shared_append_session(&a, endpoint, 1, data, client_a.clone(), 1).unwrap();
-        let same = shared_append_session(&a, endpoint, 1, data, client_a, 1).unwrap();
-        let other = shared_append_session(&b, endpoint, 1, data, client_b, 1).unwrap();
-        assert!(first.sender.same_channel(&same.sender));
-        assert!(!first.sender.same_channel(&other.sender));
-        assert!(!Arc::ptr_eq(&first.budget, &other.budget));
+        shared_raft_client(&a, endpoint, None).unwrap();
+        shared_raft_client(&b, endpoint, None).unwrap();
         shared_raft_client(&a, endpoint, Some(1)).unwrap();
         assert_eq!(a.channels.lock().unwrap()[endpoint].generation, 2);
         assert_eq!(b.channels.lock().unwrap()[endpoint].generation, 1);
+        let data = RaftTarget::Data(RaftGroupId(1));
+        let first = shared_append_session(&a, endpoint, 1, data).unwrap();
+        let same = shared_append_session(&a, endpoint, 1, data).unwrap();
+        let other = shared_append_session(&b, endpoint, 1, data).unwrap();
+        assert!(first.sender.same_channel(&same.sender));
+        assert!(!first.sender.same_channel(&other.sender));
+        assert!(!Arc::ptr_eq(&first.budget, &other.budget));
+        // Each session rides its own pool's channel.
+        assert_eq!(first.generation, 2);
+        assert_eq!(other.generation, 1);
     }
 
     fn remove_shared_channel(transport: &CoreRaftTransport, endpoint: &str) {
@@ -4175,11 +4358,13 @@ mod reconnect_tests {
             .expect("shared append session")
             .sender
             .clone();
+        // Failures while an append session is open keep its channel, so
+        // unary calls ride the session's connection.
         let original_generation = first.generation();
         for _ in 0..first.reconnect_threshold {
             first.note_failure("test channel replacement");
         }
-        assert_ne!(first.generation(), original_generation);
+        assert_eq!(first.generation(), original_generation);
         let result = first
             .try_append_stream(envelope(1), Duration::from_secs(2))
             .await;
@@ -4197,7 +4382,7 @@ mod reconnect_tests {
             .clone();
         assert!(
             original_sender.same_channel(&replacement_sender),
-            "a unary channel generation change must not replace a healthy append stream"
+            "a failure streak must not replace a healthy append stream"
         );
 
         server.abort();
@@ -4478,6 +4663,129 @@ mod reconnect_tests {
             assert_eq!(peer_cluster.misdeliveries(1), 3, "{raft_target:?}");
         }
         other_server.abort();
+    }
+
+    /// A leadership transfer whose dial fails never left this node: it fails
+    /// as OpenRaft's `Network` error, which the leader's transfer bound reads
+    /// as the target's refusal. One sent to a peer that took the connection
+    /// and never answers may have arrived, and stays unreachable.
+    #[tokio::test]
+    async fn only_a_transfer_that_never_left_this_node_fails_as_unsent() {
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            format!("http://{}", listener.local_addr().expect("local addr"))
+        };
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let silent_url = format!("http://{}", silent.local_addr().expect("local addr"));
+        let request = || TransferLeaderRequest::new(UrsulaVote::new_committed(3, 2), 1, None);
+        let option = RPCOption::new(Duration::from_millis(500));
+
+        let mut unsent = test_network(
+            Arc::new(CoreRaftTransport::default()),
+            RaftGroupId(1),
+            1,
+            closed,
+        );
+        let failed = unsent
+            .transfer_leader(request(), option.clone())
+            .await
+            .expect_err("nothing listens at the address");
+        assert!(matches!(failed, RPCError::Network(_)), "{failed:?}");
+
+        let mut unanswered = test_network(
+            Arc::new(CoreRaftTransport::default()),
+            RaftGroupId(1),
+            1,
+            silent_url,
+        );
+        let failed = unanswered
+            .transfer_leader(request(), option)
+            .await
+            .expect_err("the peer never answers");
+        assert!(matches!(failed, RPCError::Unreachable(_)), "{failed:?}");
+        drop(silent);
+    }
+
+    /// A transfer whose request reached the peer, which then reset the
+    /// connection, may have been taken: tonic gives the reset a status code
+    /// that is no `Unavailable`, and the transfer still fails as unreachable,
+    /// never as the `Network` error of a transfer that never left.
+    #[tokio::test]
+    async fn a_transfer_reset_after_its_request_arrived_stays_unreachable() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        /// Whether `bytes`, the client's side of an HTTP/2 connection after
+        /// its preface, hold a whole DATA frame of a request stream.
+        fn holds_request_data(mut bytes: &[u8]) -> bool {
+            while let Some(header) = bytes.get(..9) {
+                let length = usize::from(header[0]) << 16
+                    | usize::from(header[1]) << 8
+                    | usize::from(header[2]);
+                let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+                let Some(frame) = length.checked_add(9).and_then(|end| bytes.get(end..)) else {
+                    return false;
+                };
+                if header[3] == 0 && stream & 0x7fff_ffff != 0 {
+                    return true;
+                }
+                bytes = frame;
+            }
+            false
+        }
+
+        const PREFACE: usize = 24;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            // An empty server SETTINGS frame, so the client sends at once.
+            socket
+                .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                .await
+                .expect("write settings");
+            let mut received = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let arrived = loop {
+                let read = socket.read(&mut chunk).await.expect("read request");
+                if read == 0 {
+                    break false;
+                }
+                received.extend_from_slice(&chunk[..read]);
+                if received.get(PREFACE..).is_some_and(holds_request_data) {
+                    break true;
+                }
+            };
+            // An abortive close: the client reads a connection reset.
+            socket.set_zero_linger().expect("set linger");
+            drop(socket);
+            arrived
+        });
+
+        let mut network = test_network(
+            Arc::new(CoreRaftTransport::default()),
+            RaftGroupId(1),
+            1,
+            url,
+        );
+        let failed = network
+            .transfer_leader(
+                TransferLeaderRequest::new(UrsulaVote::new_committed(3, 2), 1, None),
+                RPCOption::new(Duration::from_secs(5)),
+            )
+            .await
+            .expect_err("the peer reset the connection");
+        assert!(
+            peer.await.expect("peer task"),
+            "the transfer's request reached the peer"
+        );
+        assert!(matches!(failed, RPCError::Unreachable(_)), "{failed:?}");
     }
 
     /// A peer of another cluster refuses this node's votes and appends

@@ -570,16 +570,20 @@ pub(crate) enum TransferOutcome {
     /// It answered that it does not campaign: its election policy refused
     /// the transfer (an error answer), or its log never caught up with the
     /// leader's within OpenRaft's wait
-    /// ([`TransferLeaderError::LogNotFlushed`]).
+    /// ([`TransferLeaderError::LogNotFlushed`]). Or the transfer never
+    /// reached it: the call failed before its request left this node, as a
+    /// dial to a peer that restarted a moment ago can
+    /// ([`crate::grpc::Delivery::Unsent`]).
     Refused,
     /// It already holds another vote than the leader's
     /// ([`TransferLeaderError::VoteChanged`]): a newer
     /// election may be under way, which a campaign of the old leader would
     /// race, so the old leader gives it one leader lease.
     Superseded,
-    /// No answer reached the leader: the call timed out, the target was
-    /// unreachable, or OpenRaft dropped the call. The target may have
-    /// taken it.
+    /// No answer reached the leader: the call timed out, failed after its
+    /// request may have left this node (a reset or an HTTP/2 error, whatever
+    /// status code it got, [`crate::grpc::Delivery::Lost`]), or OpenRaft
+    /// dropped the call. The target may have taken it.
     Unanswered,
 }
 
@@ -596,8 +600,12 @@ impl TransferOutcome {
             Ok(Err(TransferLeaderError::VoteChanged { .. })) => Self::Superseded,
             Ok(Err(TransferLeaderError::LogNotFlushed { .. })) => Self::Refused,
             // Each transport sends a refusal by the target as an error
-            // answer over a working channel. Another error answer reads as
-            // a refusal too, which is safe: the leader's campaign after it
+            // answer over a working channel, and fails a transfer whose
+            // request never left this node as `Network` too, OpenRaft's
+            // error for a request it failed to send: neither reached the
+            // target's Raft. A transfer that may have arrived and got no
+            // answer fails as `Unreachable`. Another error answer reads as a
+            // refusal too, which is safe: the leader's campaign after it
             // starts with a pre-vote, which a quorum that follows a newer
             // leader refuses.
             Err(RPCError::Network(_) | RPCError::RemoteError(_)) => Self::Refused,
