@@ -94,7 +94,8 @@ impl Acknowledgements {
         }
     }
 
-    fn acknowledged(&self) -> bool {
+    /// Whether the replica acknowledged a leader in this run.
+    pub(crate) fn acknowledged(&self) -> bool {
         self.acknowledged.load(Ordering::Acquire)
     }
 

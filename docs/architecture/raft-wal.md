@@ -577,8 +577,12 @@ instead of being refused before the proposal.
 within one minimum election timeout (1.5 s) and holds every committed entry
 (`ElectionPolicy::validate_handoff`, used by every planner and the admin
 transfer endpoint). A follower the leader rewound is refused as lagging until
-it caught up. If the target has not taken over within two maximum election
-timeouts (6 s), the leader steps down and campaigns.
+it caught up. A target that refuses the transfer, fails it or does not answer
+within one minimum election timeout ends it at once, and one that took it has
+one more minimum election timeout to win. The leader then steps down and
+campaigns, and the voters that took the transfer's broadcast grant its vote.
+Two maximum election timeouts (6 s) stay the bound of a transfer that no
+client of the leader sent.
 
 **Stall and accept-unsynced-loss.** A gated replica with no barrier and no
 apply for 30 s reports its group stalled: a majority may be gated, so the group
@@ -763,9 +767,11 @@ The data-group engine owns its recovery tasks and exposes the runtime's
 | `ursula-proto` | Shared admin requests, responses and recovery status. WAL metric samples live in `ursula-runtime`. |
 
 All server handoffs enter through the registry. The destination refuses a
-transfer to itself while it cannot campaign, and one carrying its own committed
-vote, because OpenRaft would start that election while still holding its old
-leader state. The check reads only the request's vote, and OpenRaft acts on a
+leader's transfer to itself while its replica may not take the leadership
+(`ElectionPolicy::may_take_leadership`: it cannot campaign, or it has not
+acknowledged a leader of its group since it started), a self-election while it
+cannot campaign, and either one carrying its own committed vote, because
+OpenRaft would start that election while still holding its old leader state. The check reads only the request's vote, and OpenRaft acts on a
 transfer only while the node holds that vote, so nothing slips in between.
 
 The bootstrap driver waits on server-state and gate notifications, the

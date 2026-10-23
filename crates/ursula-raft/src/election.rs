@@ -180,10 +180,29 @@ impl ElectionPolicy {
     pub fn may_campaign(&self, gate: Option<&GroupRejoin>) -> bool {
         self.state().should_campaign() && gate.is_none_or(GroupRejoin::may_campaign)
     }
-    /// Whether a replica behind `gate` may take a leadership transfer
-    /// ([`LeadershipShedState::should_accept_transfer`]).
+    /// Whether a replica behind `gate` may start an election by a transfer
+    /// to itself ([`LeadershipShedState::should_accept_transfer`], and the
+    /// gate lets it campaign): a self-election, or this node's own stance
+    /// with no gate.
     pub fn may_accept_transfer(&self, gate: Option<&GroupRejoin>) -> bool {
         self.state().should_accept_transfer() && gate.is_none_or(GroupRejoin::may_campaign)
+    }
+
+    /// The one rule for whether the replica behind `gate` may take its
+    /// group's leadership from a leader: the node's policy lets it take a
+    /// transfer ([`LeadershipShedState::should_accept_transfer`]) and the
+    /// replica may campaign and acknowledged a leader of its group in this
+    /// run ([`GroupRejoin::may_take_leadership`]). A replica that restarted
+    /// a moment ago has not, so no leadership is handed to it before its
+    /// leader counts it again.
+    ///
+    /// The replica's node answers it for each of its replicas in its
+    /// participation answer, which a leader reads before it hands a
+    /// leadership over, and the replica checks it again when the transfer
+    /// arrives ([`Self::validate_incoming_transfer`]). A leader therefore
+    /// starts no transfer the target would refuse by the answer it read.
+    pub fn may_take_leadership(&self, gate: Option<&GroupRejoin>) -> bool {
+        self.state().should_accept_transfer() && gate.is_none_or(GroupRejoin::may_take_leadership)
     }
     /// The one handoff policy: whether `target` can take over this node's
     /// leadership of `group` now. OpenRaft parks a leader whose transfer
@@ -235,11 +254,16 @@ impl ElectionPolicy {
     }
 
     /// The one policy for a leadership transfer this node receives, from a
-    /// leader or from a self-election. A transfer to another node only
-    /// drops this node's leader lease. A transfer to this node makes it
-    /// campaign, so its campaign policy must allow that, and it must not
-    /// carry this node's own committed vote. A node without a meta replica
-    /// takes no transfer ([`LeadershipShedReason::PlacementUnavailable`]).
+    /// leader or from a self-election (`ask`). A transfer to another node
+    /// only drops this node's leader lease. A transfer to this node makes
+    /// it campaign, so it must not carry this node's own committed vote,
+    /// and the replica must be allowed to take it: a leader's handoff by
+    /// the one rule [`Self::may_take_leadership`], which the leader read
+    /// from this node's participation answer, and a self-election by the
+    /// campaign policy ([`Self::may_accept_transfer`]), since a replica
+    /// asked to campaign may know no leader to have acknowledged. A node
+    /// without a meta replica takes no transfer
+    /// ([`LeadershipShedReason::PlacementUnavailable`]).
     ///
     /// OpenRaft acts on a transfer only while this node's vote equals the
     /// vote the transfer carries, and compares the two in its core as it
@@ -266,6 +290,7 @@ impl ElectionPolicy {
         node_id: u64,
         request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
         gate: Option<&GroupRejoin>,
+        ask: TransferAsk,
     ) -> Result<(), IncomingTransferError> {
         if *request.to_node_id() != node_id {
             return Ok(());
@@ -274,7 +299,11 @@ impl ElectionPolicy {
         if vote.is_committed() && *vote.leader_id().node_id() == node_id {
             return Err(IncomingTransferError::OwnCommittedVote { group, vote });
         }
-        if !self.may_accept_transfer(gate) {
+        let allowed = match ask {
+            TransferAsk::Handoff => self.may_take_leadership(gate),
+            TransferAsk::SelfElection => self.may_accept_transfer(gate),
+        };
+        if !allowed {
             return Err(IncomingTransferError::MayNotCampaign { group });
         }
         Ok(())
@@ -318,6 +347,16 @@ impl ElectionPolicy {
         let alone = gate.as_deref().is_some_and(GroupRejoin::is_only_voter);
         raft.elect(move || policy.may_campaign_in(gate.as_deref(), alone));
     }
+}
+
+/// Who asks a replica to take its group's leadership by a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferAsk {
+    /// A leader of the group hands its leadership over.
+    Handoff,
+    /// An operator asks the replica to campaign
+    /// ([`crate::RaftGroupHandleRegistry::request_self_election`]).
+    SelfElection,
 }
 
 /// A rejected handoff never reaches OpenRaft's transfer state.
@@ -374,7 +413,8 @@ pub enum IncomingTransferError {
     },
     #[error(
         "node may not take a leadership transfer of Raft group {group:?} (recovery gate closed, \
-         leadership shed or placement unavailable); refusing it"
+         its leader not acknowledged in this run, leadership shed or placement unavailable); \
+         refusing it"
     )]
     MayNotCampaign { group: RaftGroupId },
     #[error("OpenRaft could not take the leadership transfer for {group:?}: {source}")]

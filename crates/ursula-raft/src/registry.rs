@@ -1367,18 +1367,23 @@ impl RaftGroupHandleRegistry {
         self.election.may_accept_transfer(None) && self.recovery_barriers_ready()
     }
 
-    /// This node's leadership-shed state, as a node of `cluster_id` answers
-    /// it. A node cannot receive a planned leadership handoff until the
-    /// recovery gate of every data replica that counts as a voter is open
-    /// ([`Self::recovery_barriers_ready`]). The answer carries every
-    /// recovery gate ([`Self::recovery_gates`]), which a group's leader
-    /// reads before it promotes this node's learner, and how many data
-    /// groups the node leads ([`Self::leader_count`]), which the peers'
-    /// leadership balancers read, and what its last cluster-egress probe
-    /// found ([`Self::egress_probe`]), which the peers' egress gates read.
+    /// This node's leadership-shed state, as a node of `cluster_id` whose
+    /// readiness is `serving_ready` answers it. A node cannot receive a
+    /// planned leadership handoff until the recovery gate of every data
+    /// replica that counts as a voter is open
+    /// ([`Self::recovery_barriers_ready`]). The answer carries the replicas
+    /// whose group's leadership the node may take now
+    /// ([`Self::takes_leadership`]), which a leader reads before it hands a
+    /// leadership over, every recovery gate ([`Self::recovery_gates`]),
+    /// which a group's leader reads before it promotes this node's learner,
+    /// how many data groups the node leads ([`Self::leader_count`]) and
+    /// whether it is serving-ready, which the peers' leadership balancers
+    /// read, and what its last cluster-egress probe found
+    /// ([`Self::egress_probe`]), which the peers' egress gates read.
     pub fn participation_status(
         &self,
         cluster_id: ursula_headers::ClusterId,
+        serving_ready: bool,
     ) -> ursula_proto::admin::LeadershipShedStatus {
         let state = self.election.state();
         ursula_proto::admin::LeadershipShedStatus {
@@ -1389,10 +1394,39 @@ impl RaftGroupHandleRegistry {
             should_campaign: self.should_campaign(),
             recovery_barriers_ready: self.recovery_barriers_ready(),
             should_shed_current_leaders: state.should_shed_current_leaders(),
+            takes_leadership: self.takes_leadership(),
             recovery_gates: self.recovery_gates(),
             leader_count: self.leader_count(),
+            serving_ready,
             egress: self.egress_probe(),
         }
+    }
+
+    /// The replicas of this node whose group's leadership it may take from
+    /// a leader now, the meta replica's as `meta`: none while the node may
+    /// not take a planned handoff at all ([`Self::should_accept_transfer`]),
+    /// and otherwise each replica the one rule admits
+    /// ([`ElectionPolicy::may_take_leadership`]), which the replica checks
+    /// again when the transfer arrives.
+    pub fn takes_leadership(&self) -> BTreeSet<RaftTargetKey> {
+        if !self.should_accept_transfer() {
+            return BTreeSet::new();
+        }
+        let meta = self
+            .meta()
+            .filter(|meta| meta.core.takes_leadership(&self.election))
+            .map(|_| RaftTargetKey::Meta);
+        self.groups
+            .load()
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .active()
+                    .is_some_and(|active| active.core.takes_leadership(&self.election))
+            })
+            .map(|(id, _)| RaftTargetKey::Data(*id))
+            .chain(meta)
+            .collect()
     }
 
     /// How many data groups this node leads, each by its replica's
@@ -1780,7 +1814,12 @@ impl RaftGroupHandleRegistry {
         let entry = self.entry(raft_group_id)?;
         entry
             .core
-            .deliver_transfer(&self.election, raft_group_id, request)
+            .deliver_transfer(
+                &self.election,
+                raft_group_id,
+                request,
+                crate::election::TransferAsk::Handoff,
+            )
             .await
     }
 
@@ -2125,9 +2164,14 @@ where
         });
     }
     let request = TransferLeaderRequest::new(observed.vote, observed.id, None);
-    core.deliver_transfer(election, group, request)
-        .await?
-        .map_err(|source| SelfElectionError::Rejected { group, source })
+    core.deliver_transfer(
+        election,
+        group,
+        request,
+        crate::election::TransferAsk::SelfElection,
+    )
+    .await?
+    .map_err(|source| SelfElectionError::Rejected { group, source })
 }
 
 /// Refuses a recovery plan for `group` whose floor is of the other plane
@@ -3564,9 +3608,13 @@ mod tests {
             Some(LeadershipShedReason::PlacementUnavailable)
         );
         let status = registry_with(LeadershipShedReason::PlacementUnavailable)
-            .participation_status(ursula_headers::ClusterId::new("placement-shed").unwrap());
+            .participation_status(
+                ursula_headers::ClusterId::new("placement-shed").unwrap(),
+                true,
+            );
         assert!(status.should_campaign);
         assert!(!status.should_accept_transfer);
+        assert!(status.takes_leadership.is_empty());
         assert!(status.should_shed_current_leaders);
     }
 

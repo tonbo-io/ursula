@@ -400,7 +400,12 @@ impl ActiveMeta {
             .check(RaftTarget::Meta)
             .map_err(IncomingTransferError::Group)?;
         self.core
-            .deliver_transfer(&self.election, META_GROUP, request)
+            .deliver_transfer(
+                &self.election,
+                META_GROUP,
+                request,
+                crate::election::TransferAsk::Handoff,
+            )
             .await
     }
 
@@ -573,10 +578,12 @@ impl MetaReplica {
         let (openraft_work, work) = OpenRaftWork::start();
         let installs = Arc::new(WorkAdmission::new(work.as_kind(WorkKind::Install)));
         let snapshot_sends = crate::openraft_work::SnapshotSends::default();
+        let transfer_answers = crate::openraft_work::TransferAnswers::default();
         let network = crate::openraft_work::TrackedNetworkFactory::new(
             network,
             work.as_kind(WorkKind::Client),
             snapshot_sends.clone(),
+            transfer_answers.clone(),
         );
         let store =
             crate::openraft_work::TrackedLogStore::new(store, work.as_kind(WorkKind::Reader));
@@ -604,6 +611,7 @@ impl MetaReplica {
             apply_health,
             reconcile: tasks.reconcile.clone(),
             snapshot_sends,
+            transfer_answers,
         };
         let replica = Self {
             active: Arc::new(ActiveMeta {

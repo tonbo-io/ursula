@@ -5,18 +5,24 @@
 //!
 //! Each node runs it independently and moves only the groups it leads. A
 //! node's fair share is `ceil(groups / eligible nodes)`: every data group
-//! of the bootstrapped view, over the nodes that may campaign and have a
-//! role in some group's placement that takes a leadership. The counts come
-//! from the participation answers, each peer reporting how many groups it
-//! leads, so a node needs no replica of a group to count its leader. A
-//! transfer from this node to `t` needs `mine > fair`, `count(t) < fair`
-//! and `count(t) + 1 < mine`, the transfers planned before it counted, so
-//! each one strictly lowers the sum of the squared counts and the balancer
-//! settles at zero transfers. A target is one of [`handoff_targets`]: a
-//! voter that may campaign, never an outgoing or abandoned replica. A
-//! planned handoff fires only when the registry's handoff policy accepts the
-//! target (it answered recently, holds every committed entry and did not
-//! lose its log). Otherwise the group is retried on a later tick.
+//! of the bootstrapped view, over the nodes the balancer may move
+//! leaderships to ([`CampaignStances::balance_eligible`]: they may campaign
+//! and answered that they are serving-ready) and that have a role in some
+//! group's placement that takes a leadership. The counts come from the
+//! participation answers, each peer reporting how many groups it leads, so
+//! a node needs no replica of a group to count its leader. A transfer from
+//! this node to `t` needs `mine > fair`, `count(t) < fair` and
+//! `count(t) + 1 < mine`, the transfers planned before it counted, so each
+//! one strictly lowers the sum of the squared counts and the balancer
+//! settles at zero transfers. A target is one of [`handoff_targets`]: an
+//! eligible voter whose node answered that its replica of the group may
+//! take the leadership ([`CampaignStances::may_take`]), never an outgoing
+//! or abandoned replica. A node that restarted is not serving-ready, and
+//! its replicas take no leadership, before each of them acknowledges its
+//! leader again, so the balancer pulls no leadership onto it before that.
+//! A planned handoff fires only when the registry's handoff policy accepts
+//! the target (it answered recently, holds every committed entry and did
+//! not lose its log). Otherwise the group is retried on a later tick.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -25,6 +31,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ursula_control::Cluster;
+use ursula_proto::admin::RaftTargetKey;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::meta::status::MetaStatusReader;
@@ -131,12 +138,12 @@ pub(crate) fn balance_inputs(
     cluster: &Cluster,
     stances: &CampaignStances,
 ) -> Option<BalanceInputs> {
-    let may_campaign = stances.may_campaign();
+    let may_lead = stances.balance_eligible();
     let groups = cluster.groups().len();
     let eligible = cluster
         .nodes()
         .keys()
-        .filter(|node| may_campaign.contains(&node.get()))
+        .filter(|node| may_lead.contains(&node.get()))
         .filter(|node| {
             cluster.groups().iter().any(|(_, placement)| {
                 placement
@@ -151,7 +158,10 @@ pub(crate) fn balance_inputs(
         .filter(|snap| snap.current_leader == Some(me))
         .map(|snap| LedGroup {
             group_id: snap.raft_group_id,
-            targets: handoff_targets(snap, me, Some(cluster), |node| may_campaign.contains(&node)),
+            targets: handoff_targets(snap, me, Some(cluster), |node| {
+                may_lead.contains(&node)
+                    && stances.may_take(node, RaftTargetKey::Data(snap.raft_group_id))
+            }),
         })
         .collect();
     Some(BalanceInputs {
@@ -363,6 +373,7 @@ mod tests {
 
     use proptest::prelude::*;
     use ursula_control::samples;
+    use ursula_proto::admin::RaftTargetKey;
     use ursula_raft::RaftGroupMetricsSnapshot;
 
     use super::BalanceInputs;
@@ -429,15 +440,16 @@ mod tests {
     /// may campaign and have a role that takes a leadership, and the counts
     /// are the answered ones. The bugs it catches: a share over the groups
     /// and voters this node sees, which never settles once a node hosts
-    /// fewer than all groups, and a share that counts a node about to leave
-    /// every group it is in.
+    /// fewer than all groups, a share that counts a node about to leave
+    /// every group it is in, and one that counts a peer that is not
+    /// serving-ready, which the balancer moves nothing to.
     #[test]
     fn the_fair_share_counts_every_group_over_the_nodes_that_may_lead() {
         // Three groups. Node 5 is only an abandoned target and node 4 has
         // no role, so nodes 1, 2 and 3 may lead.
         let state = samples::sample_state();
         let cluster = state.cluster().unwrap();
-        let stances = |refusing: u64| {
+        let stances = |refusing: u64, ready: &[u64]| {
             CampaignStances::of_nodes(
                 1,
                 (1..=5).map(|node| {
@@ -450,17 +462,57 @@ mod tests {
                 }),
             )
             .with_leader_counts([(1, 2), (2, 1)])
+            .with_serving_ready(ready.iter().copied())
         };
-        let inputs = balance_inputs(&[], 1, cluster, &stances(0)).unwrap();
+        let every_peer = [2, 3, 4, 5];
+        let inputs = balance_inputs(&[], 1, cluster, &stances(0, &every_peer)).unwrap();
         assert_eq!(inputs.fair, 1);
         assert_eq!(inputs.counts, BTreeMap::from([(1, 2), (2, 1)]));
         assert!(inputs.led.is_empty());
         assert_eq!(
-            balance_inputs(&[], 1, cluster, &stances(3)).unwrap().fair,
+            balance_inputs(&[], 1, cluster, &stances(3, &every_peer))
+                .unwrap()
+                .fair,
+            2
+        );
+        assert_eq!(
+            balance_inputs(&[], 1, cluster, &stances(0, &[2, 4, 5]))
+                .unwrap()
+                .fair,
             2
         );
         let nobody = CampaignStances::of_nodes(1, [(1, CampaignStance::MayNotCampaign)]);
         assert_eq!(balance_inputs(&[], 1, cluster, &nobody), None);
+    }
+
+    /// A leadership goes only to a serving-ready peer whose answer lists
+    /// its replica of the group as one that may take the leadership. The
+    /// bugs it catches: a target picked from the node's stance alone, which
+    /// hands a leadership to a replica that restarted a moment ago and
+    /// refuses it, and one picked without the peer's readiness, which pulls
+    /// leaderships onto a node before its replicas caught up.
+    #[test]
+    fn a_balancer_target_is_a_ready_peer_whose_replica_takes_the_leadership() {
+        // Group 2 moves from {1, 3} to {1, 2}: node 2 is its one target.
+        let state = samples::sample_state();
+        let cluster = state.cluster().unwrap();
+        let moving = snap(2, 1, &[1, 2, 3, 5, 6]);
+        let stances = |takes: &[u32], ready: &[u64]| {
+            CampaignStances::of_nodes(1, (1..=3).map(|node| (node, CampaignStance::MayCampaign)))
+                .with_takers([(2, takes.iter().copied().map(RaftTargetKey::Data).collect())])
+                .with_serving_ready(ready.iter().copied())
+        };
+        let targets = |stances: &CampaignStances| {
+            balance_inputs(std::slice::from_ref(&moving), 1, cluster, stances)
+                .unwrap()
+                .led
+                .into_iter()
+                .flat_map(|group| group.targets)
+                .collect::<Vec<u64>>()
+        };
+        assert_eq!(targets(&stances(&[2], &[2, 3])), vec![2]);
+        assert_eq!(targets(&stances(&[1, 3], &[2, 3])), Vec::<u64>::new());
+        assert_eq!(targets(&stances(&[2], &[3])), Vec::<u64>::new());
     }
 
     /// A transfer goes only to a node below its share that ends below this

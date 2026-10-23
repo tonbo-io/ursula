@@ -326,9 +326,16 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     assert!(restarted_registry.recovery_barriers_ready());
     let participation = restarted_registry.participation_status(
         ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap(),
+        true,
     );
     assert!(participation.should_campaign);
     assert!(participation.should_accept_transfer);
+    // The stopped group takes no leadership.
+    assert!(
+        !participation
+            .takes_leadership
+            .contains(&ursula_proto::admin::RaftTargetKey::Data(0))
+    );
     assert!(!restarted_registry.may_campaign(RaftGroupId(999)));
     assert!(!restarted_registry.may_campaign(RaftGroupId(0)));
     assert!(restarted_registry.may_campaign(RaftGroupId(1)));

@@ -101,6 +101,8 @@ use ursula_stream::StreamCommand;
 use super::*;
 use crate::codec::*;
 #[cfg(not(madsim))]
+use crate::election::TransferAsk;
+#[cfg(not(madsim))]
 use crate::engine::test_support::open_single_voter;
 #[cfg(not(madsim))]
 use crate::engine::test_support::single_node_factory;
@@ -4541,15 +4543,33 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
 
     let policy = ElectionPolicy::default();
     assert!(matches!(
-        policy.validate_incoming_transfer(group, node, &transfer(leader_vote, node), None),
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, node),
+            None,
+            TransferAsk::Handoff,
+        ),
         Ok(())
     ));
     assert!(matches!(
-        policy.validate_incoming_transfer(group, node, &transfer(candidacy, node), None),
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(candidacy, node),
+            None,
+            TransferAsk::Handoff,
+        ),
         Ok(())
     ));
     assert!(matches!(
-        policy.validate_incoming_transfer(group, node, &transfer(own_vote, node), None),
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(own_vote, node),
+            None,
+            TransferAsk::Handoff,
+        ),
         Err(IncomingTransferError::OwnCommittedVote { vote, .. }) if vote == own_vote
     ));
 
@@ -4559,18 +4579,36 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
         .unwrap();
     assert!(!gate.vote_gate_open());
     assert!(matches!(
-        policy.validate_incoming_transfer(group, node, &transfer(leader_vote, node), Some(&gate)),
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, node),
+            Some(&gate),
+            TransferAsk::Handoff,
+        ),
         Err(IncomingTransferError::MayNotCampaign { .. })
     ));
     let registry = RaftGroupHandleRegistry::default();
     registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     let shed = registry.election_policy();
     assert!(matches!(
-        shed.validate_incoming_transfer(group, node, &transfer(leader_vote, node), None),
+        shed.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, node),
+            None,
+            TransferAsk::Handoff,
+        ),
         Err(IncomingTransferError::MayNotCampaign { .. })
     ));
     assert!(matches!(
-        shed.validate_incoming_transfer(group, node, &transfer(leader_vote, 3), Some(&gate)),
+        shed.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, 3),
+            Some(&gate),
+            TransferAsk::Handoff,
+        ),
         Ok(())
     ));
 }

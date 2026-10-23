@@ -147,6 +147,7 @@ impl InProcessEndpoint for RaftGroupStateMachine {
             target,
             request,
             registry.rejoin(*group).as_deref(),
+            crate::election::TransferAsk::Handoff,
         )
     }
 }

@@ -309,6 +309,8 @@ pub struct RaftGroupEngine {
     pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
     /// The snapshot sends of the engine's network clients that run.
     pub(crate) snapshot_sends: crate::openraft_work::SnapshotSends,
+    /// What the target of each leadership transfer of the engine answered.
+    pub(crate) transfer_answers: crate::openraft_work::TransferAnswers,
     /// What dropping the engine stops, until its shutdown ran (#709).
     pub(crate) drop_stop: std::sync::Mutex<DropStop>,
     /// How long [`Self::shutdown`] waits for that work.
@@ -460,6 +462,7 @@ impl ForwardedReadEngine {
             reconcile: None,
             openraft_work: crate::openraft_work::OpenRaftWork::none(),
             snapshot_sends: Default::default(),
+            transfer_answers: Default::default(),
             drop_stop: std::sync::Mutex::new(DropStop::Nothing),
             work_stop_timeout: crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT,
         }
@@ -754,10 +757,12 @@ impl RaftGroupEngine {
             work.as_kind(crate::openraft_work::WorkKind::Install),
         ));
         let snapshot_sends = crate::openraft_work::SnapshotSends::default();
+        let transfer_answers = crate::openraft_work::TransferAnswers::default();
         let network_factory = crate::openraft_work::TrackedNetworkFactory::new(
             network_factory,
             work.as_kind(crate::openraft_work::WorkKind::Client),
             snapshot_sends.clone(),
+            transfer_answers.clone(),
         );
         let log_store = crate::openraft_work::TrackedLogStore::new(
             log_store,
@@ -827,6 +832,7 @@ impl RaftGroupEngine {
             ),
             openraft_work,
             snapshot_sends,
+            transfer_answers,
             drop_stop: std::sync::Mutex::new(drop_stop),
             work_stop_timeout,
         })
@@ -850,6 +856,7 @@ impl RaftGroupEngine {
                 .as_ref()
                 .map(crate::rt::sync::watch::Sender::subscribe),
             snapshot_sends: self.snapshot_sends.clone(),
+            transfer_answers: self.transfer_answers.clone(),
         }
     }
 

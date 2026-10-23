@@ -548,22 +548,106 @@ impl Drop for SnapshotSend {
     }
 }
 
+/// What the target of a leadership transfer this engine's leader sent
+/// answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferAnswer {
+    /// The vote of the leader that sent the transfer.
+    pub(crate) from: crate::UrsulaVote,
+    /// The node the transfer names, which answered it.
+    pub(crate) to: u64,
+    /// Whether the target took the transfer: its OpenRaft accepted it and
+    /// campaigns. A refusal by its policy or by OpenRaft, an error and no
+    /// answer within the transfer's timeout all mean it does not campaign.
+    pub(crate) taken: bool,
+}
+
+/// The last answer the target of a leadership transfer sent this engine's
+/// network clients ([`TransferAnswer`]). OpenRaft only logs it, and its
+/// leader stays in the transfer until it sees a higher vote, so the
+/// leader's transfer bound waits on it
+/// ([`crate::owner::OwnerRaftHandle::abandon_stalled_transfer`]).
+#[derive(Debug, Clone)]
+pub(crate) struct TransferAnswers(Arc<watch::Sender<Option<TransferAnswer>>>);
+
+impl Default for TransferAnswers {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(None).0))
+    }
+}
+
+impl TransferAnswers {
+    /// A receiver that has seen every answer recorded so far.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<TransferAnswer>> {
+        self.0.subscribe()
+    }
+
+    fn record(&self, answer: TransferAnswer) {
+        self.0.send_replace(Some(answer));
+    }
+}
+
+/// The answer a transfer's target owes while its RPC runs. A call that
+/// OpenRaft drops at its timeout got no answer, which is recorded as not
+/// taken when the guard drops.
+struct OwedAnswer {
+    answers: TransferAnswers,
+    from: crate::UrsulaVote,
+    to: u64,
+    owed: bool,
+}
+
+impl OwedAnswer {
+    /// Records `taken`, or nothing when `taken` is `None`: the engine
+    /// stops, and nothing waits for the transfer any more.
+    fn settle(mut self, taken: Option<bool>) {
+        self.owed = false;
+        if let Some(taken) = taken {
+            self.answers.record(TransferAnswer {
+                from: self.from,
+                to: self.to,
+                taken,
+            });
+        }
+    }
+}
+
+impl Drop for OwedAnswer {
+    fn drop(&mut self) {
+        if self.owed {
+            self.answers.record(TransferAnswer {
+                from: self.from,
+                to: self.to,
+                taken: false,
+            });
+        }
+    }
+}
+
 /// A network factory whose clients hold the engine's [`WorkToken`]:
 /// OpenRaft hands them to heartbeat, vote, replication and snapshot-sending
 /// tasks that `Raft::shutdown` does not join. Its clients count their
-/// snapshot sends in `sends`.
+/// snapshot sends in `sends` and record what the target of each leadership
+/// transfer answered in `transfers`.
 pub(crate) struct TrackedNetworkFactory<NF> {
     factory: NF,
     work: WorkToken,
     sends: SnapshotSends,
+    transfers: TransferAnswers,
 }
 
 impl<NF> TrackedNetworkFactory<NF> {
-    pub(crate) fn new(factory: NF, work: WorkToken, sends: SnapshotSends) -> Self {
+    pub(crate) fn new(
+        factory: NF,
+        work: WorkToken,
+        sends: SnapshotSends,
+        transfers: TransferAnswers,
+    ) -> Self {
         Self {
             factory,
             work,
             sends,
+            transfers,
         }
     }
 }
@@ -577,6 +661,7 @@ pub(crate) struct TrackedNetwork<N> {
     /// The node the client sends to.
     target: u64,
     sends: SnapshotSends,
+    transfers: TransferAnswers,
 }
 
 impl<NF> RaftNetworkFactory<UrsulaRaftTypeConfig> for TrackedNetworkFactory<NF>
@@ -592,6 +677,7 @@ where
             work: self.work.clone(),
             target,
             sends: self.sends.clone(),
+            transfers: self.transfers.clone(),
         }
     }
 
@@ -603,6 +689,7 @@ where
             work: self.work.clone(),
             target,
             sends: self.sends.clone(),
+            transfers: self.transfers.clone(),
         }
     }
 
@@ -612,6 +699,7 @@ where
             work: self.work.clone(),
             target,
             sends: self.sends.clone(),
+            transfers: self.transfers.clone(),
         }
     }
 }
@@ -699,6 +787,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
             work,
             target,
             sends,
+            ..
         } = self;
         let _send = sends.start(*target);
         work.until_stopping(RaftNetworkV2::full_snapshot(
@@ -717,10 +806,28 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
         req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<TransferLeaderResponse<UrsulaRaftTypeConfig>, RPCError<UrsulaRaftTypeConfig>> {
-        let Self { network, work, .. } = self;
-        work.until_stopping(RaftNetworkV2::transfer_leader(network, req, option))
-            .await
-            .unwrap_or_else(|| Err(engine_stopped()))
+        let Self {
+            network,
+            work,
+            target,
+            transfers,
+            ..
+        } = self;
+        // OpenRaft sends the transfer to every voter. The one it names
+        // answers whether it campaigns.
+        let owed = (*req.to_node_id() == *target).then(|| OwedAnswer {
+            answers: transfers.clone(),
+            from: *req.from_leader(),
+            to: *target,
+            owed: true,
+        });
+        let answer = work
+            .until_stopping(RaftNetworkV2::transfer_leader(network, req, option))
+            .await;
+        if let Some(owed) = owed {
+            owed.settle(answer.as_ref().map(|answer| matches!(answer, Ok(Ok(())))));
+        }
+        answer.unwrap_or_else(|| Err(engine_stopped()))
     }
 
     fn backoff(&self) -> Option<Backoff> {

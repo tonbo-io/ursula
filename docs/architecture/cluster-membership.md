@@ -322,19 +322,43 @@ observes.
 Each node's leadership balancer moves leaderships off a node that leads more
 than its fair share (`crates/ursula/src/bootstrap/leadership.rs`). The share
 is every data group of the bootstrapped view divided among the nodes that may
-campaign and have a voter or incoming role somewhere, rounded up. Each peer's
-participation answer says how many data groups it leads (`leader_count`). A
-node hands one of its groups to a voter `t` only while it leads more than
-its share, `t` leads fewer than its share and `t` would still lead fewer
-than this node, so every transfer lowers the spread and the balancer
-settles. The balancer, the shutdown handoff, the shedding gates and
-`ursulactl drain` pick their targets through one rule: a voter that may
-campaign, and under a bootstrapped view one whose role in the group is
-`voter` or `incoming`, never an outgoing or abandoned replica. Two handoffs
-keep only part of it. The WAL-disk pressure handoff takes any voter whose
-role is `voter` or `incoming`, whether it may campaign or not, and the
+campaign, answered that they are serving-ready (`serving_ready`, what
+`/__ursula/ready` answers) and have a voter or incoming role somewhere,
+rounded up. Each peer's participation answer says how many data groups it
+leads (`leader_count`). A node hands one of its groups to a voter `t` only
+while it leads more than its share, `t` leads fewer than its share and `t`
+would still lead fewer than this node, so every transfer lowers the spread
+and the balancer settles. It moves a leadership only to a serving-ready
+node, so it pulls none onto a node that restarted before each of its
+replicas acknowledged its leader again.
+
+One rule decides whether a replica may take its group's leadership from a
+leader (`ElectionPolicy::may_take_leadership`): its node takes transfers,
+its recovery gate lets it campaign, and it acknowledged a leader of its group
+in this run (`rejoin/acknowledge.rs`), so it holds what that leader
+committed. A node answers the rule for each of its replicas
+(`takes_leadership` in its participation answer, none while the node takes
+no planned handoff), a leader reads the answer before it hands a leadership
+over, and the replica checks the same rule when the transfer arrives. The
+balancer, the shutdown handoff, the shedding gates, the meta shed and
+`ursulactl drain` pick their targets through it, and under a bootstrapped
+view only a replica whose role in the group is `voter` or `incoming`, never
+an outgoing or abandoned one. Two handoffs keep only part of it. The WAL-disk
+pressure handoff takes any voter whose role is `voter` or `incoming`, and the
 commit-stall watchdog, which escapes a leader whose log stopped committing,
 takes any other voter, a leaving one included.
+
+A leader that started a transfer serves nothing until another node leads:
+OpenRaft forwards its writes to the target, sends no heartbeat and never
+abandons the transfer. Its network clients record what the target answered
+(`openraft_work::TransferAnswers`). A target that refuses the transfer, fails
+it or does not answer within one minimum election timeout ends it at once,
+and one that took it has one more minimum election timeout to win. The
+leader then steps down and campaigns
+(`OwnerRaftHandle::abandon_stalled_transfer`), and the voters that took the
+transfer's broadcast dropped their lease of it and grant its vote, so a
+refused transfer costs the group one election. Two maximum election timeouts
+stay the bound of a transfer that no client of the leader sent.
 
 A meta outage leaves the layout as meta left it. While the meta group has no
 live quorum no meta read barrier passes, and every voter change and every

@@ -173,17 +173,19 @@ The node routes answer `{"lifecycle": L}`, the node's lifecycle after the change
 
 ### Maintenance drain
 
-`POST /__ursula/leadership-shed/maintenance` marks the node as draining: it stops campaigning and accepting transfers until the mark is lifted with `DELETE`, so no handoff and no balancer moves a leadership to it. Both verbs return the node's leadership-shed state so tooling can confirm the transition took effect. The state also lists the recovery gate of each replica the node runs (`recovery_gates`, the meta replica's under `"meta"`) and how many data groups it leads (`leader_count`). A group's leader promotes a learner on the node only once its gate there is `open`, and the peers' leadership balancers read the count:
+`POST /__ursula/leadership-shed/maintenance` marks the node as draining: it stops campaigning and accepting transfers until the mark is lifted with `DELETE`, so no handoff and no balancer moves a leadership to it. Both verbs return the node's leadership-shed state so tooling can confirm the transition took effect. The state also lists the replicas whose group's leadership the node may take now (`takes_leadership`, the meta replica as `"meta"`), the recovery gate of each replica the node runs (`recovery_gates`), how many data groups it leads (`leader_count`) and whether it is serving-ready (`serving_ready`, as `/__ursula/ready` answers). A replica takes a leadership only while the node takes transfers, its gate lets it campaign and it acknowledged a leader of its group since the node started, and every handoff goes only to a replica listed in `takes_leadership`. A group's leader promotes a learner on the node only once its gate there is `open`, and the peers' leadership balancers read the count and move leaderships only to a serving-ready node:
 
 ```json
 {
-  "bits": 1,
+  "bits": 8,
   "state": "maintenance-drain",
   "should_accept_transfer": false,
   "should_campaign": false,
   "should_shed_current_leaders": true,
+  "takes_leadership": [],
   "recovery_gates": { "7": "open", "meta": "open" },
-  "leader_count": 3
+  "leader_count": 3,
+  "serving_ready": true
 }
 ```
 

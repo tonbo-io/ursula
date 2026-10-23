@@ -41,6 +41,7 @@ use crate::apply_failure::ApplyHealth;
 use crate::election::ElectionPolicy;
 use crate::election::IncomingTransferError;
 use crate::election::LeadershipTransferError;
+use crate::election::TransferAsk;
 use crate::history::GroupHistory;
 use crate::owner::OwnerRaftHandle;
 use crate::read_index::ReadIndexBarrier;
@@ -157,6 +158,8 @@ pub(crate) struct ReplicaCore<
         Option<crate::rt::sync::watch::Receiver<ursula_proto::placement::ReconcileStatus>>,
     /// The snapshot sends of the replica's network clients that run.
     pub(crate) snapshot_sends: crate::openraft_work::SnapshotSends,
+    /// What the target of each leadership transfer of the replica answered.
+    pub(crate) transfer_answers: crate::openraft_work::TransferAnswers,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore<SM> {
@@ -168,6 +171,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore
             apply_health: self.apply_health.clone(),
             reconcile: self.reconcile.clone(),
             snapshot_sends: self.snapshot_sends.clone(),
+            transfer_answers: self.transfer_answers.clone(),
         }
     }
 }
@@ -376,7 +380,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         Ok(())
     }
 
-    /// Hands `request` to this replica's Raft once
+    /// Hands `request`, which `ask` sent, to this replica's Raft once
     /// [`ElectionPolicy::validate_incoming_transfer`] accepts it, so the gate
     /// checked is the gate of the Raft that takes the transfer.
     pub(crate) async fn deliver_transfer(
@@ -384,12 +388,19 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         election: &ElectionPolicy,
         group: RaftGroupId,
         request: TransferLeaderRequest<C>,
+        ask: TransferAsk,
     ) -> Result<openraft::raft::TransferLeaderResponse<C>, IncomingTransferError> {
         let raft = self.owner();
         // Read first: a metrics guard held through the policy check would hold up the core's
         // next metrics update while the check takes the recovery gate's locks.
         let node_id = raft.metrics().borrow_watched().id;
-        election.validate_incoming_transfer(group, node_id, &request, self.recovery.as_deref())?;
+        election.validate_incoming_transfer(
+            group,
+            node_id,
+            &request,
+            self.recovery.as_deref(),
+            ask,
+        )?;
         raft.handle_transfer_leader(request)
             .await
             .map_err(|source| IncomingTransferError::Raft { group, source })
@@ -448,7 +459,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             maintenance: crate::types::RaftGroupMaintenanceState {
                 running,
                 recovery_ready: apply_running && recovery.is_none_or(GroupRejoin::vote_gate_open),
-                accepting_transfers: apply_running && election.may_accept_transfer(recovery),
+                accepting_transfers: self.takes_leadership(election),
                 membership_joint: membership.get_joint_config().len() != 1,
                 membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
                 stopped_for_operator: recovery.is_some_and(|rejoin| rejoin.status().is_stalled()),
@@ -487,6 +498,15 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         }
     }
 
+    /// Whether this replica may take its group's leadership from a leader
+    /// now, by the one rule ([`ElectionPolicy::may_take_leadership`]): what
+    /// its node answers for it, and what it checks a handoff against. A
+    /// replica whose apply stopped takes none.
+    pub(crate) fn takes_leadership(&self, election: &ElectionPolicy) -> bool {
+        self.apply_health.failure().is_none()
+            && election.may_take_leadership(self.recovery.as_deref())
+    }
+
     /// The Raft metrics a handoff is checked against, from one read.
     pub(crate) fn handoff_view(&self) -> RaftMetrics<C> {
         self.owner().metrics().borrow_watched().clone()
@@ -518,9 +538,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
 
     /// Hands this replica's leadership to `target` under the one handoff
     /// policy ([`Self::validate_handoff`] on one view of the metrics), and
-    /// abandons the transfer once its deadline passed without moving the
-    /// leadership. The receiver checks its own recovery gate and OpenRaft
-    /// never reports its refusal, so the deadline is the only answer.
+    /// abandons the transfer as soon as the target answers that it does not
+    /// take it, or once the transfer did not move the leadership in time
+    /// ([`OwnerRaftHandle::abandon_stalled_transfer`]): this leader then
+    /// leads again.
     pub(crate) async fn transfer_leader(
         &self,
         election: &ElectionPolicy,
@@ -530,12 +551,14 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         let metrics = self.handoff_view();
         self.validate_handoff(election, group, target, &metrics)?;
         let owner = self.owner();
+        // Subscribed before the transfer starts, so its answer is not missed.
+        let answers = self.transfer_answers.subscribe();
         owner
             .trigger()
             .transfer_leader(target)
             .await
             .map_err(|source| LeadershipTransferError::Raft { group, source })?;
-        owner.abandon_stalled_transfer(metrics.vote, target);
+        owner.abandon_stalled_transfer(metrics.vote, target, answers);
         Ok(())
     }
 
