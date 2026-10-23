@@ -10923,7 +10923,10 @@ mod leadership_shed {
                             should_campaign: true,
                             recovery_barriers_ready: true,
                             should_shed_current_leaders: false,
-                            takes_leadership: std::collections::BTreeSet::new(),
+                            // The real peer behind the stub may take every
+                            // group's leadership once the cluster is led by
+                            // node 1 (`Cluster::wait_until_may_take_over`).
+                            takes_leadership: (0..GROUPS).map(RaftTargetKey::Data).collect(),
                             recovery_gates: std::collections::BTreeMap::new(),
                             leader_count: 0,
                             serving_ready: true,
