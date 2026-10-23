@@ -64,17 +64,23 @@ identifies the Raft leader.
   connection takes longer than 1.5 s. Every `Gateway` probes its upstreams
   from its construction until its last clone is dropped.
 - **Ejection.** An upstream that fails at the transport (it refuses or times
-  out the connection, or the exchange breaks) is ejected too, and so is one
-  that sends no response headers within `--response-header-timeout`: a
-  leader that lost its quorum answers a write within its leader lease, so a
-  missing answer mostly marks a node that does not answer at all. A live
-  node can still hold a request longer (a write waiting for its group's
-  first open, a read forwarded to an unreachable leader, a snapshot commit
-  of many parts), and is then ejected although it is healthy, until it
-  answers its next probe. An ejected upstream stays out of selection until
-  it answers, a probe or a request. Requests skip it along a cached route,
-  at random, and on every hop after a redirect, a leader redirect's
-  included. A node that vanished fails within `--upstream-tcp-user-timeout`.
+  out the connection, or the exchange breaks) is ejected too. A request that
+  gets no response headers within `--response-header-timeout` ejects
+  nothing: the probes eject a node that stops answering sooner, and a live
+  node can hold one request longer (a write on a leader elected over a slow
+  link, a read forwarded to an unreachable leader, a snapshot commit of many
+  parts) while it answers every probe. An ejected upstream stays out of
+  selection until it answers, a probe or a request. Requests skip it along a
+  cached route, at random, and on every hop after a redirect, a leader
+  redirect's included. A node that vanished fails within
+  `--upstream-tcp-user-timeout`.
+- **In-flight requests.** A read or a producer append waiting on an upstream
+  when the probes eject it goes on at once to an upstream it has not tried,
+  as it does when the upstream sends nothing within
+  `--response-header-timeout`, so a write in flight to a stopped node waits
+  about 1.75 s for it rather than the whole timeout. Any other write waits
+  for its answer up to the timeout and then gets `504`, since its outcome is
+  unknown.
 - **Fallback.** If every upstream is ejected, none is: requests go along
   their cached route, or else to any upstream, and follow every redirect, as
   if nothing were ejected.
@@ -166,12 +172,14 @@ alone in `x-ursula-raft-group`:
 - When no upstream answers without redirecting within these limits, the
   client gets `503` with `Retry-After: 1`, as from a node whose group has no
   known leader.
-- A hop that gets no response headers within `--response-header-timeout` may
-  have delivered the request to a node that accepted it and never answers. A
-  read (`GET`, `HEAD`) and a producer append (a `POST` to a stream with
-  `Producer-Id`, `Producer-Epoch` and `Producer-Seq`) go on, once, to an
-  upstream the request has not tried and that is not ejected, which answers
-  or redirects to the current leader. That search starts its own 5 s
+- A hop that gets no response headers within `--response-header-timeout`,
+  or before the probes eject its upstream, may have delivered the request to
+  a node that accepted it and never answers. A read (`GET`, `HEAD`) and a
+  producer append (a `POST` to a stream with `Producer-Id`, `Producer-Epoch`
+  and `Producer-Seq`) go on, once, to an upstream the request has not tried
+  and that is not ejected, which answers or redirects to the current leader.
+  They go on at the ejection when it comes first, and wait for the timeout
+  only when no other upstream is left. That search starts its own 5 s
   redirect deadline. A producer append's key applies it at most once, but
   the first node may still apply it, so only a `2xx` receipt of the repeat
   reaches the client, and any other ending is the `504 UPSTREAM_TIMEOUT` of
