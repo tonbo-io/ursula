@@ -580,8 +580,11 @@ transfer endpoint). A follower the leader rewound is refused as lagging until
 it caught up. A target that refuses the transfer ends it at once, and so
 does a transfer whose call failed before its request left the leader (the
 target's name did not resolve or its connect failed, `Delivery::Unsent`),
-which cannot have reached the target. One that took it has one minimum
-election timeout to win. A target that already
+which cannot have reached the target. A call that failed after its request
+may have left (a reset or an HTTP/2 error, `Delivery::Lost`) counts as no
+answer, and so does a dial that hangs, since OpenRaft drops the call after
+one minimum election timeout, before the 2 s connect timeout fails the dial.
+One that took it has one minimum election timeout to win. A target that already
 holds another vote, or whose answer does not arrive, leaves the transfer one
 leader lease (3 s), since a newer election may be under way, and without any
 answer the transfer ends at two maximum election timeouts (6 s). The leader

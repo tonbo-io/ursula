@@ -581,8 +581,9 @@ pub(crate) enum TransferOutcome {
     /// race, so the old leader gives it one leader lease.
     Superseded,
     /// No answer reached the leader: the call timed out, failed after its
-    /// request may have left this node, or OpenRaft dropped the call. The
-    /// target may have taken it.
+    /// request may have left this node (a reset or an HTTP/2 error, whatever
+    /// status code it got, [`crate::grpc::Delivery::Lost`]), or OpenRaft
+    /// dropped the call. The target may have taken it.
     Unanswered,
 }
 
@@ -602,9 +603,11 @@ impl TransferOutcome {
             // answer over a working channel, and fails a transfer whose
             // request never left this node as `Network` too, OpenRaft's
             // error for a request it failed to send: neither reached the
-            // target's Raft. Another error answer reads as a refusal too,
-            // which is safe: the leader's campaign after it starts with a
-            // pre-vote, which a quorum that follows a newer leader refuses.
+            // target's Raft. A transfer that may have arrived and got no
+            // answer fails as `Unreachable`. Another error answer reads as a
+            // refusal too, which is safe: the leader's campaign after it
+            // starts with a pre-vote, which a quorum that follows a newer
+            // leader refuses.
             Err(RPCError::Network(_) | RPCError::RemoteError(_)) => Self::Refused,
             Err(RPCError::Timeout(_) | RPCError::Unreachable(_)) => Self::Unanswered,
         }

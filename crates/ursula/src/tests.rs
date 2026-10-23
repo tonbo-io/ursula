@@ -10899,6 +10899,14 @@ mod leadership_shed {
                 cluster.peers[2].clone(),
             ]),
         );
+        // Node 3 drains: it grants votes but does not campaign, so only node
+        // 1 and node 2 can win the election that follows. Node 2 stays
+        // eligible, since the leader hands a group only to a replica that may
+        // take it.
+        cluster
+            .node(3)
+            .registry
+            .mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
         let group = 0;
         let term = cluster.terms()[&group];
         let raft = node_1
@@ -10910,7 +10918,11 @@ mod leadership_shed {
         // only then. Node 3 grants node 1's first pre-vote once it handled
         // the transfer's broadcast. At worst that pre-vote reaches node 3
         // first, and node 1 repeats the round one minimum election timeout
-        // (1.5 s) later.
+        // (1.5 s) later. Node 2 can win the group only on that slow path, if
+        // its own election timer, at least 1.5 s after node 1's last
+        // heartbeat, fires before node 1's second round. The transfer and the
+        // pre-vote to node 3 share one connection and the transfer goes
+        // first, so that path is rare.
         let reelected_within = Duration::from_millis(2_500);
 
         let submitting = Instant::now();
