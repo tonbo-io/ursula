@@ -188,10 +188,11 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
 
     /// Abandons the leadership transfer to `target` this leader submitted at
     /// `vote` unless it moves the leadership: at once when the target
-    /// answers that it does not take it ([`TransferOutcome::Refused`] in
-    /// `answers`, subscribed before the transfer started), within one
-    /// minimum election timeout of a target's answer that it does, within
-    /// one leader lease of the transfer when the target already holds
+    /// answers that it does not take it, or the transfer never left this
+    /// node ([`TransferOutcome::Refused`] in `answers`, subscribed before
+    /// the transfer started), within one minimum election timeout of a
+    /// target's answer that it does, within one leader lease of the
+    /// transfer when the target already holds
     /// another vote ([`TransferOutcome::Superseded`]) or its answer is lost,
     /// which leaves a newer election or the target's own campaign that
     /// long, and otherwise once the transfer deadline passed
@@ -206,9 +207,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     /// ([`step_down_then_elect`]), so it never raises the term past a leader
     /// a quorum already follows. A voter that handled the transfer's
     /// broadcast dropped its lease of this leader and grants the round at
-    /// once. A target that refused the transfer never handed it to its Raft,
-    /// so it keeps that lease and refuses the round until the lease lapses,
-    /// one lease after this leader's last heartbeat. So the leader repeats
+    /// once. A target that refused the transfer, or never got it, never
+    /// handed it to its Raft, so it keeps that lease and refuses the round
+    /// until the lease lapses, one lease after this leader's last
+    /// heartbeat. So the leader repeats
     /// the round every minimum election timeout until a leader is known
     /// ([`lead_again`]), whatever its election switch says: with a voter
     /// that took the broadcast it leads again within a round, and otherwise

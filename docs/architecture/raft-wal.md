@@ -577,8 +577,11 @@ instead of being refused before the proposal.
 within one minimum election timeout (1.5 s) and holds every committed entry
 (`ElectionPolicy::validate_handoff`, used by every planner and the admin
 transfer endpoint). A follower the leader rewound is refused as lagging until
-it caught up. A target that refuses the transfer ends it at once, and one
-that took it has one minimum election timeout to win. A target that already
+it caught up. A target that refuses the transfer ends it at once, and so
+does a transfer whose call failed before its request left the leader (the
+target's name did not resolve or its connect failed, `Delivery::Unsent`),
+which cannot have reached the target. One that took it has one minimum
+election timeout to win. A target that already
 holds another vote, or whose answer does not arrive, leaves the transfer one
 leader lease (3 s), since a newer election may be under way, and without any
 answer the transfer ends at two maximum election timeouts (6 s). The leader

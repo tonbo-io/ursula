@@ -10873,6 +10873,68 @@ mod leadership_shed {
         cluster.shutdown().await;
     }
 
+    /// A leadership transfer whose call cannot reach its target never got
+    /// there, so node 1 leads the group again at once, as after a refusal,
+    /// instead of waiting out a leader lease while it serves nothing. Every
+    /// new client of node 1 dials node 2 at an address nothing listens on, as
+    /// a leader dials a peer that restarted a moment ago while its name does
+    /// not resolve yet. Replication keeps the channel it has, so node 2
+    /// still answers node 1's appends and passes the handoff checks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transfer_that_cannot_reach_its_target_is_taken_back_at_once() {
+        let cluster = Cluster::led_by_node_1().await;
+        let node_1 = cluster.node_1();
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            format!("http://{}", listener.local_addr().expect("local addr"))
+        };
+        let peer_cluster = node_1.registry.peer_cluster();
+        peer_cluster.bind(
+            peer_cluster.identity().expect("node 1 is bound"),
+            crate::shared_peers([
+                cluster.peers[0].clone(),
+                (2, closed),
+                cluster.peers[2].clone(),
+            ]),
+        );
+        let group = 0;
+        let term = cluster.terms()[&group];
+        let raft = node_1
+            .registry
+            .get(RaftGroupId(group))
+            .expect("registered group");
+        // Without the target's answer node 1 would keep the transfer for one
+        // leader lease (3 s, the maximum election timeout) and lead again
+        // only then. Node 3 grants node 1's first pre-vote once it handled
+        // the transfer's broadcast. At worst that pre-vote reaches node 3
+        // first, and node 1 repeats the round one minimum election timeout
+        // (1.5 s) later.
+        let reelected_within = Duration::from_millis(2_500);
+
+        let submitting = Instant::now();
+        node_1
+            .registry
+            .transfer_leader(RaftGroupId(group), 2)
+            .await
+            .expect("node 2 answers node 1's appends, so it may take the group");
+        raft.wait(Some(reelected_within))
+            .metrics(
+                move |metrics| metrics.current_leader == Some(1) && metrics.current_term > term,
+                "node 1 leads again at once",
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "node 1 does not lead group {group} again within {reelected_within:?} of a \
+                     transfer that never reached node 2 ({:?} ago): {err}",
+                    submitting.elapsed()
+                )
+            });
+        cluster.shutdown().await;
+    }
+
     /// An address that accepts connections and never answers, as long as
     /// the returned listener lives.
     async fn silent_url() -> (String, tokio::net::TcpListener) {
