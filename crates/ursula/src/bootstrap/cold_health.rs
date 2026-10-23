@@ -24,7 +24,8 @@ use crate::bootstrap::participation::PeerParticipation;
 ///
 /// Either condition sustained for `unhealthy_ticks` ticks triggers a soft
 /// shed: the node hands off the groups it leads, a few per tick and the
-/// hottest first, to peers that may campaign, but it stays campaign-eligible.
+/// hottest first, each to a peer whose replica of the group may take its
+/// leadership, but it stays campaign-eligible.
 /// Cold-health is often cluster-wide during backlog; disabling elections on
 /// every hot peer can freeze leadership movement. The node heals when error
 /// growth stops AND hot_max drops below HOT_LOW for `heal_ticks` ticks.

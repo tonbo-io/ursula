@@ -4529,7 +4529,8 @@ async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
 /// transfer to this node is refused when it carries this node's committed
 /// vote, because this node already leads, or when this node may not
 /// campaign. Its own uncommitted vote, or another node's committed vote,
-/// passes.
+/// passes. A leader's handoff also needs the replica to have acknowledged
+/// a leader of its group in this run, which a self-election does not.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
@@ -4608,6 +4609,36 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
             &transfer(leader_vote, 3),
             Some(&gate),
             TransferAsk::Handoff,
+        ),
+        Ok(())
+    ));
+
+    // A replica whose gate is open but that acknowledged no leader in this
+    // run may campaign: it takes a self-election, and no handoff.
+    let (_open_root, open_store) = fresh_journal_store();
+    let open = GroupRejoin::durable(node, ursula_shard::RaftTarget::Data(group), &open_store)
+        .await
+        .unwrap();
+    open.allow_fresh_bootstrap().await.unwrap();
+    assert!(open.may_campaign());
+    assert!(!policy.may_take_leadership(Some(&open)));
+    assert!(matches!(
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, node),
+            Some(&open),
+            TransferAsk::Handoff,
+        ),
+        Err(IncomingTransferError::LeaderNotAcknowledged { .. })
+    ));
+    assert!(matches!(
+        policy.validate_incoming_transfer(
+            group,
+            node,
+            &transfer(leader_vote, node),
+            Some(&open),
+            TransferAsk::SelfElection,
         ),
         Ok(())
     ));

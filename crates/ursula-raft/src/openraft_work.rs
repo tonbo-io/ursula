@@ -574,8 +574,8 @@ pub(crate) enum TransferOutcome {
     Refused,
     /// It already holds another vote than the leader's
     /// ([`TransferLeaderError::VoteChanged`]): a newer
-    /// election may already have a leader, which a campaign of the old
-    /// leader could unseat.
+    /// election may be under way, which a campaign of the old leader would
+    /// race, so the old leader gives it one leader lease.
     Superseded,
     /// No answer reached the leader: the call timed out, the target was
     /// unreachable, or OpenRaft dropped the call. The target may have
@@ -1017,15 +1017,53 @@ where LS: RaftLogStorage<UrsulaRaftTypeConfig>
 mod tests {
     use std::time::Duration;
 
+    use openraft::error::NetworkError;
+    use openraft::error::RPCError;
+    use openraft::raft::TransferLeaderError;
     use ursula_runtime::GroupInfraError;
     use ursula_shard::RaftGroupId;
     use ursula_shard::RaftTarget;
 
+    use super::EngineStopped;
     use super::EngineWorkLedger;
     use super::OpenRaftWork;
+    use super::TransferOutcome;
     use super::WorkAdmission;
     use super::WorkKind;
     use super::WorkToken;
+
+    /// Only an answer that the target does not campaign is a refusal, which
+    /// ends the transfer at once. A target that holds another vote, and a
+    /// call that got no answer, may still see a leader elected.
+    #[test]
+    fn a_transfer_answer_reads_as_its_outcome() {
+        let leader = crate::UrsulaVote::new_committed(5, 1);
+        let cases = [
+            (Ok(Ok(())), TransferOutcome::Taken),
+            (
+                Ok(Err(TransferLeaderError::VoteChanged {
+                    expected: leader,
+                    actual: crate::UrsulaVote::new(6, 3),
+                })),
+                TransferOutcome::Superseded,
+            ),
+            (
+                Ok(Err(TransferLeaderError::LogNotFlushed {
+                    expected: None,
+                    actual: None,
+                })),
+                TransferOutcome::Refused,
+            ),
+            (
+                Err(RPCError::Network(NetworkError::new(&EngineStopped))),
+                TransferOutcome::Refused,
+            ),
+            (Err(super::engine_stopped()), TransferOutcome::Unanswered),
+        ];
+        for (answer, outcome) in cases {
+            assert_eq!(TransferOutcome::of(&answer), outcome, "{answer:?}");
+        }
+    }
 
     #[tokio::test]
     async fn stop_waits_for_every_token() {

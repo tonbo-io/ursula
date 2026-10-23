@@ -579,11 +579,14 @@ within one minimum election timeout (1.5 s) and holds every committed entry
 transfer endpoint). A follower the leader rewound is refused as lagging until
 it caught up. A target that refuses the transfer ends it at once, and one
 that took it has one minimum election timeout to win. A target that already
-holds another vote, or whose answer does not arrive, leaves the transfer two
-maximum election timeouts (6 s), since a newer election may be under way. The
-leader then steps down and campaigns with a pre-vote round, so it never raises
-the term past a leader a quorum follows, and the voters that took the
-transfer's broadcast grant its vote.
+holds another vote, or whose answer does not arrive, leaves the transfer one
+leader lease (3 s), since a newer election may be under way, and without any
+answer the transfer ends at two maximum election timeouts (6 s). The leader
+then steps down and campaigns with a pre-vote round, so it never raises the
+term past a leader a quorum follows, and repeats the round every minimum
+election timeout until a leader is known. A voter that handled the
+transfer's broadcast grants it at once, and the target that refused grants
+it once its lease of the leader lapsed.
 
 **Stall and accept-unsynced-loss.** A gated replica with no barrier and no
 apply for 30 s reports its group stalled: a majority may be gated, so the group

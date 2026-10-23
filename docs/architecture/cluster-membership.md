@@ -354,12 +354,18 @@ abandons the transfer. Its network clients record what the target answered
 (`openraft_work::TransferOutcome`). A target that refuses the transfer ends
 it at once, and one that took it has one minimum election timeout to win. A
 target that already holds another vote, or whose answer does not arrive,
-leaves the transfer two maximum election timeouts, since a newer election may
-be under way. The leader then steps down and campaigns with a pre-vote round
+leaves the transfer one leader lease, since a newer election may be under
+way, and without any answer the transfer ends at two maximum election
+timeouts. The leader then steps down and campaigns with a pre-vote round
 (`OwnerRaftHandle::abandon_stalled_transfer`), so it never raises the term
-past a leader a quorum follows. The voters that took the transfer's broadcast
-dropped their lease of it and grant its vote, so a refused transfer costs the
-group one election.
+past a leader a quorum follows. It repeats the round every minimum election
+timeout until a leader is known, whatever its election switch says. A voter
+that handled the transfer's broadcast dropped its lease of the leader and
+grants the round at once. A target that refused the transfer never handed it
+to OpenRaft, so it keeps its lease and grants the round only once the lease
+has lapsed, one maximum election timeout after the leader's last heartbeat.
+A refused transfer costs the group one election, and at most one lease when
+no other voter took the broadcast.
 
 A meta outage leaves the layout as meta left it. While the meta group has no
 live quorum no meta read barrier passes, and every voter change and every

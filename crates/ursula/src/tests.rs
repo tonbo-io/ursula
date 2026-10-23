@@ -10761,11 +10761,13 @@ mod leadership_shed {
 
         // Each target refuses its transfer at once, and node 1 abandons it
         // at the refusal: it leads the group again in a newer term within
-        // one election, which its draining peers grant. At worst its first
-        // pre-vote reaches the other peer before that peer's copy of the
-        // transfer did, and its next round, one election timeout (at most
-        // 3 s) later, wins. No peer campaigns, so without the refusal only
-        // the 6 s transfer deadline would end the transfer.
+        // one election, which node 3 grants once it handled the transfer's
+        // broadcast. At worst node 1's first pre-vote reaches node 3 before
+        // that broadcast did. Node 1 sheds, so its election timers are off,
+        // but it repeats the round itself one minimum election timeout
+        // (1.5 s) later, and that round wins. No peer campaigns, so without
+        // the refusal only the 6 s transfer deadline would end the
+        // transfer.
         let reelected_within = Duration::from_millis(4_500);
         assert!(
             reelected_within < settle,

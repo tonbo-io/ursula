@@ -585,7 +585,7 @@ impl RaftGroupHandleRegistry {
     /// ([`ElectionPolicy::may_take_leadership`]). OpenRaft never acts on its
     /// answer, so this leader reads it: a refusal ends the transfer at once
     /// and the leader campaigns to lead again, and a transfer that neither
-    /// moves the leadership nor is refused is abandoned at its deadline
+    /// moves the leadership nor is refused is abandoned at its bound
     /// ([`crate::owner::OwnerRaftHandle::abandon_stalled_transfer`]).
     pub async fn transfer_leader(
         &self,

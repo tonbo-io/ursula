@@ -189,7 +189,8 @@ pub(crate) fn balance_inputs(
 /// the shipped timeouts), so within the grace each leadership is submitted
 /// at most once. Its shed also takes on the leaderships the node gains
 /// while it runs. The drain mark it sets holds until the process exits
-/// ([`ShedMark::UntilExit`]), so the node does not campaign again, and makes
+/// ([`ShedMark::UntilExit`]), so the node's election timers start no
+/// campaign again, and makes
 /// the meta shed hand meta's leadership away (`super::meta_shed`), the one
 /// place meta's leadership is handed off.
 ///
@@ -198,7 +199,11 @@ pub(crate) fn balance_inputs(
 ///
 /// Answers how many leaderships are left here. When some are once the
 /// grace ends, it reports each with the handoff check's last refusals, and
-/// the caller steps the node down from them
+/// the caller steps the node down from them, then shuts the Raft transport
+/// down. A leader whose handoff is refused still campaigns to lead again
+/// (`OwnerRaftHandle::abandon_stalled_transfer`), so the group is not left
+/// leaderless, and a leadership it regains so counts as left and is
+/// stepped down from at the end
 /// (`RaftGroupHandleRegistry::step_down_leaderships`). Enqueuing a transfer
 /// is not completion: a group counts until another node leads it.
 pub(crate) async fn handoff_shutdown_leadership(
