@@ -400,6 +400,9 @@ const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// Translate SIGTERM (systemd stop, Kubernetes pod termination) and Ctrl-C
 /// into a bounded leadership handoff followed by listener draining, after
 /// which `serve` stops the Raft groups and shuts the WAL down cleanly. A
+/// leadership the handoff did not move within [`SHUTDOWN_HANDOFF_GRACE`] is
+/// stepped down from before the drain, so the node leads nothing while its
+/// listeners close. A
 /// second signal, or the overall grace deadline expiring, exits immediately
 /// without recording a clean shutdown, so the next start treats the run as a
 /// crash.
@@ -427,6 +430,12 @@ fn spawn_shutdown_signal_task(
                     } else {
                         tracing::warn!(remaining_leaders, timed_out = result.is_err(),
                             "shutdown leadership handoff incomplete; continuing bounded shutdown");
+                        // The node is about to stop serving: what the handoff
+                        // did not move it gives up, so its peers elect now
+                        // rather than after the listener drain.
+                        let stepped_down = registry.step_down_leaderships().await;
+                        tracing::warn!(stepped_down,
+                            "shutdown: stepped down from the leaderships the handoff did not move");
                     }
                     registry.shutdown_transport();
                 }

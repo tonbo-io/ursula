@@ -3724,48 +3724,61 @@ fn spawn_per_group_node(
     (guard, admin_port)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
-    let _guard = static_cluster_cli_test_guard().await;
-    let binary = env!("CARGO_BIN_EXE_ursula");
-    let ports = [free_port(), free_port(), free_port()];
-    let peers = ports
-        .iter()
-        .zip(1_u64..)
-        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
-        .collect::<Vec<_>>();
-    let wal_root = tempfile::tempdir().expect("WAL root");
-    let mut children = Vec::new();
-    let mut nodes = Vec::new();
-    for (node_id, url) in &peers {
-        let (child, admin_port) = spawn_per_group_node(
-            binary,
-            *node_id,
-            node_port(&ports, *node_id),
-            &peers,
-            wal_root.path(),
-        );
-        children.push(child);
-        nodes.push(ctl_node(*node_id, admin_port, url));
+/// A running cluster of three per-group nodes ([`spawn_per_group_node`]),
+/// each ready, with its WAL root.
+struct PerGroupCluster {
+    children: Vec<ChildGuard>,
+    nodes: Vec<ursula_ctl::NodeInfo>,
+    peers: Vec<(u64, String)>,
+    _wal_root: tempfile::TempDir,
+}
+
+impl PerGroupCluster {
+    async fn start(binary: &str, client: &reqwest::Client) -> Self {
+        let ports = [free_port(), free_port(), free_port()];
+        let peers = ports
+            .iter()
+            .zip(1_u64..)
+            .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+            .collect::<Vec<_>>();
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let mut children = Vec::new();
+        let mut nodes = Vec::new();
+        for (node_id, url) in &peers {
+            let (child, admin_port) = spawn_per_group_node(
+                binary,
+                *node_id,
+                node_port(&ports, *node_id),
+                &peers,
+                wal_root.path(),
+            );
+            children.push(child);
+            nodes.push(ctl_node(*node_id, admin_port, url));
+        }
+        for (_, url) in &peers {
+            wait_until_ready(client, url, &mut children).await;
+        }
+        Self {
+            children,
+            nodes,
+            peers,
+            _wal_root: wal_root,
+        }
     }
-    let client = reqwest::Client::new();
-    for (_, url) in &peers {
-        wait_until_ready(&client, url, &mut children).await;
-    }
-    for index in 0..6 {
-        put_with_body_until_created(
-            &client,
-            &format!("{}/benchcmp/sigterm-{index}", peers[0].1),
-            "acknowledged-before-sigterm",
-        )
-        .await;
-    }
-    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).expect("ctl client");
+}
+
+/// Waits until every one of `nodes` names a leader for each of the six
+/// groups of a per-group cluster and is ready for maintenance, and answers
+/// that view.
+async fn wait_per_group_leaders(
+    ctl: &ursula_ctl::MetricsClient,
+    nodes: &[ursula_ctl::NodeInfo],
+) -> ursula_ctl::ClusterSnapshot {
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(60))
         .unwrap();
-    let snapshot = loop {
-        let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
+    loop {
+        let snapshot = ctl.fetch_cluster(nodes).await.expect("fetch cluster");
         if nodes.iter().all(|node| {
             snapshot.node(node.id).is_some_and(|view| {
                 view.groups.len() == 6
@@ -3776,14 +3789,37 @@ async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
             }) && ursula_ctl::plan::check_readiness(&snapshot, &(0..6).collect(), node.id, 0)
                 .all_ready
         }) {
-            break snapshot;
+            return snapshot;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "cluster not caught up: {snapshot:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let client = reqwest::Client::new();
+    let PerGroupCluster {
+        mut children,
+        mut nodes,
+        peers,
+        _wal_root,
+    } = PerGroupCluster::start(binary, &client).await;
+    for index in 0..6 {
+        put_with_body_until_created(
+            &client,
+            &format!("{}/benchcmp/sigterm-{index}", peers[0].1),
+            "acknowledged-before-sigterm",
+        )
+        .await;
+    }
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).expect("ctl client");
+    let snapshot = wait_per_group_leaders(&ctl, &nodes).await;
     let leader_count = |node_id| {
         snapshot
             .node(node_id)
@@ -3843,6 +3879,159 @@ async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
         .unwrap();
     drop(children.remove(1 - leader_index));
     sigterm_and_wait_for_clean_exit(&mut children[0]).await;
+}
+
+/// A voter that stops while no peer may take its leaderships cannot hand
+/// them off: both peers answer that they are drained. Once its handoff
+/// grace ends it steps down from them, so its peers, undrained then, elect
+/// leaders while it still drains its listeners (a live read it serves
+/// holds the drain open), not only once its Raft stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_sigterm_steps_down_from_leaderships_it_could_not_hand_off() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let client = reqwest::Client::new();
+    let PerGroupCluster {
+        mut children,
+        nodes,
+        peers,
+        _wal_root,
+    } = PerGroupCluster::start(binary, &client).await;
+    let map = ursula_shard::StaticShardMap::new(1, 6).expect("shard map");
+    let streams: BTreeMap<u32, String> = (0_u32..)
+        .map(|candidate| format!("step-down-{candidate}"))
+        .map(|stream| {
+            let group = map
+                .locate(&ursula_shard::BucketStreamId::new("benchcmp", &stream))
+                .raft_group_id;
+            (group.0, stream)
+        })
+        .scan(BTreeMap::new(), |found, (group, stream)| {
+            found.entry(group).or_insert(stream);
+            Some(found.clone())
+        })
+        .find(|found| found.len() == 6)
+        .expect("a stream of every group");
+    for stream in streams.values() {
+        put_with_body_until_created(
+            &client,
+            &format!("{}/benchcmp/{stream}", peers[0].1),
+            "before-sigterm",
+        )
+        .await;
+    }
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).expect("ctl client");
+    let snapshot = wait_per_group_leaders(&ctl, &nodes).await;
+    let leader_of = |node_id: u64| -> Vec<u64> {
+        snapshot
+            .node(node_id)
+            .unwrap()
+            .groups
+            .iter()
+            .filter(|group| group.current_leader == Some(node_id))
+            .map(|group| group.raft_group_id)
+            .collect()
+    };
+    let index = (0..nodes.len())
+        .max_by_key(|index| leader_of(nodes[*index].id).len())
+        .unwrap();
+    let outgoing = nodes[index].id;
+    let led = leader_of(outgoing);
+    let held_group = u32::try_from(*led.first().expect("the outgoing node leads a group")).unwrap();
+    let peers_left: Vec<ursula_ctl::NodeInfo> = nodes
+        .iter()
+        .filter(|node| node.id != outgoing)
+        .cloned()
+        .collect();
+    for peer in &peers_left {
+        ctl.set_maintenance_drain(peer, true)
+            .await
+            .expect("drain a peer");
+    }
+    // A live read the outgoing node serves as its group's leader keeps its
+    // listener drain going for the drain's whole bound.
+    let live_read = client
+        .get(format!(
+            "{}/benchcmp/{}?offset=-1&live=sse",
+            peers[index].1, streams[&held_group]
+        ))
+        .send()
+        .await
+        .expect("open a live read");
+    assert_eq!(live_read.status(), reqwest::StatusCode::OK);
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(children[index].child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+    let log_path = children[index].stderr_path.clone();
+    let read_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(15))
+        .unwrap();
+    while !read_log().contains("shutdown leadership handoff incomplete") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the handoff did not end incomplete: {}",
+            read_log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let gave_up = std::time::Instant::now();
+    for peer in &peers_left {
+        ctl.set_maintenance_drain(peer, false)
+            .await
+            .expect("undrain a peer");
+    }
+    // Two election timeouts at most (3 s each), well inside the 10 s
+    // listener drain the live read holds open.
+    let elected_by = gave_up.checked_add(Duration::from_secs(6)).unwrap();
+    loop {
+        let snapshot = ctl.fetch_cluster(&peers_left).await.expect("fetch peers");
+        let moved = led.iter().all(|group_id| {
+            snapshot.per_node.iter().all(|view| {
+                view.group(*group_id)
+                    .and_then(|group| group.current_leader)
+                    .is_some_and(|leader| leader != outgoing)
+            })
+        });
+        if moved {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < elected_by,
+            "the peers still follow the stopping node: {snapshot:?}\n{}",
+            read_log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(live_read);
+    let log = read_log();
+    assert!(
+        log.contains("shutdown: stepped down from the leaderships the handoff did not move"),
+        "{log}"
+    );
+    assert!(
+        log.contains("no peer can take over these leaderships now"),
+        "{log}"
+    );
+    let mut outgoing_child = children.remove(index);
+    let exit_by = std::time::Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .unwrap();
+    let exit = loop {
+        if let Some(status) = outgoing_child.child.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < exit_by,
+            "the stopping node did not exit: {}",
+            child_report(&outgoing_child)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(exit.success(), "unclean shutdown: {exit}; {}", read_log());
 }
 
 /// The data groups of every meta test cluster.

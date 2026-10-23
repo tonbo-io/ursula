@@ -300,16 +300,6 @@ impl PeerParticipation {
         }
     }
 
-    /// The nodes known to be allowed to campaign
-    /// ([`CampaignStances::may_campaign`]). A peer that does not answer in
-    /// time is left out.
-    pub(crate) async fn campaign_eligible_nodes(
-        &self,
-        registry: &RaftGroupHandleRegistry,
-    ) -> HashSet<u64> {
-        self.campaign_stances(registry).await.may_campaign()
-    }
-
     /// Each answering peer's WAL-disk state, `true` when its answer says it
     /// sheds leadership for WAL disk pressure. A peer that does not answer
     /// in time, or answers for another cluster, is left out: its state is
@@ -597,10 +587,6 @@ mod tests {
         assert_eq!(stances.of(3), Some(CampaignStance::MayNotCampaign));
         assert_eq!(stances.of(4), Some(CampaignStance::Unknown));
         assert_eq!(stances.may_campaign(), HashSet::from([1, 2]));
-        assert_eq!(
-            participation.campaign_eligible_nodes(&registry).await,
-            HashSet::from([1, 2])
-        );
 
         // This node reads its own policy.
         registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);

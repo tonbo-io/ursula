@@ -27,9 +27,14 @@ use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
 
+use crate::bootstrap::health_gate::LeadershipShed;
+use crate::bootstrap::health_gate::ShedPace;
 use crate::bootstrap::participation::CampaignStances;
 use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::util::handoff_targets;
+
+/// How long the shutdown handoff waits between its steps.
+const SHUTDOWN_HANDOFF_STEP: Duration = Duration::from_millis(50);
 
 /// One planned leader handoff for the M1 balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,18 +157,34 @@ pub(crate) fn balance_inputs(
     })
 }
 
-/// Best-effort shutdown handoff while Raft transport is still available.
-/// It waits for the data groups' leaderships and the meta group's to leave:
-/// it hands the data groups' away itself, and the drain mark it sets makes
-/// the meta shed hand meta's away (`super::meta_shed`), the one place meta's
-/// leadership is handed off.
-/// The caller bounds the whole operation, including peer discovery and waiting
-/// for observed leadership changes. Enqueuing a transfer is not completion.
+/// The shutdown handoff, while Raft transport is still available: the
+/// maintenance-drain shed of every leadership this node holds, at once
+/// ([`LeadershipShed`], [`ShedPace::AllAtOnce`]), the drain the health
+/// gates run. Each step asks the peers which of them may take a transfer
+/// and submits every queued leadership to one of them that the registry's
+/// handoff check accepts, so a leadership no peer could take on one step is
+/// tried again on the next, on another target once a submitted handoff
+/// stalled, and the groups no peer can take are reported with the check's
+/// refusals. The drain mark it sets holds until the process exits
+/// ([`LeadershipShed::until_exit`]), so the node does not campaign again,
+/// and makes the meta shed hand meta's leadership away (`super::meta_shed`),
+/// the one place meta's leadership is handed off.
+///
+/// It returns once no leadership is left here; the caller bounds it, and
+/// steps the node down from what is left
+/// (`RaftGroupHandleRegistry::step_down_leaderships`). Enqueuing a transfer
+/// is not completion: a group counts until another node leads it.
 pub(crate) async fn handoff_shutdown_leadership(
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
 ) -> usize {
-    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    let mut shed = LeadershipShed::until_exit(
+        registry,
+        LeadershipShedReason::MaintenanceDrain,
+        node_id,
+        ShedPace::AllAtOnce,
+    );
+    shed.begin();
     let led_groups: HashSet<_> = registry
         .metrics_snapshot()
         .iter()
@@ -202,50 +223,13 @@ pub(crate) async fn handoff_shutdown_leadership(
             return remaining_leaders();
         }
     };
-    let mut submitted = HashSet::new();
     loop {
-        let snapshots = registry.metrics_snapshot();
         if remaining_leaders() == 0 {
             return 0;
         }
-        let eligible = participation.campaign_eligible_nodes(registry).await;
-        let counts = crate::bootstrap::util::leader_counts(&snapshots);
-        let view = registry.placement_watch().current();
-        for snapshot in snapshots {
-            if snapshot.current_leader != Some(node_id)
-                || submitted.contains(&snapshot.raft_group_id)
-            {
-                continue;
-            }
-            let group = RaftGroupId(snapshot.raft_group_id);
-            for target in crate::bootstrap::util::prioritized_transfer_targets(
-                &snapshot,
-                node_id,
-                view.cluster(),
-                |node| eligible.contains(&node),
-                &counts,
-            ) {
-                if registry.check_handoff(group, target).is_err() {
-                    continue;
-                }
-                match registry
-                    .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
-                    .await
-                {
-                    Ok(()) => {
-                        submitted.insert(snapshot.raft_group_id);
-                        break;
-                    }
-                    Err(err) => tracing::warn!(
-                        raft_group_id = snapshot.raft_group_id,
-                        target,
-                        %err,
-                        "shutdown: leadership transfer request failed"
-                    ),
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stances = participation.campaign_stances(registry).await;
+        shed.step(&stances.shed_targets(), &[]).await;
+        tokio::time::sleep(SHUTDOWN_HANDOFF_STEP).await;
     }
 }
 

@@ -245,6 +245,30 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         }
     }
 
+    /// Steps this replica down from the leadership it holds, without
+    /// campaigning ([`step_down`]), to the lowest other voter of its
+    /// membership: the vote it grants itself names that voter, which still
+    /// has to win its own election. `None` when the replica does not lead,
+    /// or is its group's only voter, which no other voter could take over
+    /// from.
+    pub(crate) async fn step_down_leadership(&self) -> Option<Result<StepDownVote, StepDownError>> {
+        let metrics = self.metrics.borrow_watched().clone();
+        if metrics.current_leader != Some(metrics.id) {
+            return None;
+        }
+        let target = metrics
+            .membership_config
+            .voter_ids()
+            .find(|voter| *voter != metrics.id)?;
+        let vote = metrics.vote;
+        Some(
+            self.call(move |raft| async move { step_down(&raft, vote, target).await })
+                .await
+                .map_err(|stopped| StepDownError::Vote(RaftError::Fatal(stopped)))
+                .and_then(|stepped| stepped),
+        )
+    }
+
     /// Starts a new term with this leader's own campaign. It steps down
     /// first, to `target`, as [`Self::abandon_stalled_transfer`] does
     /// ([`step_down_and_campaign`]). `target` must be another node. A
@@ -475,7 +499,19 @@ pub enum StepDown {
     Refused { by: UrsulaVote },
 }
 
-/// Why a leader's [`step_down_and_campaign`] did not finish.
+/// How a leader's [`step_down`] vote went.
+#[derive(Debug)]
+pub(crate) enum StepDownVote {
+    /// The leader granted itself the step-down vote, which dropped its
+    /// leader state.
+    Granted,
+    /// The node already holds a vote above the step-down vote: the
+    /// leadership moved on without this step-down.
+    Refused { by: UrsulaVote },
+}
+
+/// Why a leader's step-down ([`step_down`], [`step_down_and_campaign`]) did
+/// not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum StepDownError {
     #[error("submit the step-down vote")]
@@ -488,17 +524,16 @@ pub enum StepDownError {
     TargetIsSelf { target: u64 },
 }
 
-/// Steps the leader at `vote` down to `target`, then campaigns.
-///
-/// OpenRaft ignores `elect` on a leader (#721). So the leader first grants
-/// itself [`transfer_step_down`], which drops the leader state as for any
-/// follower, and campaigns only then. `target` must be another node
-/// ([`StepDownError::TargetIsSelf`]).
-pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
+/// Steps the leader at `vote` down to `target` without campaigning: it
+/// grants itself [`transfer_step_down`], which drops the leader state as for
+/// any follower. It sends no heartbeat from then on, so the other voters
+/// elect a leader once their election timeout passes. `target` must be
+/// another node ([`StepDownError::TargetIsSelf`]).
+pub(crate) async fn step_down<SM: RaftStateMachine<C>>(
     raft: &Raft<C, SM>,
     vote: UrsulaVote,
     target: u64,
-) -> Result<StepDown, StepDownError> {
+) -> Result<StepDownVote, StepDownError> {
     if raft.metrics().borrow_watched().id == target {
         return Err(StepDownError::TargetIsSelf { target });
     }
@@ -508,9 +543,24 @@ pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
         .await
         .map_err(StepDownError::Vote)?;
     if !stepped_down.vote_granted {
-        return Ok(StepDown::Refused {
+        return Ok(StepDownVote::Refused {
             by: stepped_down.vote,
         });
+    }
+    Ok(StepDownVote::Granted)
+}
+
+/// Steps the leader at `vote` down to `target`, then campaigns.
+///
+/// OpenRaft ignores `elect` on a leader (#721). So the leader first steps
+/// down ([`step_down`]) and campaigns only then.
+pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
+    vote: UrsulaVote,
+    target: u64,
+) -> Result<StepDown, StepDownError> {
+    if let StepDownVote::Refused { by } = step_down(raft, vote, target).await? {
+        return Ok(StepDown::Refused { by });
     }
     raft.trigger()
         .elect(false)

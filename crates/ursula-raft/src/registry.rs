@@ -725,6 +725,60 @@ impl RaftGroupHandleRegistry {
         self.transport_shutdown.send_replace(true);
     }
 
+    /// Steps this node down from every leadership it still holds, of the
+    /// data groups and of meta, without campaigning
+    /// ([`OwnerRaftHandle::step_down_leadership`]). Its replicas stop
+    /// sending heartbeats, so the other voters of each group elect a leader
+    /// once their election timeout passes. A shutdown calls it when its
+    /// handoff ends: a node about to stop must not keep leaderships its
+    /// peers would go on following while it drains its listeners. A group
+    /// whose only voter is this node keeps its leader. Answers how many
+    /// leaderships it stepped down from.
+    pub async fn step_down_leaderships(&self) -> usize {
+        let groups = self.groups.load();
+        let data =
+            groups
+                .iter()
+                .filter_map(|(id, entry)| {
+                    Some((RaftTarget::Data(RaftGroupId(*id)), entry.active()?))
+                })
+                .map(|(target, active)| async move {
+                    (target, active.raft().step_down_leadership().await)
+                })
+                .map(futures_util::FutureExt::boxed);
+        let meta = self.meta().map(|meta| {
+            futures_util::FutureExt::boxed(async move {
+                (
+                    RaftTarget::Meta,
+                    meta.core.owner().step_down_leadership().await,
+                )
+            })
+        });
+        let outcomes = futures_util::future::join_all(data.chain(meta)).await;
+        let mut stepped_down = 0_usize;
+        for (target, outcome) in outcomes {
+            match outcome {
+                None => {}
+                Some(Ok(crate::owner::StepDownVote::Granted)) => {
+                    stepped_down = stepped_down.saturating_add(1);
+                }
+                Some(Ok(crate::owner::StepDownVote::Refused { by })) => tracing::debug!(
+                    plane = target.plane().as_str_name(),
+                    raft_group_id = target.wire_group_id(),
+                    refused_by = %by,
+                    "step-down: the leadership moved on already"
+                ),
+                Some(Err(error)) => tracing::warn!(
+                    plane = target.plane().as_str_name(),
+                    raft_group_id = target.wire_group_id(),
+                    %error,
+                    "step-down: could not step down from a leadership"
+                ),
+            }
+        }
+        stepped_down
+    }
+
     pub(crate) fn subscribe_transport_shutdown(&self) -> watch::Receiver<bool> {
         self.transport_shutdown.subscribe()
     }
