@@ -3,8 +3,8 @@ description: >-
   Before a job that used .github/actions/ci-s3 in AWS mode uploads a directory: replaces the bucket,
   the role ARN and the account id in its files with <redacted>, then fails if any of them, or the
   session's AWS credentials, still appear. Secret masking covers logs, not artifacts, and server
-  logs can name the bucket. Run it only when URSULA_S3_PREFIX is set, and upload only when it did
-  not fail.
+  logs can name the bucket. Run it only when URSULA_S3_PREFIX is set, and upload only when it
+  succeeded (a cancelled run of it leaves the directory unchecked).
 inputs:
   dir: { description: "The directory about to be uploaded (a missing one passes)", required: true }
   role-arn: { description: "secrets.URSULA_CI_AWS_ROLE_ARN", required: false, default: "" }

@@ -174,7 +174,7 @@ jobs:
           role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
 
       - name: Upload soak logs
-        if: always() && steps.leak.outcome != 'failure'
+        if: always() && (steps.leak.outcome == 'success' || env.URSULA_S3_PREFIX == '')
         uses: actions/upload-artifact@v6
         with:
           name: soak-logs
