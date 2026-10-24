@@ -125,7 +125,15 @@ impl Run {
         const PHASE: &str = "reuse";
         let old = self.removed_root(PHASE, node);
         if self.cluster.runtimes.contains_key(&node) {
-            self.cluster.stop_node(node).await;
+            let status = self.cluster.data.wals[&node]
+                .raft_wal()
+                .fence()
+                .status(ursula_runtime::node_fence::fence_now());
+            if status == ursula_runtime::node_fence::FenceStatus::Superseded {
+                self.cluster.kill_node(node).await;
+            } else {
+                self.cluster.stop_node(node).await;
+            }
         }
         self.step("removed_node_stopped");
         self.vacant(PHASE, node, old).await;
@@ -300,12 +308,16 @@ pub(super) async fn reused_id_vote(seed: u64, controls: Controls) -> ThreeNodeRa
     });
     run.vacant(PHASE, LEAVING, old).await;
     run.bound_anew(PHASE, LEAVING, old).await;
-    // No message of G passes between K and node 4, and K holds its learner
-    // addition, so node 4's replica gets no barrier and no floor.
+    // No message of G passes between K and node 4, nor yet between S and
+    // node 4, and K holds its learner addition, so node 4's replica gets no
+    // barrier and no floor.
     let new_process = run.cluster.process(LEAVING).expect("node 4 runs");
     let keeper_process = run.cluster.process(keeper).expect("the keeper runs");
+    let stale_process = run.cluster.process(stale).expect("S runs");
     run.cluster.cut_group_route(group, new_process, keeper);
     run.cluster.cut_group_route(group, keeper_process, LEAVING);
+    run.cluster.cut_group_route(group, new_process, stale);
+    run.cluster.cut_group_route(group, stale_process, LEAVING);
     run.cluster.hold(keeper, group, StepKind::AddLearners);
     let mut to = run.cluster.placed_voters(group);
     to.remove(&stale);
@@ -319,8 +331,7 @@ pub(super) async fn reused_id_vote(seed: u64, controls: Controls) -> ThreeNodeRa
     })
     .await;
     // S and node 4 reach each other in G, and nothing else of S does.
-    run.cluster
-        .pin_group_route(group, run.cluster.process(stale).expect("S runs"), LEAVING);
+    run.cluster.pin_group_route(group, stale_process, LEAVING);
     run.cluster.pin_group_route(group, new_process, stale);
     run.step("stale_reaches_the_new_life");
     let deadline = madsim::time::Instant::now() + CAMPAIGN_WATCH;
