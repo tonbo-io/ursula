@@ -1194,7 +1194,7 @@ A gate holds back what leaves the process until `synced()` says it may. It is th
 | `gate`: each chunk of a returned global `Response` body, and its end or error | a `synced()` call made after the chunk was read resolves on every database | the body errors and its source is cancelled | not applied; cancelling the body ends the waits |
 
 1. **Release.** An output is released only by a `synced()` call made after the output was produced, on every database given. The queue takes its cutoff before it calls `synced()`.
-2. **Batching.** A gate has at most one `synced()` call per database in flight. Outputs produced meanwhile wait for the next call, so a stream costs one round trip per batch, not per chunk. A body is read ahead at most 64 KiB, counting held chunks and released chunks its reader has not taken.
+2. **Batching.** A gate has at most one `synced()` call per database in flight. Outputs produced meanwhile wait for the next call, so a stream costs one round trip per batch, not per chunk. A body is read ahead at most 64 KiB plus one chunk, counting held chunks and released chunks its reader has not taken: the bound is checked before each read, so one chunk of any size is read once the body is under it.
 3. **Order.** Outputs leave in the order they were produced.
 4. **Package errors.** An `UrsulaError` thrown by `work` is rethrown at once, because it carries no application state: a refusal committed nothing, and a reset is what `synced()` would report. Every other outcome waits, errors included.
 5. **Resets.** A reset replaces the outcome. A gate never releases what it held after its wait failed, and a failure on one database ends the waits on the others.
