@@ -445,10 +445,17 @@ predecessor wait:
 from then on its meta replica grants no vote and writes no floor, and the
 node sheds every leadership. Its registration status is `root_refused` with
 the slot, readiness reports `root_refused`, and it registers again at most
-5 seconds apart. The refusal comes even when the meta leader is the running
-process of the same id: a peer names that id as the leader, the run's own
-meta replica does not lead, so the run sends its registration to the address
-`raft.peers` lists for the id (`crates/ursula-raft/src/meta/handle.rs`). Once an operator released the old root it binds with no
+5 seconds apart. When the meta leader is the running process of the same
+id, the refusal comes only if the address `raft.peers` lists for the id, on
+the new run, reaches that process: a peer names the id as the leader, the
+run's own meta replica refuses the write before proposing it since it does
+not lead, so the run sends its registration to that address
+(`crates/ursula-raft/src/meta/handle.rs`). When the address reaches the new
+run itself, as when a replacement takes over the id's DNS name while the old
+process keeps its disk and its meta leadership, the registration gets the
+same not-leader answer back. While that holds the run gets no answer and no
+`root_refused`, and its data replicas stay held as for any run without an
+answer. Once an operator released the old root it binds with no
 restart, waits out its predecessor (readiness `predecessor_wait`), and its
 replicas rejoin through their gates as in the rest of this section.
 
