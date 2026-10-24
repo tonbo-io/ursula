@@ -271,23 +271,37 @@ export function advice(action: UrsulaErrorAction): string {
 }
 
 /**
- * {@link classify} for an error a library may have wrapped: `error` itself, the errors an
- * AggregateError holds (a driver's failed ROLLBACK after a COMMIT that SQLite rolled back), and the
- * errors they wrap (`cause`, such as Pi's StorageRejected around a read the extension failed), in
- * that order. The first that maps to an {@link UrsulaError} is the result, so a failure of the
- * extension never passes for the wrapper's own kind of error. `error` itself otherwise.
+ * The first value `match` returns for an error in the chain of `error`, which a library may have
+ * wrapped: `error` itself, the errors an AggregateError holds (a driver's failed ROLLBACK after a
+ * COMMIT that SQLite rolled back), and the errors they wrap (`cause`, such as Pi's StorageRejected
+ * around a read the extension failed, or drizzle's DrizzleQueryError), in that order. Each object is
+ * visited once, and at most 16 are. `undefined` when `match` returns it for every one.
  */
-export function classifyWrapped(error: unknown, status: () => FailureStatus): unknown {
+export function findWrapped<T>(error: unknown, match: (error: object) => T | undefined): T | undefined {
 	const pending: unknown[] = [error];
 	const seen = new Set<unknown>();
 	while (pending.length > 0 && seen.size < 16) {
 		const next = pending.shift();
 		if (next === null || typeof next !== "object" || seen.has(next)) continue;
 		seen.add(next);
-		const classified = classify(next, status);
-		if (classified instanceof UrsulaError) return classified;
+		const found = match(next);
+		if (found !== undefined) return found;
 		if (next instanceof AggregateError) pending.push(...(next.errors as unknown[]));
 		if ("cause" in next) pending.push(next.cause);
 	}
-	return error;
+	return undefined;
+}
+
+/**
+ * {@link classify} for an error a library may have wrapped: the first error of the chain
+ * {@link findWrapped} walks that maps to an {@link UrsulaError} is the result, so a failure of the
+ * extension never passes for the wrapper's own kind of error. `error` itself otherwise.
+ */
+export function classifyWrapped(error: unknown, status: () => FailureStatus): unknown {
+	return (
+		findWrapped(error, (next) => {
+			const classified = classify(next, status);
+			return classified instanceof UrsulaError ? classified : undefined;
+		}) ?? error
+	);
 }

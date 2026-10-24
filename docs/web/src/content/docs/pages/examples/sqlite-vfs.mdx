@@ -51,6 +51,34 @@ The local cache outlives the node. The quick-start node keeps nothing across res
 
 The design, with the test behind each guarantee, is in [`docs/architecture/sqlite-vfs.md`](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md).
 
+## Gating outputs
+
+`gate(db, work, { signal })` applies the one rule for you. It runs `work` and settles with its outcome only once a `synced()` call made after `work` settled resolved, on every database given (`db` may be an array).
+
+```ts
+import { gate, open } from "@tonbo/sqlite-ursula";
+
+const db = await open("http://127.0.0.1:4437/demo/notes");
+
+// A fetch-style handler: the status, the headers and every body chunk wait.
+const handler = (request: Request) => gate(db, () => router.fetch(request), { signal: request.signal });
+
+// A job processor whose promise a queue framework acknowledges.
+const processor = (job: Job) => gate(db, () => applyJob(db, job));
+```
+
+| what is held | released when | if a reset comes first | if `signal` fires first |
+| --- | --- | --- | --- |
+| the result of `work`, or its error unless that is or wraps an `UrsulaError` | a `synced()` call made after `work` settled resolves on every database | rejects with the `UrsulaResetError`, and the outcome is dropped | rejects with `signal.reason`, the outcome is dropped and a returned body is cancelled |
+| each chunk of a returned `Response` body, and its end | a `synced()` call made after the chunk was read resolves | the body errors | not applied: cancel the body to stop it |
+
+- Reads wait too: a result may have read another call's pending commit, or state this process is about to lose to a takeover.
+- An `UrsulaError` thrown by `work` is rethrown at once, also when a library wrapped it (as a `cause`, or in an `AggregateError`): a refused write committed nothing, and a reset is what the wait would report.
+- A gate has at most one `synced()` call in flight, and chunks read meanwhile wait for the next one, so a streamed body pays one round trip per batch, not per chunk. It reads ahead at most 64 KiB plus one chunk, and chunks leave in order.
+- A `node:http` response is not gated by itself: write it after the gate, as in `res.end(await gate(db, () => save(req)))`.
+
+The gate does not cover effects inside `work` before it returns (an outbound call or a manual acknowledgement in the middle of a handler needs `await db.synced()` first), WebSocket frames, raw sockets, timers, background jobs or child processes. It does not make effects exactly once: a crash after the release but before an acknowledgement runs the work again, so record message ids and idempotency keys in the same transaction as the work. And it promises nothing beyond what `synced()` means: the stream holds the commit, with the durability the server gives it.
+
 ## Open options
 
 `open(url, options)` returns a promise of an `UrsulaDatabase`, a `node:sqlite` `DatabaseSync` subclass, so drizzle, kysely and Pi's driver take it. Options it does not know go to `DatabaseSync`.
