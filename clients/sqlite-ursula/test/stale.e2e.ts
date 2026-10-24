@@ -393,7 +393,8 @@ describe("stale caches reopened across hosts", () => {
 		// included, so C's next commit lands on the original's next one only if both logs hold as
 		// many records. Probes find both positions: a copy of a root opens, commits through the
 		// blackholed gate and dies, leaving the stream unchanged but for a claim, which no
-		// catch-up logs. The original is padded with opens (a CLAIM record each) until they meet.
+		// catch-up logs. Whichever root is behind is padded with an open (a CLAIM record or more)
+		// until they meet. C's first padding open catches r2 up in place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
@@ -402,14 +403,14 @@ describe("stale caches reopened across hosts", () => {
 			await mode("forward");
 			return st.commits.logged;
 		};
-		const q = await nextCommit(dirC);
+		let q = 0;
 		for (let pads = 0; ; pads++) {
+			q = await nextCommit(dirC);
 			const p = await nextCommit(dirA);
-			report(`S5: the copy commits next at ${q}, the original at ${p} after ${pads} padding opens`);
+			report(`S5: after ${pads} padding opens the copy commits next at ${q}, the original at ${p}`);
 			if (p === q) break;
-			expect(p, "the original's log is already past the copy's").toBeLessThan(q);
-			expect(pads, "padding never met the copy's position").toBeLessThan(16);
-			const pad = host(`${front.url}${s.path}`, dirA);
+			expect(pads, "padding never met both positions").toBeLessThan(16);
+			const pad = host(`${front.url}${s.path}`, p < q ? dirA : dirC);
 			expect((await pad.opened()).state).toBe("live");
 			await pad.stop("SIGKILL");
 		}
