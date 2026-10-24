@@ -2,12 +2,16 @@
 //! 8.3 and 15.2), over a placed [`MetaCluster`], at every observation of a
 //! run, and what each judged:
 //!
-//! - I13 ([`I13`]): a node the latest view shows removed stays removed, no
-//!   running node's view at or past the entry it was first seen removed at
-//!   gives it a role, and no running replica names it its group's leader
-//!   in a term above every term the group's replicas held then. Its close
-//!   half is a wait ([`MetaCluster::removed_open`]): once every group
-//!   answered, a running removed node holds no replica open.
+//! - I13 ([`I13`]), per life: a life of a node id is its root. A life the
+//!   latest view shows removed stays out: the latest view shows that root's
+//!   record removed, or the id vacant on that root released, or a new life
+//!   on another root, which the kernel binds only on a vacant id. No running node's
+//!   view at or past the entry the life was first seen removed at gives
+//!   that life a role (a role of a new life's record is the new life's),
+//!   and until a new life binds, no running replica names the id its
+//!   group's leader in a term above every term the group's replicas held
+//!   then. Its close half is a wait ([`MetaCluster::removed_open`]): once
+//!   every group answered, a running removed node holds no replica open.
 //! - I8's sweep half ([`I8`]): every DELETE the removed-node sweep sent
 //!   names a node the latest view shows removed, and no running replica's
 //!   latest committed membership of the object's group lists that node as
@@ -25,6 +29,9 @@ use std::collections::BTreeSet;
 
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
+use ursula_proto::placement::NodeRecord;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_runtime::OwnedKey;
 use ursula_runtime::snapshot_harness::DeleteKind;
 use ursula_runtime::snapshot_harness::SnapshotStoreEvent;
@@ -39,13 +46,24 @@ use super::placed_hosting::I8;
 
 pub(super) const I13: &str = "a_removed_node_stays_out";
 
-/// When the checks first saw a node removed.
+/// When the checks first saw a node's life removed, and how far its id
+/// got since.
 #[derive(Debug, Clone)]
 struct Removal {
+    /// The root of the removed life.
+    root: RootId,
     /// The latest view's applied index then.
     applied: u64,
     /// The highest term each group's running replicas held then.
     terms: BTreeMap<u32, u64>,
+    /// Whether a latest view showed a new life of the id, on another root.
+    reused: bool,
+}
+
+/// Whether `record` is the removed life on `root`'s record: its slot names
+/// that root.
+fn of_life(record: &NodeRecord, root: RootId) -> bool {
+    record.root.root() == root
 }
 
 /// What the removal checks judged of one removed node.
@@ -133,8 +151,10 @@ impl RemovalChecks {
         self.sweeps(cluster, trace, after_event);
     }
 
-    /// Notes each node the latest view shows removed, and fails I13 for a
-    /// node seen removed that the latest view no longer shows so.
+    /// Notes each node life the latest view shows removed, and fails I13
+    /// for a life seen removed whose id the latest view shows anywhere but
+    /// out: removed on its root, vacant on it released, or in a new life on
+    /// another root.
     fn learn_removals(&mut self, cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
         let latest = cluster.latest_view();
         let Some(bootstrapped) = latest.cluster() else {
@@ -142,25 +162,51 @@ impl RemovalChecks {
         };
         let applied = latest.applied().map_or(0, |applied| applied.get().index);
         for (node, record) in bootstrapped.nodes() {
-            if record.lifecycle == NodeLifecycle::Removed && !self.removed.contains_key(&node.get())
-            {
+            let seen = self
+                .removed
+                .get(&node.get())
+                .is_some_and(|removal| of_life(record, removal.root));
+            if record.lifecycle == NodeLifecycle::Removed && !seen {
                 let terms = JOURNAL_GROUPS
                     .iter()
                     .map(|group| (*group, cluster.max_term(*group)))
                     .collect();
-                self.removed.insert(node.get(), Removal { applied, terms });
+                self.removed.insert(node.get(), Removal {
+                    root: record.root.root(),
+                    applied,
+                    terms,
+                    reused: false,
+                });
             }
         }
-        for node in self.removed.keys() {
-            let lifecycle = bootstrapped
-                .node(NodeId::new(*node))
-                .map(|record| record.lifecycle);
-            if lifecycle != Some(NodeLifecycle::Removed) {
+        for (node, removal) in &mut self.removed {
+            let record = bootstrapped.node(NodeId::new(*node)).copied();
+            let out = match record {
+                Some(record) if of_life(&record, removal.root) => match record.lifecycle {
+                    NodeLifecycle::Removed => true,
+                    NodeLifecycle::Vacant => record.root == RootSlot::Released(removal.root),
+                    NodeLifecycle::Active
+                    | NodeLifecycle::Cordoned
+                    | NodeLifecycle::Decommissioning => false,
+                },
+                // A new life: the kernel binds one only on a vacant id
+                // (its K5), which a step between the two entries may miss.
+                Some(_) => {
+                    removal.reused = true;
+                    true
+                }
+                None => false,
+            };
+            if !out {
                 fail(
                     trace,
                     I13,
                     after_event,
-                    format!("node {node} was removed, but the latest view shows it {lifecycle:?}"),
+                    format!(
+                        "node {node}'s life on root {} was removed, but the latest view shows \
+                         {record:?}",
+                        removal.root
+                    ),
                 );
             }
         }
@@ -220,6 +266,11 @@ impl RemovalChecks {
                 *count = count.saturating_add(1);
             }
         }
+    }
+
+    /// Every node id the checks saw removed, whatever life of it runs now.
+    pub(super) fn ever_removed(&self) -> BTreeSet<u64> {
+        self.removed.keys().copied().collect()
     }
 
     /// How many of the sweep's DELETEs of `node`'s objects I8's sweep half
@@ -312,15 +363,22 @@ fn stays_without_role(
         let Some(bootstrapped) = view.cluster().filter(|_| past) else {
             continue;
         };
-        judged.views = judged.views.saturating_add(1);
         let id = NodeId::new(node);
-        let lifecycle = bootstrapped.node(id).map(|record| record.lifecycle);
+        let Some(record) = bootstrapped.node(id) else {
+            continue;
+        };
+        // A new life's record, and its roles, are the new life's.
+        if !of_life(record, removal.root) {
+            continue;
+        }
+        judged.views = judged.views.saturating_add(1);
+        let lifecycle = Some(record.lifecycle);
         let roles: Vec<u32> = JOURNAL_GROUPS
             .iter()
             .copied()
             .filter(|group| bootstrapped.role(RaftGroupId(*group), id).is_some())
             .collect();
-        if lifecycle != Some(NodeLifecycle::Removed) || !roles.is_empty() {
+        if record.lifecycle.has_life() || !roles.is_empty() {
             fail(
                 trace,
                 I13,
@@ -344,6 +402,10 @@ fn leads_nothing(
     trace: &mut SimTrace,
     after_event: &str,
 ) {
+    // A new life of the id may lead: its leaderships are its own.
+    if removal.reused {
+        return;
+    }
     for group in JOURNAL_GROUPS {
         let before = removal.terms.get(&group).copied().unwrap_or(0);
         for replica in cluster.running() {

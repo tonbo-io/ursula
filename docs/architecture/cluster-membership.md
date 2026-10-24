@@ -152,7 +152,7 @@ No admin route changes a data group's OpenRaft membership directly.
 ### Node lifecycle
 
 Each node record in meta carries a lifecycle, `active`, `cordoned`,
-`decommissioning` or `removed`, which `SetNodeLifecycle` changes
+`decommissioning`, `removed` or `vacant`, which `SetNodeLifecycle` changes
 (`plan_lifecycle` in `crates/ursula-control/src/placement/apply.rs`). A
 node registers `active`. A cordon makes an active node `cordoned`, a
 decommission makes an active or cordoned node `decommissioning`, and an
@@ -166,11 +166,19 @@ group (`ineligible_target`). A target never holds a removed node
 (`retirement_pending`). Every entry that leaves a decommissioning node
 without a role in any group marks the node `removed` in that same entry and
 drops its retirement records, so the decommission of a node with no role
-removes it at once. `removed` is final: the node's registration, a release
-of its root, a teardown report of it, a seeded group's convergence report
-that names it and every lifecycle change of it are refused with
-`node_removed`. A removal
-deletes nothing, and the node's replicas close as their groups answer.
+removes it at once. A life of a node id is its root, and a removed life is
+final: the node's registration, a release of its root, a teardown report of
+it, a seeded group's convergence report that names it and every lifecycle
+change of it are refused with `node_removed`. A removal deletes nothing, and
+the node's replicas close as their groups answer. The id itself comes back:
+`ReportRemovalComplete` of the meta leader, a compare-and-set on the removed
+record and its root, turns it `vacant` on that root released, and a vacant
+id refuses the same commands with `node_vacant`. `NodeLifecycle::has_life`
+is the one predicate of both refusals and of every reader that skips an id
+with no life (`meta_target`, `ursulactl`'s members). A registration of an
+`empty` root other than the released one begins a new life on a fresh
+`active` record, through the same slot rule a released slot binds by. The
+old root, and any root that holds state, stays refused (`other_root`).
 
 The meta leader runs the decommission driver
 (`crates/ursula-raft/src/meta/decommission.rs`). While it leads under a
@@ -191,12 +199,16 @@ shed leadership for its WAL disk (`crates/ursula-raft/src/meta/liveness.rs`).
 A node the leader has not heard from in that time, or whose answer did not
 arrive, is not live and gets no group. On the meta leader `GET /__ursula/placement` carries the leader's
 report in `leader_report`: each live node's eligibility, the groups the last
-pass could not move with the reason, the age of the oldest move and the
-groups whose objects the removed-node sweep left. Every
-other node answers `null` there. A node whose view shows it removed, or
-whose registration the meta group refused as removed, stays removed for the
-rest of the run, even when a later view no longer shows it (a damaged meta
-replica, a restored older snapshot). It marks the `placement-unavailable`
+pass could not move with the reason, the age of the oldest move and what
+each removed node's removal still waits for (`removal_pending`). Every
+other node answers `null` there. A node reads its own record only where the
+record's slot names the root the run runs on (`Cluster::own_record`), so a
+new disk catching up through the meta log never takes the removed life's
+record, or its roles, for its own. A node whose own record shows it with no
+life, or whose bound root's registration the meta group refused as removed,
+stays removed for the rest of the run, even when a later view no longer
+shows it (a damaged meta replica, a restored older snapshot). The latch also
+ends the run's snapshot deletes (`NodeFence::removed`). It marks the `placement-unavailable`
 leadership shed, which refuses leadership transfers to it, and its hosting
 driver closes each replica once it stops counting as a voter. No group
 places a removed node, whatever its view shows
@@ -210,22 +222,38 @@ whose objects the sweep took fails every open, asks in the open's back-off,
 and its `not_member` answer keeps it closed. A replica whose group's leader
 still lists the node stays open until a move takes it off.
 
-A node deletes only its own snapshot objects, with one exception: the
-removed-node sweep (`crates/ursula-raft/src/meta/sweep.rs`). While the meta
-leader leads and its node fence admits, at the start of its leadership and
-then every 10 minutes, it confirms its view by a meta read barrier it
-answered itself in the term it leads, so a deposed meta leader sweeps
-nothing. For each node that view shows removed it lists the groups the
-node's snapshot directory holds objects of, and per group lists the node's
-objects of it, then asks the group for a fresh quorum barrier, its own
-replica first and then the group's leader candidates, until a live leader
-answers. When that leader's memberships list the node in neither membership,
-the sweep deletes exactly the objects it listed
-(`sweep_removed_group` in `crates/ursula-raft/src/snapshot_holds.rs`). An
-object written after the listing waits for the next pass. A group without
-a live leader, or whose leader still lists the node, keeps its objects, and
-`leader_report.sweep_pending` names it under the removed node. The pass
-keeps no replicated state.
+A node deletes only its own snapshot objects, with one exception: the meta
+leader's removal pass (`crates/ursula-raft/src/meta/sweep.rs`). No run
+deletes a snapshot object before the meta group answered its registration in
+that run, and none once it knows itself removed (`NodeFence::check_snapshot_delete`,
+behind every DELETE of the fenced snapshot store). An old disk of a removed
+id, started again where it reaches the store but not the meta group, so
+deletes nothing under the node directory a new life of the id shares.
+
+While the meta leader leads and its node fence admits, a pass runs at the
+start of its leadership, on the first view that shows a removed node the
+last pass did not, and every 30 seconds while a node is removed. It confirms
+its view by a meta read barrier it answered itself in the term it leads, so
+a deposed meta leader does nothing. For each node that view shows removed on
+a root `r`, it asks every data group whose live leader has not confirmed the
+node no member in this leadership for a fresh quorum barrier, its own
+replica first and then the group's leader candidates, eight groups at a
+time, and keeps each `not_member` answer for the leadership: no placement
+gives a removed node a role, so the answer stays true while the record
+stays removed on `r`. Per confirmed group whose objects the node's directory
+holds, it lists the node's objects of it, confirms the view again, and
+deletes exactly the objects it listed while the view still shows the node
+removed on `r` (`sweep_removed_group` in
+`crates/ursula-raft/src/snapshot_holds.rs`), so every object it deletes was
+written before any new life of the id bound. Then it reads whether its own
+committed or effective meta membership lists the node, and sends the node a
+genesis probe, whose answer counts only when stamped by a process of the
+root the view binds the id to. Once every group confirmed, the directory
+lists nothing, the meta memberships do not list the node and no process of
+`r` answers, it submits `ReportRemovalComplete { node, root: r }`. Each
+removal's progress is the report's `removal_pending`. The pass keeps no
+replicated state. A late PUT of the old life that lands after the
+completion stays until a new life of the id collects it at its start.
 
 ## 2. Replica loss and rejoin
 
@@ -468,6 +496,23 @@ superseded process takes part in no Raft traffic, writes nothing more to
 its WAL, never records a clean end, answers clients `503` and reports
 readiness `superseded` until it exits.
 
+A new disk under a removed id is refused with `node_removed` until the
+removal completes. Its run judges that by its standing too: an unbound root
+is held out as a refused one is (registration and readiness
+`removal_pending`), registers again with a back-off capped at 30 seconds,
+since each refusal is a meta entry, and binds with no restart once the id is
+vacant. A bound root refused as removed is the removed life's own process.
+A vacant id's new life then runs through the same binding, predecessor wait,
+meta learner join, vote floor and recovery gate as any new node: its
+replicas are created only by moves, and an empty replica refuses every vote
+and acknowledgement until a live leader's barrier gave it a floor and it
+caught up to the barrier. An empty log whose persisted vote is committed
+above genesis, a live leader's (such a floor, or the vote OpenRaft saves
+before it appends a leader's entries), opens with its gate refusing every
+candidate, across a restart too (`GroupRejoin::durable`). A seed follower at
+genesis that saved a leader's vote before its first entry opens so as well:
+safe, at the cost of liveness in a narrow genesis corner.
+
 `ursulactl node replace-disk --node N --expect-root R` releases `R`
 through `POST /__ursula/placement/nodes/{node}/replace-disk` on another
 node's admin plane, a compare-and-set on the expected root that answers the
@@ -651,12 +696,18 @@ the pod's grace period.
 
 A pod's node id is its ordinal plus one, so `server.replicaCount` names the
 node ids. A higher count adds nodes that host nothing until groups move onto
-them, and a lower count drops the highest ids for good. Before every upgrade
-and rollback that changes the count, the chart's `scale-check` hook
+them, and a lower count drops the highest ids, whose removals complete once
+their pods are gone. Before every upgrade and rollback that changes the
+count, the chart's `scale-check` hook
 (`charts/ursula/templates/scale-check.yaml`) reads the live StatefulSet's
 count and runs `ursulactl node verify-removed` for every id a lower count
-drops and `verify-not-removed` for every id a higher count starts, against
-the meta leader's view. It refuses a raise from one pod. That cluster
+drops, against the meta leader's view. For every id a higher count starts it
+runs `verify-joinable`, which waits for a pending removal, then, for each
+started ordinal whose PVC still exists, `verify-vacant`, and acts on its
+exit status alone: it deletes the PVC of a vacant id, keeps the PVC of an id
+in a life and refuses the raise otherwise. The StatefulSet keeps its PVCs on
+a scale-down (`Retain`), so a scale-down that skipped the hook comes back on
+its volumes. It refuses a raise from one pod. That cluster
 recorded one meta voter and a replication factor of 1 at its bootstrap, and
 the chart sets neither `raft.meta_voters` nor
 `raft.placement.replication_factor`, so the pods of a raised count would

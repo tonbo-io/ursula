@@ -1543,16 +1543,21 @@ impl RaftGroupHandleRegistry {
 
     /// Latches this node `Removed` for the rest of the run when `answered`,
     /// its registration's standing, or `cluster`, its bootstrapped view,
-    /// shows node `me` removed ([`ursula_control::Standing::knows_removed`]),
-    /// and returns the run's standing ([`Self::standing`]).
+    /// shows node `me`'s record of the run on `root` with no life
+    /// ([`ursula_control::Standing::knows_removed`]), and returns the run's
+    /// standing ([`Self::standing`]). The latch also ends the run's snapshot
+    /// deletes for good (`NodeFence::removed`): a removed node's objects are
+    /// the meta leader's sweep's.
     pub(crate) fn learn_standing(
         &self,
         answered: ursula_control::Standing,
         cluster: Option<&ursula_control::Cluster>,
         me: ursula_proto::placement::NodeId,
+        root: ursula_proto::placement::RootId,
     ) -> ursula_control::Standing {
-        if answered.knows_removed(cluster, me) {
+        if answered.knows_removed(cluster, me, root) {
             self.removed.store(true, Ordering::Release);
+            self.peer_cluster().fence().removed();
         }
         self.standing()
     }

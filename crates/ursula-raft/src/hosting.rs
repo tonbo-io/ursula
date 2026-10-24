@@ -347,9 +347,10 @@ impl<H: GroupHost> HostingDriver<H> {
         // A removal holds for the rest of the run (design 8.1), even when
         // the view regresses: without the latch the plan would fall back to
         // opening every held replica, the closed ones included.
+        let root = self.wal.incarnation().root;
         let standing = self
             .registry
-            .learn_standing(answered, view.cluster(), self.me);
+            .learn_standing(answered, view.cluster(), self.me, root);
         if standing == Standing::Removed {
             // A removed node takes no leadership transfer for the rest of
             // the run: a group it led would never reconcile toward a
@@ -360,6 +361,7 @@ impl<H: GroupHost> HostingDriver<H> {
         }
         let input = |view| HostingInput {
             me: self.me,
+            root,
             standing,
             view,
             local: &local,
@@ -567,9 +569,10 @@ impl<H: GroupHost> HostingDriver<H> {
                 // Without a bootstrapped view an open replica counts by its
                 // membership, and a leader knows its own: nothing says it
                 // may have left.
+                let root = self.wal.incarnation().root;
                 let placed = view
                     .cluster()
-                    .map(|cluster| standing.placed_role(cluster, *group, self.me));
+                    .map(|cluster| standing.placed_role(cluster, *group, self.me, root));
                 let may_have_left = matches!(
                     placed,
                     Some(None | Some(ReplicaRole::Outgoing | ReplicaRole::Abandoned))

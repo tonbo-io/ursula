@@ -1,5 +1,5 @@
-//! `node cordon`, `uncordon` and `decommission`, and `node verify-removed`
-//! and `verify-not-removed`.
+//! `node cordon`, `uncordon` and `decommission`, and `node verify-removed`,
+//! `verify-joinable` and `verify-vacant`.
 //!
 //! A lifecycle verb runs in passes, as a move does ([`super::moves`]). Each
 //! pass reads a view a meta read barrier confirmed and decides every named
@@ -13,10 +13,16 @@
 //! every named node that is active first, so no group moves onto a node that
 //! leaves in the same scale-down, and only then decommissions them. The meta
 //! leader moves their groups away, and a decommissioning node is removed for
-//! good once it has no role ([`IRREVERSIBLE`]).
+//! good once it has no role ([`IRREVERSIBLE`]). The meta leader then
+//! completes the removal and marks the id `vacant`, and an empty disk may
+//! register under it as a new node.
 //!
-//! `verify-removed` and `verify-not-removed` read the meta leader's own view
-//! over the nodes' read URLs ([`crate::view`]), which a chart hook reaches.
+//! `verify-removed`, `verify-joinable` and `verify-vacant` read the meta
+//! leader's own view over the nodes' read URLs ([`crate::view`]), which a
+//! chart hook reaches, and decide each node with one check
+//! ([`check_removal`]). The two that start a node wait while a node is
+//! removed and its removal has not completed, printing what it waits for
+//! from the meta leader's report.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,7 +38,9 @@ use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
 use ursula_control::LifecycleChange;
 use ursula_control::LifecycleResponse;
+use ursula_control::PendingRemoval;
 use ursula_control::PlacementApiReason;
+use ursula_control::RemovalDirectory;
 use ursula_control::Requeue;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
@@ -49,8 +57,10 @@ use crate::view::ViewRefusal;
 
 /// What `node decommission` prints before it decommissions a node.
 pub const IRREVERSIBLE: &str = "A decommissioning node is removed for good once its last group \
-                                moved away: its id never holds a group again. `node uncordon` \
-                                aborts a decommission only while the node still has a role.";
+                                moved away: its process and its disk never take part again. Once \
+                                its removal completes the id is vacant, and an empty disk started \
+                                under it registers as a new node. `node uncordon` aborts a \
+                                decommission only while the node still has a role.";
 
 /// Why a lifecycle verb sends no change for a node, or stopped.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -151,7 +161,7 @@ pub fn plan_decommission(
     let mut leaving = BTreeSet::new();
     for &node in nodes {
         let lifecycle = lifecycle_of(state, node);
-        if lifecycle == Some(NodeLifecycle::Removed) {
+        if lifecycle.is_some_and(|lifecycle| !lifecycle.has_life()) {
             continue;
         }
         state
@@ -161,9 +171,10 @@ pub fn plan_decommission(
             Some(NodeLifecycle::Active) => cordon.insert(node),
             Some(NodeLifecycle::Cordoned) => decommission.insert(node),
             // The check refuses a node the view does not hold.
-            Some(NodeLifecycle::Decommissioning | NodeLifecycle::Removed) | None => {
-                leaving.insert(node)
-            }
+            Some(
+                NodeLifecycle::Decommissioning | NodeLifecycle::Removed | NodeLifecycle::Vacant,
+            )
+            | None => leaving.insert(node),
         };
     }
     Ok(if !cordon.is_empty() {
@@ -403,15 +414,21 @@ async fn leaving_progress(
     line
 }
 
-/// What `verify-removed` and `verify-not-removed` check.
+/// What `verify-removed`, `verify-joinable` and `verify-vacant` check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removal {
-    /// Every node is removed, or never registered: a scale-down may drop
-    /// it.
-    Removed,
-    /// No node is removed: a scale-up may start it, since a removed id never
-    /// holds a group again.
-    NotRemoved,
+    /// Every node is removed, vacant or never registered: a scale-down may
+    /// drop it.
+    Leaving,
+    /// Every node may start: it never registered, it is vacant, so an
+    /// empty disk registers as a new node, or it is in a life, so its own
+    /// process comes back on its disk. A removed node waits for its removal
+    /// to complete.
+    Joining,
+    /// Every node is vacant, so a volume left under its id holds a removed
+    /// life's disk, or a root that never bound. A removed node waits for its
+    /// removal to complete.
+    Vacant,
 }
 
 /// Why a removal check failed.
@@ -430,46 +447,113 @@ pub enum RemovalRefusal {
          still be given groups"
     )]
     NotBootstrapped,
+    /// A removed node whose removal had not completed by the timeout, with
+    /// what it waits for as the meta leader last reported it.
     #[error(
-        "node {node} is removed: its id never holds a group again, and a process under it never serves"
+        "node {node} is removed and its removal has not completed: a disk started under its id \
+         waits until the id is vacant. It waits for {}",
+        pending.as_ref().map_or_else(|| "the meta leader's next pass".to_owned(), pending_text)
     )]
-    Removed { node: NodeId },
+    RemovalPending {
+        node: NodeId,
+        pending: Option<PendingRemoval>,
+    },
+    /// `verify-vacant`: the node is in a life, so a disk under its id is
+    /// that life's.
+    #[error("node {node} is {lifecycle}: a disk under its id is its own, keep it")]
+    InLife {
+        node: NodeId,
+        lifecycle: NodeLifecycle,
+    },
+    /// `verify-vacant`: the node never registered, so a disk under its id
+    /// is no node's of this cluster.
+    #[error("node {node} never registered: a disk under its id belongs to no node of this cluster")]
+    NotRegistered { node: NodeId },
     #[error(transparent)]
     View(ViewRefusal),
 }
 
+/// What a pending removal waits for, in words.
+fn pending_text(pending: &PendingRemoval) -> String {
+    let mut waits = Vec::new();
+    if !pending.unconfirmed.is_empty() {
+        waits.push(format!(
+            "a live leader of groups {} to confirm the node no member (a group without one is \
+             down or lost its quorum)",
+            join(pending.unconfirmed.iter().map(|group| group.0))
+        ));
+    }
+    match &pending.directory {
+        RemovalDirectory::Swept => {}
+        RemovalDirectory::Unlisted => {
+            waits.push("its snapshot directory to list".to_owned());
+        }
+        RemovalDirectory::Unswept(groups) => waits.push(format!(
+            "its snapshot objects of groups {} to be swept",
+            join(groups.iter().map(|group| group.0))
+        )),
+    }
+    if pending.meta_member {
+        waits.push("the meta group to drop it as a learner".to_owned());
+    }
+    if pending.process_answers {
+        waits.push(format!(
+            "its old process, on root {}, to stop answering: stop it, and never start its disk \
+             again",
+            pending.root
+        ));
+    }
+    if waits.is_empty() {
+        "the meta leader's next pass".to_owned()
+    } else {
+        waits.join("; ")
+    }
+}
+
 /// Checks `nodes` against `cluster`, the meta leader's bootstrapped view,
-/// `None` before Bootstrap.
+/// `None` before Bootstrap. The one decision of every removal check.
 pub fn check_removal(
     cluster: Option<&Cluster>,
     nodes: &BTreeSet<NodeId>,
     removal: Removal,
 ) -> Result<(), RemovalRefusal> {
-    let lifecycle = |node| {
-        cluster
-            .and_then(|cluster| cluster.node(node))
-            .map(|record| record.lifecycle)
+    let Some(cluster) = cluster else {
+        return match removal {
+            Removal::Leaving => Err(RemovalRefusal::NotBootstrapped),
+            Removal::Joining => Ok(()),
+            Removal::Vacant => match nodes.first() {
+                Some(&node) => Err(RemovalRefusal::NotRegistered { node }),
+                None => Ok(()),
+            },
+        };
     };
     for &node in nodes {
-        match (removal, lifecycle(node)) {
-            (Removal::Removed, _) if cluster.is_none() => {
-                return Err(RemovalRefusal::NotBootstrapped);
-            }
-            (Removal::Removed, Some(lifecycle)) if lifecycle != NodeLifecycle::Removed => {
+        let lifecycle = cluster.node(node).map(|record| record.lifecycle);
+        match (removal, lifecycle) {
+            (Removal::Leaving, Some(lifecycle)) if lifecycle.has_life() => {
                 return Err(RemovalRefusal::NotRemoved { node, lifecycle });
             }
-            (Removal::NotRemoved, Some(NodeLifecycle::Removed)) => {
-                return Err(RemovalRefusal::Removed { node });
+            (Removal::Joining | Removal::Vacant, Some(NodeLifecycle::Removed)) => {
+                return Err(RemovalRefusal::RemovalPending {
+                    node,
+                    pending: None,
+                });
             }
-            (Removal::Removed | Removal::NotRemoved, _) => {}
+            (Removal::Vacant, Some(lifecycle)) if lifecycle.has_life() => {
+                return Err(RemovalRefusal::InLife { node, lifecycle });
+            }
+            (Removal::Vacant, None) => return Err(RemovalRefusal::NotRegistered { node }),
+            (Removal::Leaving | Removal::Joining | Removal::Vacant, _) => {}
         }
     }
     Ok(())
 }
 
-/// `verify-removed` and `verify-not-removed`: checks `ids` against the meta
-/// leader's own view, reading it again while no node names a meta leader,
-/// until `timeout`.
+/// `verify-removed`, `verify-joinable` and `verify-vacant`: checks `ids`
+/// against the meta leader's own view, reading it again while no node names
+/// a meta leader and, for a check that starts a node, while a node's
+/// removal has not completed, until `timeout`. Each change of what a
+/// pending removal waits for is printed to `out`.
 pub async fn verify_removal(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -477,19 +561,44 @@ pub async fn verify_removal(
     removal: Removal,
     timeout: Duration,
     poll_interval: Duration,
+    out: &mut impl Write,
 ) -> Result<()> {
     let deadline = Deadline::after(timeout);
+    let mut printed = None;
     loop {
-        match crate::view::read_view(client, nodes).await? {
-            Ok(view) => return Ok(check_removal(Some(&view.cluster), ids, removal)?),
-            Err(ViewRefusal::NotBootstrapped { .. }) => {
-                return Ok(check_removal(None, ids, removal)?);
-            }
-            Err(refusal @ ViewRefusal::NoMetaLeader) => {
+        let status = match crate::view::leader_status(client, nodes).await? {
+            Ok(status) => status,
+            Err(refusal) => {
                 if deadline.is_reached() {
                     return Err(RemovalRefusal::View(refusal).into());
                 }
+                tokio::time::sleep(poll_interval).await;
+                continue;
             }
+        };
+        let cluster = match &status.view {
+            ClusterView::Bootstrapped(cluster) => Some(cluster),
+            ClusterView::MetaGenesis { .. }
+            | ClusterView::MetaCatchingUp
+            | ClusterView::Registering { .. }
+            | ClusterView::FormationCut => None,
+        };
+        match check_removal(cluster, ids, removal) {
+            Err(RemovalRefusal::RemovalPending { node, .. }) => {
+                let pending = status
+                    .leader_report
+                    .and_then(|report| report.removal_pending.get(&node).cloned());
+                let refusal = RemovalRefusal::RemovalPending { node, pending };
+                if deadline.is_reached() {
+                    return Err(refusal.into());
+                }
+                let line = refusal.to_string();
+                if printed.as_ref() != Some(&line) {
+                    writeln!(out, "waiting: {line}")?;
+                    printed = Some(line);
+                }
+            }
+            checked => return Ok(checked?),
         }
         tokio::time::sleep(poll_interval).await;
     }

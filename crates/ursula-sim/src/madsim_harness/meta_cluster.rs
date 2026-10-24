@@ -765,6 +765,22 @@ impl MetaCluster {
         self.data.wals[&node_id].process_crash().await;
     }
 
+    /// Kills `node_id`'s placed process as [`Self::stop_node`] does, but
+    /// whatever its stop answers: a process that fenced itself for good, as
+    /// the old disk of a vacant id does, may fail its stop.
+    pub(super) async fn kill_node(&mut self, node_id: u64) {
+        if let Some(runtime) = self.runtimes.remove(&node_id)
+            && let Err(error) = runtime.shutdown().await
+        {
+            tracing::info!(node_id, %error, "a killed process's meta runtime stopped with an error");
+        }
+        if let Some(host) = self.take_host(node_id) {
+            host.kill().await;
+        }
+        self.data.new_process(node_id);
+        self.data.wals[&node_id].process_crash().await;
+    }
+
     /// Stops `node_id`'s meta runtime, then its data replicas. The WAL run
     /// stays: the caller ends it.
     async fn stop_replicas(&mut self, node_id: u64) {

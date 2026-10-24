@@ -211,6 +211,7 @@ pub async fn run_predecessor_wait(
                 }
                 RegistrationStatus::Pending
                 | RegistrationStatus::RootRefused { .. }
+                | RegistrationStatus::RemovalPending
                 | RegistrationStatus::Refused(_)
                 | RegistrationStatus::Removed => {}
             }

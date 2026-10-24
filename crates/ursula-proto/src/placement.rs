@@ -262,8 +262,11 @@ impl std::str::FromStr for PlacementEpoch {
     }
 }
 
-/// Where a node is in its one life. `Removed` is terminal: a removed id is
-/// never placed again.
+/// Where a node id stands: in a life (`Active`, `Cordoned`,
+/// `Decommissioning`), at the end of one whose removal still runs
+/// (`Removed`), or between lives (`Vacant`). A life is one root: the
+/// process and disk of a removed life never take part again, and a new
+/// life of the id begins only on an empty root, once its id is `Vacant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeLifecycle {
@@ -273,8 +276,28 @@ pub enum NodeLifecycle {
     Cordoned,
     /// Its groups move away. It becomes `Removed` once it has no role.
     Decommissioning,
-    /// Has no role for good.
+    /// The life has no role for good. The meta leader completes its removal
+    /// once every group confirmed the node no member, the meta group lists
+    /// it in neither membership, its snapshot objects are swept and no
+    /// process of its root answers: the id then turns `Vacant`.
     Removed,
+    /// The id's last life was removed and its removal completed: its slot
+    /// names the released root, and an empty root registering under the id
+    /// begins a new life.
+    Vacant,
+}
+
+impl NodeLifecycle {
+    /// Whether the id is in a life: false for `Removed` and `Vacant`, which
+    /// hold no role, take no move and change no lifecycle. The one
+    /// predicate of the kernel's refusals and of every reader that skips an
+    /// id with no life.
+    pub fn has_life(self) -> bool {
+        match self {
+            Self::Active | Self::Cordoned | Self::Decommissioning => true,
+            Self::Removed | Self::Vacant => false,
+        }
+    }
 }
 
 impl fmt::Display for NodeLifecycle {
@@ -285,6 +308,7 @@ impl fmt::Display for NodeLifecycle {
             Self::Cordoned => "cordoned",
             Self::Decommissioning => "decommissioning",
             Self::Removed => "removed",
+            Self::Vacant => "vacant",
         })
     }
 }
@@ -1044,6 +1068,7 @@ mod tests {
             NodeLifecycle::Cordoned,
             NodeLifecycle::Decommissioning,
             NodeLifecycle::Removed,
+            NodeLifecycle::Vacant,
         ] {
             let json = serde_json::to_string(&lifecycle).unwrap();
             assert_eq!(json, format!("\"{lifecycle}\""));

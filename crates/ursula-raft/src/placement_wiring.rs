@@ -360,11 +360,13 @@ impl SeedRole for MetaSeedRole {
     /// ([`ursula_control::Standing::placed_role`]).
     fn placed_role(&self) -> Option<ReplicaRole> {
         let registry = &self.placement.registry;
+        let root = self.placement.meta.get()?.root();
         let confirmed = registry.confirmed_view()?;
         registry.standing().placed_role(
             confirmed.view().cluster()?,
             self.group,
             self.placement.node,
+            root,
         )
     }
 }

@@ -18,6 +18,7 @@ use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::ReplicationFactor;
+use ursula_proto::placement::RootId;
 use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
@@ -108,6 +109,16 @@ impl Cluster {
         self.retirements
             .get(&group)
             .and_then(|records| records.get(&node))
+    }
+
+    /// The node's record when it is the record of the run on `root`: its
+    /// slot, bound or released, names that root. A node id runs one life
+    /// per root, so a record that names another root is another life's:
+    /// the removed life's, read by a new disk catching up through the meta
+    /// log, or a newer one's, read by an old disk. The one reading of a
+    /// node's own record.
+    pub fn own_record(&self, node: NodeId, root: RootId) -> Option<&NodeRecord> {
+        self.node(node).filter(|record| record.root.root() == root)
     }
 
     /// The node's role in the group, `None` when it has none.

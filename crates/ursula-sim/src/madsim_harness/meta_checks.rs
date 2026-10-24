@@ -128,10 +128,12 @@ impl MetaChecks {
     pub(super) fn judged_the_moves(
         &self,
         cluster: &MetaCluster,
+        ever_removed: &BTreeSet<u64>,
         trace: &mut SimTrace,
         after_event: &str,
     ) {
-        self.hosting.judged_the_moves(cluster, trace, after_event);
+        self.hosting
+            .judged_the_moves(cluster, ever_removed, trace, after_event);
     }
 
     /// I12 while the claims differ: no node applied a genesis.

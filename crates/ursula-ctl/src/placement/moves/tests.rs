@@ -403,7 +403,7 @@ fn a_move_adds_only_nodes_the_meta_leader_reports_live() {
             .map(|(id, eligibility)| (node(*id), *eligibility))
             .collect(),
         decommission_blocked: Vec::new(),
-        sweep_pending: BTreeMap::new(),
+        removal_pending: BTreeMap::new(),
         last_bootstrap_refusal: None,
         oldest_move_age_ms: None,
     };

@@ -4,8 +4,10 @@
 //! (issue #768):
 //! refusals change nothing, placement keys move exactly on accepted moves,
 //! converges and history events and never backwards, retirements never sit
-//! beside a role, removal is terminal, a root slot changes only as its
-//! table says, and the rest. An accepted command
+//! beside a role, a removed life never comes back (its id turns vacant only
+//! by a removal report naming its root, and a vacant id begins a new life
+//! only on an empty root other than the released one), a root slot changes
+//! only as its table says, and the rest. An accepted command
 //! must also leave exactly the state the effect column of the command table
 //! (2.3) describes, built here from that table rather than from the
 //! dispatcher, and answer what that state says.
@@ -178,7 +180,7 @@ impl Run {
     /// The step `(op, x, y, z)` chooses from the current state: mostly
     /// commands a correct caller would send, some stale or invalid.
     fn generate(&self, op: u8, x: u8, y: u8, z: u8) -> Step {
-        match op.checked_rem(14).unwrap() {
+        match op.checked_rem(15).unwrap() {
             0 => {
                 let node = self.pick_node(x);
                 Step::Command(ControlCommand::RegisterNode {
@@ -291,6 +293,20 @@ impl Run {
                     Some(_) | None => Self::pick_root(node, z),
                 };
                 Step::Command(ControlCommand::ReleaseRoot { node, root })
+            }
+            13 => {
+                // Mostly the root the slot names, so a removed node's report
+                // mostly applies.
+                let node = self.pick_node(x);
+                let root = match self.slot_root(node) {
+                    Some(root) if !one_in(y, 4) => root,
+                    Some(_) | None => Self::pick_root(node, z),
+                };
+                Step::Command(ControlCommand::ReportRemovalComplete {
+                    node,
+                    root,
+                    now_ms: u64::from(z),
+                })
             }
             _ => Step::History(if one_in(x, 4) {
                 HistoryCause::Plan
@@ -460,6 +476,12 @@ fn invariants(state: &ControlPlaneState) -> Result<(), String> {
             NodeLifecycle::Removed => ensure(!has_role && !has_record, || {
                 format!("K5: removed node {id} keeps a role or record")
             })?,
+            // K20: an id between lives holds nothing, and its slot names
+            // the released root of its last life.
+            NodeLifecycle::Vacant => ensure(
+                !has_role && !has_record && matches!(record.root, RootSlot::Released(_)),
+                || format!("K20: vacant node {id} keeps a role, a record or a bound slot"),
+            )?,
             NodeLifecycle::Decommissioning => ensure(has_role, || {
                 format!("K6: decommissioning node {id} has no role and is not removed")
             })?,
@@ -471,7 +493,9 @@ fn invariants(state: &ControlPlaneState) -> Result<(), String> {
         ensure(
             !matches!(
                 lifecycle,
-                Some(NodeLifecycle::Decommissioning | NodeLifecycle::Removed)
+                Some(
+                    NodeLifecycle::Decommissioning | NodeLifecycle::Removed | NodeLifecycle::Vacant
+                )
             ),
             || format!("K12: meta voter {id} is {lifecycle:?}"),
         )?;
@@ -628,14 +652,46 @@ fn check_accepted(
             },
         )?;
     }
-    // K5 and K6: removal is terminal, and only a decommissioning node, or
-    // one decommissioned by this command, is removed.
+    // K5 and K6: a removed life never comes back: a removed node turns
+    // vacant only by a removal report naming its slot's root (K21: a
+    // registration never changes it), and a vacant id begins a new life
+    // only by an empty root's registration, on a fresh record. Only a
+    // decommissioning node, or one decommissioned by this command, is
+    // removed.
     for (id, record) in old.nodes() {
-        let lifecycle = new.node(*id).map(|record| record.lifecycle);
+        let now = new.node(*id);
+        let lifecycle = now.map(|record| record.lifecycle);
         if record.lifecycle == NodeLifecycle::Removed {
-            ensure(lifecycle == Some(NodeLifecycle::Removed), || {
-                format!("K5: removed node {id} came back as {lifecycle:?}")
+            let reported = matches!(
+                command,
+                ControlCommand::ReportRemovalComplete { node, root, .. }
+                    if node == id && *root == record.root.root()
+            );
+            ensure(
+                lifecycle == Some(NodeLifecycle::Removed)
+                    || (reported && lifecycle == Some(NodeLifecycle::Vacant)),
+                || format!("K5: removed node {id} became {lifecycle:?} on {command:?}"),
+            )?;
+        } else if record.lifecycle == NodeLifecycle::Vacant {
+            let begun = matches!(
+                (command, now),
+                (
+                    ControlCommand::RegisterNode { node, root, empty: true, .. },
+                    Some(NodeRecord {
+                        lifecycle: NodeLifecycle::Active,
+                        root: RootSlot::Bound(bound),
+                        ..
+                    }),
+                ) if node == id && root == bound && *root != record.root.root()
+            );
+            ensure(lifecycle == Some(NodeLifecycle::Vacant) || begun, || {
+                format!("K5: vacant node {id} became {now:?} on {command:?}")
             })?;
+        } else if lifecycle == Some(NodeLifecycle::Vacant) {
+            return Err(format!(
+                "K5: node {id} went from {:?} to vacant",
+                record.lifecycle
+            ));
         } else if lifecycle == Some(NodeLifecycle::Removed) {
             let decommissioned_now = matches!(
                 command,
@@ -673,7 +729,8 @@ fn now_ms_of(command: &ControlCommand) -> Option<u64> {
         | ControlCommand::Bootstrap { now_ms, .. }
         | ControlCommand::RequestMove { now_ms, .. }
         | ControlCommand::ReportConverged { now_ms, .. }
-        | ControlCommand::SetNodeLifecycle { now_ms, .. } => Some(*now_ms),
+        | ControlCommand::SetNodeLifecycle { now_ms, .. }
+        | ControlCommand::ReportRemovalComplete { now_ms, .. } => Some(*now_ms),
         ControlCommand::SetMoveLimit { .. }
         | ControlCommand::ReportTornDown { .. }
         | ControlCommand::ReleaseRoot { .. } => None,
@@ -729,7 +786,7 @@ fn check_group_transition(
                 voters.len() == usize::from(old.params().replication_factor.get())
                     && voters.iter().all(|id| {
                         old.node(id)
-                            .is_some_and(|record| record.lifecycle != NodeLifecycle::Removed)
+                            .is_some_and(|record| record.lifecycle.has_life())
                     }),
                 || format!("K3: {group:?} formed on {voters:?}"),
             )
@@ -761,6 +818,15 @@ fn expected_cluster(
                     since_ms: *now_ms,
                     root: RootSlot::Bound(*root),
                 });
+            }
+            // A vacant id begins a new life: a fresh `Active` record on the
+            // root.
+            Some(record) if record.lifecycle == NodeLifecycle::Vacant => {
+                *record = NodeRecord {
+                    lifecycle: NodeLifecycle::Active,
+                    since_ms: *now_ms,
+                    root: RootSlot::Bound(*root),
+                };
             }
             // A known id keeps its lifecycle and time, and changes its slot
             // only when an empty root takes a released one.
@@ -910,6 +976,26 @@ fn expected_cluster(
             }
         }
         ControlCommand::SetMoveLimit { limit } => expected.params.max_concurrent_moves = *limit,
+        ControlCommand::ReportRemovalComplete { node, root, now_ms } => {
+            let Some(record) = expected.nodes.get_mut(node) else {
+                return Err(format!("accepted {command:?} for an unregistered node"));
+            };
+            match record.lifecycle {
+                // A removed id turns vacant on its root released.
+                NodeLifecycle::Removed => {
+                    *record = NodeRecord {
+                        lifecycle: NodeLifecycle::Vacant,
+                        since_ms: *now_ms,
+                        root: RootSlot::Released(*root),
+                    };
+                }
+                // A repeat changes nothing.
+                NodeLifecycle::Vacant => {}
+                lifecycle => {
+                    return Err(format!("accepted {command:?} for a {lifecycle:?} node"));
+                }
+            }
+        }
         ControlCommand::ReportTornDown {
             group,
             node,
@@ -1003,6 +1089,9 @@ fn check_answer(
         },
         ControlCommand::SetMoveLimit { limit } => ControlApplied::MoveLimitSet { limit: *limit },
         ControlCommand::ReleaseRoot { node, .. } => ControlApplied::RootReleased(record_of(*node)?),
+        ControlCommand::ReportRemovalComplete { node, .. } => {
+            ControlApplied::RemovalCompleted(record_of(*node)?)
+        }
         ControlCommand::ReportTornDown {
             group,
             node,
@@ -1169,7 +1258,10 @@ fn check_slots(
                 RootSlot::Bound(bound),
             ) => node == id && root == bound && was != *root,
             (
-                Some(ControlCommand::ReleaseRoot { node, root }),
+                Some(
+                    ControlCommand::ReleaseRoot { node, root }
+                    | ControlCommand::ReportRemovalComplete { node, root, .. },
+                ),
                 Some((RootSlot::Bound(was), _)),
                 RootSlot::Released(now),
             ) => node == id && root == now && was == *root,
@@ -1178,7 +1270,17 @@ fn check_slots(
         ensure(allowed, || {
             format!("K17: node {id}'s slot went from {previous:?} to {slot:?} on {step:?}")
         })?;
-        if let Some((_, previous_since)) = previous {
+        // A vacancy and a new life date their records (K6), every other
+        // slot change leaves the time.
+        let lifecycle = |state: &ControlPlaneState| {
+            state
+                .cluster()
+                .and_then(|cluster| cluster.node(*id))
+                .map(|record| record.lifecycle)
+        };
+        if let Some((_, previous_since)) = previous
+            && lifecycle(before) == lifecycle(after)
+        {
             ensure(previous_since == *since_ms, || {
                 format!("K6: node {id}'s slot change moved its time on {step:?}")
             })?;
@@ -1231,7 +1333,7 @@ fn steps_strategy(
 ) -> impl proptest::strategy::Strategy<Value = Vec<(u8, u8, u8, u8)>> {
     proptest::collection::vec(
         (
-            0_u8..14,
+            0_u8..15,
             proptest::num::u8::ANY,
             proptest::num::u8::ANY,
             proptest::num::u8::ANY,

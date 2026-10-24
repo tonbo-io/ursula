@@ -1080,8 +1080,10 @@ impl World {
         }
         let standing = self.standing(me);
         let local = self.local(me);
+        let root = crate::placement::samples::root(me.get());
         let mut plan = plan_hosting(&HostingInput {
             me,
+            root,
             standing,
             view: ViewInput::Unconfirmed(view.as_ref()),
             local: &local,
@@ -1095,6 +1097,7 @@ impl World {
             fresh = self.in_current_history(&confirmed);
             plan = plan_hosting(&HostingInput {
                 me,
+                root,
                 standing,
                 view: ViewInput::Confirmed(&confirmed),
                 local: &local,
@@ -1711,7 +1714,8 @@ impl World {
                 | ControlCommand::SetNodeLifecycle { .. }
                 | ControlCommand::SetMoveLimit { .. }
                 | ControlCommand::ReportTornDown { .. }
-                | ControlCommand::ReleaseRoot { .. } => None,
+                | ControlCommand::ReleaseRoot { .. }
+                | ControlCommand::ReportRemovalComplete { .. } => None,
             })
             .collect();
         let Some(raft) = self.raft_mut(group) else {

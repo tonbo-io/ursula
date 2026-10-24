@@ -33,6 +33,7 @@ use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::RootId;
 use ursula_proto::placement::UnplacedReplica;
 use ursula_shard::RaftGroupId;
 
@@ -68,6 +69,9 @@ pub struct NodePlacement<'a> {
     /// The node's standing in this run, its registration's answers
     /// included ([`RaftGroupHandleRegistry::learn_standing`]).
     pub standing: Standing,
+    /// The WAL root this run of the node runs on: the view's record of the
+    /// node is this run's only when its slot names it.
+    pub root: RootId,
 }
 
 /// The inputs of [`check_raft_maintenance`].
@@ -146,10 +150,11 @@ pub fn check_raft_maintenance(
         Some(placement) => {
             let cluster = read_placement(&mut report, placement, &running, &counts);
             let status = placement.status;
-            if placement
-                .standing
-                .knows_removed(shown_cluster(&status.view), status.node)
-            {
+            if placement.standing.knows_removed(
+                shown_cluster(&status.view),
+                status.node,
+                placement.root,
+            ) {
                 report.node_issues = vec![Issue::NodeRemoved];
             }
             cluster
@@ -255,6 +260,7 @@ fn read_placement<'a>(
         RegistrationStatus::Answered(answer) => Some(*answer),
         RegistrationStatus::Pending
         | RegistrationStatus::RootRefused { .. }
+        | RegistrationStatus::RemovalPending
         | RegistrationStatus::Refused(_)
         | RegistrationStatus::Removed => None,
     };
@@ -265,7 +271,7 @@ fn read_placement<'a>(
         meta_role,
         meta_leader,
         lifecycle: cluster
-            .and_then(|cluster| cluster.node(me))
+            .and_then(|cluster| cluster.own_record(me, placement.root))
             .map(|record| record.lifecycle),
         registration,
     });
@@ -285,7 +291,11 @@ fn read_placement<'a>(
                 report.node_issues.push(Issue::ReplicationFactorMismatch);
             }
             for (group, placed) in cluster.groups().iter() {
-                if let Some(role) = placement.standing.placed_role(cluster, group, me) {
+                if let Some(role) =
+                    placement
+                        .standing
+                        .placed_role(cluster, group, me, placement.root)
+                {
                     report.expected_groups.insert(group.0, ExpectedReplica {
                         role,
                         since: placed.since(),
@@ -472,7 +482,9 @@ pub fn raft_maintenance_report(
                 status.registration.standing(),
                 shown_cluster(&status.view),
                 status.node,
+                reader.root(),
             ),
+            root: reader.root(),
         });
     check_raft_maintenance(MaintenanceInputs {
         node_id,

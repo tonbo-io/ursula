@@ -140,6 +140,18 @@ impl RootGuard {
         crate::predecessor_wait::sync_fence_shed(&self.0.registry, &self.0.fence);
     }
 
+    /// The meta group answered this run's registration: the run may delete
+    /// snapshot objects from now on (`NodeFence::registered`).
+    pub(crate) fn registered(&self) {
+        self.0.fence.registered();
+    }
+
+    /// The meta group refused this run's bound root as removed: the run
+    /// deletes no snapshot object again (`NodeFence::removed`).
+    pub(crate) fn removed(&self) {
+        self.0.fence.removed();
+    }
+
     /// Checks node's slot in `view` (see the module docs).
     pub(crate) fn check_view(&self, view: &PlacementView, confirmed: bool) {
         let slot = slot_of(&view.state, self.0.node);

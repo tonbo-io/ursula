@@ -1261,6 +1261,22 @@ impl GroupRejoin {
                     .map_err(|source| GateOpenError::StartAsFollower { group, source })?;
                 VoteGate::closed(GroupEvidence::Initialized)
             }
+            // A committed vote above genesis on an empty log is a live
+            // leader's: a barrier's floor, or the vote OpenRaft saves before
+            // it appends a leader's entries, a conflicting probe's too. A
+            // genesis vote is uncommitted. The group then holds entries, so
+            // the gate refuses every candidate, across a restart between the
+            // vote and the first entry too. A seed follower at genesis that
+            // saved a leader's vote opens Initialized as well, which is safe
+            // and costs only liveness in a narrow genesis corner.
+            (None, HeldLogState::Empty)
+                if store
+                    .vote()
+                    .is_some_and(|vote| vote.is_committed() && vote.leader_id().term() > 0) =>
+            {
+                store.hold_unknown_history();
+                VoteGate::closed(GroupEvidence::Initialized)
+            }
             (None, HeldLogState::Empty) => {
                 tracing::debug!(
                     node_id,
@@ -1431,7 +1447,26 @@ impl GroupRejoin {
     /// A replica that lost its vote must not help a stale leader prove a quorum.
     /// This includes empty heartbeats and snapshot acknowledgements.
     pub(crate) fn replication_allowed(&self, vote: UrsulaVote) -> bool {
+        if self.unscreened_empty_replica() {
+            return true;
+        }
         self.recovery_vote().is_some_and(|floor| vote >= floor)
+    }
+
+    /// Whether a negative control turned off the screens of a replica that
+    /// held nothing of its group when its Raft was bound
+    /// (`Defence::EmptyReplicaVote`): its votes and acknowledgements then
+    /// go to OpenRaft unscreened, floor and gate alike, as a fresh disk's
+    /// would without them.
+    fn unscreened_empty_replica(&self) -> bool {
+        use ursula_stream::sim_controls::Defence;
+        if !ursula_stream::sim_controls::off(Defence::EmptyReplicaVote)
+            || !self.metrics.get().is_some_and(|bound| !bound.held_log)
+        {
+            return false;
+        }
+        ursula_stream::sim_controls::note_fired(Defence::EmptyReplicaVote);
+        true
     }
 
     /// The higher of the floor and the Raft core's current vote, read on
@@ -2493,6 +2528,9 @@ impl GroupRejoin {
                 self.last_log_id().or(metrics.last_applied),
                 floor.is_some(),
             ));
+        }
+        if self.unscreened_empty_replica() {
+            return None;
         }
         let last_applied = metrics.last_applied.as_ref().map(|log_id| log_id.index());
         match floor {

@@ -6,7 +6,8 @@
 //! - [`moves`]: `placement move`, `cancel` and `set-move-limit`, pre-checked
 //!   with the kernel's own `check` on a confirmed view.
 //! - [`lifecycle`]: `node cordon`, `uncordon` and `decommission`, pre-checked
-//!   the same way, and `node verify-removed` and `verify-not-removed`.
+//!   the same way, and `node verify-removed`, `verify-joinable` and
+//!   `verify-vacant`.
 //!
 //! `node replace-disk` releases the root (the WAL disk) a node id is bound
 //! to in meta, so an empty disk under that id binds. It reads the node's

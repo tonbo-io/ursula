@@ -45,9 +45,10 @@ it reports the first of:
 
 | `reason` | Meaning |
 | -------- | ------- |
-| `superseded` | Another process may answer as this node: the meta group released this process's WAL root or binds its node ID to another root, or a peer saw a newer run of the root. The process takes part in nothing until it exits. Stop it ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)) |
+| `superseded` | Another process may answer as this node: the meta group released this process's WAL root or binds its node ID to another root, or a peer saw a newer run of the root. The old disk of a decommissioned node whose ID is vacant reports it too. The process takes part in nothing until it exits. Stop it, and never start that disk again ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node), [Cordon and decommission](/docs/operations#cordon-and-decommission)) |
 | `disk_lease_lost` | No probe of the WAL disk synced within `raft.wal.lease`. The node takes part in no Raft traffic and answers clients `503` until a probe succeeds ([The disk lease](/docs/operations#the-disk-lease)) |
 | `root_refused` | The meta group binds this node ID to another WAL root than the new one the node runs on. The node takes part in no group until `ursulactl node replace-disk` releases the old root ([Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)) |
+| `removal_pending` | This node ID is decommissioned and its removal has not completed, and the node runs on a new disk. The node takes part in no group and binds with no restart once the meta leader marks the ID vacant. `leader_report.removal_pending` on the meta leader names what the removal waits for, often a group without a leader or the old process still running ([Cordon and decommission](/docs/operations#cordon-and-decommission)) |
 | `predecessor_wait` | A process of an earlier run of this root may still run, after a host crash, a reboot, a remount or a lost run state, or the root is a new disk that just joined. The node grants no vote and opens no recovery gate for 12 seconds |
 | `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
 | `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |

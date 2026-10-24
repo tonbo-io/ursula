@@ -101,9 +101,11 @@ server:
   scaleCheck:
     # Render the pre-upgrade,pre-rollback hook that checks a change of
     # replicaCount: a lower count needs every dropped node id removed by
-    # `ursulactl node decommission --wait`, a higher one needs no started id
-    # removed, and a raise from 1 is refused. It reads the live StatefulSet
-    # with kubectl (RBAC: get on this release's StatefulSet).
+    # `ursulactl node decommission --wait`, a higher one waits for each
+    # started id's removal to complete and deletes the left volume of a
+    # vacant id, and a raise from 1 is refused. It reads the live StatefulSet
+    # with kubectl (RBAC: get on this release's StatefulSet, get and delete
+    # on the raft-data PVCs of the ordinals a raise can start).
     enabled: true
     activeDeadlineSeconds: 300
     # The image kubectl is copied from into the check's Ursula container.

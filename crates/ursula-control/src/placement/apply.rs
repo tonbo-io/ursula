@@ -184,6 +184,11 @@ enum Change {
         node: NodeId,
         record: NodeRecord,
     },
+    /// A removed node's removal completed: its id turns vacant.
+    Vacate {
+        node: NodeId,
+        record: NodeRecord,
+    },
     /// The group starts, retargets or cancels a move.
     Move {
         group: RaftGroupId,
@@ -278,7 +283,8 @@ fn plan_forming(
         | ControlCommand::ReportConverged { .. }
         | ControlCommand::SetNodeLifecycle { .. }
         | ControlCommand::SetMoveLimit { .. }
-        | ControlCommand::ReportTornDown { .. } => Err(ControlError::NotBootstrapped),
+        | ControlCommand::ReportTornDown { .. }
+        | ControlCommand::ReportRemovalComplete { .. } => Err(ControlError::NotBootstrapped),
     }
 }
 
@@ -386,6 +392,9 @@ impl Cluster {
                 node,
                 created_at,
             } => self.plan_torn_down(group, node, created_at),
+            ControlCommand::ReportRemovalComplete { node, root, now_ms } => {
+                self.plan_removal_complete(node, root, now_ms)
+            }
         }
     }
 
@@ -399,10 +408,18 @@ impl Cluster {
         let Some(record) = self.node(node) else {
             return Ok(Change::Register { node, root, now_ms });
         };
-        if record.lifecycle == NodeLifecycle::Removed {
-            return Err(ControlError::NodeRemoved { node });
-        }
-        let slot = register_slot(node, Some(record.root), root, empty)?;
+        let slot = match record.lifecycle {
+            NodeLifecycle::Removed => return Err(ControlError::NodeRemoved { node }),
+            // A new life: only an empty root other than the released one
+            // takes the slot, and it starts on a fresh record.
+            NodeLifecycle::Vacant => {
+                register_slot(node, Some(record.root), root, empty)?;
+                return Ok(Change::Register { node, root, now_ms });
+            }
+            NodeLifecycle::Active | NodeLifecycle::Cordoned | NodeLifecycle::Decommissioning => {
+                register_slot(node, Some(record.root), root, empty)?
+            }
+        };
         if slot == record.root {
             return Ok(Change::Nothing(ControlApplied::NodeRegistered(
                 self.registered(node, *record),
@@ -419,9 +436,7 @@ impl Cluster {
 
     fn plan_release(&self, node: NodeId, root: RootId) -> Result<Change, ControlError> {
         let record = self.node(node).ok_or(ControlError::UnknownNode { node })?;
-        if record.lifecycle == NodeLifecycle::Removed {
-            return Err(ControlError::NodeRemoved { node });
-        }
+        check_life(node, record)?;
         let slot = release_slot(node, record.root, root)?;
         let released = NodeRecord {
             root: slot,
@@ -525,9 +540,9 @@ impl Cluster {
         placed_now: &VoterSet,
     ) -> Result<(), ControlError> {
         let record = self.node(node).ok_or(ControlError::UnknownNode { node })?;
+        check_life(node, record)?;
         match record.lifecycle {
-            NodeLifecycle::Removed => return Err(ControlError::NodeRemoved { node }),
-            NodeLifecycle::Active => {}
+            NodeLifecycle::Removed | NodeLifecycle::Vacant | NodeLifecycle::Active => {}
             NodeLifecycle::Cordoned | NodeLifecycle::Decommissioning => {
                 if !placed_now.contains(node) {
                     return Err(ControlError::IneligibleTarget {
@@ -560,9 +575,7 @@ impl Cluster {
             GroupPlacement::Seeded { .. } => {
                 for node in voters.iter() {
                     let record = self.node(node).ok_or(ControlError::UnknownNode { node })?;
-                    if record.lifecycle == NodeLifecycle::Removed {
-                        return Err(ControlError::NodeRemoved { node });
-                    }
+                    check_life(node, record)?;
                 }
                 if voters.len() != usize::from(self.params.replication_factor.get()) {
                     return Err(ControlError::NotTarget {
@@ -610,17 +623,16 @@ impl Cluster {
         now_ms: u64,
     ) -> Result<Change, ControlError> {
         let record = *self.node(node).ok_or(ControlError::UnknownNode { node })?;
+        check_life(node, &record)?;
         let lifecycle = match (record.lifecycle, change) {
-            (NodeLifecycle::Removed, _) => return Err(ControlError::NodeRemoved { node }),
             (_, LifecycleChange::Decommission) if self.params.meta_voters.contains(node) => {
                 return Err(ControlError::MetaVoter { node });
             }
             (NodeLifecycle::Decommissioning, LifecycleChange::Cordon) => {
                 return Err(ControlError::Decommissioning { node });
             }
-            (NodeLifecycle::Active | NodeLifecycle::Cordoned, LifecycleChange::Cordon) => {
-                NodeLifecycle::Cordoned
-            }
+            // A node with no life was refused above.
+            (_, LifecycleChange::Cordon) => NodeLifecycle::Cordoned,
             (_, LifecycleChange::Uncordon) => NodeLifecycle::Active,
             (_, LifecycleChange::Decommission) => NodeLifecycle::Decommissioning,
         };
@@ -646,15 +658,45 @@ impl Cluster {
         created_at: MetaLogId,
     ) -> Result<Change, ControlError> {
         let record = self.node(node).ok_or(ControlError::UnknownNode { node })?;
-        if record.lifecycle == NodeLifecycle::Removed {
-            return Err(ControlError::NodeRemoved { node });
-        }
+        check_life(node, record)?;
         Ok(match self.retirement(group, node) {
             Some(retirement) if retirement.created_at == created_at => {
                 Change::TornDown { group, node }
             }
             Some(_) | None => Change::Nothing(ControlApplied::NothingToTearDown),
         })
+    }
+
+    /// A removal report of `node` on `root`: a compare-and-set on the
+    /// removed record and the root its slot names. A repeat of the report
+    /// that made the id vacant answers the vacant record unchanged.
+    fn plan_removal_complete(
+        &self,
+        node: NodeId,
+        root: RootId,
+        now_ms: u64,
+    ) -> Result<Change, ControlError> {
+        let record = *self.node(node).ok_or(ControlError::UnknownNode { node })?;
+        if record.root.root() != root {
+            return Err(ControlError::StaleRoot {
+                node,
+                slot: record.root,
+            });
+        }
+        match record.lifecycle {
+            NodeLifecycle::Removed => Ok(Change::Vacate {
+                node,
+                record: NodeRecord {
+                    lifecycle: NodeLifecycle::Vacant,
+                    since_ms: now_ms,
+                    root: RootSlot::Released(root),
+                },
+            }),
+            NodeLifecycle::Vacant => Ok(Change::Nothing(ControlApplied::RemovalCompleted(record))),
+            lifecycle @ (NodeLifecycle::Active
+            | NodeLifecycle::Cordoned
+            | NodeLifecycle::Decommissioning) => Err(ControlError::NotRemoved { node, lifecycle }),
+        }
     }
 
     fn existing(&self, group: RaftGroupId) -> Result<&GroupPlacement, ControlError> {
@@ -682,6 +724,10 @@ impl Cluster {
             Change::Release { node, record } => {
                 self.nodes.insert(node, record);
                 ControlApplied::RootReleased(record)
+            }
+            Change::Vacate { node, record } => {
+                self.nodes.insert(node, record);
+                ControlApplied::RemovalCompleted(record)
             }
             Change::Move {
                 group,
@@ -806,6 +852,16 @@ fn register_slot(
         Some(slot @ (RootSlot::Bound(_) | RootSlot::Released(_))) => {
             Err(ControlError::OtherRoot { node, slot })
         }
+    }
+}
+
+/// Refuses a command that needs `node` in a life (see
+/// [`NodeLifecycle::has_life`]): one refusal per lifecycle without one.
+fn check_life(node: NodeId, record: &NodeRecord) -> Result<(), ControlError> {
+    match record.lifecycle {
+        NodeLifecycle::Removed => Err(ControlError::NodeRemoved { node }),
+        NodeLifecycle::Vacant => Err(ControlError::NodeVacant { node }),
+        NodeLifecycle::Active | NodeLifecycle::Cordoned | NodeLifecycle::Decommissioning => Ok(()),
     }
 }
 

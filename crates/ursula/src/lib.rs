@@ -1548,6 +1548,7 @@ pub(crate) struct ReadinessFacts {
     pub(crate) superseded: bool,
     pub(crate) disk_lease_lost: bool,
     pub(crate) root_refused: bool,
+    pub(crate) removal_pending: bool,
     pub(crate) predecessor_wait: bool,
     pub(crate) format_epoch_mismatch: bool,
     pub(crate) wal_disk_pressure: bool,
@@ -1568,6 +1569,8 @@ pub(crate) fn readiness_reason(
         Some(Reason::DiskLeaseLost)
     } else if facts.root_refused {
         Some(Reason::RootRefused)
+    } else if facts.removal_pending {
+        Some(Reason::RemovalPending)
     } else if facts.predecessor_wait {
         Some(Reason::PredecessorWait)
     } else if facts.format_epoch_mismatch {
@@ -1626,16 +1629,24 @@ fn serving_readiness(state: &HttpState) -> ursula_proto::admin::ServingReadiness
     let predecessor_wait = fence
         .as_ref()
         .is_some_and(ursula_runtime::NodeFence::owes_wait);
-    // An unbound root under a node id that meta binds to another root.
-    let root_refused = state.meta().status_reader().is_some_and(|reader| {
-        matches!(
-            reader.registration(),
-            ursula_control::RegistrationStatus::RootRefused { .. }
-        )
-    });
+    // An unbound root under a node id that meta binds to another root, and
+    // one under a removed id whose removal has not completed.
+    let registration = state
+        .meta()
+        .status_reader()
+        .map(|reader| reader.registration());
+    let root_refused = matches!(
+        registration,
+        Some(ursula_control::RegistrationStatus::RootRefused { .. })
+    );
+    let removal_pending = matches!(
+        registration,
+        Some(ursula_control::RegistrationStatus::RemovalPending)
+    );
     let ready = !superseded
         && !disk_lease_lost
         && !root_refused
+        && !removal_pending
         && !predecessor_wait
         && !disk.pressure
         && !format_epoch_mismatch
@@ -1654,6 +1665,7 @@ fn serving_readiness(state: &HttpState) -> ursula_proto::admin::ServingReadiness
             superseded,
             disk_lease_lost,
             root_refused,
+            removal_pending,
             predecessor_wait,
             format_epoch_mismatch,
             wal_disk_pressure: disk.pressure,

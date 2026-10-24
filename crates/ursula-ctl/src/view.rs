@@ -15,9 +15,10 @@
 //! placement the replicas' memberships still show: a group whose replicas
 //! report other voters fails [`check_groups`].
 //!
-//! The verbs that walk the manifest skip the nodes the view shows removed
-//! ([`MetaLeaderView::members`]): a removed node has no role and may already
-//! be stopped.
+//! The verbs that walk the manifest skip the nodes the view shows with no
+//! life, removed or vacant ([`MetaLeaderView::members`]): such a node has no
+//! role and may already be stopped. A new life of a vacant id is a member
+//! again.
 //!
 //! A node that gives no status, through a transport failure or a `503` (it
 //! runs no meta runtime yet), is skipped. Any other failed answer, a body
@@ -35,7 +36,6 @@ use ursula_control::PlacementStatus;
 use ursula_control::Target;
 use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::NodeId;
-use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
@@ -109,16 +109,17 @@ impl MetaLeaderView {
         settled_targets(self.cluster.groups().iter())
     }
 
-    /// The nodes of `nodes` that the view does not show removed. A removed
-    /// node holds no role and may be stopped, so the verbs that walk the
-    /// manifest skip it. A node the view does not list yet stays.
+    /// The nodes of `nodes` that the view shows in a life
+    /// (`NodeLifecycle::has_life`). A removed or vacant node holds no role
+    /// and may be stopped, so the verbs that walk the manifest skip it. A
+    /// node the view does not list yet stays.
     pub fn members(&self, nodes: &[NodeInfo]) -> Vec<NodeInfo> {
         nodes
             .iter()
             .filter(|node| {
                 self.cluster
                     .node(NodeId::new(node.id))
-                    .is_none_or(|record| record.lifecycle != NodeLifecycle::Removed)
+                    .is_none_or(|record| record.lifecycle.has_life())
             })
             .cloned()
             .collect()

@@ -219,13 +219,21 @@ enum NodeCommand {
     /// until every node is removed. Exits 2 when a node was refused or the
     /// timeout passed.
     Decommission(DecommissionArgs),
-    /// Verify that every named node is removed, or never registered, so it
-    /// may leave. Reads the meta leader's view over the read URLs. Exits 2
-    /// when a node is not removed.
+    /// Verify that every named node is removed, vacant or never registered,
+    /// so it may leave. Reads the meta leader's view over the read URLs.
+    /// Exits 2 when a node is in a life.
     VerifyRemoved(VerifyRemovalArgs),
-    /// Verify that no named node is removed, so it may start: a removed id
-    /// never holds a group again. Exits 2 when a node is removed.
-    VerifyNotRemoved(VerifyRemovalArgs),
+    /// Verify that every named node may start: it never registered, it is
+    /// vacant (an empty disk registers as a new node), or it is in a life
+    /// (its own disk comes back). Waits, up to the timeout, while a node is
+    /// removed and its removal has not completed, printing what it waits
+    /// for. Exits 2 when a removal has not completed by the timeout.
+    VerifyJoinable(VerifyRemovalArgs),
+    /// Verify that every named node is vacant, so a disk left under its id
+    /// holds a removed life's state and may be deleted. Waits like
+    /// `verify-joinable` for a pending removal. Exits 3 when a node is in a
+    /// life (its disk is its own: keep it), and 2 for anything else.
+    VerifyVacant(VerifyRemovalArgs),
 }
 
 #[derive(Args, Debug)]
@@ -274,7 +282,8 @@ struct VerifyRemovalArgs {
     /// A node id. Repeat it for several nodes.
     #[arg(long = "node", required = true)]
     nodes: Vec<u64>,
-    /// How long to read again while no node names a meta leader.
+    /// How long to read again while no node names a meta leader, or a
+    /// node's removal has not completed.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
     #[arg(long, default_value_t = 1)]
@@ -1009,8 +1018,10 @@ fn lifecycle_options(
     }
 }
 
-/// `node cordon`, `uncordon`, `decommission`, `verify-removed` and
-/// `verify-not-removed`. A refusal or a check that fails exits 2.
+/// `node cordon`, `uncordon`, `decommission`, `verify-removed`,
+/// `verify-joinable` and `verify-vacant`. A refusal or a check that fails
+/// exits 2, and `verify-vacant` of a node in a life exits
+/// [`IN_LIFE_EXIT`].
 async fn run_lifecycle_subcommand(command: NodeCommand) -> Result<()> {
     use ursula_control::LifecycleChange;
     use ursula_ctl::placement::lifecycle;
@@ -1031,10 +1042,13 @@ async fn run_lifecycle_subcommand(command: NodeCommand) -> Result<()> {
             lifecycle::decommission(&client, &nodes, &options, &mut stdout).await
         }
         NodeCommand::VerifyRemoved(args) => {
-            run_verify_removal(&args, lifecycle::Removal::Removed).await
+            run_verify_removal(&args, lifecycle::Removal::Leaving).await
         }
-        NodeCommand::VerifyNotRemoved(args) => {
-            run_verify_removal(&args, lifecycle::Removal::NotRemoved).await
+        NodeCommand::VerifyJoinable(args) => {
+            run_verify_removal(&args, lifecycle::Removal::Joining).await
+        }
+        NodeCommand::VerifyVacant(args) => {
+            run_verify_removal(&args, lifecycle::Removal::Vacant).await
         }
     };
     let refused = |error: &anyhow::Error| {
@@ -1048,7 +1062,8 @@ async fn run_lifecycle_subcommand(command: NodeCommand) -> Result<()> {
         Ok(lifecycle::LifecycleEnd::Leaving(leaving)) => {
             println!(
                 "nodes {leaving:?} are decommissioning: the meta leader moves their groups away, \
-                 and `node verify-removed` passes once they are removed"
+                 `node verify-removed` passes once they are removed, and `node verify-joinable` \
+                 once their removal completed and their ids are vacant"
             );
             Ok(())
         }
@@ -1058,11 +1073,19 @@ async fn run_lifecycle_subcommand(command: NodeCommand) -> Result<()> {
         }
         Err(error) if refused(&error) => {
             println!("refused: {error}");
-            std::process::exit(2);
+            let in_life = matches!(
+                error.downcast_ref::<lifecycle::RemovalRefusal>(),
+                Some(lifecycle::RemovalRefusal::InLife { .. })
+            );
+            std::process::exit(if in_life { IN_LIFE_EXIT } else { 2 });
         }
         Err(error) => Err(error),
     }
 }
+
+/// The exit status of `node verify-vacant` for a node in a life, whose
+/// disk is its own: the chart's scale-check keeps such a volume.
+const IN_LIFE_EXIT: i32 = 3;
 
 async fn run_set_lifecycle(
     args: &LifecycleArgs,
@@ -1093,6 +1116,7 @@ async fn run_verify_removal(
         .copied()
         .map(ursula_proto::placement::NodeId::new)
         .collect();
+    let mut stdout = std::io::stdout().lock();
     ursula_ctl::placement::lifecycle::verify_removal(
         &client,
         &nodes,
@@ -1100,9 +1124,15 @@ async fn run_verify_removal(
         removal,
         Duration::from_secs(args.timeout_secs),
         Duration::from_secs(args.poll_interval_secs),
+        &mut stdout,
     )
     .await?;
-    println!("verified: nodes {:?} are {removal:?}", args.nodes);
+    let verified = match removal {
+        ursula_ctl::placement::lifecycle::Removal::Leaving => "may leave",
+        ursula_ctl::placement::lifecycle::Removal::Joining => "may start",
+        ursula_ctl::placement::lifecycle::Removal::Vacant => "are vacant",
+    };
+    println!("verified: nodes {:?} {verified}", args.nodes);
     Ok(ursula_ctl::placement::lifecycle::LifecycleEnd::Done)
 }
 
