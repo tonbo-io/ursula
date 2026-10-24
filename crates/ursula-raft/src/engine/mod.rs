@@ -505,6 +505,15 @@ pub(crate) fn may_hold_only_for_a_lagging_state(error: &GroupEngineError) -> boo
     )
 }
 
+/// Records that a leader's read barrier (`Defence::ImmutableLeaderBarrier`)
+/// starts a ReadIndex round for a read it would otherwise answer from its
+/// own state, so a simulation shows the barrier decided that read.
+fn barrier_round() {
+    ursula_stream::sim_controls::note_fired(
+        ursula_stream::sim_controls::Defence::ImmutableLeaderBarrier,
+    );
+}
+
 /// The OpenRaft config a replica runs with behind its recovery gate: it
 /// allows log reversion. A follower that lost entries it had acknowledged
 /// answers a conflict below the index its leader saw it match, and the
@@ -1735,6 +1744,7 @@ impl GroupEngine for RaftGroupEngine {
                 {
                     Ok(_) => {}
                     Err(error) if linearize && may_hold_only_for_a_lagging_state(&error) => {
+                        barrier_round();
                         self.require_linearizable_leader_read("read_stream", None)
                             .await?;
                         self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
@@ -1767,6 +1777,7 @@ impl GroupEngine for RaftGroupEngine {
                     Err(error) => may_hold_only_for_a_lagging_state(error),
                 }
             {
+                barrier_round();
                 self.require_linearizable_leader_read("read_stream", None)
                     .await?;
                 plan = self.plan_read(&request).await?;

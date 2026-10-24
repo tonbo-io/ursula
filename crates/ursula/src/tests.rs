@@ -2840,12 +2840,45 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
 
     // After the body is read a node never redirects. A router without the
     // leadership view thinks this follower leads, reads the body, and its
-    // engine refuses the write: a retryable 503, no Location.
+    // engine refuses the write through the append handler's after-body
+    // path: a retryable 503, no Location.
     let unaware = Router::new().merge(client_router_with_admission(
         HttpState::new(nodes[1].runtime.clone()),
         IngressAdmission::default(),
     ));
     let late = append(unaware).await;
+    assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(late.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert!(!late.headers().contains_key(LOCATION));
+    assert_eq!(
+        typed_routing(&late),
+        ursula_headers::RoutingAnswer::NoLeader {
+            group: ursula_headers::RaftGroup::from_u32(0)
+        }
+    );
+
+    // The same holds with a router that redirects the same refusal before
+    // the body. The follower's
+    // engine refuses an append, naming its leader: before the body the
+    // node's router answers it with a 307 to that leader, and after the
+    // body with a retryable 503 and no Location.
+    let refusal = nodes[1]
+        .runtime
+        .append(AppendRequest::from_bytes(
+            BucketStreamId::new("benchcmp", "routed"),
+            b"abc".to_vec(),
+        ))
+        .await
+        .expect_err("a follower refuses an append");
+    let routed = HttpState::with_raft_cluster(nodes[1].runtime.clone(), nodes[1].registry.clone());
+    let before =
+        write_error_or_leader_redirect_async(&routed, refusal.clone(), "/benchcmp/routed").await;
+    assert_eq!(before.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(matches!(
+        typed_routing(&before),
+        ursula_headers::RoutingAnswer::NotLeader { leader, .. } if leader.get() == 1
+    ));
+    let late = runtime_error_after_body(&routed, refusal);
     assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(late.headers().contains_key(axum::http::header::RETRY_AFTER));
     assert!(!late.headers().contains_key(LOCATION));

@@ -91,7 +91,10 @@ plan. The same predicate decides these errors for the follower's forward and the
 A leader that was just elected, or was deposed without knowing it, may not have applied everything
 committed: without the round its chunk could be short of one another replica marked, and its `404`
 or `410` could be for the stream before a recreate. A markable answer holds committed bytes, so it
-needs no round, and neither does a base-protocol read that succeeds.
+needs no round, and neither does a base-protocol read that succeeds. A deposed leader whose last quorum
+acknowledgement is older than its lease no longer leads (`LeaderRole::Lapsed`) and takes the
+follower's path. Inside its lease, or before any quorum acknowledged it, it still leads, as after a
+leadership-transfer election, which skips the voters' leases, and then only the round stops it.
 
 **Refusals.** A `410` or `416` of any read, and the `404` of a snapshot that is not the latest, carry the token of the stream that decided them: the state machine puts it in the error's context (`StreamErrorContext::StreamIncarnation`), the context survives a forward from a follower, and `render::insert_stream_error_headers` renders it. These answers come before the precondition, so a client compares the token instead of sending a `HEAD`.
 

@@ -875,12 +875,15 @@ impl ClientWriteLeaderRouter {
     /// The one answer of a node that cannot name `group`'s leader: the
     /// base URL a `NotHosted` redirect names, or `None` for a retryable
     /// `503`. `None` when `replica` counts as a voter, and on the admin
-    /// plane, whose redirect would name a client-plane URL.
+    /// plane, whose redirect would name a client-plane URL. `turn` says
+    /// whether the answer is given, which advances the rotation, or only
+    /// looked up.
     fn unhosted_answer(
         &self,
         group: RaftGroupId,
         replica: Replica,
         plane: Plane,
+        turn: Turn,
     ) -> Option<String> {
         if plane == Plane::Admin {
             return None;
@@ -904,7 +907,10 @@ impl ClientWriteLeaderRouter {
             None,
             &ids,
         );
-        let turn = self.not_hosted_turns.fetch_add(1, Ordering::Relaxed);
+        let turn = match turn {
+            Turn::Take => self.not_hosted_turns.fetch_add(1, Ordering::Relaxed),
+            Turn::Peek => self.not_hosted_turns.load(Ordering::Relaxed),
+        };
         let hint = candidates.not_hosted_hint(turn, |node| peers.contains(node.get()))?;
         peers.client_url(hint.get()).map(str::to_owned)
     }
@@ -916,7 +922,7 @@ impl ClientWriteLeaderRouter {
         group: RaftGroupId,
         request_target: &str,
     ) -> Option<Response> {
-        let base = self.unhosted_answer(group, Replica::Hosted, Plane::Client)?;
+        let base = self.unhosted_answer(group, Replica::Hosted, Plane::Client, Turn::Take)?;
         redirect(
             &base,
             RoutingAnswer::NotHosted {
@@ -936,9 +942,27 @@ impl ClientWriteLeaderRouter {
         request_target: &str,
         plane: Plane,
     ) -> Option<Response> {
-        let (base, answer) = match err {
+        let (base, answer) = self.redirect_answer(err, plane, Turn::Take)?;
+        redirect(&base, answer, request_target)
+    }
+
+    /// Whether [`Self::redirect_response`] would redirect `err`, looked up
+    /// without giving an answer: it advances no `NotHosted` rotation.
+    #[cfg(madsim)]
+    fn redirects(&self, err: &RuntimeError, plane: Plane) -> bool {
+        self.redirect_answer(err, plane, Turn::Peek).is_some()
+    }
+
+    /// The base URL and routing answer of the redirect for `err`.
+    fn redirect_answer(
+        &self,
+        err: &RuntimeError,
+        plane: Plane,
+        turn: Turn,
+    ) -> Option<(String, RoutingAnswer)> {
+        Some(match err {
             RuntimeError::GroupNotHosted { raft_group_id, .. } => (
-                self.unhosted_answer(*raft_group_id, Replica::Absent, plane)?,
+                self.unhosted_answer(*raft_group_id, Replica::Absent, plane, turn)?,
                 RoutingAnswer::NotHosted {
                     group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
                 },
@@ -954,16 +978,31 @@ impl ClientWriteLeaderRouter {
                     term: ursula_headers::RaftTerm::from_u64(leader.term),
                 }),
                 None => (
-                    self.unhosted_answer(*raft_group_id, Replica::Hosted, plane)?,
+                    self.unhosted_answer(*raft_group_id, Replica::Hosted, plane, turn)?,
                     RoutingAnswer::NotHosted {
                         group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
                     },
                 ),
             },
             _ => return None,
-        };
-        redirect(&base, answer, request_target)
+        })
     }
+}
+
+/// Whether a `NotHosted` lookup gives its answer or only looks it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// The answer is given: the rotation advances.
+    Take,
+    /// The answer is only looked up: the rotation stays.
+    #[cfg_attr(
+        not(madsim),
+        expect(
+            dead_code,
+            reason = "only a simulation looks up a redirect it does not give"
+        )
+    )]
+    Peek,
 }
 
 /// Whether the node that answers holds a replica of the group.
@@ -5619,13 +5658,19 @@ pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> 
     count_refusal(state, &err);
     // Only a DST negative control turns the rule off, to show the
     // simulation catches a redirect after the body (its `Location` names
-    // the leader's base URL); every other build has no switch.
-    if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::NoRedirectAfterBody)
-        && let Some(redirect) = state
-            .client_write_router()
-            .and_then(|router| router.redirect_response(&err, "", Plane::Client))
-    {
-        return redirect;
+    // the leader's base URL). With the rule on, a simulation counts each
+    // refusal the rule kept from redirecting, so its runs show the rule
+    // decided an answer. Every other build has no switch.
+    #[cfg(madsim)]
+    if let Some(router) = state.client_write_router() {
+        use ursula_stream::sim_controls::Defence;
+        if ursula_stream::sim_controls::off(Defence::NoRedirectAfterBody) {
+            if let Some(redirect) = router.redirect_response(&err, "", Plane::Client) {
+                return redirect;
+            }
+        } else if router.redirects(&err, Plane::Client) {
+            ursula_stream::sim_controls::note_fired(Defence::NoRedirectAfterBody);
+        }
     }
     if is_leadership_refusal(&err) {
         return leader_unknown_retry_response(err, Access::Write);

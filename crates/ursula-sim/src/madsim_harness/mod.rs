@@ -586,6 +586,7 @@ mod http;
 mod identity_fence;
 mod immutable_reads;
 mod immutable_reads_loss;
+mod immutable_reads_transfer;
 mod journal_cluster;
 mod leader_reads;
 mod membership_rollback;

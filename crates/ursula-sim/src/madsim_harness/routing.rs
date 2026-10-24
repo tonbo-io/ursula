@@ -12,10 +12,16 @@
 //! held at their body until it follows a successor. The others elect a new
 //! leader and the partition heals, so the old leader steps down and its
 //! view follows the new one. Writes whose head arrives now are redirected
-//! before their body. The held writes are refused after theirs, by a node
-//! that names its leader: the refusal that redirects before a body. Then
-//! the runtime swaps to the new leader's engine and the old leader restarts
-//! as a follower.
+//! before their body. The held writes are refused after theirs, before a
+//! proposal, `503 NO_LEADER`. In some episodes the refusing node names its
+//! leader, the refusal that redirects before a body, and in others it names
+//! none (seed 501's second episode). The front door counts each refusal after a
+//! body that the node's router redirects when asked, and every run must
+//! count one, so the rule decides answers in every defended run, not only
+//! in its negative control. Then the runtime swaps to the new leader's
+//! engine and the old leader restarts as a follower. Every run also needs a
+//! write in flight that the cut-off leader proposed and refused after its
+//! body, `503 OUTCOME_UNKNOWN`.
 //!
 //! Every request body records whether the server polled it. Writes go as
 //! HTTP/2 or with `Expect: 100-continue`, where a server that answers before
@@ -50,11 +56,15 @@ use axum::http::header::RETRY_AFTER;
 use futures_util::future::BoxFuture;
 use openraft::ServerState;
 use ursula_headers::Delivery;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
 use ursula_headers::WriteKind;
 use ursula_headers::WriteOutcome;
 use ursula_headers::classify;
+use ursula_stream::sim_controls::Defence;
+use ursula_stream::sim_controls::fired;
 
 use super::Arc;
 use super::Body;
@@ -279,6 +289,23 @@ struct Exchange {
 }
 
 impl Exchange {
+    /// What the answer says of the write, by `ursula_headers::classify`.
+    fn outcome(&self) -> WriteOutcome {
+        classify(
+            WriteKind::Producer,
+            self.response.status().as_u16(),
+            header_pairs(&self.response),
+            self.response.body(),
+        )
+    }
+
+    /// The code of the answer's error body, if it has one.
+    fn error_code(&self) -> Option<ErrorCode> {
+        ErrorBody::parse(self.response.body())
+            .ok()
+            .map(|body| body.code)
+    }
+
     /// Whether the server refused the write after it polled the body, as
     /// the rule prescribes: `503` with `Retry-After`.
     fn refused_after_body(&self) -> bool {
@@ -398,6 +425,9 @@ struct Ledger {
     repeated: BTreeSet<(u8, u64)>,
     redirects: u64,
     refused_after_body: u64,
+    /// Writes in flight across a leader's cut that it proposed and then
+    /// refused after their bodies: `503 OUTCOME_UNKNOWN` with `Retry-After`.
+    in_flight_unknown_after_body: u64,
 }
 
 impl Ledger {
@@ -554,6 +584,7 @@ pub(super) async fn run_routing_before_body_inner(
     let mut ledger = Ledger::default();
     let mut next_seq = BTreeMap::<u8, u64>::new();
     let mut unresolved = Vec::new();
+    let kept_from_redirecting = fired(Defence::NoRedirectAfterBody);
     for (index, episode) in plan.episodes.iter().enumerate() {
         for producer in 0..STEADY_PRODUCERS {
             for _ in 0..episode.steady {
@@ -653,27 +684,37 @@ pub(super) async fn run_routing_before_body_inner(
                 unresolved.push(*write);
             }
         }
-        // The writes in flight resolve: their bodies were polled.
+        // The writes in flight resolve: their bodies were polled. One the
+        // cut-off leader proposed is refused after its body with an unknown
+        // outcome, and never redirected.
         for handle in in_flight {
             let exchange = handle.await.expect("in-flight write task");
             if ledger.check(&mut trace, &exchange).is_none() {
                 unresolved.push(exchange.write);
             }
+            if exchange.refused_after_body()
+                && exchange.error_code() == Some(ErrorCode::OutcomeUnknown)
+            {
+                ledger.in_flight_unknown_after_body =
+                    ledger.in_flight_unknown_after_body.saturating_add(1);
+            }
         }
         // The held writes resolve: the node that admitted each one refuses
-        // it after its body, naming its successor, so the rule alone keeps
-        // that refusal from redirecting.
+        // it after its body, before proposing it, and when the refusal names
+        // its successor, the rule alone keeps it from redirecting.
         for handle in held {
             let exchange = handle.await.expect("held write task");
             if ledger.check(&mut trace, &exchange).is_none() {
                 unresolved.push(exchange.write);
             }
             assert!(
-                exchange.refused_after_body(),
-                "seed {}: {:?}, whose body reached the deposed leader, was answered {}",
+                exchange.refused_after_body()
+                    && exchange.outcome() == WriteOutcome::Refused(ErrorCode::NoLeader),
+                "seed {}: {:?}, whose body reached the deposed leader, was answered {} ({:?})",
                 config.seed,
                 exchange.write,
-                exchange.response.status()
+                exchange.response.status(),
+                exchange.outcome()
             );
         }
 
@@ -748,6 +789,23 @@ pub(super) async fn run_routing_before_body_inner(
     assert!(
         ledger.refused_after_body > 0,
         "seed {} refused no write after its body",
+        config.seed
+    );
+    assert!(
+        ledger.in_flight_unknown_after_body > 0,
+        "seed {} refused no write it proposed after its body",
+        config.seed
+    );
+    // Some refusal after a body is one the node's router redirects when
+    // asked, which it would have answered with the rule off: the rule
+    // decided its answer. A refusal the router does not redirect answers
+    // the same with the rule off, and leaves the negative control nothing
+    // to catch.
+    let kept_from_redirecting =
+        fired(Defence::NoRedirectAfterBody).saturating_sub(kept_from_redirecting);
+    assert!(
+        kept_from_redirecting > 0,
+        "seed {}: the rule kept no refusal after a body from redirecting",
         config.seed
     );
     trace.push(SimEvent::RoutingBeforeBodyVerified {

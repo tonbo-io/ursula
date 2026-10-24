@@ -1232,8 +1232,7 @@ impl From<VoteRound> for InProcessRaftRpcKind {
 #[derive(Debug, Clone)]
 pub enum InProcessRaftNetworkPolicyEvent {
     SetDelay(Option<Duration>),
-    /// Retained for external observers (ursula-sim introspection) even though
-    /// no in-crate policy method emits one-way events today.
+    /// [`InProcessRaftNetworkPolicy::partition_one_way`].
     PartitionOneWay {
         source: u64,
         target: u64,
@@ -1242,8 +1241,7 @@ pub enum InProcessRaftNetworkPolicyEvent {
         a: u64,
         b: u64,
     },
-    /// Retained for external observers (ursula-sim introspection) even though
-    /// no in-crate policy method emits one-way events today.
+    /// [`InProcessRaftNetworkPolicy::heal_one_way`].
     HealOneWay {
         source: u64,
         target: u64,
@@ -1475,6 +1473,35 @@ impl InProcessRaftNetworkPolicy {
             a,
             b,
         });
+    }
+
+    /// Fails every RPC that `source` sends to `target`, its answer
+    /// included, while `target`'s RPCs to `source` still pass. A leader
+    /// whose peers' RPCs to it fail still reaches them, and hears of a
+    /// newer term only through the answer to an RPC it sends itself.
+    /// Only the Raft RPCs ask by direction: the calls
+    /// that ask [`Self::partitioned`], such as the recovery-gate barrier,
+    /// bootstrap probes and meta calls, find the pair cut both ways.
+    pub fn partition_one_way(&self, source: u64, target: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("in-process raft network policy mutex");
+        inner.partitions.insert((source, target));
+        self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::PartitionOneWay {
+            source,
+            target,
+        });
+    }
+
+    /// Lets `source`'s RPCs to `target` pass again.
+    pub fn heal_one_way(&self, source: u64, target: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("in-process raft network policy mutex");
+        inner.partitions.remove(&(source, target));
+        self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::HealOneWay { source, target });
     }
 
     pub fn heal_bidirectional(&self, a: u64, b: u64) {
