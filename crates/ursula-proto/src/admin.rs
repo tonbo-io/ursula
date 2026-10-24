@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -1808,12 +1809,21 @@ pub struct BucketUsageReport {
     /// replaced body during its GC grace, staged parts (see
     /// `staged_snapshot_parts`) and Raft group snapshots do not count.
     /// Bounded by streams times 1 GiB, saturating.
-    #[serde(default)]
-    pub snapshot_bytes: u64,
+    ///
+    /// `None` means unknown, never zero: a node of 0.10.1 or later always
+    /// reports `Some`, so `None` only comes from a report without the field,
+    /// such as a 0.10.0 node's, or from a sum with such a part
+    /// ([`Self::add`]). `None` is skipped when serialized, so an unknown
+    /// value has the shape of a 0.10.0 report. A consumer must not bill
+    /// `None` as `0`. The derived [`Default`] is `None` as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_bytes: Option<u64>,
 }
 
 impl BucketUsageReport {
-    /// Adds `other`'s counters and gauges to these.
+    /// Adds `other`'s counters and gauges to these. `snapshot_bytes` stays
+    /// known only when both are known: the saturating sum of two `Some`,
+    /// otherwise `None`, so a sum with an unknown part is unknown.
     pub fn add(&mut self, other: &Self) {
         self.committed_append_bytes = self
             .committed_append_bytes
@@ -1826,7 +1836,10 @@ impl BucketUsageReport {
             .saturating_add(other.committed_write_units);
         self.retained_bytes = self.retained_bytes.saturating_add(other.retained_bytes);
         self.stream_count = self.stream_count.saturating_add(other.stream_count);
-        self.snapshot_bytes = self.snapshot_bytes.saturating_add(other.snapshot_bytes);
+        self.snapshot_bytes = match (self.snapshot_bytes, other.snapshot_bytes) {
+            (Some(ours), Some(theirs)) => Some(ours.saturating_add(theirs)),
+            _ => None,
+        };
     }
 }
 
@@ -1866,7 +1879,14 @@ impl UsageReport {
         let complete = (0..group_count).all(|group| newest.contains_key(&group));
         let mut buckets = BTreeMap::<String, BucketUsageReport>::new();
         for (bucket_id, usage) in newest.values().flat_map(|group| &group.buckets) {
-            buckets.entry(bucket_id.clone()).or_default().add(usage);
+            // The first part starts the sum: the default's unknown
+            // `snapshot_bytes` would make every sum unknown.
+            match buckets.entry(bucket_id.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(*usage);
+                }
+                Entry::Occupied(mut entry) => entry.get_mut().add(usage),
+            }
         }
         (buckets, complete)
     }
@@ -1937,7 +1957,7 @@ mod usage_tests {
                 committed_write_units: streams.saturating_mul(3),
                 retained_bytes: streams.saturating_mul(7),
                 stream_count: streams,
-                snapshot_bytes: streams.saturating_mul(11),
+                snapshot_bytes: Some(streams.saturating_mul(11)),
             })]),
         }
     }
@@ -1967,27 +1987,107 @@ mod usage_tests {
             committed_write_units: 18,
             retained_bytes: 42,
             stream_count: 6,
-            snapshot_bytes: 66,
+            snapshot_bytes: Some(66),
         });
         let (buckets, complete) = UsageReport::bucket_usage(&reports[1..2]);
         assert!(!complete);
         assert_eq!(buckets["tenant"].stream_count, 5);
     }
 
-    /// A bucket entry from a node that does not report `snapshot_bytes`
-    /// decodes with zero, so a collector can read every patch of the minor.
+    /// A 0.10.1 report carries `snapshot_bytes` for every bucket, and a
+    /// known value, zero included, round-trips as a number.
     #[test]
-    fn a_bucket_without_snapshot_bytes_decodes_as_zero() {
-        let bucket: BucketUsageReport = serde_json::from_value(serde_json::json!({
+    fn a_reported_snapshot_bytes_round_trips_as_known() {
+        let json = serde_json::json!({
             "committed_append_bytes": 10,
             "committed_records": 2,
             "committed_write_units": 3,
             "retained_bytes": 7,
             "stream_count": 1,
-        }))
-        .expect("a bucket entry without snapshot_bytes decodes");
-        assert_eq!(bucket.snapshot_bytes, 0);
+            "snapshot_bytes": 0,
+        });
+        let bucket: BucketUsageReport =
+            serde_json::from_value(json.clone()).expect("a 0.10.1 bucket entry decodes");
+        assert_eq!(bucket.snapshot_bytes, Some(0));
+        assert_eq!(serde_json::to_value(bucket).expect("encodes"), json);
+    }
+
+    /// A bucket entry from a node that does not report `snapshot_bytes`,
+    /// such as a 0.10.0 node, decodes as unknown, not as zero, and an
+    /// unknown value is skipped again when encoded.
+    #[test]
+    fn a_bucket_without_snapshot_bytes_decodes_as_unknown() {
+        let json = serde_json::json!({
+            "committed_append_bytes": 10,
+            "committed_records": 2,
+            "committed_write_units": 3,
+            "retained_bytes": 7,
+            "stream_count": 1,
+        });
+        let bucket: BucketUsageReport = serde_json::from_value(json.clone())
+            .expect("a bucket entry without snapshot_bytes decodes");
+        assert_eq!(bucket.snapshot_bytes, None);
         assert_eq!(bucket.stream_count, 1);
+        assert_eq!(serde_json::to_value(bucket).expect("encodes"), json);
+    }
+
+    fn bucket(snapshot_bytes: Option<u64>) -> BucketUsageReport {
+        BucketUsageReport {
+            stream_count: 1,
+            snapshot_bytes,
+            ..BucketUsageReport::default()
+        }
+    }
+
+    /// A sum of known parts is known and saturates.
+    #[test]
+    fn adding_known_snapshot_bytes_stays_known() {
+        let mut sum = bucket(Some(4));
+        sum.add(&bucket(Some(5)));
+        assert_eq!(sum.snapshot_bytes, Some(9));
+        assert_eq!(sum.stream_count, 2);
+        sum.add(&bucket(Some(u64::MAX)));
+        assert_eq!(sum.snapshot_bytes, Some(u64::MAX));
+    }
+
+    /// One unknown part makes the sum unknown, on either side and for every
+    /// later part, and the other fields still add up.
+    #[test]
+    fn adding_an_unknown_snapshot_bytes_is_unknown() {
+        let mut sum = bucket(Some(4));
+        sum.add(&bucket(None));
+        assert_eq!(sum.snapshot_bytes, None);
+        assert_eq!(sum.stream_count, 2);
+        sum.add(&bucket(Some(5)));
+        assert_eq!(sum.snapshot_bytes, None);
+        let mut sum = bucket(None);
+        sum.add(&bucket(Some(5)));
+        assert_eq!(sum.snapshot_bytes, None);
+    }
+
+    /// A collector's total is unknown when a kept group's report lacks the
+    /// field, as a 0.10.0 replica's does during a rolling upgrade, and known
+    /// once every kept report carries it.
+    #[test]
+    fn a_collector_total_with_a_0_10_0_group_is_unknown() {
+        let mut old = usage(1, 3, 1);
+        for usage in old.buckets.values_mut() {
+            usage.snapshot_bytes = None;
+        }
+        let reports = [
+            usage_report(1, vec![usage(0, 9, 4)]),
+            usage_report(2, vec![old]),
+        ];
+        let (buckets, complete) = UsageReport::bucket_usage(&reports);
+        assert!(complete);
+        assert_eq!(buckets["tenant"].snapshot_bytes, None);
+        assert_eq!(buckets["tenant"].stream_count, 5);
+        let reports = [
+            usage_report(1, vec![usage(0, 9, 4)]),
+            usage_report(2, vec![usage(1, 3, 1)]),
+        ];
+        let (buckets, _complete) = UsageReport::bucket_usage(&reports);
+        assert_eq!(buckets["tenant"].snapshot_bytes, Some(55));
     }
 
     fn group(raft_group_id: u32, term: u64, finished: bool, bytes: u64) -> GroupStagedParts {

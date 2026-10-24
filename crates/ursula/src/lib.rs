@@ -2250,7 +2250,10 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
                                 committed_write_units: entry.usage.committed_write_units,
                                 retained_bytes: entry.usage.retained_bytes,
                                 stream_count: entry.usage.stream_count,
-                                snapshot_bytes: 0,
+                                // Every bucket this node reports carries a
+                                // known value; `None` is left for a report
+                                // without the field.
+                                snapshot_bytes: Some(0),
                             })
                         })
                         .collect::<std::collections::BTreeMap<_, _>>();
@@ -2258,7 +2261,7 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
                     // has a usage entry; `or_default` only keeps the bytes if
                     // that ever stops holding.
                     for (bucket_id, bytes) in usage.snapshot_bytes {
-                        buckets.entry(bucket_id).or_default().snapshot_bytes = bytes;
+                        buckets.entry(bucket_id).or_default().snapshot_bytes = Some(bytes);
                     }
                     ursula_proto::admin::GroupUsage {
                         raft_group_id: group.0,

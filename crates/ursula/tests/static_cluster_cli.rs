@@ -5593,17 +5593,17 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
         &mut procs,
         "every replica reports the snapshot bytes",
         async || {
-            let mut replicas = BTreeMap::<u32, Vec<u64>>::new();
+            let mut replicas = BTreeMap::<u32, Vec<Option<u64>>>::new();
             for node in &nodes {
                 for group in usage_report(&client, node).await?.groups {
                     let bytes = group
                         .buckets
                         .get("wide")
-                        .map_or(0, |usage| usage.snapshot_bytes);
+                        .and_then(|usage| usage.snapshot_bytes);
                     replicas.entry(group.raft_group_id).or_default().push(bytes);
                 }
             }
-            let expected: Vec<u64> = vec![5; 3];
+            let expected: Vec<Option<u64>> = vec![Some(5); 3];
             if replicas.len() == META_TEST_GROUPS
                 && replicas.values().all(|bytes| *bytes == expected)
             {
@@ -5679,8 +5679,8 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
                 reports.push(usage_report(&client, node).await?);
             }
             let (buckets, complete) = ursula_proto::admin::UsageReport::bucket_usage(&reports);
-            let bytes = buckets.get("wide").map_or(0, |usage| usage.snapshot_bytes);
-            if complete && bytes == 20 {
+            let bytes = buckets.get("wide").and_then(|usage| usage.snapshot_bytes);
+            if complete && bytes == Some(20) {
                 Ok(())
             } else {
                 Err(format!("complete {complete}, {buckets:?}"))
