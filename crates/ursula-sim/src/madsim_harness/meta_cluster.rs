@@ -17,6 +17,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 
 use ursula_control::ControlCommand;
@@ -66,6 +68,7 @@ use ursula_raft::meta::formation::FormationParams;
 use ursula_raft::meta::genesis::GenesisProbe;
 use ursula_raft::meta::handle::MetaHandle;
 use ursula_raft::meta::pause::MetaPausePoint;
+use ursula_raft::meta::replica::ActiveMeta;
 use ursula_raft::meta::replica::MetaSnapshotTrigger;
 use ursula_raft::meta::runtime::MetaJournal;
 use ursula_raft::meta::runtime::MetaRuntime;
@@ -78,6 +81,7 @@ use ursula_runtime::RuntimeMetrics;
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::journal_cluster::JournalCluster;
 use super::placed_hosting::DetachedHost;
+use super::placed_hosting::GateMarks;
 use super::placed_hosting::Placed;
 use super::recovery_wiring::RecoveryProbeError;
 use super::recovery_wiring::in_process_barrier;
@@ -256,6 +260,23 @@ struct Processes {
     next: u64,
     /// The node and incarnation of every process started, by tag.
     started: BTreeMap<u64, (u64, ProcessIncarnation)>,
+    /// The meta replica each process opened, by tag, with what its gate
+    /// showed then.
+    metas: BTreeMap<u64, OpenedMeta>,
+}
+
+/// A process's meta replica as it opened, before its drivers ran.
+struct OpenedMeta {
+    replica: Weak<ActiveMeta>,
+    opened: GateMarks,
+}
+
+/// What the recovery gate of a node's meta replica showed when its process
+/// opened it, and shows now ([`MetaCluster::meta_gate`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MetaGate {
+    pub(super) opened: GateMarks,
+    pub(super) now: GateMarks,
 }
 
 /// A node process that no longer answers for its node, which runs on, as a
@@ -363,6 +384,7 @@ impl MetaCluster {
                 current: BTreeMap::new(),
                 next: 1,
                 started: BTreeMap::new(),
+                metas: BTreeMap::new(),
             }),
             pause_next: None,
             meta_policy,
@@ -673,6 +695,31 @@ impl MetaCluster {
             drop(runtime.pauses().pause(point));
         }
         self.runtimes.insert(node_id, runtime);
+        let meta = self.registry(node_id).meta();
+        if let (Some(process), Some(fenced), Some(meta)) = (process, self.fenced.as_mut(), meta)
+            && let Some(gate) = meta.recovery_gate()
+        {
+            fenced.metas.insert(process, OpenedMeta {
+                opened: GateMarks::of(gate),
+                replica: Arc::downgrade(&meta),
+            });
+        }
+    }
+
+    /// The recovery gate of the meta replica that `node_id`'s current
+    /// process opened, while that replica runs. `None` for a cluster that
+    /// is not fenced, or a process whose meta replica did not open.
+    pub(super) fn meta_gate(&self, node_id: u64) -> Option<MetaGate> {
+        let fenced = self.fenced.as_ref()?;
+        let opened = fenced.metas.get(fenced.current.get(&node_id)?)?;
+        let meta = self.registry(node_id).meta()?;
+        if !Weak::ptr_eq(&opened.replica, &Arc::downgrade(&meta)) {
+            return None;
+        }
+        Some(MetaGate {
+            opened: opened.opened,
+            now: GateMarks::of(meta.recovery_gate()?),
+        })
     }
 
     /// Makes the next meta runtime this cluster starts wait at `point` for

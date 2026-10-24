@@ -89,13 +89,19 @@
 //!   whose unbound root its fence shows bound less than a predecessor wait
 //!   ago (`NodeFence::bound_at`), opens its gate, writes a vote floor, or
 //!   shows at a step an uncommitted vote other than the one it opened with.
-//!   It reads each replica at every step, and reads neither meta replicas
-//!   nor snapshot objects. It does not see a granted vote: a candidate that
-//!   wins commits the vote with its first heartbeat, well inside a step, and
-//!   the vote then reads as a leader's. No control exercises the vote clause.
-//!   Under `always` a moved volume's replicas open with their gates open
-//!   and need no floor, so there the gate and floor clauses judge only the
-//!   empty replicas of a new disk.
+//!   Nor does the meta replica of a process that owes its predecessor
+//!   wait, or whose unbound root its fence shows bound less than a wait
+//!   ago, open its gate or write a vote floor. It reads each replica at
+//!   every step, but not a meta replica's vote, and reads no snapshot
+//!   objects. It does not see a granted vote: a candidate that wins commits
+//!   the vote with its first heartbeat, well inside a step, and the vote
+//!   then reads as a leader's. No control exercises the vote clause. Under
+//!   `always` a moved volume's data replicas open with their gates open and
+//!   need no floor, so there the data gate and floor clauses judge nothing.
+//!   A new disk runs no data replica while held: its meta replica's barrier
+//!   rounds are held too (`fence_holds_barrier`), so that replica takes no
+//!   meta entries and confirms no view to create one by. In the new-disk
+//!   scripts I16 therefore judges the new disk's meta replica alone.
 //! - I17 ([`I17`]): no process counts an answer of a process of a node
 //!   given after a later process of that node made a promise (granted a
 //!   vote, acknowledged entries or installed a snapshot). It reads every
@@ -428,8 +434,13 @@ struct Read {
 /// I2's, I16's, I17's and I18's records across a run.
 #[derive(Default)]
 struct FenceChecks {
-    /// How many observations saw a held replica.
+    /// How many observations saw a held data replica.
     held_observations: u64,
+    /// How many observations saw a held process's meta replica.
+    held_meta_observations: u64,
+    /// Whether a step saw a held process whose journals hold a data
+    /// replica, which it opens while held.
+    held_with_journal: bool,
     /// Each acknowledged write, by group: when, and its payload.
     acknowledged: BTreeMap<u32, Vec<(madsim::time::Instant, Vec<u8>)>>,
     /// How many linearizable reads I18 compared.
@@ -448,11 +459,20 @@ impl FenceChecks {
     /// shows the gate and floor it showed when it opened, before its
     /// drivers ran, and either that vote or a committed one. A vote it
     /// granted to a candidate that won is committed by then, so the vote
-    /// clause sees only an uncommitted vote at the step. A held process
-    /// opens its replicas while held, since a hold begins at the start of
-    /// its run or, for a new disk's, their creation follows the binding. A
-    /// process is held while its fence holds it out, and for a predecessor
-    /// wait after its fence shows its unbound root bound.
+    /// clause sees only an uncommitted vote at the step. A process is held
+    /// while its fence holds it out, and for a predecessor wait after its
+    /// fence shows its unbound root bound. Its meta replica shows the gate
+    /// and floor it opened with while the process owes its wait, and for a
+    /// predecessor wait after that binding, but not while its root awaits
+    /// the binding: a forming cluster's meta replicas take their genesis
+    /// floors then.
+    ///
+    /// A held process opens its data replicas while held only when its
+    /// journals hold them, since a hold begins at the start of its run. A
+    /// new disk creates none until its hold ends: its meta replica's
+    /// barrier rounds are held too (`fence_holds_barrier`), so it holds no
+    /// floor, takes no meta entries and confirms no view to create a
+    /// replica by. Its meta replica is what a new disk's hold keeps out.
     fn observe(&mut self, cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
         let now = fence_now();
         for node_id in cluster.running() {
@@ -460,26 +480,48 @@ impl FenceChecks {
                 continue;
             };
             self.one_leader_per_term(cluster, trace, after_event, node_id, process);
-            let fence = cluster.data.wals[&node_id].raft_wal().fence();
+            let wal = cluster.data.wals[&node_id].raft_wal();
+            let fence = wal.fence();
             let bound_at = fence.bound_at();
             let by_clock = bound_at.is_some_and(|at| now < at + PREDECESSOR_WAIT);
             let by_fence = fence.holds_data();
             if !by_fence && !by_clock {
                 continue;
             }
+            if !self.held_with_journal
+                && wal
+                    .local_groups()
+                    .is_ok_and(|local| local.iter().any(|(_, log)| log.is_held()))
+            {
+                self.held_with_journal = true;
+            }
+            let owes_wait = fence.owes_wait();
+            if (owes_wait || by_clock)
+                && let Some(meta) = cluster.meta_gate(node_id)
+            {
+                self.held_meta_observations = self.held_meta_observations.saturating_add(1);
+                if let Some(broke) = meta.now.taken_since(meta.opened) {
+                    fail(
+                        trace,
+                        I16,
+                        after_event,
+                        format!(
+                            "node {node_id}'s process {process} {broke} in the meta group while \
+                             held (held by its fence: {owes_wait}, within a wait of its binding: \
+                             {by_clock}, bound at {bound_at:?}): opened {:?}, now {:?}",
+                            meta.opened, meta.now
+                        ),
+                    );
+                }
+            }
             for replica in cluster.hosted_replicas(node_id) {
                 let now_marks = ReplicaMarks::of(&replica.raft, &replica.rejoin);
                 let opened = replica.opened;
                 self.held_observations = self.held_observations.saturating_add(1);
-                let broke = if now_marks.gate_open && !opened.gate_open {
-                    Some("opened its gate")
-                } else if now_marks.floor && !opened.floor {
-                    Some("wrote a vote floor")
-                } else if now_marks.vote != opened.vote && !now_marks.vote.is_committed() {
-                    Some("granted a vote or campaigned")
-                } else {
-                    None
-                };
+                let broke = now_marks.gate.taken_since(opened.gate).or_else(|| {
+                    (now_marks.vote != opened.vote && !now_marks.vote.is_committed())
+                        .then_some("granted a vote or campaigned")
+                });
                 if let Some(broke) = broke {
                     fail(
                         trace,
@@ -2448,16 +2490,31 @@ impl Run {
     }
 
     /// Ends the run: I17 over the whole run, and I16 fails when no step
-    /// saw a held replica, so that every run's I16 judged something.
+    /// saw a held data replica, so that every run's I16 judged something.
+    /// A run whose held processes held no data replica in their journals,
+    /// such as new disks, which create none while held, passes with a held
+    /// meta replica instead.
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
         answers_after_promises(&self.cluster, &mut self.trace, "finished");
-        if self.fence.held_observations == 0 {
-            fail(
-                &mut self.trace,
-                I16,
-                "finished",
-                "no step saw a held replica, so I16 judged nothing".to_owned(),
-            );
+        let fence = &self.fence;
+        if fence.held_observations == 0 {
+            if fence.held_with_journal {
+                fail(
+                    &mut self.trace,
+                    I16,
+                    "finished",
+                    "a held process's journals held a data replica, and no step saw a held data \
+                     replica, so I16 judged none"
+                        .to_owned(),
+                );
+            } else if fence.held_meta_observations == 0 {
+                fail(
+                    &mut self.trace,
+                    I16,
+                    "finished",
+                    "no step saw a held replica, so I16 judged nothing".to_owned(),
+                );
+            }
         }
         self.trace.push(SimEvent::IdentityFenceHeld {
             held_observations: self.fence.held_observations,
