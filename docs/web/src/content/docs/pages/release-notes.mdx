@@ -3,6 +3,14 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.10.1 (unreleased)
+
+0.10.1 is not released yet. These changes are on `main`.
+
+### `@tonbo/sqlite-ursula`
+
+- **`gate(db, work, { signal })` applies the one rule for you.** It runs `work` and settles with its outcome, a result or an error, only once a `synced()` call made after `work` settled resolved on every database given. A returned `Response` comes back with the same status and headers, and its body passes each chunk on only after a `synced()` call made after the chunk was read, one call per batch of chunks. An `UrsulaError` thrown by `work` is rethrown at once, a reset during the wait rejects with the `UrsulaResetError` and drops the outcome, and `signal` bounds the wait for the outcome but not a body that has started. See [Gating outputs](/docs/examples/sqlite-vfs#gating-outputs). The helper only calls `synced()`: no server, extension, wire or format change, and it works with any 0.10 extension and server.
+
 ## 0.10.0
 
 **0.10.0 is a breaking release.** A meta group replaces static membership: it records every node and places every data group, so groups move between nodes and nodes join and leave a running cluster. 0.10 moves the storage and protocol format to format epoch 6. A 0.10 node refuses epoch-5 Raft WAL directories and object-storage prefixes at startup and refuses 0.9 peers, and a 0.9 node refuses 0.10 peers. The backup format stays 5, so `ursulactl restore` of 0.10 restores a 0.9 backup. There is no in-place upgrade, no rolling upgrade and no rollback.

@@ -7,7 +7,7 @@ durable once the stream acknowledges it, and `await db.synced()` is the output g
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
 `clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
-event pump, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The server
+event pump, `gate`, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The server
 contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
 docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
@@ -1132,6 +1132,11 @@ export class UrsulaDatabase extends DatabaseSync {
   on(event: "reset", listener: (error: UrsulaResetError) => void): this;
   off(event: "reset", listener: (error: UrsulaResetError) => void): this;
 }
+
+export interface GateOptions {
+  signal?: AbortSignal;     // bounds the wait for the outcome (Gates)
+}
+export function gate<T>(db: UrsulaDatabase | readonly UrsulaDatabase[], work: () => T | Promise<T>, options?: GateOptions): Promise<Awaited<T>>;
 ```
 
 - The first open of a stream in a process binds, catches up and claims ([Open](#open)). Later
@@ -1175,6 +1180,29 @@ Tests: `replicator/tests/machine.rs` `synced_waits_for_a_round_trip_that_started
 `test/synced.e2e.ts` "resolves once the stream holds every commit made before the call", "rejects
 with its signal's reason, while the commits keep replicating", "resolves thousands of concurrent
 calls through one watermark while the stream holds its answer back".
+
+### Gates
+
+A gate holds back what leaves the process until `synced()` says it may. It is the one definition of output gating: `gate` (`src/gate.ts`) implements it, and any later gate (a `node:http` helper, an in-guest HTTP gate) implements the same table. The gate is `synced()` itself: a gate only decides when to call it and what to hold, and adds no wire field, extension call or dependency. Gating twice is safe and costs at most one more round trip.
+
+| what is held | released when | if a reset comes first | if `signal` fires first |
+| --- | --- | --- | --- |
+| `gate`: the result of `work`, or its error unless that is an `UrsulaError` | a `synced()` call made after `work` settled resolves on every database | rejects with the `UrsulaResetError`; the outcome is dropped | rejects with `signal.reason`; the outcome is dropped and a returned body is cancelled |
+| `gate`: each chunk of a returned global `Response` body, and its end or error | a `synced()` call made after the chunk was read resolves on every database | the body errors and its source is cancelled | not applied; cancelling the body ends the waits |
+
+1. **Release.** An output is released only by a `synced()` call made after the output was produced, on every database given. The queue takes its cutoff before it calls `synced()`.
+2. **Batching.** A gate has at most one `synced()` call per database in flight. Outputs produced meanwhile wait for the next call, so a stream costs one round trip per batch, not per chunk. A body is read ahead at most 64 KiB, counting held chunks and released chunks its reader has not taken.
+3. **Order.** Outputs leave in the order they were produced.
+4. **Package errors.** An `UrsulaError` thrown by `work` is rethrown at once, because it carries no application state: a refusal committed nothing, and a reset is what `synced()` would report. Every other outcome waits, errors included.
+5. **Resets.** A reset replaces the outcome. A gate never releases what it held after its wait failed, and a failure on one database ends the waits on the others.
+6. **Signal scope.** `signal` bounds the wait only until the head (the outcome, or a `Response`'s status and headers) has left, so a timeout never cuts a long stream short. A signal that fired before the call keeps `work` from running.
+7. **Cancellation.** Cancelling a gated body cancels its source and aborts the wait in flight, so no ticket outlives the body ([Pump](#pump)).
+
+A returned `Response` comes back as a new `Response` with the same status, status text and headers. Its `url`, `type` and `redirected` are not carried, since a handler's response has none of them.
+
+What a gate does not cover: effects inside `work` before it returns, such as an outbound call or a manual acknowledgement in the middle of a handler, which need `await db.synced()` first; WebSocket frames, raw sockets, `node:http` responses written outside the gate, timers, background jobs and child processes; exactly-once effects, since a crash after the release but before an acknowledgement repeats the work, so effects need idempotency keys and message ids recorded in the same transaction; and anything beyond what `synced()` means.
+
+Tests: `test/gated.e2e.ts` "G1: settles only once the stream acknowledged the commit work made, where awaiting work alone does not", "G2: holds a read-only result that read another call's pending commit until that commit is acknowledged", "G3: holds work's own error as it holds a result, and rethrows a backlog_full refusal at once", "G4: rejects with the reset when another process took the stream over before the release, never with the result", "G5: rejects with its signal's reason, cancelling a returned body, while the commits keep replicating", "G6: passes a returned Response's head, and each chunk, on only after the commit before it is acknowledged, in order", "G7: gates 10,000 chunks with one synced() call per batch, not per chunk", "G8: errors a body with the reset when another process takes the stream over in the middle of it", "G9: with two databases, settles only once both acknowledged".
 
 ### Resets
 

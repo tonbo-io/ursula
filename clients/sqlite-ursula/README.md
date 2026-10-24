@@ -37,6 +37,39 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 
 `UrsulaDatabase` adds `name` (the stream's path, such as `/acme/notes`), `synced({ signal })`, `status()` and `on("reset", listener)` / `off("reset", listener)`.
 
+## Gating outputs
+
+`gate(db, work, { signal })` runs `work` and settles with its outcome only once a `synced()` call made after `work` settled resolved. It applies the one rule to whatever acts on the outcome: a fetch-style handler's `Response`, a job processor's promise that a queue framework acknowledges, a message you acknowledge yourself.
+
+```ts
+import { gate, open } from "@tonbo/sqlite-ursula";
+
+const db = await open("https://streams.example.com/acme/notes");
+
+// A fetch-style handler: the status, the headers and every body chunk wait.
+const handler = (request: Request) => gate(db, () => router.fetch(request), { signal: request.signal });
+
+// A queue you acknowledge yourself.
+for await (const message of subscription) {
+  await gate(db, () => applyMessage(db, message)); // records message.id in the same transaction
+  await message.ack(); // a crash before this redelivers, and applyMessage skips an id it has seen
+}
+```
+
+- `db` is one database or an array of them. With several, the gate waits for all of them, in parallel.
+- Reads wait too: a result may have read another call's pending commit, or state this process is about to lose to a takeover.
+- `work`'s errors wait as its results do, except an `UrsulaError`, which is thrown at once: a refused write committed nothing, and a reset is what the wait would report. A reset during the wait rejects with the `UrsulaResetError`, and the outcome is dropped.
+- When `work` returns a `Response` with a body, the gate resolves with one of the same status and headers whose body passes each chunk, and its end, on only once a `synced()` call made after the chunk was read resolved. One call covers every chunk read while the previous call was in flight, so a stream pays one round trip per batch, not per chunk, and the gate reads at most 64 KiB ahead. A reset errors the body.
+- `signal` bounds the wait for the outcome, which for a `Response` is its status and headers: the gate rejects with `signal.reason` and cancels a returned body, and the commits keep replicating. It does not cut short a body that has started. Cancel the body to stop it.
+- A `node:http` response is not gated by itself: write it after the gate, as in `res.end(await gate(db, () => save(req)))`.
+
+What the gate does not cover:
+
+- Effects inside `work` before it returns, such as an outbound call or a manual acknowledgement in the middle of a handler. `await db.synced()` before them.
+- WebSocket frames, raw sockets, timers, background jobs and child processes.
+- Exactly-once effects. A crash after the release but before an acknowledgement runs the work again, so record message ids and idempotency keys in the same transaction as the work.
+- Anything beyond what `synced()` itself means: the stream holds the commit, with the durability the server gives it.
+
 ## Import
 
 `importSqlite(url, file, { token, timeoutMs })` imports a plain SQLite database file into a new stream, as the stream's first snapshot, and returns `{ offset, digest, pages, bytes }`. Then `open(url)` it as any other stream.
