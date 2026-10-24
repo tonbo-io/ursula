@@ -13,6 +13,8 @@
 //   extension to them, which the root entry and the Pi adapter share.
 // - database.ts: the database `open` returns, a node:sqlite DatabaseSync with `synced()`, `status()`
 //   and the `reset` listeners, whose statements classify their errors.
+// - gate.ts: `gate`, which hands a unit of work's outcome, and a returned Response's body chunk by
+//   chunk, on only after `synced()`.
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
 // - platform.ts: the prebuilt extension of this platform.
@@ -24,6 +26,7 @@ import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "
 import { pump } from "./pump.ts";
 
 export { loadUrsulaVfs } from "./control.ts";
+export { type GateOptions, gate } from "./gate.ts";
 export { type ResetListener, UrsulaDatabase, type UrsulaSalvage, type UrsulaStatus } from "./database.ts";
 export {
 	type ResetKind,
