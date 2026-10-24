@@ -194,6 +194,11 @@ struct Episode {
     late: Vec<Write>,
     /// Writes the cut-off leader admits with the writes in flight, whose
     /// body arrives only once it follows its successor ([`once_deposed`]).
+    /// They go as HTTP/2 with a small body, which asks for no early answer,
+    /// so the front door admits the head from its leadership view at once.
+    /// A head with `Expect: 100-continue` asks the group's core, which may
+    /// still be waiting on a write in flight until the leader lapses, and is
+    /// then refused before its body.
     held: Vec<Write>,
 }
 
@@ -247,7 +252,12 @@ impl RoutingPlan {
         // draws.
         for episode in &mut episodes {
             let held_count = 1_u64.saturating_add(rng.next_bounded(2));
-            episode.held = (0..held_count).map(|_| write(&mut rng, 10)).collect();
+            episode.held = (0..held_count)
+                .map(|_| Write {
+                    framing: Framing::Http2,
+                    ..write(&mut rng, 10)
+                })
+                .collect();
         }
         Self { episodes }
     }
