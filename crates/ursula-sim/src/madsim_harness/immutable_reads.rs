@@ -37,9 +37,10 @@
 //! (`LeaderRole::Lapsed`), so it forwards or refuses what it cannot mark.
 //! Either defence alone keeps it from answering short.
 //!
-//! [`Controls`] turn off one server defence each, through
+//! [`Controls`] turn off server defences, through
 //! [`ursula_stream::sim_controls`], for the tests that show the invariant
-//! catches its loss.
+//! catches their loss: one defence each, or both defences of a deposed
+//! leader.
 
 use std::collections::BTreeMap;
 
