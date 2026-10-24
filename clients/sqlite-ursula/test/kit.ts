@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -80,6 +80,55 @@ export async function frames(path: string): Promise<{ claims: number; commits: n
 		at += 13 + len;
 	}
 	return count;
+}
+
+/** The stream's retained offset, tail and latest snapshot offset (`null` with none), from a HEAD. */
+export async function head(path: string): Promise<{ retained: number; tail: number; snapshot: number | null }> {
+	const r = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
+	expect(r.status).toBe(200);
+	const tail = r.headers.get("stream-next-offset");
+	expect(tail).not.toBeNull();
+	const snapshot = r.headers.get("stream-snapshot-offset");
+	return { retained: Number(r.headers.get("stream-retained-offset") ?? "0"), tail: Number(tail), snapshot: snapshot === null ? null : Number(snapshot) };
+}
+
+/**
+ * A `USQ2` frame decoded as far as its owner (design: Frames): a CLAIM names its epoch and
+ * activation, a COMMIT or PART its commit id `(lineage, position)`. Ids are lowercase hex, as
+ * `ursula_status` spells a lineage.
+ */
+export type OwnedFrame = { kind: "claim"; epoch: number; activation: string } | { kind: "commit" | "part"; lineage: string; position: number };
+
+/** The frames the stream at `path` holds as far as it is retained, in stream order, each with its owner. */
+export async function ownedFrames(path: string): Promise<OwnedFrame[]> {
+	const { retained } = await head(path);
+	const bytes = await streamBytes(path, retained === 0 ? "-1" : String(retained));
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const hex = (from: number): string => Buffer.from(bytes.subarray(from, from + 16)).toString("hex");
+	const out: OwnedFrame[] = [];
+	for (let at = 0; at < bytes.length; at += 13 + view.getUint32(at + 5, true)) {
+		expect(new TextDecoder().decode(bytes.subarray(at, at + 4))).toBe("USQ2");
+		const kind = bytes[at + 4];
+		const body = at + 13;
+		if (kind === 1) out.push({ kind: "claim", epoch: Number(view.getBigUint64(body, true)), activation: hex(body + 8) });
+		else if (kind === 2 || kind === 3) out.push({ kind: kind === 2 ? "commit" : "part", lineage: hex(body), position: Number(view.getBigUint64(body + 16, true)) });
+		else throw new Error(`frame kind ${kind} at byte ${at} of ${path}`);
+	}
+	return out;
+}
+
+/** No commit id `(lineage, position)` is in the stream at `path` twice, as far as it is retained, and it holds one at least. */
+export async function commitsOnce(path: string): Promise<void> {
+	const ids = (await ownedFrames(path)).flatMap((f) => (f.kind === "commit" ? [`${f.lineage}:${f.position}`] : []));
+	expect(ids.length).toBeGreaterThan(0);
+	expect(ids.filter((id, i) => ids.indexOf(id) !== i)).toEqual([]);
+}
+
+/** Reports a line to the console and, in CI, to the job summary. */
+export function report(line: string): void {
+	process.stderr.write(`${line}\n`);
+	const summary = process.env.GITHUB_STEP_SUMMARY;
+	if (summary !== undefined && summary.length > 0) appendFileSync(summary, `${line}\n`);
 }
 
 /** The `USQ2` PART frames (kind 3) the stream at `path` holds. */
