@@ -9139,9 +9139,11 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
 /// 1. Every group takes a write. `node decommission --node 5 --wait` ends
 ///    with node 5 removed.
 /// 2. Two voters of a group that node 4 votes in, node 4 among them and at
-///    most one meta voter, are killed: that group has no live leader, so no
-///    removal completes. Node 5 is killed and its WAL directory is moved
-///    aside (the old disk).
+///    most one meta voter, are killed: that group has no live leader. Node
+///    5 still runs, so its removal waits for its process. The meta
+///    leadership moves, the new leader asks every group again, and reports
+///    the leaderless group unconfirmed, so no removal completes. Node 5 is
+///    killed and its WAL directory is moved aside (the old disk).
 /// 3. Node 5 starts on an empty WAL. Its registration and its readiness
 ///    report `removal_pending` (503), and its data replicas take part in
 ///    nothing. `verify-joinable` times out naming the leaderless group,
@@ -9264,9 +9266,66 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
     for down in [4, partner] {
         procs.kill(down);
     }
+    let down: Vec<u64> = [4, partner].into();
+    // A meta leadership keeps the groups that confirmed node 5 no member,
+    // and node 5's process still answering kept its removal from
+    // completing. A new meta leadership asks every group again, and the
+    // group without a leader confirms nothing.
+    let alive_voters: Vec<u64> = META_VOTERS
+        .iter()
+        .copied()
+        .filter(|voter| !down.contains(voter))
+        .collect();
+    let first = known_meta_leader(
+        &client,
+        &mut procs,
+        &nodes,
+        node_of(&nodes, alive_voters[0]),
+    )
+    .await;
+    let to = alive_voters
+        .iter()
+        .copied()
+        .find(|voter| *voter != first)
+        .expect("a second meta voter runs");
+    eventually(&mut procs, "the meta leadership moves", async || {
+        let status = placement_status(&client, node_of(&nodes, to)).await?;
+        if meta_leader(&status) == Some(to) {
+            return Ok(());
+        }
+        let url = format!(
+            "{}/__ursula/raft/meta/leader/transfer/{to}",
+            node_of(&nodes, first).admin()
+        );
+        let response = try_admin_test_post(&client, url.clone())
+            .await?
+            .send()
+            .await
+            .map_err(|err| format!("POST {url}: {err}"))?;
+        Err(format!("POST {url}: {}", response.status()))
+    })
+    .await;
+    let members = ctl_manifest(&nodes, &down);
+    let what = format!("the meta leader reports group {} unconfirmed", blocked.0);
+    eventually(&mut procs, &what, async || {
+        let status = ursula_ctl::view::leader_status(&ctl_client(), &members)
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(|refusal| refusal.to_string())?;
+        let pending = status
+            .leader_report
+            .as_ref()
+            .and_then(|report| report.removal_pending.get(&NodeId::new(5)));
+        match pending {
+            Some(pending) if pending.unconfirmed.contains(&blocked) && pending.process_answers => {
+                Ok(())
+            }
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
     procs.kill(5);
     std::fs::rename(&nodes[4].wal, &old_disk.wal).expect("move node 5's old disk aside");
-    let down: Vec<u64> = [4, partner].into();
 
     // 3. A new disk under id 5 waits for the removal.
     procs.start(binary, &nodes[4]);
@@ -9289,7 +9348,6 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
         .await
         .expect("the new disk reports its replicas");
     assert_data_held(&held, 5);
-    let members = ctl_manifest(&nodes, &down);
     let what = format!("verify-joinable names group {} as unconfirmed", blocked.0);
     eventually(&mut procs, &what, async || {
         let mut out = Vec::new();

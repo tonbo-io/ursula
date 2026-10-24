@@ -2198,13 +2198,16 @@ impl HostingChecks {
     pub(super) fn judged_the_moves(
         &self,
         cluster: &MetaCluster,
+        ever_removed: &BTreeSet<u64>,
         trace: &mut SimTrace,
         after_event: &str,
     ) {
         let Some(placed) = cluster.placed.as_ref() else {
             return;
         };
-        let removed = cluster.removed_nodes();
+        // A node removed once stays exempt when a new life of its id runs.
+        let mut removed = cluster.removed_nodes();
+        removed.extend(ever_removed.iter().copied());
         for group in JOURNAL_GROUPS {
             let seeds = cluster.seeds(group);
             let voters = cluster.placed_voters(group);

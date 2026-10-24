@@ -268,6 +268,11 @@ impl RemovalChecks {
         }
     }
 
+    /// Every node id the checks saw removed, whatever life of it runs now.
+    pub(super) fn ever_removed(&self) -> BTreeSet<u64> {
+        self.removed.keys().copied().collect()
+    }
+
     /// How many of the sweep's DELETEs of `node`'s objects I8's sweep half
     /// judged so far.
     pub(super) fn swept(&self, node: u64) -> u64 {

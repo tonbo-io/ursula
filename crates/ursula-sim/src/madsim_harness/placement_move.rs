@@ -1444,8 +1444,12 @@ impl Run {
     /// Ends the run: a moved group fails a check that judged nothing of it
     /// ([`MetaChecks::judged_the_moves`]).
     pub(super) fn finish(mut self) -> ThreeNodeRaftSimOutcome {
-        self.checks
-            .judged_the_moves(&self.cluster, &mut self.trace, "finished");
+        self.checks.judged_the_moves(
+            &self.cluster,
+            &self.removals.ever_removed(),
+            &mut self.trace,
+            "finished",
+        );
         self.trace.push(SimEvent::PlacementMoveMetaHeld {
             genesis: self.checks.genesis().unwrap_or(0),
             nodes: self.cluster.running(),
