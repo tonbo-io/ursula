@@ -406,12 +406,20 @@ describe("stale caches reopened across hosts", () => {
 		// copy's probe then finds that claim and the original's probe the copy's, as the real opens
 		// will. Measured alike, every open of a root adds three records to it (the catch-up's ACK,
 		// its CLAIM and one more), whether it closes cleanly or is killed (CI runs 40111986003 and
-		// 40113019791), so opens alone keep the gap modulo three. A synced commit by the original
-		// shifts it by four or five: the original logs three records for the open and three for the
-		// commit, and the copy's catch-up grows by one commit (or by a commit and a BASE once it had
-		// only claims to catch up). So while the gap is not a multiple of three the original commits
-		// once more, and then the root that is behind is padded with opens until both positions
-		// meet. C's first padding open, if any, catches the original's commits up in place.
+		// 40113019791), so opens alone keep the gap modulo three.
+		//
+		// A synced commit by the original always shifts the gap by five: the original logs three
+		// records for the open and three for the commit, and the copy's catch-up, which already
+		// logs r2 and then an ACK and a BASE, logs one commit more. A catch-up that found only
+		// claims would grow by a commit and a BASE, a shift of four, but C's catch-up finds r2
+		// until C's first padding open, and no commit by the original follows a padding open:
+		// padding starts only once the gap is a multiple of three, which opens keep. (On every leg
+		// of CI run 40113707188 one commit took the copy from 13 to 14 and the original from 14 to
+		// 20.) So while the gap is not a multiple of three the original commits once more, at most
+		// twice: shifts of five make a gap of 1 modulo three a multiple of three after one commit
+		// and a gap of 2 after two. Then the root that is behind is padded with opens until both
+		// positions meet. C's first padding open, if any, catches the original's commits up in
+		// place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
