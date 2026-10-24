@@ -19,7 +19,7 @@ import { cpSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open } from "../src/index.ts";
-import { Child, directUrl, ext, freshDir, fromStream, frames, gate, killChildren, retired, stream, streamBytes } from "./kit.ts";
+import { Child, commitsOnce, directUrl, ext, freshDir, fromStream, frames, gate, head, killChildren, retired, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -78,31 +78,6 @@ async function rejects(c: Child, kind: string): Promise<void> {
 	const reply = await c.send({ synced: 30_000 });
 	expect(reply.ok, JSON.stringify(reply)).toBe(false);
 	expect(String(reply.error)).toContain(`ursula_synced: ${kind}: `);
-}
-
-/** The stream's retained offset and tail, from a HEAD. */
-async function head(path: string): Promise<{ retained: number; tail: number }> {
-	const r = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
-	expect(r.status).toBe(200);
-	const tail = r.headers.get("stream-next-offset");
-	expect(tail).not.toBeNull();
-	return { retained: Number(r.headers.get("stream-retained-offset") ?? "0"), tail: Number(tail) };
-}
-
-/** No commit id `(lineage, position)` is in the stream at `path` twice, as far as it is retained. */
-async function commitsOnce(path: string): Promise<void> {
-	const { retained } = await head(path);
-	const bytes = await streamBytes(path, retained === 0 ? "-1" : String(retained));
-	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	const ids: string[] = [];
-	for (let at = 0; at < bytes.length; at += 13 + view.getUint32(at + 5, true)) {
-		expect(new TextDecoder().decode(bytes.subarray(at, at + 4))).toBe("USQ2");
-		if (bytes[at + 4] !== 2) continue;
-		const lineage = Buffer.from(bytes.subarray(at + 13, at + 29)).toString("hex");
-		ids.push(`${lineage}:${view.getBigUint64(at + 29, true)}`);
-	}
-	expect(ids.length).toBeGreaterThan(0);
-	expect(ids.filter((id, i) => ids.indexOf(id) !== i)).toEqual([]);
 }
 
 describe("copies of a live cache", () => {

@@ -7,11 +7,10 @@
 // due during the outage is published after it (URSULA_VFS_SNAPSHOT_DUE_BYTES), and the stream
 // (snapshot and tail) equals the local database.
 import { spawn } from "node:child_process";
-import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, type UrsulaStatus, UrsulaWriteRefusedError } from "../src/index.ts";
-import { ext, fromStream, freshDir, stream, thrown, ursulaUrl } from "./kit.ts";
+import { ext, fromStream, freshDir, report, stream, thrown, ursulaUrl } from "./kit.ts";
 
 const OUTAGE_MS = Number(process.env.OUTAGE_MS ?? 60_000);
 const MODES = (process.env.OUTAGE_MODES ?? "blackhole,refuse").split(",") as ("blackhole" | "refuse")[];
@@ -96,13 +95,6 @@ async function until<T>(f: () => T | undefined): Promise<T> {
 		if (Date.now() > deadline) throw new Error("it never happened within 30 s");
 		await sleep(50);
 	}
-}
-
-/** Reports a line to the console and, in CI, to the job summary. */
-function report(line: string): void {
-	process.stderr.write(`${line}\n`);
-	const summary = process.env.GITHUB_STEP_SUMMARY;
-	if (summary !== undefined && summary.length > 0) appendFileSync(summary, `${line}\n`);
 }
 
 describe(`an outage of ${OUTAGE_MS / 1000} s`, () => {

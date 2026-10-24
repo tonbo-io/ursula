@@ -483,6 +483,7 @@ Tests: `replicator/tests/reconcile_rows.rs`, one test per row:
 `replicator/tests/world.rs` `a_clones_snapshot_never_covers_the_originals_commit`. Takeovers:
 `driver/tests.rs` `a_takeover_fences_the_owner_which_keeps_its_tail_then_discards_it_and_rebuilds`,
 `a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot`.
+End to end across hosts, with the superseded lineage absent above its acknowledged position and after the takeover's claim: `test/stale.e2e.ts` "S2: a cache killed with an unsent tail rebuilds without it after another host wrote" and "S2b: a cache killed with an unsent tail rebuilds without it after another host wrote, from the latest snapshot once retention passed it".
 
 ### Replicator
 
@@ -825,6 +826,7 @@ Driver: `driver/tests.rs` `a_server_without_protocol_2_is_refused`,
 "goes live after two offline opens in a row, with the commits of both", `test/open.e2e.ts` "cancels
 at its signal: an unavailable error, and the stream is not held", `test/handout.e2e.ts` "is refused
 in another cache while a connection of the host is open, naming the cache it is open in".
+A provisional open of a cache another host took over serves its stale rows until `synced()` rejects `fenced`, which only code that waits for `synced()` is protected from: `test/provisional.e2e.ts` "S6: serves the stale rows of a cache another host took over, keeps its commits local, rejects synced() `fenced` once the stream answers, and rebuilds at the next open".
 
 ### Materialize
 
@@ -857,6 +859,7 @@ Tests: `materialize/tests.rs` `materialization_yields_the_state_at_the_last_vali
 `a_commit_after_a_reset_is_refused_under_the_log_lock`, `test/reopen.e2e.ts` "succeeds after a
 fenced reset: the old read keeps its snapshot, its new statements fail, the new database commits",
 and its `copy_db` and `copy_log` kills.
+A stale cache reopened on its host after another host wrote, with real pages: `test/stale.e2e.ts` "S1: a cache that came back with nothing pending catches up in place" and "S1: a cache that came back with nothing pending rebuilds when the catch-up is larger than the database".
 
 ### Readers
 
@@ -1108,7 +1111,7 @@ commit", "shares one epoch between two copies opened with one activation, and th
 divergent commit fences exactly one", "resets `stale` with nothing sent when its original kept
 writing", "goes live over an idle original and fences it", "goes live over an idle original that
 never wrote and fences it", and "rebuilds a copy that fell behind retention, never trusting the
-original's snapshot".
+original's snapshot". An old disk snapshot whose catch-up and next commit take the commit id of the original's unsent tail: `test/stale.e2e.ts` "S5: an old disk snapshot catches up and commits under the id of the original's unsent tail, and the original rebuilds without sending it".
 
 ## API
 
@@ -1434,6 +1437,7 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store
   (with `test/history-real.e2e.ts`) and three nodes behind the gateway (with
   `test/failover.e2e.ts`).
+  Both report, without asserting, the open time of a fresh build, a stale catch-up and a stale rebuild from `test/stale.e2e.ts` in the job summary, at 1 MiB and, on one node, 16 MiB. That suite prints its seed, and `STALE_SEED` replays it.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)). It fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
 - `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a 600 s outage, daily, on pushes
