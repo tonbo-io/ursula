@@ -235,14 +235,29 @@ const READ_ON: Duration = Duration::from_secs(2);
 /// Mixed into the seed of a run's draws.
 const SALT: u64 = 0x6964_656e_7469_7479;
 /// The snapshot drivers of a zombie GC run: a pass every 100 ms, four
-/// entries kept below a snapshot, and no removal due on its age.
+/// entries kept below a snapshot, no removal due on its age, and a build
+/// permit per group. The script holds the moved node's LIST gate, which
+/// holds the GC pass of every group, and a build keeps its permit through
+/// the pass that follows it. A group builds once at a time, so with a
+/// permit per group another group's held pass never keeps the scripted
+/// group's build from starting.
 const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(600),
     keep: 4,
     interval: Duration::from_millis(100),
+    permits: JOURNAL_GROUPS.len(),
 };
 /// `raft.install_snapshot_timeout` of every node in a zombie GC run.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How far a script's operator snapshot goes before the script moves on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotUntil {
+    /// A build that covers the replica's applied log started or ran.
+    Started,
+    /// OpenRaft published a snapshot that covers it.
+    Published,
+}
 
 /// The object stores a run's nodes write besides their journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2171,17 +2186,46 @@ impl Run {
     }
 
     /// An operator's snapshot of `group` on `node_id` within the bound,
-    /// after its replica applied an entry past its last snapshot.
+    /// after its replica applied an entry past its last snapshot, published
+    /// by OpenRaft.
     async fn snapshot_on(&mut self, group: u32, node_id: u64, phase: &str) {
+        self.operator_snapshot(group, node_id, phase, SnapshotUntil::Published)
+            .await;
+    }
+
+    /// [`Self::snapshot_on`] up to the start of the build. OpenRaft
+    /// publishes a snapshot only once its build returned, after the GC pass
+    /// that follows it, so a build whose pass waits at a held gate is never
+    /// published while the gate holds.
+    async fn start_snapshot_on(&mut self, group: u32, node_id: u64, phase: &str) {
+        self.operator_snapshot(group, node_id, phase, SnapshotUntil::Started)
+            .await;
+    }
+
+    async fn operator_snapshot(
+        &mut self,
+        group: u32,
+        node_id: u64,
+        phase: &str,
+        until: SnapshotUntil,
+    ) {
         self.apply_past_snapshot(group, node_id, phase).await;
         let deadline = madsim::time::Instant::now() + BOUND;
         loop {
-            match self
-                .cluster
-                .placed_snapshot(group, node_id, STEP * 20)
-                .await
-            {
-                Ok(_) => break,
+            let snapshot = match until {
+                SnapshotUntil::Started => {
+                    self.cluster
+                        .start_placed_snapshot(group, node_id, STEP * 20)
+                        .await
+                }
+                SnapshotUntil::Published => self
+                    .cluster
+                    .placed_snapshot(group, node_id, STEP * 20)
+                    .await
+                    .map(|_index| ()),
+            };
+            match snapshot {
+                Ok(()) => break,
                 Err(error) if madsim::time::Instant::now() >= deadline => fail(
                     &mut self.trace,
                     RESUME,
@@ -2214,13 +2258,14 @@ impl Run {
         self.snapshot_on(group, moved, PHASE).await;
         self.led_by(group, leader, PHASE).await;
         // The second snapshot replaces the first, whose key leaves the
-        // holds, so a pass is owed at once. It begins now, and its LIST
-        // waits at the gate.
+        // holds, so a pass is owed at once. The build's own pass begins as
+        // the build ends, and its LIST waits at the gate, inside the build,
+        // so the build is only started.
         let gates = self.cluster.data.snapshot_gates(moved);
         let list = Gate::before(moved, StoreOp::ListOwn);
         gates.hold(list);
         let arrived = Self::lists_of(&gates, list, moved, group);
-        self.snapshot_on(group, moved, PHASE).await;
+        self.start_snapshot_on(group, moved, PHASE).await;
         let deadline = madsim::time::Instant::now() + BOUND;
         while Self::lists_of(&gates, list, moved, group) <= arrived {
             if madsim::time::Instant::now() >= deadline {

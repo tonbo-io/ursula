@@ -90,6 +90,7 @@ const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(600),
     keep: 4,
     interval: Duration::from_millis(100),
+    permits: 1,
 };
 /// `raft.install_snapshot_timeout` of every node.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);

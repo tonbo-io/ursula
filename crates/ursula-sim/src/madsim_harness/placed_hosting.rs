@@ -789,6 +789,13 @@ pub(super) struct Placed {
     appended: BTreeMap<u32, u64>,
 }
 
+/// Whether `metrics` show a published snapshot through log index `applied`.
+fn publishes_through(metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>, applied: u64) -> bool {
+    metrics
+        .snapshot
+        .is_some_and(|snapshot| snapshot.index >= applied)
+}
+
 /// `group`'s seed voters by the kernel's seed rule over `claim`.
 pub(super) fn seed_voters(claim: &GenesisClaim, group: u32) -> BTreeSet<u64> {
     let factor =
@@ -917,6 +924,41 @@ impl MetaCluster {
         node_id: u64,
         wait: std::time::Duration,
     ) -> Result<u64, &'static str> {
+        let (raft, applied) = self.started_placed_snapshot(group, node_id, wait).await?;
+        raft.wait(Some(wait))
+            .metrics(
+                |metrics| publishes_through(metrics, applied),
+                "snapshot built",
+            )
+            .await
+            .map_err(|_timeout| "wait for the snapshot")?
+            .snapshot
+            .map(|snapshot| snapshot.index)
+            .ok_or("snapshot log id")
+    }
+
+    /// [`Self::placed_snapshot`] up to the start of the build: answers once
+    /// a build that covers the replica's applied log started within `wait`,
+    /// or ran, without waiting for OpenRaft to publish its snapshot.
+    pub(super) async fn start_placed_snapshot(
+        &self,
+        group: u32,
+        node_id: u64,
+        wait: std::time::Duration,
+    ) -> Result<(), &'static str> {
+        self.started_placed_snapshot(group, node_id, wait)
+            .await
+            .map(|_started| ())
+    }
+
+    /// Starts [`Self::placed_snapshot`]'s build, and answers the replica
+    /// and the index of the log it applied, which the build covers.
+    async fn started_placed_snapshot(
+        &self,
+        group: u32,
+        node_id: u64,
+        wait: std::time::Duration,
+    ) -> Result<(Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>, u64), &'static str> {
         let raft = self
             .placed()
             .hosts
@@ -925,11 +967,6 @@ impl MetaCluster {
             .ok_or("no replica of the group runs")?;
         let wanted = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).last_applied;
         let applied = wanted.map_or(0, |log_id| log_id.index);
-        let published = |metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>| {
-            metrics
-                .snapshot
-                .is_some_and(|snapshot| snapshot.index >= applied)
-        };
         self.registry(node_id)
             .snapshot_build_coordinator()
             .start_snapshot(
@@ -937,22 +974,17 @@ impl MetaCluster {
                 wanted,
                 wait,
                 || {
-                    published(&openraft::rt::WatchReceiver::borrow_watched(
-                        &raft.metrics(),
-                    ))
+                    publishes_through(
+                        &openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()),
+                        applied,
+                    )
                 },
                 std::future::pending(),
                 || async { raft.trigger().snapshot().await },
             )
             .await
             .map_err(|_not_started| "start a snapshot")?;
-        raft.wait(Some(wait))
-            .metrics(published, "snapshot built")
-            .await
-            .map_err(|_timeout| "wait for the snapshot")?
-            .snapshot
-            .map(|snapshot| snapshot.index)
-            .ok_or("snapshot log id")
+        Ok((raft, applied))
     }
 
     /// Stops `node_id`'s hosting driver, then every replica it runs.

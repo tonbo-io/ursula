@@ -120,6 +120,7 @@ pub(super) const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(4),
     keep: 8,
     interval: Duration::from_millis(200),
+    permits: 1,
 };
 /// The drivers' settings the bound is checked with: twelve seconds, so the
 /// floor is three. The bound covers a pass of the driver too, which may wait
