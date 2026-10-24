@@ -407,8 +407,8 @@ impl Run {
         }
         // The sent object is no longer current once this build commits, so
         // the pass after it deletes it unless the send still holds it.
-        self.cluster.append(GROUP, 1).await;
-        self.snapshot(GROUP, leader, "sent_object_replaced").await;
+        self.replace_current_snapshot(leader, "sent_object_replaced")
+            .await;
         // Once the send ends, its hold on the replaced object drops and the
         // leader owes a pass, which its driver runs. That pass races a build
         // in one forced order.
@@ -447,6 +447,34 @@ impl Run {
             .heal_bidirectional(other_leader, follower);
         self.build_for(BUILDING, "follower_installing").await;
         self.caught_up("follower_caught_up").await;
+    }
+
+    /// Appends to group 0 and builds on `leader`, which then stands on a
+    /// snapshot past the one it published before: the object that one names
+    /// is no longer current. An append answers once the state machine
+    /// applied it, before OpenRaft's metrics show it applied, and an
+    /// operator's snapshot covers what the metrics show. Started at once, it
+    /// could find the published snapshot covering them and build nothing, so
+    /// the build waits for the metrics.
+    async fn replace_current_snapshot(&mut self, leader: u64, after_event: &str) {
+        let published = snapshot_index(&self.cluster, leader);
+        self.cluster.append(GROUP, 1).await;
+        let shown = self
+            .wait_for(after_event, |cluster| {
+                applied_index(cluster, leader) > published
+            })
+            .await;
+        assert!(
+            shown,
+            "{}: node {leader}'s metrics never showed the append applied",
+            self.context
+        );
+        self.snapshot(GROUP, leader, after_event).await;
+        assert!(
+            snapshot_index(&self.cluster, leader) > published,
+            "{}: node {leader} built no snapshot past index {published}",
+            self.context
+        );
     }
 
     /// A pass of group 0 waiting at the held `list` gate of `leader` races a
@@ -772,6 +800,22 @@ impl Run {
             store_log_digest: digest,
         }
     }
+}
+
+/// The index of the snapshot `node_id`'s replica of group 0 published, as
+/// OpenRaft's metrics show it.
+fn snapshot_index(cluster: &JournalCluster, node_id: u64) -> u64 {
+    metrics(cluster, GROUP, node_id)
+        .snapshot
+        .map_or(0, |log_id| log_id.index)
+}
+
+/// The index `node_id`'s replica of group 0 applied, as OpenRaft's metrics
+/// show it.
+fn applied_index(cluster: &JournalCluster, node_id: u64) -> u64 {
+    metrics(cluster, GROUP, node_id)
+        .last_applied
+        .map_or(0, |log_id| log_id.index)
 }
 
 pub(super) async fn run_snapshot_objects_inner(
