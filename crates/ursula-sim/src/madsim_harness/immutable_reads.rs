@@ -4,9 +4,11 @@
 //! snapshot reads through the HTTP route, against a three-node OpenRaft
 //! group, while the leader dies mid-read, followers lag behind partitions,
 //! the stream is closed, deleted and recreated, snapshots are published and
-//! retention advances, and the group is restored from a backup. A last step
-//! ([`super::immutable_reads_loss`]) reads through every replica of a
-//! journal-backed group across an accepted loss and its recovery plan.
+//! retention advances, and the group is restored from a backup. Two last
+//! steps read through every replica of a journal-backed group: across an
+//! accepted loss and its recovery plan ([`super::immutable_reads_loss`]),
+//! and across a leadership transfer the old leader never hears the end of
+//! ([`super::immutable_reads_transfer`]).
 //!
 //! Invariant `marked_chunks_never_contradict`: a cache-like observer keeps
 //! the first marked answer of every chunk URL, `(token, offset)`, as a
@@ -35,12 +37,19 @@
 //! without knowing it may lag too. Its barrier round finds no quorum, and
 //! once no quorum acknowledged it within its lease it no longer leads
 //! (`LeaderRole::Lapsed`), so it forwards or refuses what it cannot mark.
-//! Either defence alone keeps it from answering short.
+//! The two defences overlap only once its lease ended: then either alone
+//! keeps it from answering short, which the accepted-loss step shows. A
+//! leader still inside its lease leads, and only its barrier stops it. The
+//! transfer step shows that case: a leadership-transfer election skips the
+//! voters' leases, so the old leader is deposed while its own lease holds.
+//! A leader cut off before a quorum first acknowledged it, which the
+//! leader predicate keeps leading, and a just-elected leader whose apply
+//! lags rely on the barrier alone too, though no step here reads one.
 //!
 //! [`Controls`] turn off server defences, through
 //! [`ursula_stream::sim_controls`], for the tests that show the invariant
 //! catches their loss: one defence each, or both defences of a deposed
-//! leader.
+//! leader whose lease ended.
 
 use std::collections::BTreeMap;
 
@@ -83,7 +92,7 @@ pub(super) const INVARIANT: &str = "marked_chunks_never_contradict";
 const CONTENT_TYPE: &str = "application/octet-stream";
 /// The simulation's chunk grid. Marking does not depend on its size, so a
 /// small grid puts many chunk boundaries inside a short stream.
-const GRID: u64 = 16;
+pub(super) const GRID: u64 = 16;
 const NOW_MS: u64 = 1_000;
 /// The server's chunk grid, which the HTTP chunk route reads on.
 const HTTP_GRID: u64 = 4 * 1024 * 1024;
@@ -131,7 +140,8 @@ impl Controls {
         leader_barrier_off: false,
         fenced_leadership_off: true,
     };
-    /// Both defences of a leader deposed without knowing it.
+    /// Both defences of a leader deposed without knowing it whose lease
+    /// ended.
     pub(super) const DEPOSED_LEADER_UNDEFENDED: Self = Self {
         open_tail_marked: false,
         follower_mark_check_off: false,
@@ -269,6 +279,11 @@ pub(super) struct Observer {
 impl Observer {
     pub(super) fn marked(&self) -> Vec<(u64, u64)> {
         self.order.clone()
+    }
+
+    /// Whether the observer kept a marked answer for `url`.
+    pub(super) fn is_marked(&self, url: (u64, u64)) -> bool {
+        self.marked.contains_key(&url)
     }
 
     pub(super) fn marked_count(&self) -> u64 {
@@ -1118,6 +1133,9 @@ pub(super) async fn run_marked_chunks_never_contradict_inner(
     let loss =
         super::immutable_reads_loss::accepted_loss_phase(config.seed, &mut observer, &mut trace)
             .await;
+    // A leader that transferred its leadership and heard nothing since,
+    // read within its lease.
+    super::immutable_reads_transfer::transfer_phase(config.seed, &mut observer, &mut trace).await;
     trace.push(SimEvent::MarkedChunksVerified {
         stream: config.stream.clone(),
         marked: observer.marked_count(),
@@ -1150,6 +1168,9 @@ mod tests {
     use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
     use crate::madsim_harness::ThreeNodeRaftSimConfig;
+    use crate::madsim_harness::immutable_reads_loss::LOSS_STEP;
+    use crate::madsim_harness::immutable_reads_transfer::TRANSFER_READ;
+    use crate::madsim_harness::immutable_reads_transfer::TRANSFER_STEP;
     use crate::madsim_harness::introspect::invariant_failed;
     use crate::madsim_harness::tests::sim_test_guard;
 
@@ -1159,9 +1180,24 @@ mod tests {
         ThreeNodeRaftSimConfig::new(seed, format!("ursula-sim-{seed}-{}", SCENARIO.slug()))
     }
 
-    /// Runs the scenario at `seed` with `controls` and asserts the
-    /// invariant failed after `step`, the read the lost defence decided.
-    fn assert_fails(seed: u64, controls: Controls, step: &str) {
+    /// What the reads through the deposed leader of `step` decided in
+    /// `trace`: `(refused, barrier_rounds)`.
+    fn deposed_reads(trace: &SimTrace, step: &str) -> Option<(u64, u64)> {
+        trace.events.iter().find_map(|event| match event {
+            SimEvent::DeposedLeaderReadsJudged {
+                step: judged,
+                refused,
+                barrier_rounds,
+                ..
+            } if judged == step => Some((*refused, *barrier_rounds)),
+            _ => None,
+        })
+    }
+
+    /// Runs the scenario at `seed` with `controls`, asserts the invariant
+    /// failed after `step`, the read the lost defence decided, and returns
+    /// the run's trace.
+    fn assert_fails(seed: u64, controls: Controls, step: &str) -> SimTrace {
         let _guard = sim_test_guard();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -1188,6 +1224,7 @@ mod tests {
             Some(step),
             "{controls:?} failed `{INVARIANT}` at another step"
         );
+        recorded
     }
 
     #[test]
@@ -1204,13 +1241,24 @@ mod tests {
         );
     }
 
+    /// With the leader's barrier alone off, seed 920 fails the invariant in
+    /// the transfer step: the old leader, deposed by a transfer election
+    /// while its own lease holds, still leads by the leader predicate, and
+    /// answers short of a chunk its successor marked. With every defence on
+    /// the seed passes, and its barrier refused those reads
+    /// (`marked_chunks_never_contradict_replays`).
+    #[test]
+    fn negative_control_a_leader_in_transfer_without_its_barrier_contradicts_a_marked_chunk() {
+        assert_fails(920, Controls::LEADER_BARRIER_OFF, TRANSFER_READ);
+    }
+
     /// With the leader's barrier and the lease of the leader predicate both
     /// off, seed 920 fails the invariant at `before_power_loss`, in the
     /// accepted-loss step: the leader cut off from the others, deposed
     /// without knowing it, keeps leading past its lease and answers short of
     /// a chunk the new leader marked. With every defence on the seed passes
     /// (`marked_chunks_never_contradict_replays` runs it), and with either
-    /// one on it passes too
+    /// one on the accepted-loss step passes too
     /// (`either_defence_against_a_deposed_leader_alone_suffices`).
     #[test]
     fn negative_control_a_deposed_leader_without_barrier_or_lease_contradicts_a_marked_chunk() {
@@ -1221,39 +1269,41 @@ mod tests {
         );
     }
 
-    /// Either defence of a leader deposed without knowing it alone keeps
-    /// seed 920 passing, the run its negative control above fails. With the
-    /// barrier off, the cut-off leader's lease has ended by the time the
-    /// others elected a leader and wrote, so it no longer leads, and it
-    /// forwards or refuses what it cannot mark. With the lease off, it still
-    /// leads, and its barrier round finds no quorum. The loss step reads
-    /// through every replica, the cut-off leader included, and each run must
-    /// judge some of its answers: one that judged none would pass vacuously.
+    /// Either defence of a leader deposed without knowing it, once its
+    /// lease ended, alone keeps the accepted-loss step of seed 920 passing,
+    /// the step its negative control above fails, and the defence left on
+    /// decides the cut-off leader's reads of chunks marked elsewhere: it
+    /// refuses some. With the lease off, it still leads, and its barrier
+    /// starts the rounds that find no quorum. With the barrier off, its
+    /// lease has ended by the time the others elected a leader and wrote,
+    /// so it no longer leads, starts no round, and forwards or refuses what
+    /// it cannot mark. That run then fails only in the transfer step, where
+    /// the barrier is the only defence.
     #[test]
     fn either_defence_against_a_deposed_leader_alone_suffices() {
-        let _guard = sim_test_guard();
-        for controls in [
-            Controls::LEADER_BARRIER_OFF,
-            Controls::FENCED_LEADERSHIP_OFF,
-        ] {
+        {
+            let _guard = sim_test_guard();
             // A run that fails the invariant panics.
-            let report =
-                ThreeNodeRaftSim::run_immutable_reads_with_controls_report(config(920), controls);
-            let loss_checked = report
-                .outcome
-                .trace
-                .events
-                .iter()
-                .find_map(|event| match event {
-                    SimEvent::MarkedChunksVerified { loss_checked, .. } => Some(*loss_checked),
-                    _ => None,
-                })
-                .expect("the run verified its chunks");
+            let report = ThreeNodeRaftSim::run_immutable_reads_with_controls_report(
+                config(920),
+                Controls::FENCED_LEADERSHIP_OFF,
+            );
+            let (refused, rounds) = deposed_reads(&report.outcome.trace, LOSS_STEP)
+                .expect("the loss step judged the cut-off leader's reads");
             assert!(
-                loss_checked > 0,
-                "{controls:?}: the loss step checked no answer"
+                refused > 0 && rounds > 0,
+                "lease off: the cut-off leader refused {refused} marked chunks in {rounds} \
+                 barrier rounds"
             );
         }
+        let recorded = assert_fails(920, Controls::LEADER_BARRIER_OFF, TRANSFER_READ);
+        let (refused, rounds) = deposed_reads(&recorded, LOSS_STEP)
+            .expect("the loss step judged the cut-off leader's reads");
+        assert!(
+            refused > 0,
+            "barrier off: the cut-off leader refused {refused} marked chunks in {rounds} \
+             barrier rounds"
+        );
     }
 
     #[test]
@@ -1297,6 +1347,13 @@ mod tests {
             assert!(
                 verified.iter().all(|count| *count > 0),
                 "seed {seed}: {verified:?}"
+            );
+            // The old leader in transfer led, and its barrier refused a
+            // chunk its successor marked.
+            let transfer = deposed_reads(&first.outcome.trace, TRANSFER_STEP);
+            assert!(
+                transfer.is_some_and(|(refused, rounds)| refused > 0 && rounds > 0),
+                "seed {seed}: the transfer step's old leader decided {transfer:?}"
             );
         }
     }

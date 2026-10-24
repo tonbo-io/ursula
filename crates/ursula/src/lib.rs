@@ -5619,13 +5619,19 @@ pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> 
     count_refusal(state, &err);
     // Only a DST negative control turns the rule off, to show the
     // simulation catches a redirect after the body (its `Location` names
-    // the leader's base URL); every other build has no switch.
-    if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::NoRedirectAfterBody)
-        && let Some(redirect) = state
-            .client_write_router()
-            .and_then(|router| router.redirect_response(&err, "", Plane::Client))
+    // the leader's base URL). With the rule on, a simulation counts each
+    // refusal the rule kept from redirecting, so its runs show the rule
+    // decided an answer. Every other build has no switch.
+    #[cfg(madsim)]
+    if let Some(redirect) = state
+        .client_write_router()
+        .and_then(|router| router.redirect_response(&err, "", Plane::Client))
     {
-        return redirect;
+        use ursula_stream::sim_controls::Defence;
+        if ursula_stream::sim_controls::off(Defence::NoRedirectAfterBody) {
+            return redirect;
+        }
+        ursula_stream::sim_controls::note_fired(Defence::NoRedirectAfterBody);
     }
     if is_leadership_refusal(&err) {
         return leader_unknown_retry_response(err, Access::Write);

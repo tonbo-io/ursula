@@ -681,6 +681,17 @@ pub enum SimEvent {
         leader_first: bool,
         guard_refusals: u64,
     },
+    /// A step of `marked_chunks_never_contradict` read through `node`, a
+    /// leader deposed without knowing it: of its reads of chunk URLs the
+    /// observer had marked, it refused `refused`, and its read barrier
+    /// started `barrier_rounds` ReadIndex rounds for them. A refusal there
+    /// is a defence's decision: the leader could not mark the chunk.
+    DeposedLeaderReadsJudged {
+        step: String,
+        node: u64,
+        refused: u64,
+        barrier_rounds: u64,
+    },
     /// `marked_chunks_never_contradict` held: the observer kept `marked`
     /// chunk URLs from `answers` answers, and `checked` later answers for a
     /// marked URL agreed with it, across `leader_kills` kills.

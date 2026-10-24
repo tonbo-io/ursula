@@ -19,6 +19,8 @@ use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupReadRoute;
 use ursula_runtime::ReadStreamRequest;
+use ursula_stream::sim_controls::Defence;
+use ursula_stream::sim_controls::fired;
 
 use super::SimEvent;
 use super::SimTrace;
@@ -40,7 +42,65 @@ use super::journal_cluster::wait_plan_satisfied;
 use super::recovery_wiring::RECOVERY_STALL_AFTER;
 
 /// The group the step reads.
-const GROUP: u32 = 0;
+pub(super) const GROUP: u32 = 0;
+/// The step's name in [`SimEvent::DeposedLeaderReadsJudged`].
+pub(super) const LOSS_STEP: &str = "accepted_loss";
+
+/// What reads through one replica, a leader deposed without knowing it,
+/// decided: of its reads of chunk URLs the observer had marked, how many it
+/// refused, and how many ReadIndex rounds its read barrier started for
+/// them.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct WatchedReads {
+    pub(super) refused: u64,
+    pub(super) barrier_rounds: u64,
+}
+
+impl WatchedReads {
+    /// Records them in `trace` for `step`.
+    pub(super) fn record(self, trace: &mut SimTrace, step: &str, node: u64) {
+        trace.push(SimEvent::DeposedLeaderReadsJudged {
+            step: step.to_owned(),
+            node,
+            refused: self.refused,
+            barrier_rounds: self.barrier_rounds,
+        });
+    }
+}
+
+/// A chunk read of `url` through `node_id`'s replica, judged by `observer`
+/// under the stream's `current` token. A read through the `watched` node
+/// of a URL the observer had marked counts toward `reads`.
+pub(super) async fn judged_read(
+    cluster: &mut JournalCluster,
+    observer: &mut Observer,
+    trace: &mut SimTrace,
+    phase: &str,
+    (token, offset): (u64, u64),
+    current: u64,
+    node_id: u64,
+    watched: Option<(u64, &mut WatchedReads)>,
+) {
+    let counted = watched
+        .filter(|(node, _)| *node == node_id && observer.is_marked((token, offset)))
+        .map(|(_, reads)| reads);
+    let rounds = fired(Defence::ImmutableLeaderBarrier);
+    let read = read_through(
+        cluster,
+        node_id,
+        chunk_request(&group_stream(GROUP), offset),
+    )
+    .await;
+    if let Some(reads) = counted {
+        reads.barrier_rounds = reads
+            .barrier_rounds
+            .saturating_add(fired(Defence::ImmutableLeaderBarrier).saturating_sub(rounds));
+        if matches!(read, Read::Refused) {
+            reads.refused = reads.refused.saturating_add(1);
+        }
+    }
+    observer.observe(trace, phase, (token, offset), current, read);
+}
 
 /// `request` routed by `node_id`'s own replica of the group. A read it
 /// forwards to the leader is not answered here: the leader's own replica
@@ -67,7 +127,7 @@ async fn read_through(
 }
 
 /// The stream's current token, from a read through the group's leader.
-async fn current_token(cluster: &mut JournalCluster, context: &str) -> u64 {
+pub(super) async fn current_token(cluster: &mut JournalCluster, context: &str) -> u64 {
     let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
     loop {
         let leader = wait_leader(cluster, GROUP, context).await;
@@ -86,8 +146,9 @@ async fn current_token(cluster: &mut JournalCluster, context: &str) -> u64 {
 }
 
 /// Chunk reads at `reads` random offsets up to `tail`, through every
-/// replica, and of every URL the observer marked under `current`.
-async fn sweep(
+/// replica, and of every URL the observer marked under `current`. Reads
+/// through the `watched` node count toward its [`WatchedReads`].
+pub(super) async fn sweep(
     cluster: &mut JournalCluster,
     observer: &mut Observer,
     trace: &mut SimTrace,
@@ -95,6 +156,7 @@ async fn sweep(
     phase: &str,
     current: u64,
     reads: u64,
+    mut watched: Option<(u64, &mut WatchedReads)>,
 ) {
     let tail = cluster.acknowledged.get(&GROUP).map_or(0, |bytes| {
         u64::try_from(bytes.len()).expect("offset fits u64")
@@ -103,15 +165,19 @@ async fn sweep(
         .map(|_| (current, rng.next_bounded(tail.saturating_add(8))))
         .collect();
     urls.extend(observer.marked());
-    for (token, offset) in urls {
+    for url in urls {
         for node_id in NODES {
-            let read = read_through(
+            judged_read(
                 cluster,
+                observer,
+                trace,
+                phase,
+                url,
+                current,
                 node_id,
-                chunk_request(&group_stream(GROUP), offset),
+                watched.as_mut().map(|(node, reads)| (*node, &mut **reads)),
             )
             .await;
-            observer.observe(trace, phase, (token, offset), current, read);
         }
     }
 }
@@ -141,6 +207,7 @@ pub(super) async fn accepted_loss_phase(
         "before_loss",
         old,
         12,
+        None,
     )
     .await;
 
@@ -190,6 +257,9 @@ pub(super) async fn accepted_loss_phase(
                 .extend_from_slice(&payload);
         }
     }
+    // The cut-off leader is read too, deposed without knowing it: a
+    // defence decides each read it cannot mark.
+    let mut deposed = WatchedReads::default();
     sweep(
         &mut cluster,
         observer,
@@ -198,8 +268,10 @@ pub(super) async fn accepted_loss_phase(
         "before_power_loss",
         old,
         12,
+        Some((cut_off, &mut deposed)),
     )
     .await;
+    deposed.record(trace, LOSS_STEP, cut_off);
 
     // Both lose power and every page written since their last fsync.
     for node in &others {
@@ -228,6 +300,7 @@ pub(super) async fn accepted_loss_phase(
         "stalled_after_loss",
         old,
         12,
+        None,
     )
     .await;
 
@@ -250,6 +323,7 @@ pub(super) async fn accepted_loss_phase(
         "after_plan",
         new,
         12,
+        None,
     )
     .await;
     cluster.append(GROUP, 4).await;
@@ -261,6 +335,7 @@ pub(super) async fn accepted_loss_phase(
         "after_plan_writes",
         new,
         12,
+        None,
     )
     .await;
     observer.checked.saturating_sub(checked_before)
