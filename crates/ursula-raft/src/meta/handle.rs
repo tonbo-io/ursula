@@ -16,9 +16,11 @@
 //! does: an address that reaches this process again gets the same
 //! refusal back.
 //!
-//! A write goes on to another node only from a leadership refusal given
-//! before the command was proposed (`MetaWriteError::refused_unproposed`),
-//! the one predicate of the redirect, the own-id hop and the candidate walk.
+//! A leadership refusal sends a write on only when it was given before the
+//! command was proposed (`MetaWriteError::refused_unproposed`, the one
+//! predicate of the redirect, the own-id hop and the candidate walk's step
+//! past a leader's refusal). The walk also moves on after a forward that
+//! reached no meta leader and applied nothing.
 //! A refusal after it was proposed may still commit: it is the write's
 //! answer, never sent again, and reads [`WriteEffect::MayHaveApplied`].
 //!
@@ -52,7 +54,6 @@ use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::LeadershipRefusal;
-use ursula_runtime::Proposal;
 
 use super::MetaCommand;
 use super::MetaForwardError;
@@ -131,15 +132,15 @@ impl MetaWriteError {
 
     /// The leadership refusal of the node asked, when it refused the write
     /// because it does not lead before it proposed the command
-    /// ([`Proposal::NotProposed`]): nothing of the write can commit, so it
-    /// may go on to another node. A refusal after the command was proposed
-    /// ([`Proposal::MayHaveCommitted`]) is none: that command may still
-    /// commit, so the refusal is the write's answer.
+    /// ([`GroupEngineError::refused_before_proposal`]): nothing of the write
+    /// can commit, so it may go on to another node. A refusal after the
+    /// command was proposed is none: that command may still commit, so the
+    /// refusal is the write's answer.
     fn refused_unproposed(&self) -> Option<&LeadershipRefusal> {
         match self {
             Self::Leader { source, .. } => source
                 .not_leader()
-                .filter(|refusal| refusal.proposal == Proposal::NotProposed),
+                .filter(|_| source.refused_before_proposal()),
             Self::NoLeader
             | Self::Forward { .. }
             | Self::Refused(_)
