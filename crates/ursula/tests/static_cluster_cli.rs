@@ -8336,7 +8336,7 @@ async fn wait_superseded_and_closed(
     let what = format!("node {} is superseded and runs nothing", node.id);
     let mut since: Option<std::time::Instant> = None;
     eventually_for(procs, &what, LIFECYCLE_WAIT, async || {
-        let metrics = try_node_metrics(client, &node.url()).await?;
+        let metrics = try_node_metrics(client, &node.admin()).await?;
         if let Some(group) = metrics.groups.iter().find(|group| {
             never
                 .iter()
@@ -8347,12 +8347,17 @@ async fn wait_superseded_and_closed(
                 node.id, group.raft_group_id
             );
         }
-        let (status, ready) = readiness(client, node).await?;
-        let superseded = status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            && ready.reason == Some(ursula_proto::admin::ServingReadinessReason::Superseded);
+        let ready = admin_get_json::<ursula_proto::admin::ServingReadiness>(
+            client,
+            node,
+            "/__ursula/ready",
+        )
+        .await?;
+        let superseded =
+            ready.reason == Some(ursula_proto::admin::ServingReadinessReason::Superseded);
         if !superseded || !metrics.groups.is_empty() {
             since = None;
-            return Err(format!("{status} {ready:?} {:?}", metrics.groups));
+            return Err(format!("{ready:?} {:?}", metrics.groups));
         }
         let closed = since.get_or_insert_with(std::time::Instant::now).elapsed();
         if closed >= hold {
@@ -9427,27 +9432,7 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
 
     // 5. The old disk is refused for its released root.
     procs.start(binary, &old_disk);
-    wait_placement(
-        &client,
-        &mut procs,
-        &old_disk,
-        "is refused for its released root",
-        |status| {
-            status.registration
-                == RegistrationStatus::Refused(ursula_control::ControlError::OtherRoot {
-                    node: NodeId::new(5),
-                    slot: RootSlot::Released(old),
-                })
-        },
-    )
-    .await;
-    wait_readiness_reason(
-        &client,
-        &mut procs,
-        &old_disk,
-        Some(ServingReadinessReason::Superseded),
-    )
-    .await;
+    wait_superseded_for(&client, &mut procs, &old_disk, RootSlot::Released(old)).await;
     for group in 0..groups {
         append_until_done(&client, &mut procs, &url(&nodes[0], group), "old-disk-up;").await;
     }
@@ -9521,27 +9506,7 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
     // 7. The old disk is refused for the new root, and the new disk rejoins.
     procs.kill(5);
     procs.start(binary, &old_disk);
-    wait_placement(
-        &client,
-        &mut procs,
-        &old_disk,
-        "is refused for the new root",
-        |status| {
-            status.registration
-                == RegistrationStatus::Refused(ursula_control::ControlError::OtherRoot {
-                    node: NodeId::new(5),
-                    slot: RootSlot::Bound(new),
-                })
-        },
-    )
-    .await;
-    wait_readiness_reason(
-        &client,
-        &mut procs,
-        &old_disk,
-        Some(ServingReadinessReason::Superseded),
-    )
-    .await;
+    wait_superseded_for(&client, &mut procs, &old_disk, RootSlot::Bound(new)).await;
     for group in 0..groups {
         append_until_done(
             &client,
@@ -9565,6 +9530,57 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
         )
         .await;
     }
+}
+
+/// Waits until node `node`'s process is superseded for `slot`: its
+/// registration refused for another root and readiness `superseded`, read
+/// on its admin listener, since the client listener answers a fenced node
+/// `503`.
+async fn wait_superseded_for(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    slot: ursula_proto::placement::RootSlot,
+) {
+    let what = format!("node {} is superseded for {slot}", node.id);
+    eventually(procs, &what, async || {
+        let status = admin_get_json::<PlacementStatus>(client, node, "/__ursula/placement").await?;
+        let refused = RegistrationStatus::Refused(ursula_control::ControlError::OtherRoot {
+            node: NodeId::new(node.id),
+            slot,
+        });
+        let ready = admin_get_json::<ursula_proto::admin::ServingReadiness>(
+            client,
+            node,
+            "/__ursula/ready",
+        )
+        .await?;
+        if status.registration == refused
+            && ready.reason == Some(ursula_proto::admin::ServingReadinessReason::Superseded)
+        {
+            Ok(())
+        } else {
+            Err(format!("{:?} {ready:?}", status.registration))
+        }
+    })
+    .await;
+}
+
+/// `path` of node `node`'s admin listener as JSON, whatever its status.
+async fn admin_get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    node: &MetaNode,
+    path: &str,
+) -> Result<T, String> {
+    let url = format!("{}{path}", node.admin());
+    client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))
 }
 
 /// Node `node`'s readiness from its client listener: the status and the

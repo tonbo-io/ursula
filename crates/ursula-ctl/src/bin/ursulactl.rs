@@ -1127,7 +1127,12 @@ async fn run_verify_removal(
         &mut stdout,
     )
     .await?;
-    println!("verified: nodes {:?} are {removal:?}", args.nodes);
+    let verified = match removal {
+        ursula_ctl::placement::lifecycle::Removal::Leaving => "may leave",
+        ursula_ctl::placement::lifecycle::Removal::Joining => "may start",
+        ursula_ctl::placement::lifecycle::Removal::Vacant => "are vacant",
+    };
+    println!("verified: nodes {:?} {verified}", args.nodes);
     Ok(ursula_ctl::placement::lifecycle::LifecycleEnd::Done)
 }
 

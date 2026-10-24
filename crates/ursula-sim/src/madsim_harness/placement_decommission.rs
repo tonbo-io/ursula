@@ -20,12 +20,13 @@
 //!   a third once a group of node 4 moves;
 //! - once node 4 is removed and every group settled, a live node 4 closes
 //!   every replica (I13);
-//! - kills the meta leader once node 4 is removed, so a new meta leadership
-//!   begins, and a leadership sweeps at its start and then every 10
-//!   minutes. On three quarters of the seeds the new leader's sweep holds
-//!   at a drawn store call, the LIST of a group's objects or before or
-//!   after a DELETE, and that leader is killed there too. The leader after
-//!   it sweeps node 4's directory empty (I5);
+//! - on three quarters of the seeds holds the first pass after node 4's
+//!   removal at a drawn store call, the LIST of a group's objects or before
+//!   or after a DELETE, armed on every meta voter before the removal, since
+//!   a meta leader passes as soon as it sees a node newly removed, and
+//!   kills the meta leader that holds there. On the others it kills the
+//!   meta leader once node 4 is removed. The next leadership passes at its
+//!   start and sweeps node 4's directory empty (I5);
 //! - restarts node 4 with its disk before or after the sweep. While its
 //!   objects remain it opens what it holds, its left marks gone with its
 //!   process, and closes each once its group answered (I13, which fails a
@@ -226,6 +227,16 @@ pub(super) async fn decommission_family(
         run.move_group(0, MoveDraw::ONE).await;
     }
     run.snapshot_groups_of(LEAVING).await;
+    // A meta leader passes as soon as it sees node 4 removed, so the drawn
+    // hold is armed on every meta voter's store before the removal.
+    if let Some(hold) = draw.sweep_hold {
+        for voter in META_VOTERS {
+            run.cluster
+                .data
+                .snapshot_gates(voter)
+                .hold(hold.gate(voter));
+        }
+    }
     run.decommission(LEAVING, draw).await;
     if !draw.dead {
         run.closes(LEAVING).await;
@@ -461,51 +472,54 @@ impl Run {
         }
     }
 
-    /// The sweep of the removed `node`: the meta leader is killed, so a new
-    /// leadership sweeps at its start. With `hold`, that leader's sweep
-    /// holds at the store call and it is killed there too. Then I5's
-    /// removal half: within the bound, `node`'s directory is empty.
+    /// The sweep of the removed `node`. With `hold`, armed on every meta
+    /// voter's store before the removal, the meta leader that passed first
+    /// holds at the store call and is killed there, and the gates open.
+    /// Without, the meta leader is killed. Either way a new leadership
+    /// passes at once. Then I5's removal half: within the bound, `node`'s
+    /// directory is empty.
     async fn sweep(&mut self, node: u64, hold: Option<SweepHold>) {
         const PHASE: &str = "sweep";
         let leader = self.meta_leader(PHASE).await;
-        // The next leader's store holds, whichever meta voter it is.
-        let held: Vec<u64> = match hold {
-            Some(_) => META_VOTERS
-                .into_iter()
-                .filter(|voter| *voter != leader && self.cluster.runtimes.contains_key(voter))
-                .collect(),
-            None => Vec::new(),
-        };
-        if let Some(hold) = hold {
-            for voter in &held {
-                self.cluster
-                    .data
-                    .snapshot_gates(*voter)
-                    .hold(hold.gate(*voter));
+        match hold {
+            None => {
+                self.kill_meta_leader(PHASE, leader).await;
             }
-        }
-        let next = self.kill_meta_leader(PHASE, leader).await;
-        if let Some(hold) = hold {
-            for voter in held.iter().filter(|voter| **voter != next) {
-                self.cluster
-                    .data
-                    .snapshot_gates(*voter)
-                    .open(hold.gate(*voter));
-            }
-            let gate = hold.gate(next);
-            let arrived = self
-                .within(PHASE, BOUND, move |cluster| {
-                    cluster.runtimes.contains_key(&next)
-                        && cluster.data.snapshot_gates(next).arrived(gate) > 0
-                })
-                .await;
-            if arrived {
-                self.trace.push(SimEvent::FaultApplied {
-                    phase: format!("{PHASE}: node {next}'s sweep holds at {hold:?}"),
+            Some(hold) => {
+                let held = self
+                    .within(PHASE, BOUND, move |cluster| {
+                        META_VOTERS.into_iter().any(|voter| {
+                            cluster.runtimes.contains_key(&voter)
+                                && cluster.data.snapshot_gates(voter).arrived(hold.gate(voter)) > 0
+                        })
+                    })
+                    .await;
+                let holder = META_VOTERS.into_iter().find(|voter| {
+                    self.cluster.runtimes.contains_key(voter)
+                        && self
+                            .cluster
+                            .data
+                            .snapshot_gates(*voter)
+                            .arrived(hold.gate(*voter))
+                            > 0
                 });
-                self.kill_meta_leader(PHASE, next).await;
-            } else if self.cluster.runtimes.contains_key(&next) {
-                self.cluster.data.snapshot_gates(next).open(gate);
+                match holder.filter(|_| held) {
+                    Some(holder) => {
+                        self.trace.push(SimEvent::FaultApplied {
+                            phase: format!("{PHASE}: node {holder}'s sweep holds at {hold:?}"),
+                        });
+                        self.kill_meta_leader(PHASE, holder).await;
+                    }
+                    None => {
+                        self.kill_meta_leader(PHASE, leader).await;
+                    }
+                }
+                for voter in META_VOTERS {
+                    self.cluster
+                        .data
+                        .snapshot_gates(voter)
+                        .open(hold.gate(voter));
+                }
             }
         }
         self.until(PHASE, I5, MOVE_BOUND, move |cluster| cluster.unswept(node))
