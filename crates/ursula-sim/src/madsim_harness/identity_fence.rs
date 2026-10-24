@@ -91,7 +91,8 @@
 //!   shows at a step an uncommitted vote other than the one it opened with.
 //!   Nor does the meta replica of a process that owes its predecessor
 //!   wait, or whose unbound root its fence shows bound less than a wait
-//!   ago, open its gate or write a vote floor. It reads each replica at
+//!   ago or, once the cluster bootstrapped, awaits its binding, open its
+//!   gate or write a vote floor. It reads each replica at
 //!   every step, but not a meta replica's vote, and reads no snapshot
 //!   objects. It does not see a granted vote: a candidate that wins commits
 //!   the vote with its first heartbeat, well inside a step, and the vote
@@ -105,16 +106,25 @@
 //! - I17 ([`I17`]): no process counts an answer of a process of a node
 //!   given after a later process of that node made a promise: granted a
 //!   vote or installed a snapshot (an answer a peer counted), or opened the
-//!   gate of its meta replica or of a data replica or wrote its vote floor
-//!   (seen at a step, and dated from the step before, the earliest it can
-//!   have happened). These are
-//!   what a predecessor wait holds. An acknowledgement of entries is no
+//!   gate of its meta replica or of a data replica, wrote its vote floor,
+//!   or showed a data replica's vote changed to an uncommitted one or to a
+//!   term it leads (seen at a step, and dated from the step before, the
+//!   earliest it can have happened): it campaigned, or granted a vote. These
+//!   are what a predecessor wait holds. An acknowledgement of entries is no
 //!   promise: a successor acknowledges during its wait while its
 //!   predecessor may still be counted, which the fence allows (addendum
-//!   2.1 and 2.6), since under `always` both acknowledge only what they
-//!   synced and every leader the successor acknowledges was elected
-//!   without the node's vote. It reads every answer a process counted, the
-//!   recovery calls' included, and runs at the end of a run.
+//!   2.1 and 2.6). Under `always` both acknowledge only what they synced,
+//!   and where the two processes' acknowledgements disagree about the
+//!   node's vote, the leader the successor acknowledges won without the
+//!   node (addendum 2.9, step 2). Under `never` the old process acknowledges
+//!   from its page cache until its lease ends, and the successor reads its
+//!   volume remounted and is gated: its gate opens only on a barrier begun
+//!   after its wait, whose floor covers every entry counted on the old
+//!   process's acknowledgements, and that opening is a promise. It reads
+//!   every answer a process counted, the recovery calls' included, and runs
+//!   at the end of a run. The split, the two moved volumes and the zombie
+//!   leads fail it when no successor of a moved volume made a promise while
+//!   its predecessor ran, as the broken release rule does for its new root.
 //! - I18 ([`I18`]): no linearizable read invoked after a write was
 //!   acknowledged misses that write. It compares each read with its
 //!   invocation, so a read invoked before a write is free to miss it.
@@ -160,6 +170,7 @@ use std::time::Duration;
 
 use futures_util::lock::Mutex as AsyncMutex;
 use openraft::ServerState;
+use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
 use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
@@ -169,6 +180,7 @@ use ursula_proto::placement::RootId;
 use ursula_proto::placement::RootSlot;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
+use ursula_raft::UrsulaVote;
 use ursula_raft::meta::pause::MetaPausePoint;
 use ursula_raft::predecessor_wait::PREDECESSOR_WAIT;
 use ursula_runtime::AppendExternalRequest;
@@ -306,6 +318,9 @@ pub(super) enum Controls {
     /// The new disk refused for longer than a wait, with its wait from its
     /// binding (`true`) or from the start of its run (N23).
     WaitFromBinding { defended: bool },
+    /// The crash between meta's answer and its record, with the barrier
+    /// held while the root awaits its binding (`true`) or run then (N26).
+    BarrierAwaitsBinding { defended: bool },
     /// Two moved volumes, with the disk lease on (`true`) or never ending
     /// (N21).
     TwoMoved { defended: bool },
@@ -372,7 +387,8 @@ impl Switched {
         );
         set_off(
             Defence::GateAfterWait,
-            controls == Controls::GateAfterWait { defended: false },
+            controls == Controls::GateAfterWait { defended: false }
+                || controls == Controls::BarrierAwaitsBinding { defended: false },
         );
         set_off(
             Defence::RemountedRun,
@@ -464,6 +480,9 @@ struct FenceChecks {
     /// Whether a step saw a held process whose journals hold a data
     /// replica, which it opens while held.
     held_with_journal: bool,
+    /// Whether the cluster bootstrapped, so no meta replica takes a genesis
+    /// floor or opens its gate on a fresh bootstrap any more.
+    bootstrapped: bool,
     /// Each acknowledged write, by group: when, and its payload.
     acknowledged: BTreeMap<u32, Vec<(madsim::time::Instant, Vec<u8>)>>,
     /// How many linearizable reads I18 compared.
@@ -488,10 +507,13 @@ impl FenceChecks {
     /// clause sees only an uncommitted vote at the step. A process is held
     /// while its fence holds it out, and for a predecessor wait after its
     /// fence shows its unbound root bound. Its meta replica shows the gate
-    /// and floor it opened with while the process owes its wait, and for a
-    /// predecessor wait after that binding, but not while its root awaits
-    /// the binding: a forming cluster's meta replicas take their genesis
-    /// floors then.
+    /// and floor it opened with while the process owes its wait, for a
+    /// predecessor wait after that binding, and, once the cluster
+    /// bootstrapped, while its root awaits the binding. A forming cluster's
+    /// meta replicas take their genesis floors and open their gates on a
+    /// fresh bootstrap while they await it. A bootstrapped cluster's do
+    /// neither, since every peer they probe holds meta history, and their
+    /// barrier rounds are held.
     ///
     /// A held process opens its data replicas while held only when its
     /// journals hold them, since a hold begins at the start of its run. A
@@ -508,7 +530,7 @@ impl FenceChecks {
                 continue;
             };
             self.one_leader_per_term(cluster, trace, after_event, node_id, process);
-            self.gate_promises(cluster, node_id, process, since);
+            self.step_promises(cluster, node_id, process, since);
             let wal = cluster.data.wals[&node_id].raft_wal();
             let fence = wal.fence();
             let bound_at = fence.bound_at();
@@ -525,10 +547,15 @@ impl FenceChecks {
                 self.held_with_journal = true;
             }
             let owes_wait = fence.owes_wait();
-            if (owes_wait || by_clock)
+            let awaits_binding = self.bootstrapped && fence.awaits_binding();
+            if (owes_wait || by_clock || awaits_binding)
                 && let Some(meta) = cluster.meta_gate(node_id)
             {
-                self.held_meta_observations = self.held_meta_observations.saturating_add(1);
+                // The new-disk vacuity escape (`Run::finish`) counts the
+                // holds of a wait only.
+                if owes_wait || by_clock {
+                    self.held_meta_observations = self.held_meta_observations.saturating_add(1);
+                }
                 if let Some(broke) = meta.now.taken_since(meta.opened) {
                     fail(
                         trace,
@@ -537,7 +564,8 @@ impl FenceChecks {
                         format!(
                             "node {node_id}'s process {process} {broke} in the meta group while \
                              held (held by its fence: {owes_wait}, within a wait of its binding: \
-                             {by_clock}, bound at {bound_at:?}): opened {:?}, now {:?}",
+                             {by_clock}, awaiting its binding: {awaits_binding}, bound at \
+                             {bound_at:?}): opened {:?}, now {:?}",
                             meta.opened, meta.now
                         ),
                     );
@@ -610,10 +638,11 @@ impl FenceChecks {
 
     /// I17's promises at one step: `node_id`'s current process `process`
     /// promised when its meta replica or one of its data replicas opened
-    /// its gate or wrote a vote floor since it opened, dated `since`, the
-    /// step before, which no gate seen closed or not yet hosted then can
-    /// precede.
-    fn gate_promises(
+    /// its gate or wrote a vote floor since it opened, or one of its data
+    /// replicas voted ([`voted_since`]), dated `since`, the step before,
+    /// which no gate seen closed, vote seen unchanged or replica not yet
+    /// hosted then can precede.
+    fn step_promises(
         &mut self,
         cluster: &MetaCluster,
         node_id: u64,
@@ -628,10 +657,9 @@ impl FenceChecks {
             .is_some_and(|meta| meta.now.taken_since(meta.opened).is_some());
         let promised = meta
             || cluster.hosted_replicas(node_id).iter().any(|replica| {
-                ReplicaMarks::of(&replica.raft, &replica.rejoin)
-                    .gate
-                    .taken_since(replica.opened.gate)
-                    .is_some()
+                let now = ReplicaMarks::of(&replica.raft, &replica.rejoin);
+                now.gate.taken_since(replica.opened.gate).is_some()
+                    || voted_since(node_id, &now.vote, &replica.opened.vote)
             });
         if promised {
             let first = self.promised.entry(process).or_insert(since);
@@ -725,6 +753,17 @@ impl FenceChecks {
             }
         }
     }
+}
+
+/// Whether `node_id`'s replica, which opened with the vote `opened`, voted
+/// since, showing `now`: an uncommitted vote it did not open with, granted
+/// or its own campaign's, or a committed one of a term it leads, which only
+/// a campaign it won gives. A committed vote of another leader is that
+/// leader's, adopted with its entries, which a successor may acknowledge
+/// during its wait, and a vote it granted that leader is an answer a peer
+/// counted ([`FenceChecks::answer_promises`]).
+fn voted_since(node_id: u64, now: &UrsulaVote, opened: &UrsulaVote) -> bool {
+    now != opened && (!now.is_committed() || *now.leader_id().node_id() == node_id)
 }
 
 /// The tag and node of the process whose incarnation is `incarnation`,
@@ -896,6 +935,7 @@ impl Run {
         run.meta
             .bootstrapped(&run.cluster, &mut run.trace, "formed", &nodes)
             .await;
+        run.fence.bootstrapped = true;
         for group in JOURNAL_GROUPS {
             run.resume(group, "formed").await;
         }
@@ -1342,6 +1382,7 @@ impl Run {
         self.far_side_writes(group, &[far, moved], PHASE).await;
         reader.abort();
         self.judge_reads(PHASE, leader, group, &reads);
+        self.successor_promised(&[moved], PHASE);
         self.heal(vec![zombie]).await;
         self.resume(group, "split_healed").await;
         self.reads_back("split_reads").await;
@@ -1364,6 +1405,37 @@ impl Run {
         }
         self.fence
             .reads_see_writes(&mut self.trace, phase, group, &reads);
+    }
+
+    /// I17's guard against a run that judges nothing of a moved volume:
+    /// while the old processes of `moved` still run, the current process
+    /// of one of them made a promise. Without one, every answer of an old
+    /// process is free to be counted, as when a successor waits and then
+    /// only acknowledges.
+    fn successor_promised(&mut self, moved: &[u64], phase: &str) {
+        self.observe(phase);
+        let successors: Vec<(u64, u64)> = moved
+            .iter()
+            .filter_map(|node_id| {
+                self.cluster
+                    .process(*node_id)
+                    .map(|process| (*node_id, process))
+            })
+            .collect();
+        for (_, process) in &successors {
+            if self.fence.promised(&self.cluster, *process) {
+                return;
+            }
+        }
+        fail(
+            &mut self.trace,
+            I17,
+            phase,
+            format!(
+                "no successor process of a moved volume, by node {successors:?}, made a promise \
+                 while its predecessor ran, so I17 judged nothing of the predecessor"
+            ),
+        );
     }
 
     /// Writes to `group` through a leader among `far` until [`READ_ON`]
@@ -1881,10 +1953,11 @@ impl Run {
         let new_root = self.cluster.data.wals[&moved].raft_wal().incarnation().root;
         self.step(PHASE);
         // Meta bound the new root, and the process stopped before it
-        // recorded the binding: its data stays held.
+        // recorded the binding: its data stays held, and its meta replica's
+        // barrier rounds too, which I16 judges at every step of the watch.
         self.views_show(&[leader, far], moved, RootSlot::Bound(new_root), PHASE)
             .await;
-        self.watch(PHASE, STEP * 10).await;
+        self.watch(PHASE, STEP * 40).await;
         let registration = self.cluster.runtimes[&moved]
             .status_reader()
             .placement_status()
@@ -2024,6 +2097,7 @@ impl Run {
             .await;
         reader.abort();
         self.judge_reads(PHASE, leader, group, &reads);
+        self.successor_promised(&[leader, moved], PHASE);
         self.heal(vec![old_leader, old_follower]).await;
         self.resume(group, "two_moved_healed").await;
         self.reads_back("two_moved_reads").await;
@@ -2146,6 +2220,7 @@ impl Run {
         self.far_side_writes(group, &[far, leader], PHASE).await;
         reader.abort();
         self.judge_reads(PHASE, leader, group, &reads);
+        self.successor_promised(&[leader], PHASE);
         self.heal(vec![zombie]).await;
         self.resume(group, "zombie_leads_healed").await;
         self.reads_back("zombie_leads_reads").await;
@@ -2699,6 +2774,11 @@ pub(super) async fn run_identity_fence_inner(
             run.new_disk().await;
             run.finish()
         }
+        Controls::BarrierAwaitsBinding { .. } => {
+            let mut run = Run::start(seed, WalFsync::Always).await;
+            run.registration_crash().await;
+            run.finish()
+        }
         Controls::TwoMoved { .. } => {
             let mut run = Run::start(seed, WalFsync::Always).await;
             run.two_moved(SCRIPTED_OFFSET).await;
@@ -3015,6 +3095,27 @@ mod tests {
             message.contains("within a wait of its binding: true"),
             "{message}"
         );
+    }
+
+    /// A new disk whose meta replica runs its barrier rounds while its
+    /// root awaits its binding takes a meta floor or opens its meta gate
+    /// before it recorded the binding (N26).
+    #[test]
+    fn negative_control_barrier_awaits_binding() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::BarrierAwaitsBinding { defended: true },
+            Controls::BarrierAwaitsBinding { defended: false },
+            I16,
+            "registration_crash",
+        );
+        assert!(message.contains("in the meta group"), "{message}");
+        assert!(message.contains("held by its fence: false"), "{message}");
+        assert!(
+            message.contains("within a wait of its binding: false"),
+            "{message}"
+        );
+        assert!(message.contains("awaiting its binding: true"), "{message}");
     }
 
     /// Two moved volumes whose old processes reach each other keep
