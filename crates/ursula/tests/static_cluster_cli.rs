@@ -5502,7 +5502,8 @@ async fn cli_a_durable_single_node_reports_its_fsync_and_restarts_unattended() {
 /// answers still cover every group. One node's purge removes the bucket
 /// from every group, through the leaders of the groups it hosts no replica
 /// of. The nodes' usage reports, kept per group by the newest replica,
-/// count every stream once. `backup-create` exports every group, and its
+/// count every stream once, and each replica of a group reports the same
+/// snapshot bytes. `backup-create` exports every group, and its
 /// restore into the wiped cluster imports every group. Each group's leader
 /// flushes its hot bytes to the cold tier, though its node's cold flush
 /// pass meets groups the node does not host.
@@ -5577,6 +5578,43 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
     }
     wait_bucket_streams(&client, &mut procs, &nodes, "wide", 4).await;
 
+    // Each stream publishes a snapshot. Its group's three replicas each
+    // report the body's bytes once they have applied it: the value is
+    // derived from applied state, the same on every replica.
+    for stream in &streams {
+        let url = format!(
+            "{}/wide/{stream}/snapshot/{:020}",
+            purger.url(),
+            "before;".len()
+        );
+        put_snapshot_until_no_content(&client, &url, "state").await;
+    }
+    eventually(
+        &mut procs,
+        "every replica reports the snapshot bytes",
+        async || {
+            let mut replicas = BTreeMap::<u32, Vec<Option<u64>>>::new();
+            for node in &nodes {
+                for group in usage_report(&client, node).await?.groups {
+                    let bytes = group
+                        .buckets
+                        .get("wide")
+                        .and_then(|usage| usage.snapshot_bytes);
+                    replicas.entry(group.raft_group_id).or_default().push(bytes);
+                }
+            }
+            let expected: Vec<Option<u64>> = vec![Some(5); 3];
+            if replicas.len() == META_TEST_GROUPS
+                && replicas.values().all(|bytes| *bytes == expected)
+            {
+                Ok(())
+            } else {
+                Err(format!("{replicas:?}"))
+            }
+        },
+    )
+    .await;
+
     let backup_store = ursula_ctl::backup::BackupStore::open(
         root.path().join("backup").to_str().expect("a UTF-8 path"),
     )
@@ -5630,6 +5668,26 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
         every_group
     );
     wait_bucket_streams(&client, &mut procs, &nodes, "wide", 4).await;
+    // The restored streams' snapshots count again, derived from the
+    // imported state.
+    eventually(
+        &mut procs,
+        "the restored snapshot bytes count",
+        async || {
+            let mut reports = Vec::new();
+            for node in &nodes {
+                reports.push(usage_report(&client, node).await?);
+            }
+            let (buckets, complete) = ursula_proto::admin::UsageReport::bucket_usage(&reports);
+            let bytes = buckets.get("wide").and_then(|usage| usage.snapshot_bytes);
+            if complete && bytes == Some(20) {
+                Ok(())
+            } else {
+                Err(format!("complete {complete}, {buckets:?}"))
+            }
+        },
+    )
+    .await;
 
     for stream in &streams {
         let url = format!("{}/wide/{stream}", purger.url());
@@ -13139,6 +13197,23 @@ async fn post_until_no_content(client: &reqwest::Client, url: &str, payload: &'s
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("append did not succeed at {url}");
+}
+
+async fn put_snapshot_until_no_content(client: &reqwest::Client, url: &str, body: &'static str) {
+    for _ in 0..100 {
+        if let Ok(response) = client
+            .put(url)
+            .header("content-type", "text/plain")
+            .body(body)
+            .send()
+            .await
+            && response.status() == reqwest::StatusCode::NO_CONTENT
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("snapshot publish did not succeed at {url}");
 }
 
 async fn read_until_replicated(client: &reqwest::Client, url: &str) -> Vec<u8> {

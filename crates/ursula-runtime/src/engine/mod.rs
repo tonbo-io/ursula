@@ -5,6 +5,7 @@ mod error_tests;
 mod hygiene_tests;
 pub mod in_memory;
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -120,6 +121,11 @@ pub struct GroupBucketUsage {
     /// higher index is the newer.
     pub applied_index: u64,
     pub buckets: Vec<BucketUsageSnapshot>,
+    /// Per bucket, the bytes of each live stream's latest visible snapshot
+    /// body, read from the same applied state as `buckets`
+    /// ([`ursula_stream::StreamStateMachine::snapshot_bytes_by_bucket`]).
+    /// A bucket without a published snapshot is absent.
+    pub snapshot_bytes: BTreeMap<String, u64>,
 }
 pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
