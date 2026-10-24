@@ -1860,15 +1860,29 @@ impl UsageReport {
     /// The usage per bucket across `reports`, one per node, as a collector
     /// sums it: for each group the report with the highest `applied_index`
     /// counts, and `false` beside the sum when no report names one of the
-    /// cluster's groups.
+    /// cluster's groups. Of two reports at the same `applied_index`, which
+    /// describe the same applied state, the one that carries
+    /// `snapshot_bytes` for every bucket counts, whatever their order.
     pub fn bucket_usage(reports: &[Self]) -> (BTreeMap<String, BucketUsageReport>, bool) {
+        fn knows_snapshot_bytes(group: &GroupUsage) -> bool {
+            group
+                .buckets
+                .values()
+                .all(|usage| usage.snapshot_bytes.is_some())
+        }
         let mut newest = BTreeMap::<u32, &GroupUsage>::new();
         for group in reports.iter().flat_map(|report| &report.groups) {
-            match newest.get(&group.raft_group_id) {
-                Some(seen) if seen.applied_index >= group.applied_index => {}
-                _ => {
-                    newest.insert(group.raft_group_id, group);
+            let newer = match newest.get(&group.raft_group_id) {
+                None => true,
+                Some(seen) => {
+                    group.applied_index > seen.applied_index
+                        || (group.applied_index == seen.applied_index
+                            && knows_snapshot_bytes(group)
+                            && !knows_snapshot_bytes(seen))
                 }
+            };
+            if newer {
+                newest.insert(group.raft_group_id, group);
             }
         }
         let group_count = reports
@@ -2088,6 +2102,31 @@ mod usage_tests {
         ];
         let (buckets, _complete) = UsageReport::bucket_usage(&reports);
         assert_eq!(buckets["tenant"].snapshot_bytes, Some(55));
+    }
+
+    /// During a rolling upgrade a 0.10.0 and a 0.10.1 replica of one group
+    /// can report the same `applied_index`, the same applied state. The
+    /// collector keeps the report that carries `snapshot_bytes`, in either
+    /// order.
+    #[test]
+    fn a_tied_report_with_snapshot_bytes_wins_in_either_order() {
+        let mut old = usage(1, 3, 1);
+        for usage in old.buckets.values_mut() {
+            usage.snapshot_bytes = None;
+        }
+        let new = usage(1, 3, 1);
+        for groups in [[old.clone(), new.clone()], [new, old]] {
+            let [first, second] = groups;
+            let reports = [
+                usage_report(1, vec![usage(0, 9, 4)]),
+                usage_report(2, vec![first]),
+                usage_report(3, vec![second]),
+            ];
+            let (buckets, complete) = UsageReport::bucket_usage(&reports);
+            assert!(complete);
+            assert_eq!(buckets["tenant"].snapshot_bytes, Some(55));
+            assert_eq!(buckets["tenant"].stream_count, 5);
+        }
     }
 
     fn group(raft_group_id: u32, term: u64, finished: bool, bytes: u64) -> GroupStagedParts {

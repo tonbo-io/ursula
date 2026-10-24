@@ -11760,9 +11760,10 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
 }
 
 /// `snapshot_bytes` is the body length of each live stream's latest
-/// snapshot: an inline body by its length, a cold body by its uploaded
-/// length, a replacement instead of the body it replaced, and nothing once
-/// the stream is deleted. A bucket without a snapshot reports zero.
+/// snapshot: a body by its uploaded length, a replacement instead of the
+/// body it replaced, and nothing once the stream is deleted. A bucket
+/// without a snapshot reports zero. It does not check where a body is held
+/// or the replaced body's GC grace.
 #[tokio::test]
 async fn usage_reports_the_latest_snapshot_bytes_per_bucket() {
     let cold_store: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -11808,8 +11809,8 @@ async fn usage_reports_the_latest_snapshot_bytes_per_bucket() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(snapshot_bytes().await, (Some(6), Some(0)));
 
-    // A larger replacement held as a cold object counts its body length,
-    // and only it: the replaced body in its GC grace does not count.
+    // A larger replacement counts its body length, and only it: the body
+    // it replaced does not count.
     let cold_body = "a snapshot body held in the cold tier";
     let response = http_put(
         &app,
