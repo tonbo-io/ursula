@@ -1802,6 +1802,14 @@ pub struct BucketUsageReport {
     pub committed_write_units: u64,
     pub retained_bytes: u64,
     pub stream_count: u64,
+    /// Summed body length of the latest visible snapshot of each of the
+    /// bucket's live streams, as uploaded: the stored image, not the bytes
+    /// published over time. Derived from applied state at read time, so a
+    /// replaced body during its GC grace, staged parts (see
+    /// `staged_snapshot_parts`) and Raft group snapshots do not count.
+    /// Bounded by streams times 1 GiB, saturating.
+    #[serde(default)]
+    pub snapshot_bytes: u64,
 }
 
 impl BucketUsageReport {
@@ -1818,6 +1826,7 @@ impl BucketUsageReport {
             .saturating_add(other.committed_write_units);
         self.retained_bytes = self.retained_bytes.saturating_add(other.retained_bytes);
         self.stream_count = self.stream_count.saturating_add(other.stream_count);
+        self.snapshot_bytes = self.snapshot_bytes.saturating_add(other.snapshot_bytes);
     }
 }
 
@@ -1928,6 +1937,7 @@ mod usage_tests {
                 committed_write_units: streams.saturating_mul(3),
                 retained_bytes: streams.saturating_mul(7),
                 stream_count: streams,
+                snapshot_bytes: streams.saturating_mul(11),
             })]),
         }
     }
@@ -1957,10 +1967,27 @@ mod usage_tests {
             committed_write_units: 18,
             retained_bytes: 42,
             stream_count: 6,
+            snapshot_bytes: 66,
         });
         let (buckets, complete) = UsageReport::bucket_usage(&reports[1..2]);
         assert!(!complete);
         assert_eq!(buckets["tenant"].stream_count, 5);
+    }
+
+    /// A bucket entry from a node that does not report `snapshot_bytes`
+    /// decodes with zero, so a collector can read every patch of the minor.
+    #[test]
+    fn a_bucket_without_snapshot_bytes_decodes_as_zero() {
+        let bucket: BucketUsageReport = serde_json::from_value(serde_json::json!({
+            "committed_append_bytes": 10,
+            "committed_records": 2,
+            "committed_write_units": 3,
+            "retained_bytes": 7,
+            "stream_count": 1,
+        }))
+        .expect("a bucket entry without snapshot_bytes decodes");
+        assert_eq!(bucket.snapshot_bytes, 0);
+        assert_eq!(bucket.stream_count, 1);
     }
 
     fn group(raft_group_id: u32, term: u64, finished: bool, bytes: u64) -> GroupStagedParts {

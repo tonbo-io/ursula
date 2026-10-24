@@ -1755,6 +1755,53 @@ async fn usage_reports_staged_part_bytes_per_group() {
     assert_eq!(metrics["staged_snapshot_part_bytes"], 21);
 }
 
+/// Staged parts count only under `staged_snapshot_parts`, never as
+/// snapshot bytes. A committed snapshot counts its assembled body once in
+/// `snapshot_bytes`, not its parts as well, and its parts leave the staged
+/// count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_counts_a_committed_snapshot_once() {
+    let (state, cold_store) = bounded_state(10, 1_000);
+    let app = router_with_http_state(state.clone());
+    let mut ended = state.snapshot_commits.ended();
+    create(&app, "/parts/s").await;
+    let handle: ursula_runtime::ColdStoreHandle = cold_store.clone();
+    state.count_staged_parts_once(&handle).await;
+    let staged_bytes = |report: &ursula_proto::admin::UsageReport| {
+        report
+            .staged_snapshot_parts
+            .iter()
+            .filter_map(|group| group.bytes.get("parts"))
+            .copied()
+            .sum::<u64>()
+    };
+    let snapshot_bytes = |report: &ursula_proto::admin::UsageReport| {
+        let (buckets, _complete) =
+            ursula_proto::admin::UsageReport::bucket_usage(std::slice::from_ref(report));
+        buckets["parts"].snapshot_bytes
+    };
+
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    let report = usage_report(&app).await;
+    assert_eq!(staged_bytes(&report), 11);
+    assert_eq!(snapshot_bytes(&report), 0);
+
+    let response = send(
+        &app,
+        commit_request("/parts/s", &parts, digest_of(b"firstsecond")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    ended.wait_for(|ended| *ended >= 1).await.unwrap();
+    assert!(part_names(&cold_store).await.is_empty());
+    let report = usage_report(&app).await;
+    assert_eq!(staged_bytes(&report), 0);
+    assert_eq!(snapshot_bytes(&report), 11);
+}
+
 /// #648 review: reading usage changes nothing a part or a count depends on,
 /// a deleted stream's leftover parts and an emptied bucket included.
 #[tokio::test]

@@ -2200,10 +2200,8 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
         Ok(report) => {
             let groups = report
                 .into_iter()
-                .map(|(group, usage)| ursula_proto::admin::GroupUsage {
-                    raft_group_id: group.0,
-                    applied_index: usage.applied_index,
-                    buckets: usage
+                .map(|(group, usage)| {
+                    let mut buckets = usage
                         .buckets
                         .into_iter()
                         .map(|entry| {
@@ -2213,9 +2211,21 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
                                 committed_write_units: entry.usage.committed_write_units,
                                 retained_bytes: entry.usage.retained_bytes,
                                 stream_count: entry.usage.stream_count,
+                                snapshot_bytes: 0,
                             })
                         })
-                        .collect(),
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    // A stream with a snapshot is live, so its bucket already
+                    // has a usage entry; `or_default` only keeps the bytes if
+                    // that ever stops holding.
+                    for (bucket_id, bytes) in usage.snapshot_bytes {
+                        buckets.entry(bucket_id).or_default().snapshot_bytes = bytes;
+                    }
+                    ursula_proto::admin::GroupUsage {
+                        raft_group_id: group.0,
+                        applied_index: usage.applied_index,
+                        buckets,
+                    }
                 })
                 .collect();
             axum::Json(ursula_proto::admin::UsageReport {
