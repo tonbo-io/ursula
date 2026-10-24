@@ -1479,6 +1479,9 @@ impl InProcessRaftNetworkPolicy {
     /// included, while `target`'s RPCs to `source` still pass. A leader
     /// whose peers' RPCs to it fail still reaches them, and hears of a
     /// newer term only through the answer to an RPC it sends itself.
+    /// Only the Raft RPCs ask by direction: the calls
+    /// that ask [`Self::partitioned`], such as the recovery-gate barrier,
+    /// bootstrap probes and meta calls, find the pair cut both ways.
     pub fn partition_one_way(&self, source: u64, target: u64) {
         let mut inner = self
             .inner

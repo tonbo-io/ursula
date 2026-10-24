@@ -39,12 +39,9 @@ pub(super) const TRANSFER_READ: &str = "read_through_the_leader_in_transfer";
 /// The step's name in [`SimEvent::DeposedLeaderReadsJudged`].
 pub(super) const TRANSFER_STEP: &str = "leader_in_transfer";
 
-/// Runs the step and returns what the old leader's reads decided.
-pub(super) async fn transfer_phase(
-    seed: u64,
-    observer: &mut Observer,
-    trace: &mut SimTrace,
-) -> WatchedReads {
+/// Runs the step. What the old leader's reads decided goes to the trace
+/// ([`SimEvent::DeposedLeaderReadsJudged`]).
+pub(super) async fn transfer_phase(seed: u64, observer: &mut Observer, trace: &mut SimTrace) {
     let context = format!("seed {seed}: leadership transfer");
     let mut rng = SplitMix64::new(seed ^ 0x7472_616e_7366_6572);
     let mut cluster = JournalCluster::start_with_fsync(
@@ -187,5 +184,4 @@ pub(super) async fn transfer_phase(
         None,
     )
     .await;
-    deposed
 }

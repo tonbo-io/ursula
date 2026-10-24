@@ -2838,8 +2838,27 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
     );
     assert!(!refused.headers().contains_key(names::X_URSULA_RAFT_GROUP));
 
-    // After the body is read a node never redirects, even with a router
-    // that redirects the same refusal before the body. The follower's
+    // After the body is read a node never redirects. A router without the
+    // leadership view thinks this follower leads, reads the body, and its
+    // engine refuses the write through the append handler's after-body
+    // path: a retryable 503, no Location.
+    let unaware = Router::new().merge(client_router_with_admission(
+        HttpState::new(nodes[1].runtime.clone()),
+        IngressAdmission::default(),
+    ));
+    let late = append(unaware).await;
+    assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(late.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert!(!late.headers().contains_key(LOCATION));
+    assert_eq!(
+        typed_routing(&late),
+        ursula_headers::RoutingAnswer::NoLeader {
+            group: ursula_headers::RaftGroup::from_u32(0)
+        }
+    );
+
+    // The same holds with a router that redirects the same refusal before
+    // the body. The follower's
     // engine refuses an append, naming its leader: before the body the
     // node's router answers it with a 307 to that leader, and after the
     // body with a retryable 503 and no Location.

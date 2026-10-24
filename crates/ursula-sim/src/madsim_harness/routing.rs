@@ -13,11 +13,12 @@
 //! leader and the partition heals, so the old leader steps down and its
 //! view follows the new one. Writes whose head arrives now are redirected
 //! before their body. The held writes are refused after theirs, before a
-//! proposal, by a node that names its leader: the refusal that redirects
-//! before a body. The front door counts each refusal after a body that a
-//! router would have redirected, and every run must count one, so the rule
-//! decides answers in every defended run, not only in its negative control.
-//! Then the runtime swaps to the new leader's
+//! proposal, `503 NO_LEADER`. In some episodes the refusing node names its
+//! leader, the refusal that redirects before a body, and in others it names
+//! none (seed 501's second episode). The front door counts each refusal after a
+//! body that the node's router redirects when asked, and every run must
+//! count one, so the rule decides answers in every defended run, not only
+//! in its negative control. Then the runtime swaps to the new leader's
 //! engine and the old leader restarts as a follower. Every run also needs a
 //! write in flight that the cut-off leader proposed and refused after its
 //! body, `503 OUTCOME_UNKNOWN`.
@@ -55,6 +56,7 @@ use axum::http::header::RETRY_AFTER;
 use futures_util::future::BoxFuture;
 use openraft::ServerState;
 use ursula_headers::Delivery;
+use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
@@ -295,6 +297,13 @@ impl Exchange {
             header_pairs(&self.response),
             self.response.body(),
         )
+    }
+
+    /// The code of the answer's error body, if it has one.
+    fn error_code(&self) -> Option<ErrorCode> {
+        ErrorBody::parse(self.response.body())
+            .ok()
+            .map(|body| body.code)
     }
 
     /// Whether the server refused the write after it polled the body, as
@@ -683,7 +692,9 @@ pub(super) async fn run_routing_before_body_inner(
             if ledger.check(&mut trace, &exchange).is_none() {
                 unresolved.push(exchange.write);
             }
-            if exchange.refused_after_body() && exchange.outcome() == WriteOutcome::Unknown {
+            if exchange.refused_after_body()
+                && exchange.error_code() == Some(ErrorCode::OutcomeUnknown)
+            {
                 ledger.in_flight_unknown_after_body =
                     ledger.in_flight_unknown_after_body.saturating_add(1);
             }
@@ -699,10 +710,11 @@ pub(super) async fn run_routing_before_body_inner(
             assert!(
                 exchange.refused_after_body()
                     && exchange.outcome() == WriteOutcome::Refused(ErrorCode::NoLeader),
-                "seed {}: {:?}, whose body reached the deposed leader, was answered {}",
+                "seed {}: {:?}, whose body reached the deposed leader, was answered {} ({:?})",
                 config.seed,
                 exchange.write,
-                exchange.response.status()
+                exchange.response.status(),
+                exchange.outcome()
             );
         }
 
@@ -784,10 +796,11 @@ pub(super) async fn run_routing_before_body_inner(
         "seed {} refused no write it proposed after its body",
         config.seed
     );
-    // Some refusal after a body named a leader, so the node's router would
-    // have redirected it before the body: the rule decided its answer. A
-    // refusal that names no leader gets no redirect with the rule off
-    // either, and leaves the negative control nothing to catch.
+    // Some refusal after a body is one the node's router redirects when
+    // asked, which it would have answered with the rule off: the rule
+    // decided its answer. A refusal the router does not redirect answers
+    // the same with the rule off, and leaves the negative control nothing
+    // to catch.
     let kept_from_redirecting =
         fired(Defence::NoRedirectAfterBody).saturating_sub(kept_from_redirecting);
     assert!(
