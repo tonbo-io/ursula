@@ -393,14 +393,18 @@ describe("stale caches reopened across hosts", () => {
 		// A commit id's position is its record's place in the log, CLAIM, ACK and BASE records
 		// included, so C's next commit lands on the original's next one only if both logs hold as
 		// many records. Probes find both positions: a copy of a root opens, commits through the
-		// blackholed gate and dies, leaving the stream unchanged but for a claim, which no
-		// catch-up logs. Whichever root is behind is padded with an open until they meet. An open
-		// changes the gap by an even amount (CI showed an open of the original adds three records
-		// to its log and one to the copy's, an open of the copy two to its own), so an open alone
-		// never closes an odd gap. An odd gap is first shifted with one synced commit by the
-		// original, which logs the commit and its ACK while the copy catches it up as one record.
-		// The shift must leave the gap even, or the test stops here instead of committing r3 on a
-		// position r4 cannot take. C's first padding open catches r2 up in place.
+		// blackholed gate and dies, leaving the stream unchanged but for a claim.
+		//
+		// An open's catch-up logs nothing when the stream gained nothing since the root's last ACK,
+		// one ACK when it gained only claims, and each new commit plus an ACK and a BASE otherwise.
+		// The open that commits r3 and C's open both find new claims (each other's and the probes'),
+		// so each measurement first lets a throwaway copy of the original claim the stream: the
+		// copy's probe then finds that claim and the original's probe the copy's, as the real opens
+		// will. With the catch-ups measured alike, an open that closes cleanly adds three records to
+		// a root (the catch-up's ACK, its CLAIM and the close's ACK) and one killed after it bound
+		// adds two, so the root that is behind is padded with those until both positions meet: by
+		// three while it is three or more behind, by two at two or four, and by three at one, which
+		// leaves the other root two behind. C's first padding open, if any, catches r2 up in place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
@@ -409,27 +413,24 @@ describe("stale caches reopened across hosts", () => {
 			await mode("forward");
 			return st.commits.logged;
 		};
+		const claimOnce = async (dir: string): Promise<void> => {
+			const throwaway = host(`${front.url}${s.path}`, copyOf(dir));
+			expect((await throwaway.opened()).state).toBe("live");
+			await throwaway.stop("SIGKILL");
+		};
 		let q = 0;
-		let shifted = false;
 		for (let pads = 0; ; pads++) {
+			await claimOnce(dirA);
 			q = await nextCommit(dirC);
 			const p = await nextCommit(dirA);
-			report(`S5: after ${pads} padding opens${shifted ? " and the parity commit" : ""} the copy commits next at ${q}, the original at ${p}`);
+			report(`S5: after ${pads} padding opens the copy commits next at ${q}, the original at ${p}`);
 			if (p === q) break;
-			expect(pads, "padding never met both positions").toBeLessThan(16);
-			if ((q - p) % 2 !== 0) {
-				expect(shifted, `the parity commit left the gap odd (copy ${q}, original ${p})`).toBe(false);
-				shifted = true;
-				const parity = host(`${front.url}${s.path}`, dirA);
-				expect((await parity.opened()).state).toBe("live");
-				await parity.exec(model.tx("parity", { updates: 1, inserts: 1 }));
-				await synced(parity);
-				await closeCleanly(parity);
-				continue;
-			}
+			expect(pads, "padding never met both positions").toBeLessThan(12);
+			const behind = Math.abs(p - q);
 			const pad = host(`${front.url}${s.path}`, p < q ? dirA : dirC);
 			expect((await pad.opened()).state).toBe("live");
-			await closeCleanly(pad);
+			if (behind === 2 || behind === 4) await pad.stop("SIGKILL");
+			else await closeCleanly(pad);
 		}
 
 		// r3: held by the gate, at position q, and the host dies.
