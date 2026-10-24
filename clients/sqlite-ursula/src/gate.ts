@@ -33,7 +33,7 @@ const READ_AHEAD_BYTES = 64 * 1024;
  *   same status and headers, whose body passes each chunk, and its end or error, on only once a
  *   `synced()` call made after the chunk was read resolved. A call covers every chunk read while
  *   the previous one was in flight, so a stream pays one round trip per batch. It reads ahead at
- *   most 64 KiB. A reset errors the body, and cancelling the body ends its waits.
+ *   most 64 KiB plus one chunk. A reset errors the body, and cancelling the body ends its waits.
  * - `signal` bounds the wait for the outcome only. When it fires first (or fired before the call,
  *   when `work` does not run) the gate rejects with `signal.reason`, and a returned body is
  *   cancelled.
@@ -195,7 +195,13 @@ function gatedBody(source: ReadableStream<Uint8Array>, release: Release): Readab
 							}, fail);
 							return;
 						}
-						const chunk = next.value;
+						const chunk: unknown = next.value;
+						if (!(chunk instanceof Uint8Array)) {
+							// Not a byte chunk: an error of the body, held as its own errors are.
+							const error = new TypeError("gate: a Response body chunk is not a Uint8Array");
+							release.hold().then(() => fail(error), fail);
+							return;
+						}
 						held += chunk.byteLength;
 						release.hold().then(() => {
 							held -= chunk.byteLength;

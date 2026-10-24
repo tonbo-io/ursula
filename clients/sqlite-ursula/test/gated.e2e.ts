@@ -207,7 +207,9 @@ describe("gate", () => {
 	it("G6: passes a returned Response's head, and each chunk, on only after the commit before it is acknowledged, in order", async () => {
 		const { db } = await table("gate-body");
 		const chunks = 8;
-		// The head's append is answered late, and the chunks' commits queue behind it.
+		// The head's append is answered late. Only the first chunk's commit, which the source's high-water
+		// mark pulls while `work` builds the Response, queues behind it; later chunks are not delayed, and an
+		// ungated chunk would reach the reader within microseconds of its commit.
 		await fault("delay 500", 1, "POST");
 		/** The position of the commit made before chunk i (the head's: `positions[0]`). */
 		const positions: number[] = [];
