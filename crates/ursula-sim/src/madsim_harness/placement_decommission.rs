@@ -24,9 +24,11 @@
 //!   removal at a drawn store call, the LIST of a group's objects or before
 //!   or after a DELETE, armed on every meta voter before the removal, since
 //!   a meta leader passes as soon as it sees a node newly removed, and
-//!   kills the meta leader that holds there. On the others it kills the
-//!   meta leader once node 4 is removed. The next leadership passes at its
-//!   start and sweeps node 4's directory empty (I5);
+//!   again on a meta voter restarted during the decommission. It kills the
+//!   meta leader that holds there, and a run whose pass held nowhere fails
+//!   I5. On the others it kills the meta leader once node 4 is removed. The
+//!   next leadership passes at its start and sweeps node 4's directory
+//!   empty (I5);
 //! - restarts node 4 with its disk before or after the sweep. While its
 //!   objects remain it opens what it holds, its left marks gone with its
 //!   process, and closes each once its group answered (I13, which fails a
@@ -231,10 +233,7 @@ pub(super) async fn decommission_family(
     // hold is armed on every meta voter's store before the removal.
     if let Some(hold) = draw.sweep_hold {
         for voter in META_VOTERS {
-            run.cluster
-                .data
-                .snapshot_gates(voter)
-                .hold(hold.gate(voter));
+            run.hold_sweep(voter, hold);
         }
     }
     run.decommission(LEAVING, draw).await;
@@ -337,9 +336,9 @@ impl Run {
     }
 
     /// Kills the meta leader `leader`'s process and restarts it once
-    /// another meta voter leads, so a new meta leadership begins. Answers
-    /// the new leader.
-    async fn kill_meta_leader(&mut self, phase: &str, leader: u64) -> u64 {
+    /// another meta voter leads, so a new meta leadership begins, its new
+    /// process's store holding the sweep at `hold`. Answers the new leader.
+    async fn kill_meta_leader(&mut self, phase: &str, leader: u64, hold: Option<SweepHold>) -> u64 {
         self.trace.push(SimEvent::FaultApplied {
             phase: format!("{phase}: the meta leader {leader} is killed"),
         });
@@ -353,8 +352,39 @@ impl Run {
         .await;
         let next = self.cluster.meta_leader().unwrap_or(0);
         self.cluster.start_node(leader).await;
+        if let Some(hold) = hold {
+            self.hold_sweep(leader, hold);
+        }
         self.step(phase);
         next
+    }
+
+    /// Holds the removed-node sweep of `voter`'s running process at
+    /// `hold`. Its store starts with every gate open, and its sweep's first
+    /// pass comes a second after its meta runtime starts.
+    fn hold_sweep(&mut self, voter: u64, hold: SweepHold) {
+        self.cluster
+            .data
+            .snapshot_gates(voter)
+            .hold(hold.gate(voter));
+    }
+
+    /// Whether `voter`'s running process's sweep holds at `hold`, traced
+    /// when it does.
+    fn sweep_holds(&mut self, voter: u64, hold: SweepHold) -> bool {
+        let holds = self.cluster.runtimes.contains_key(&voter)
+            && self
+                .cluster
+                .data
+                .snapshot_gates(voter)
+                .arrived(hold.gate(voter))
+                > 0;
+        if holds {
+            self.trace.push(SimEvent::FaultApplied {
+                phase: format!("sweep: node {voter}'s sweep holds at {hold:?}"),
+            });
+        }
+        holds
     }
 
     /// Decommissions `node` as `draw` has it, and waits until the latest
@@ -376,7 +406,7 @@ impl Run {
             None => {}
             Some(MetaKill::Decommissioned) => {
                 let leader = self.meta_leader(PHASE).await;
-                self.kill_meta_leader(PHASE, leader).await;
+                self.kill_meta_leader(PHASE, leader, draw.sweep_hold).await;
             }
             Some(MetaKill::Moving) => {
                 let moving = self
@@ -388,7 +418,7 @@ impl Run {
                     .await;
                 if moving {
                     let leader = self.meta_leader(PHASE).await;
-                    self.kill_meta_leader(PHASE, leader).await;
+                    self.kill_meta_leader(PHASE, leader, draw.sweep_hold).await;
                 }
             }
         }
@@ -473,55 +503,61 @@ impl Run {
     }
 
     /// The sweep of the removed `node`. With `hold`, armed on every meta
-    /// voter's store before the removal, the meta leader that passed first
-    /// holds at the store call and is killed there, and the gates open.
-    /// Without, the meta leader is killed. Either way a new leadership
+    /// voter's store before the removal and again on a voter restarted
+    /// during the decommission, the first meta leadership that passed after
+    /// the removal holds at the store call, on whichever running voter it
+    /// is. That voter is killed there, and the gates open. A run whose pass
+    /// held nowhere fails I5, since its drawn hold judged nothing. Without
+    /// `hold`, the meta leader is killed. Either way a new leadership
     /// passes at once. Then I5's removal half: within the bound, `node`'s
     /// directory is empty.
     async fn sweep(&mut self, node: u64, hold: Option<SweepHold>) {
         const PHASE: &str = "sweep";
-        let leader = self.meta_leader(PHASE).await;
-        match hold {
-            None => {
-                self.kill_meta_leader(PHASE, leader).await;
-            }
-            Some(hold) => {
-                let held = self
-                    .within(PHASE, BOUND, move |cluster| {
-                        META_VOTERS.into_iter().any(|voter| {
-                            cluster.runtimes.contains_key(&voter)
-                                && cluster.data.snapshot_gates(voter).arrived(hold.gate(voter)) > 0
-                        })
-                    })
-                    .await;
-                let holder = META_VOTERS.into_iter().find(|voter| {
-                    self.cluster.runtimes.contains_key(voter)
-                        && self
-                            .cluster
-                            .data
-                            .snapshot_gates(*voter)
-                            .arrived(hold.gate(*voter))
-                            > 0
-                });
-                match holder.filter(|_| held) {
-                    Some(holder) => {
-                        self.trace.push(SimEvent::FaultApplied {
-                            phase: format!("{PHASE}: node {holder}'s sweep holds at {hold:?}"),
-                        });
-                        self.kill_meta_leader(PHASE, holder).await;
-                    }
-                    None => {
-                        self.kill_meta_leader(PHASE, leader).await;
-                    }
-                }
-                for voter in META_VOTERS {
-                    self.cluster
-                        .data
-                        .snapshot_gates(voter)
-                        .open(hold.gate(voter));
-                }
+        let Some(hold) = hold else {
+            let leader = self.meta_leader(PHASE).await;
+            self.kill_meta_leader(PHASE, leader, None).await;
+            self.swept(node).await;
+            return;
+        };
+        let arrived = self
+            .within(PHASE, BOUND, move |cluster| {
+                META_VOTERS.into_iter().any(|voter| {
+                    cluster.runtimes.contains_key(&voter)
+                        && cluster.data.snapshot_gates(voter).arrived(hold.gate(voter)) > 0
+                })
+            })
+            .await;
+        let holder = if arrived {
+            META_VOTERS
+                .into_iter()
+                .find(|voter| self.sweep_holds(*voter, hold))
+        } else {
+            None
+        };
+        let Some(holder) = holder else {
+            fail(
+                &mut self.trace,
+                I5,
+                PHASE,
+                format!("no meta leadership's pass over node {node} held at {hold:?}"),
+            );
+        };
+        self.kill_meta_leader(PHASE, holder, None).await;
+        for voter in META_VOTERS {
+            if self.cluster.runtimes.contains_key(&voter) {
+                self.cluster
+                    .data
+                    .snapshot_gates(voter)
+                    .open(hold.gate(voter));
             }
         }
+        self.swept(node).await;
+    }
+
+    /// I5's removal half: within the bound, the removed `node`'s directory
+    /// is empty.
+    async fn swept(&mut self, node: u64) {
+        const PHASE: &str = "sweep";
         self.until(PHASE, I5, MOVE_BOUND, move |cluster| cluster.unswept(node))
             .await;
         self.removals.emptied(node);
@@ -545,8 +581,10 @@ mod tests {
     enum Window {
         /// The meta leader killed while a group of node 4 moves.
         MovingKill,
-        /// The new meta leader's sweep held at this store call, and that
-        /// leader killed there.
+        /// Node 4's decommission drew this, as `Draw`'s debug form begins.
+        Drawn(&'static str),
+        /// A meta leadership's pass held at this store call, and its voter
+        /// killed there.
         SweepHold(&'static str),
         /// Node 4 restarted at this step of the sweep.
         Restarted(&'static str),
@@ -555,6 +593,9 @@ mod tests {
     impl Window {
         fn reached(self, phase: &str) -> bool {
             match self {
+                Self::Drawn(draw) => phase
+                    .strip_prefix("decommission node 4: ")
+                    .is_some_and(|drawn| drawn.starts_with(draw)),
                 Self::MovingKill => {
                     phase.starts_with("decommission: the meta leader ")
                         && phase.ends_with(" is killed")
@@ -571,27 +612,32 @@ mod tests {
     /// Family seeds whose shape is the decommission, with the windows each
     /// must reach: 1120 a live one of both groups, the meta leader killed
     /// while a group moves and the sweep held before a DELETE, the node
-    /// restarted after the sweep. 1139 a dead one of group 1, the meta
-    /// leader killed while the group moves and the sweep held before a
-    /// LIST, the node restarted before the sweep. 1152 a live one of both
-    /// groups, the sweep held before a LIST, the node restarted before the
-    /// sweep. A seed that kills no meta leader before the sweep may have
-    /// its node swept before the script's kill: a dead node's groups move
-    /// away within half a second of its decommission, before the first
-    /// pass of the first meta leadership, which comes a second after the
-    /// leader's sweep task starts.
-    const DECOMMISSIONS: [(u64, &[Window]); 3] = [
+    /// restarted after the sweep. 1138 a dead one of group 1, the sweep
+    /// held before a DELETE, the node restarted before any DELETE of the
+    /// sweep. 1139 a dead one of group 1, the meta leader killed while the
+    /// group moves and the sweep held before a LIST, the node restarted
+    /// before the sweep. 1152 a live one of both groups, the sweep held
+    /// before a LIST, the node restarted before the sweep.
+    const DECOMMISSIONS: [(u64, &[Window]); 4] = [
         (1120, &[
+            Window::Drawn("Draw { dead: false, both: true, "),
             Window::MovingKill,
             Window::SweepHold("BeforeDelete"),
             Window::Restarted("removed_node_restarted_swept"),
         ]),
+        (1138, &[
+            Window::Drawn("Draw { dead: true, both: false, "),
+            Window::SweepHold("BeforeDelete"),
+            Window::Restarted("removed_node_restarted"),
+        ]),
         (1139, &[
+            Window::Drawn("Draw { dead: true, both: false, "),
             Window::MovingKill,
             Window::SweepHold("List"),
             Window::Restarted("removed_node_restarted"),
         ]),
         (1152, &[
+            Window::Drawn("Draw { dead: false, both: true, "),
             Window::SweepHold("List"),
             Window::Restarted("removed_node_restarted"),
         ]),

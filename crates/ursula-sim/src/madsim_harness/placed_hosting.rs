@@ -789,6 +789,9 @@ pub(super) struct Placed {
     registries: NodeRegistries,
     /// The key of each group's next keyed append.
     keys: BTreeMap<u32, NextKey>,
+    /// The groups the run sent a data plan ([`MetaCluster::recover_data`]),
+    /// the only history events of a data group a run makes.
+    planned: BTreeSet<u32>,
 }
 
 /// The producer key `(epoch, seq)` of a group's next keyed append. The seq
@@ -809,30 +812,41 @@ impl NextKey {
     }
 
     /// The key to send again after `error`, if it refused this key's write
-    /// as closed by a history event (G2): the first seq of the next epoch,
-    /// which the producer claims. A seq above the closed one never applied
-    /// in the history that survived, so its payload goes again under the
-    /// claim. Any other answer keeps the key, so a retry of a write that
-    /// applied is answered as a repeat.
-    fn after(self, error: &GroupEngineError) -> Self {
+    /// as closed by a history event (G2) of a group the run sent a data
+    /// plan (`planned`): the first seq of the next epoch, which the
+    /// producer claims. A seq above the closed one never applied in the
+    /// history that survived, so its payload goes again under the claim.
+    /// Any other answer keeps the key, so a retry of a write that applied
+    /// is answered as a repeat, and a history event of `group`, when the
+    /// run sent it no plan, which no run makes, refuses every retry until
+    /// the append's bound fails the run. Its log names that cause.
+    fn after(self, group: u32, error: &GroupEngineError, planned: bool) -> Self {
         let GroupEngineError::Stream(refusal) = error else {
             return self;
         };
-        refusal
-            .context
-            .iter()
-            .find_map(|context| match context {
-                StreamErrorContext::Producer(ProducerRefusal::EpochClosed {
-                    by: ClosedBy::History,
-                    closed,
-                    ..
-                }) if closed.epoch == self.epoch => Some(Self {
-                    epoch: closed.epoch.saturating_add(1),
-                    seq: 0,
-                }),
-                _ => None,
-            })
-            .unwrap_or(self)
+        let closed = refusal.context.iter().find_map(|context| match context {
+            StreamErrorContext::Producer(ProducerRefusal::EpochClosed {
+                by: ClosedBy::History,
+                closed,
+                ..
+            }) if closed.epoch == self.epoch => Some(closed.epoch),
+            _ => None,
+        });
+        match closed {
+            Some(epoch) if planned => Self {
+                epoch: epoch.saturating_add(1),
+                seq: 0,
+            },
+            Some(epoch) => {
+                tracing::warn!(
+                    group,
+                    epoch,
+                    "a history event closed the producer epoch of a group the run sent no data plan"
+                );
+                self
+            }
+            None => self,
+        }
     }
 }
 
@@ -1293,8 +1307,10 @@ impl MetaCluster {
     /// Each append is keyed: its producer sequence number is the count the
     /// group acknowledged in the producer's epoch, so a retry of one whose
     /// answer was lost applies once. A history event (an accepted loss or a
-    /// restore) closes the epoch, and the appender claims the next one, as
-    /// a producer does on `epoch-closed;by=history`.
+    /// restore) closes the epoch, and for a group the run sent a data plan
+    /// the appender claims the next one, as a producer does on
+    /// `epoch-closed;by=history`. Any other group's history event fails the
+    /// append within the bound ([`NextKey::after`]).
     pub(super) async fn placed_append(&mut self, group: u32, count: usize) -> bool {
         for _ in 0..count {
             let acknowledged = self.data.acknowledged.entry(group).or_default();
@@ -1325,7 +1341,10 @@ impl MetaCluster {
                         .await;
                     match appended {
                         Ok(_) => break,
-                        Err(error) => key = key.after(&error),
+                        Err(error) => {
+                            let planned = self.placed().planned.contains(&group);
+                            key = key.after(group, &error, planned);
+                        }
                     }
                 }
                 if madsim::time::Instant::now() >= deadline {
@@ -1723,7 +1742,11 @@ impl MetaCluster {
                     cluster: self,
                     group,
                 };
-                match recover_round(&mut state, &members, &mut transport, &floor).await {
+                let round = recover_round(&mut state, &members, &mut transport, &floor).await;
+                if state.plans_sent > 0 {
+                    self.placed_mut().planned.insert(group);
+                }
+                match round {
                     Ok(Some(_))
                     | Err(MetaRecoverFailed::NoPlan {
                         outcome: RecoverOutcome::Healthy,
