@@ -393,8 +393,11 @@ describe("stale caches reopened across hosts", () => {
 		// included, so C's next commit lands on the original's next one only if both logs hold as
 		// many records. Probes find both positions: a copy of a root opens, commits through the
 		// blackholed gate and dies, leaving the stream unchanged but for a claim, which no
-		// catch-up logs. Whichever root is behind is padded with an open (a CLAIM record or more)
-		// until they meet. C's first padding open catches r2 up in place.
+		// catch-up logs. Whichever root is behind is padded with an open until they meet. An open
+		// killed after it bound adds an even number of records to the gap (on the model server:
+		// the original's three less the copy's one, or the copy's two), so an odd gap is padded
+		// with an open that also closes cleanly, which logs an exact ACK besides. C's first
+		// padding open catches r2 up in place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
@@ -412,7 +415,8 @@ describe("stale caches reopened across hosts", () => {
 			expect(pads, "padding never met both positions").toBeLessThan(16);
 			const pad = host(`${front.url}${s.path}`, p < q ? dirA : dirC);
 			expect((await pad.opened()).state).toBe("live");
-			await pad.stop("SIGKILL");
+			if ((q - p) % 2 === 0) await pad.stop("SIGKILL");
+			else await closeCleanly(pad);
 		}
 
 		// r3: held by the gate, at position q, and the host dies.
