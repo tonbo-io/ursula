@@ -11,7 +11,10 @@
 //     behind an `ursula gateway`, with S3 as the cold store (see `resolveS3`: an endpoint (MinIO)
 //     with static keys, or AWS S3 with the ambient AWS_* credentials), or with no cold tier when
 //     URSULA_COLD=none (the nodes cannot share an in-memory one). A control server
-//     (`ursulaControl`) kills and restarts nodes for test/failover.e2e.ts.
+//     (`ursulaControl`) kills and restarts nodes for test/failover.e2e.ts. With
+//     E2E_GATEWAY_MAX_REQUEST_BYTES set, the gateway runs with that `--max-request-body-bytes`, and
+//     the setup checks that HEAD through it advertises that `Ursula-Max-Request-Bytes` and, with
+//     S3, the node's `Ursula-Max-Snapshot-Bytes`: snapshots above it go up in parts through it.
 // Every server runs under test/watchdog.mjs, and the gate and the model exit with their stdin, so
 // none outlives the vitest process.
 import { type ChildProcess, spawn } from "node:child_process";
@@ -358,6 +361,30 @@ async function resolveS3(): Promise<S3Target | undefined> {
 	return undefined;
 }
 
+/** E2E_GATEWAY_MAX_REQUEST_BYTES, the gateway's `--max-request-body-bytes`, or `undefined` when unset. */
+function gatewayMaxRequestBytes(): number | undefined {
+	const raw = process.env.E2E_GATEWAY_MAX_REQUEST_BYTES ?? "";
+	if (raw === "") return undefined;
+	const limit = Number(raw);
+	if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error(`E2E_GATEWAY_MAX_REQUEST_BYTES is a positive byte count, not ${raw}`);
+	return limit;
+}
+
+/**
+ * Fails the setup unless HEAD of a stream through the gateway at `url` advertises `limit` as
+ * `Ursula-Max-Request-Bytes` (the gateway lowered the node's) and, with a cold store (`cold`),
+ * `Ursula-Max-Snapshot-Bytes` (the node's, passed through), so a run meant to send snapshots in
+ * parts through the gateway cannot pass without them.
+ */
+async function checkGatewayLimits(url: string, limit: number, cold: boolean): Promise<void> {
+	const r = await fetch(`${url}/sqlite-e2e/probe-0`, { method: "HEAD", signal: AbortSignal.timeout(5000) });
+	const request = r.headers.get("ursula-max-request-bytes");
+	const snapshot = r.headers.get("ursula-max-snapshot-bytes");
+	if (r.status !== 200 || request !== `${limit}` || (cold && snapshot === null)) {
+		throw new Error(`HEAD through the gateway: ${r.status}, Ursula-Max-Request-Bytes ${request} (want ${limit}), Ursula-Max-Snapshot-Bytes ${snapshot}${cold ? " (want one)" : ""}`);
+	}
+}
+
 /** One node of the cluster: what restarting it needs, and its process while it runs. */
 interface ClusterNode {
 	readonly id: number;
@@ -424,9 +451,12 @@ async function startCluster(): Promise<Stack> {
 		const gatewayPort = await freePort();
 		const args = ["gateway", "--listen", `127.0.0.1:${gatewayPort}`, "--raft-group-count", `${groups}`];
 		for (const node of nodes) args.push("--upstream", `http://127.0.0.1:${node.port}`);
+		const gatewayLimit = gatewayMaxRequestBytes();
+		if (gatewayLimit !== undefined) args.push("--max-request-body-bytes", `${gatewayLimit}`);
 		gateway = new Proc(ursulaBin(), args, dir, {}, "gateway");
 		const url = `http://127.0.0.1:${gatewayPort}`;
 		await waitWritable(url, logs);
+		if (gatewayLimit !== undefined) await checkGatewayLimits(url, gatewayLimit, s3 !== undefined);
 		// `GET /nodes` lists the nodes (id, url, admin, pid, running), `POST /nodes/<id>/kill` kills
 		// one with SIGKILL, `POST /nodes/<id>/start` starts it again on its config and WAL and answers
 		// once it is ready. Both answer the listing.
