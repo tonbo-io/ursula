@@ -20,22 +20,24 @@
 //!   the change, which the other voters' own membership does not name: they
 //!   must still vote for it (R3, the bug #613 reported).
 //! - **completed promotion**: the promotion commits while node 4 is cut off.
-//!   Another voter campaigns alone, with no writes, so its vote term rises
-//!   above every log term. Node 4 catches up both steps in one append and
-//!   loses power at once, so its commit marker stays below them (M1 of the
-//!   first #613 review). The old leader goes for good, and the plan cuts:
-//!   node 4 reports the promotion, but the cut keeps it a learner.
+//!   Another voter, cut off alone, campaigns at once ([`campaign_alone`]),
+//!   with no writes, so its vote term rises above every log term. Node 4
+//!   catches up both steps in one append and loses power at once, so its
+//!   commit marker stays below them (M1 of the first #613 review). The old
+//!   leader goes for good, and the plan cuts: node 4 reports the promotion,
+//!   but the cut keeps it a learner.
 //! - **learner ahead**: node 4, a learner, knows a later committed entry
 //!   than any voter: it restarts cleanly, so its log and marker are durable,
 //!   and the voters lose power and every unsynced page. A plan from a voter
 //!   would overwrite node 4's committed entries (M-A of the second #613
 //!   review); the tool refuses it, typed.
-//! - **commit ahead**: a voter campaigns alone, the leader acknowledges
-//!   writes and adds a second learner, node 5. That membership entry syncs
-//!   every voter's log but not their commit markers, which stay below it,
-//!   and node 4 restarts cleanly knowing it is committed. The voters lose
-//!   power. The plan cuts every log back to that entry, not to the voters'
-//!   markers, led by a voter that holds it (F3 of the third #613 review).
+//! - **commit ahead**: a voter campaigns alone at once, the leader
+//!   acknowledges writes and adds a second learner, node 5. That membership
+//!   entry syncs every voter's log but not their commit markers, which stay
+//!   below it, and node 4 restarts cleanly knowing it is committed. The
+//!   voters lose power. The plan cuts every log back to that entry, not to
+//!   the voters' markers, led by a voter that holds it (F3 of the third #613
+//!   review).
 //! - **missed removal**: a voter stops, and its removal commits without
 //!   it. The others lose power, and it comes back holding the membership it
 //!   had: it stays outside the leader's membership, holding an unsatisfied
@@ -725,6 +727,40 @@ struct Recovered {
     refusals: Vec<RecoveryPlanRefusal>,
 }
 
+/// Why the planning loop stopped without its plan satisfied, with the first
+/// plan it sent and every refusal, so that a negative control can assert
+/// the mechanism it switched off.
+#[derive(Debug)]
+struct Stopped {
+    error: RecoverError,
+    first: Option<ursula_ctl::recovery::GroupPlan>,
+    refusals: Vec<RecoveryPlanRefusal>,
+}
+
+impl Stopped {
+    fn new(
+        error: RecoverError,
+        first: Option<ursula_ctl::recovery::GroupPlan>,
+        refusals: &[RecoveryPlanRefusal],
+    ) -> Self {
+        Self {
+            error,
+            first,
+            refusals: refusals.to_vec(),
+        }
+    }
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (first plan {:?}, refusals {:?})",
+            self.error, self.first, self.refusals
+        )
+    }
+}
+
 /// `ursulactl recover-group`'s planning loop over `group`: observe every
 /// replica, decide with [`next_step`], send with [`send_plan`] and record
 /// with [`plan_sent`], checking meanwhile that no replica leads without the
@@ -736,7 +772,7 @@ async fn recover(
     controls: Controls,
     hidden: &[u64],
     trace: &mut SimTrace,
-) -> Result<Recovered, RecoverError> {
+) -> Result<Recovered, Stopped> {
     let mut state = LoopState::default();
     let mut fence_probes = 0_usize;
     // What a failure reports: the first plan and every refusal, so that a
@@ -748,7 +784,9 @@ async fn recover(
         let point = state.sent.map(|sent| sent.plan.point);
         assert_no_unplanned_leader(cluster, group, loss_term, point, trace, "recovery_planning");
         let members = observe(cluster, group, controls, hidden).await;
-        match next_step(&mut state, &members, &Floor::Seeded, MAX_PLANS)? {
+        match next_step(&mut state, &members, &Floor::Seeded, MAX_PLANS)
+            .map_err(|error| Stopped::new(error, first, &refusals))?
+        {
             Step::Done(RecoverOutcome::Satisfied {
                 plan,
                 plans_sent,
@@ -812,7 +850,8 @@ async fn recover(
                     plan,
                     sent,
                     &electorate(&plan, &members, &Floor::Seeded),
-                )?;
+                )
+                .map_err(|error| Stopped::new(error, first, &refusals))?;
                 fence_probes = fence_probes.saturating_add(
                     assert_fences_only_client_reads(cluster, group, plan.point, trace).await,
                 );
@@ -837,7 +876,8 @@ async fn recover(
                     plan,
                     Ok(sent),
                     &electorate(&plan, &members, &Floor::Seeded),
-                )?;
+                )
+                .map_err(|error| Stopped::new(error, first, &refusals))?;
             }
         }
         if madsim::time::Instant::now() >= deadline {
@@ -1230,11 +1270,15 @@ pub(super) async fn run_membership_rollback_inner(
         // Whatever the loop did, the learner keeps what it knew committed.
         assert_learner_kept(&cluster, &ahead, &mut trace).await;
         let recovered = match recovered {
-            Err(RecoverError::Plan(PlanError::BelowCommitted {
-                node_id,
-                committed,
-                point,
-            })) if plan.change == Change::LearnerAhead => {
+            Err(Stopped {
+                error:
+                    RecoverError::Plan(PlanError::BelowCommitted {
+                        node_id,
+                        committed,
+                        point,
+                    }),
+                ..
+            }) if plan.change == Change::LearnerAhead => {
                 // The tool refuses, typed, and sends nothing.
                 let held = NODES
                     .iter()
@@ -1479,12 +1523,12 @@ async fn roll_back_a_minority_change(
 }
 
 /// The learner's promotion commits while it is cut off. Another voter, cut
-/// off alone, campaigns meanwhile, so its vote term rises above every log
-/// term, durably. The learner then catches up both steps in one append,
-/// which syncs them, and loses power within milliseconds, before any later
-/// write syncs the commit marker after them. The leader goes for good, and
-/// the other voters lose power too. Returns whether the learner came back
-/// with its marker below its promotion.
+/// off alone, campaigns at once ([`campaign_alone`]), so its vote term rises
+/// above every log term, durably. The learner then catches up both steps in
+/// one append, which syncs them, and loses power within milliseconds, before
+/// any later write syncs the commit marker after them. The leader goes for
+/// good, and the other voters lose power too. Returns whether the learner
+/// came back with its marker below its promotion.
 async fn promote_completed(
     cluster: &mut JournalCluster,
     plan: &Plan,
@@ -1510,6 +1554,7 @@ async fn promote_completed(
     for node in VOTERS.into_iter().filter(|node| *node != campaigner) {
         cluster.policy.partition_bidirectional(campaigner, node);
     }
+    campaign_alone(cluster, campaigner, context).await;
     madsim::time::sleep(Duration::from_millis(400)).await;
     cluster.policy.heal_bidirectional(LEARNER, a);
     let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
@@ -1560,6 +1605,33 @@ async fn promote_completed(
                 .iter()
                 .any(|voters| voters.contains(&LEARNER))
     })
+}
+
+/// `campaigner`, cut off from every peer, campaigns in the next term of
+/// every group at once, a real election as the target of a leadership
+/// transfer starts one, and waits until its vote term rose. Its election
+/// timer's campaigns would not: each starts with a pre-vote (#857), which
+/// fails cut off and leaves the term alone. No vote request reaches a
+/// peer, so the voter leads nothing and writes no entry, and its durable
+/// vote term stays above every log term: a plan must cut.
+async fn campaign_alone(cluster: &JournalCluster, campaigner: u64, context: &str) {
+    for group in JOURNAL_GROUPS {
+        let raft = cluster.engines[&(group, campaigner)].raft_handle();
+        let before = metrics(cluster, group, campaigner).current_term;
+        raft.trigger()
+            .elect(false)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: group {group}: campaign: {error}"));
+        raft.wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |metrics| metrics.current_term > before,
+                "the cut-off voter's vote term rises",
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{context}: group {group}: node {campaigner} never campaigned: {error}")
+            });
+    }
 }
 
 /// The learner learns a later committed entry than any voter: writes it
@@ -1646,6 +1718,7 @@ async fn commit_ahead(
     for node in NODES.into_iter().filter(|node| *node != campaigner) {
         cluster.policy.partition_bidirectional(campaigner, node);
     }
+    campaign_alone(cluster, campaigner, context).await;
     for group in JOURNAL_GROUPS {
         for index in 0..plan.lost {
             let payload = format!("lost-{group}-{index};").into_bytes();
@@ -2395,7 +2468,9 @@ mod tests {
 
     /// R3, the bug #613 reported: members that refuse a leader outside their
     /// own membership refuse node 4, which the blackout promotion's plan
-    /// elects, as `leader_not_voter`, and the loop never recovers.
+    /// elects, as `leader_not_voter`, and the loop never recovers. Node 4's
+    /// pre-votes fail, so its campaigns leave every term alone and each plan
+    /// the loop sends again elects it again, until the loop gives up.
     #[test]
     fn negative_control_members_checking_their_own_membership_never_recover() {
         let _guard = sim_test_guard();
