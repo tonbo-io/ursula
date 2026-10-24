@@ -382,13 +382,44 @@ describe("stale caches reopened across hosts", () => {
 		await closeCleanly(a);
 		const dirC = copyOf(dirA);
 
-		// The original goes on: r2 synced (a few pages, far smaller than the database), r3 held.
+		// The original goes on: r2 synced (a few pages, far smaller than the database).
 		const resumed = host(`${front.url}${s.path}`, dirA);
 		await resumed.opened();
 		await resumed.exec(model.tx("r2", { updates: 1, inserts: 1 }));
 		await synced(resumed);
-		const r3 = await unsent(resumed, model.tx("r3", { updates: 1, inserts: 1 }, false));
 		await resumed.stop("SIGKILL");
+
+		// A commit id's position is its record's place in the log, CLAIM, ACK and BASE records
+		// included, so C's next commit lands on the original's next one only if both logs hold as
+		// many records. Probes find both positions: a copy of a root opens, commits through the
+		// blackholed gate and dies, leaving the stream unchanged but for a claim, which no
+		// catch-up logs. The original is padded with opens (a CLAIM record each) until they meet.
+		const nextCommit = async (dir: string): Promise<number> => {
+			const probe = host(`${front.url}${s.path}`, copyOf(dir));
+			expect((await probe.opened()).state).toBe("live");
+			const { st } = await unsent(probe, "INSERT INTO t VALUES (-1, 'probe', x'00')");
+			await probe.stop("SIGKILL");
+			await mode("forward");
+			return st.commits.logged;
+		};
+		const q = await nextCommit(dirC);
+		for (let pads = 0; ; pads++) {
+			const p = await nextCommit(dirA);
+			report(`S5: the copy commits next at ${q}, the original at ${p} after ${pads} padding opens`);
+			if (p === q) break;
+			expect(p, "the original's log is already past the copy's").toBeLessThan(q);
+			expect(pads, "padding never met the copy's position").toBeLessThan(16);
+			const pad = host(`${front.url}${s.path}`, dirA);
+			expect((await pad.opened()).state).toBe("live");
+			await pad.stop("SIGKILL");
+		}
+
+		// r3: held by the gate, at position q, and the host dies.
+		const original = host(`${front.url}${s.path}`, dirA);
+		await original.opened();
+		const r3 = await unsent(original, model.tx("r3", { updates: 1, inserts: 1 }, false));
+		expect(r3.st.commits.logged, "r3's position").toBe(q);
+		await original.stop("SIGKILL");
 		await mode("forward");
 
 		// C opens: it catches r2 up in place and commits r4, the next position of the same lineage,
