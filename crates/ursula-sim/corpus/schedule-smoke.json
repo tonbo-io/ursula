@@ -3767,9 +3767,9 @@
               "bucket_id": "benchcmp",
               "stream_id": "ursula-sim-schedule-500-routing-before-body-under-leader-churn"
             },
-            "keys": 19,
-            "redirects": 5,
-            "refused_after_body": 5,
+            "keys": 22,
+            "redirects": 3,
+            "refused_after_body": 8,
             "leader_changes": 2
           }
         ]
