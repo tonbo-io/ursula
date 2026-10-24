@@ -456,10 +456,13 @@ impl StreamStateMachine {
                 || u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX),
                 |object| object.payload_len,
             );
-            let total = bytes
-                .entry(slot.metadata.stream_id.bucket_id.clone())
-                .or_default();
-            *total = total.saturating_add(body_len);
+            let bucket_id = &slot.metadata.stream_id.bucket_id;
+            match bytes.get_mut(bucket_id.as_str()) {
+                Some(total) => *total = total.saturating_add(body_len),
+                None => {
+                    bytes.insert(bucket_id.clone(), body_len);
+                }
+            }
         }
         bytes
     }
