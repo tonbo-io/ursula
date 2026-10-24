@@ -2009,9 +2009,19 @@ impl HostingChecks {
             return;
         };
         let previous = self.last.insert(group, placement.clone());
+        // A move's report is first seen when the placement settled since the
+        // last observation: it was moving then, or it names a membership the
+        // last observation did not, since only a converge changes
+        // `converged_at`. A move planned and converged between two
+        // observations shows only the second.
         if let ursula_control::GroupPlacement::Live { converged_at, .. } = &placement
-            && let Some(previous @ ursula_control::GroupPlacement::Live { .. }) = &previous
-            && previous.moving().is_some()
+            && let Some(
+                previous @ ursula_control::GroupPlacement::Live {
+                    converged_at: converged_before,
+                    ..
+                },
+            ) = &previous
+            && (previous.moving().is_some() || converged_before != converged_at)
             && placement.moving().is_none()
         {
             let convergences = self.judged.convergences.entry(group).or_default();
