@@ -107,12 +107,15 @@ use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::ClosedBy;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::ProducerRefusal;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::StreamErrorContext;
 use ursula_shard::RaftGroupId;
 
 use super::SimTrace;
@@ -784,9 +787,53 @@ pub(super) struct Placed {
     creations: Creations,
     /// The registry of each node whose host runs, for its peers' gates.
     registries: NodeRegistries,
-    /// How many keyed appends each group acknowledged: the next one's
-    /// producer sequence number.
-    appended: BTreeMap<u32, u64>,
+    /// The key of each group's next keyed append.
+    keys: BTreeMap<u32, NextKey>,
+}
+
+/// The producer key `(epoch, seq)` of a group's next keyed append. The seq
+/// counts the appends the epoch acknowledged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NextKey {
+    epoch: u64,
+    seq: u64,
+}
+
+impl NextKey {
+    /// The key after the one acknowledged.
+    fn acknowledged(self) -> Self {
+        Self {
+            seq: self.seq.saturating_add(1),
+            ..self
+        }
+    }
+
+    /// The key to send again after `error`, if it refused this key's write
+    /// as closed by a history event (G2): the first seq of the next epoch,
+    /// which the producer claims. A seq above the closed one never applied
+    /// in the history that survived, so its payload goes again under the
+    /// claim. Any other answer keeps the key, so a retry of a write that
+    /// applied is answered as a repeat.
+    fn after(self, error: &GroupEngineError) -> Self {
+        let GroupEngineError::Stream(refusal) = error else {
+            return self;
+        };
+        refusal
+            .context
+            .iter()
+            .find_map(|context| match context {
+                StreamErrorContext::Producer(ProducerRefusal::EpochClosed {
+                    by: ClosedBy::History,
+                    closed,
+                    ..
+                }) if closed.epoch == self.epoch => Some(Self {
+                    epoch: closed.epoch.saturating_add(1),
+                    seq: 0,
+                }),
+                _ => None,
+            })
+            .unwrap_or(self)
+    }
 }
 
 /// `group`'s seed voters by the kernel's seed rule over `claim`.
@@ -1213,13 +1260,15 @@ impl MetaCluster {
     /// while leadership moves, and answers `false` at the first one the
     /// group does not take within the bound.
     /// Each append is keyed: its producer sequence number is the count the
-    /// group acknowledged, so a retry of one whose answer was lost applies
-    /// once.
+    /// group acknowledged in the producer's epoch, so a retry of one whose
+    /// answer was lost applies once. A history event (an accepted loss or a
+    /// restore) closes the epoch, and the appender claims the next one, as
+    /// a producer does on `epoch-closed;by=history`.
     pub(super) async fn placed_append(&mut self, group: u32, count: usize) -> bool {
         for _ in 0..count {
             let acknowledged = self.data.acknowledged.entry(group).or_default();
             let payload = format!("g{group}-{};", acknowledged.len()).into_bytes();
-            let seq = self.placed().appended.get(&group).copied().unwrap_or(0);
+            let mut key = self.placed().keys.get(&group).copied().unwrap_or_default();
             let deadline = madsim::time::Instant::now() + BOUND;
             loop {
                 let engine = self
@@ -1228,13 +1277,13 @@ impl MetaCluster {
                 let mut request = AppendRequest::from_bytes(group_stream(group), payload.clone());
                 request.producer = Some(ursula_runtime::ProducerRequest {
                     producer_id: format!("sim-placed-{group}"),
-                    producer_epoch: 0,
-                    producer_seq: seq,
+                    producer_epoch: key.epoch,
+                    producer_seq: key.seq,
                     digest: None,
                     ..Default::default()
                 });
-                if let Some(engine) = engine
-                    && engine
+                if let Some(engine) = engine {
+                    let appended = engine
                         .lock()
                         .await
                         .append(
@@ -1242,10 +1291,11 @@ impl MetaCluster {
                             group_placement(group),
                             ColdWriteAdmission::default(),
                         )
-                        .await
-                        .is_ok()
-                {
-                    break;
+                        .await;
+                    match appended {
+                        Ok(_) => break,
+                        Err(error) => key = key.after(&error),
+                    }
                 }
                 if madsim::time::Instant::now() >= deadline {
                     return false;
@@ -1257,9 +1307,7 @@ impl MetaCluster {
                 .entry(group)
                 .or_default()
                 .extend_from_slice(&payload);
-            self.placed_mut()
-                .appended
-                .insert(group, seq.saturating_add(1));
+            self.placed_mut().keys.insert(group, key.acknowledged());
         }
         true
     }
