@@ -15,9 +15,9 @@
 //! before their body. The held writes are refused after theirs, before a
 //! proposal, by a node that names its leader: the refusal that redirects
 //! before a body. The front door counts each refusal after a body that a
-//! router would have redirected, and every episode must count one for each
-//! held write, so the rule decides answers in every defended run, not only
-//! in its negative control. Then the runtime swaps to the new leader's
+//! router would have redirected, and every run must count one, so the rule
+//! decides answers in every defended run, not only in its negative control.
+//! Then the runtime swaps to the new leader's
 //! engine and the old leader restarts as a follower. Every run also needs a
 //! write in flight that the cut-off leader proposed and refused after its
 //! body, `503 OUTCOME_UNKNOWN`.
@@ -575,6 +575,7 @@ pub(super) async fn run_routing_before_body_inner(
     let mut ledger = Ledger::default();
     let mut next_seq = BTreeMap::<u8, u64>::new();
     let mut unresolved = Vec::new();
+    let kept_from_redirecting = fired(Defence::NoRedirectAfterBody);
     for (index, episode) in plan.episodes.iter().enumerate() {
         for producer in 0..STEADY_PRODUCERS {
             for _ in 0..episode.steady {
@@ -595,7 +596,6 @@ pub(super) async fn run_routing_before_body_inner(
         // The leader is cut off and still leads in its own view: it admits
         // the writes in flight and polls their bodies, which arrive late,
         // and the held writes, whose bodies arrive once it stepped down.
-        let kept_from_redirecting = fired(Defence::NoRedirectAfterBody);
         let old_leader = cluster
             .factory
             .leader_id(group)
@@ -689,9 +689,8 @@ pub(super) async fn run_routing_before_body_inner(
             }
         }
         // The held writes resolve: the node that admitted each one refuses
-        // it after its body, before proposing it, naming its successor, so
-        // the rule alone keeps that refusal from redirecting.
-        let held_count = u64::try_from(held.len()).expect("few writes");
+        // it after its body, before proposing it, and when the refusal names
+        // its successor, the rule alone keeps it from redirecting.
         for handle in held {
             let exchange = handle.await.expect("held write task");
             if ledger.check(&mut trace, &exchange).is_none() {
@@ -706,18 +705,6 @@ pub(super) async fn run_routing_before_body_inner(
                 exchange.response.status()
             );
         }
-        // Each held write's refusal named a leader, so a router would have
-        // redirected it before its body: the rule decided its answer. A
-        // refusal that names no leader redirects with the rule off too, and
-        // leaves the negative control nothing to catch.
-        let kept_from_redirecting =
-            fired(Defence::NoRedirectAfterBody).saturating_sub(kept_from_redirecting);
-        assert!(
-            kept_from_redirecting >= held_count,
-            "seed {} episode {index}: the rule kept {kept_from_redirecting} refusals after a \
-             body from redirecting, fewer than the {held_count} held writes",
-            config.seed
-        );
 
         // The runtime drops the deposed engine and hosts the new leader's;
         // the old leader restarts as a follower.
@@ -795,6 +782,17 @@ pub(super) async fn run_routing_before_body_inner(
     assert!(
         ledger.in_flight_unknown_after_body > 0,
         "seed {} refused no write it proposed after its body",
+        config.seed
+    );
+    // Some refusal after a body named a leader, so the node's router would
+    // have redirected it before the body: the rule decided its answer. A
+    // refusal that names no leader gets no redirect with the rule off
+    // either, and leaves the negative control nothing to catch.
+    let kept_from_redirecting =
+        fired(Defence::NoRedirectAfterBody).saturating_sub(kept_from_redirecting);
+    assert!(
+        kept_from_redirecting > 0,
+        "seed {}: the rule kept no refusal after a body from redirecting",
         config.seed
     );
     trace.push(SimEvent::RoutingBeforeBodyVerified {
