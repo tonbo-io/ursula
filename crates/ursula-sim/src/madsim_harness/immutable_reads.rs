@@ -31,11 +31,16 @@
 //! A kill of the leader with a chunk read in flight is followed by a read
 //! through the new leader, which may not have applied what the old one
 //! marked: the leader's barrier for what may hold only for a lagging state
-//! keeps it from answering short, `404`, `410` or `416`.
+//! keeps it from answering short, `404`, `410` or `416`. A leader deposed
+//! without knowing it may lag too. Its barrier round finds no quorum, and
+//! once no quorum acknowledged it within its lease it no longer leads
+//! (`LeaderRole::Lapsed`), so it forwards or refuses what it cannot mark.
+//! Either defence alone keeps it from answering short.
 //!
-//! [`Controls`] turn off one server defence each, through
+//! [`Controls`] turn off server defences, through
 //! [`ursula_stream::sim_controls`], for the tests that show the invariant
-//! catches its loss.
+//! catches their loss: one defence each, or both defences of a deposed
+//! leader.
 
 use std::collections::BTreeMap;
 
@@ -94,6 +99,10 @@ pub(super) struct Controls {
     /// A leader answers a chunk it cannot mark, and a `416`, from its own
     /// applied state, which after a leader change may lag.
     leader_barrier_off: bool,
+    /// The leader predicate reads OpenRaft's server state alone, without
+    /// the node fence and the leader lease, so a leader cut off from its
+    /// quorum keeps leading after its lease ends.
+    fenced_leadership_off: bool,
 }
 
 #[cfg(test)]
@@ -102,16 +111,32 @@ impl Controls {
         open_tail_marked: true,
         follower_mark_check_off: false,
         leader_barrier_off: false,
+        fenced_leadership_off: false,
     };
     pub(super) const FOLLOWER_MARK_CHECK_OFF: Self = Self {
         open_tail_marked: false,
         follower_mark_check_off: true,
         leader_barrier_off: false,
+        fenced_leadership_off: false,
     };
     pub(super) const LEADER_BARRIER_OFF: Self = Self {
         open_tail_marked: false,
         follower_mark_check_off: false,
         leader_barrier_off: true,
+        fenced_leadership_off: false,
+    };
+    pub(super) const FENCED_LEADERSHIP_OFF: Self = Self {
+        open_tail_marked: false,
+        follower_mark_check_off: false,
+        leader_barrier_off: false,
+        fenced_leadership_off: true,
+    };
+    /// Both defences of a leader deposed without knowing it.
+    pub(super) const DEPOSED_LEADER_UNDEFENDED: Self = Self {
+        open_tail_marked: false,
+        follower_mark_check_off: false,
+        leader_barrier_off: true,
+        fenced_leadership_off: true,
     };
 }
 
@@ -137,6 +162,7 @@ fn set_defences(controls: Controls) {
     set_off(Defence::ImmutableOpenTail, controls.open_tail_marked);
     set_off(Defence::FollowerMarkCheck, controls.follower_mark_check_off);
     set_off(Defence::ImmutableLeaderBarrier, controls.leader_barrier_off);
+    set_off(Defence::FencedLeadership, controls.fenced_leadership_off);
 }
 
 pub(super) fn fail(trace: &mut SimTrace, after_event: &str, message: String) -> ! {
@@ -1178,14 +1204,56 @@ mod tests {
         );
     }
 
-    /// With the leader's barrier off, seed 920 fails the invariant at
-    /// `before_power_loss`, in the accepted-loss step: the leader cut off
-    /// from the others, deposed without knowing it, answers short of a
-    /// chunk the new leader marked. With every defence on the seed passes
-    /// (`marked_chunks_never_contradict_replays` runs it).
+    /// With the leader's barrier and the lease of the leader predicate both
+    /// off, seed 920 fails the invariant at `before_power_loss`, in the
+    /// accepted-loss step: the leader cut off from the others, deposed
+    /// without knowing it, keeps leading past its lease and answers short of
+    /// a chunk the new leader marked. With every defence on the seed passes
+    /// (`marked_chunks_never_contradict_replays` runs it), and with either
+    /// one on it passes too
+    /// (`either_defence_against_a_deposed_leader_alone_suffices`).
     #[test]
-    fn negative_control_a_new_leader_that_skips_the_barrier_contradicts_a_marked_chunk() {
-        assert_fails(920, Controls::LEADER_BARRIER_OFF, "before_power_loss");
+    fn negative_control_a_deposed_leader_without_barrier_or_lease_contradicts_a_marked_chunk() {
+        assert_fails(
+            920,
+            Controls::DEPOSED_LEADER_UNDEFENDED,
+            "before_power_loss",
+        );
+    }
+
+    /// Either defence of a leader deposed without knowing it alone keeps
+    /// seed 920 passing, the run its negative control above fails. With the
+    /// barrier off, the cut-off leader's lease has ended by the time the
+    /// others elected a leader and wrote, so it no longer leads, and it
+    /// forwards or refuses what it cannot mark. With the lease off, it still
+    /// leads, and its barrier round finds no quorum. The loss step reads
+    /// through every replica, the cut-off leader included, and each run must
+    /// judge some of its answers: one that judged none would pass vacuously.
+    #[test]
+    fn either_defence_against_a_deposed_leader_alone_suffices() {
+        let _guard = sim_test_guard();
+        for controls in [
+            Controls::LEADER_BARRIER_OFF,
+            Controls::FENCED_LEADERSHIP_OFF,
+        ] {
+            // A run that fails the invariant panics.
+            let report =
+                ThreeNodeRaftSim::run_immutable_reads_with_controls_report(config(920), controls);
+            let loss_checked = report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    SimEvent::MarkedChunksVerified { loss_checked, .. } => Some(*loss_checked),
+                    _ => None,
+                })
+                .expect("the run verified its chunks");
+            assert!(
+                loss_checked > 0,
+                "{controls:?}: the loss step checked no answer"
+            );
+        }
     }
 
     #[test]
