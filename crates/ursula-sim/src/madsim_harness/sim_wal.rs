@@ -385,7 +385,7 @@ impl SimNodeWal {
     }
 
     /// Ends the node's run without a clean shutdown, as a stopped process
-    /// does.
+    /// does: once it returns, nothing of the run holds a journal lock.
     async fn stop(&self) {
         self.wait_stopped().await;
         drop(
@@ -394,6 +394,7 @@ impl SimNodeWal {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .take(),
         );
+        wait_unlocked(&self.root).await;
     }
 
     async fn wait_stopped(&self) {
@@ -438,6 +439,23 @@ pub(super) fn standalone_wal_metrics(placement: ShardPlacement) -> GroupEngineMe
             .saturating_add(1),
     )
     .group_engine_metrics()
+}
+
+/// Waits until no journal lock under `root` is held. A killed process
+/// holds nothing, but a task of the stopped node that its stop aborted,
+/// such as a hosting driver's action, drops its handle of the run, and with
+/// the last one the core writers and their locks, only at its next turn.
+/// `SimDisk::process_crash` changes nothing: it checks that no lock is
+/// held. The wait gives scheduler turns only, no simulated time, so no
+/// timer of the stopped node fires in it. A lock still held after them
+/// fails the caller's crash or power loss, which names it.
+async fn wait_unlocked(root: &Path) {
+    for _ in 0..RELEASE_YIELDS {
+        if SimDisk::process_crash(root).is_ok() {
+            return;
+        }
+        madsim::task::yield_now().await;
+    }
 }
 
 async fn wait_released(store: &Weak<RaftGroupFileLogStore>) {
