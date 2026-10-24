@@ -10,9 +10,17 @@
 //! one `ForwardToLeader` hop, and the answer returns on the request's
 //! connection. A hop that names this node's own id while its replica does
 //! not lead goes over the transport to the address `raft.peers` lists for
-//! the id: another process of this id leads there, as when a new disk
+//! the id: another process of this id may lead there, as when a new disk
 //! starts under the id of a running meta leader, whose registration only
-//! that leader can refuse.
+//! that leader can refuse. It reaches that process only while the address
+//! does: an address that reaches this process again gets the same
+//! refusal back.
+//!
+//! A write goes on to another node only from a leadership refusal given
+//! before the command was proposed (`MetaWriteError::refused_unproposed`),
+//! the one predicate of the redirect, the own-id hop and the candidate walk.
+//! A refusal after it was proposed may still commit: it is the write's
+//! answer, never sent again, and reads [`WriteEffect::MayHaveApplied`].
 //!
 //! A view is confirmed by a meta read barrier: on the leader its own, after
 //! its history fence, elsewhere the leader's over the recovery transport.
@@ -43,6 +51,8 @@ use ursula_proto::placement::ViewStage;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 
 use super::MetaCommand;
 use super::MetaForwardError;
@@ -119,13 +129,17 @@ impl MetaWriteError {
         }
     }
 
-    /// The leader a refusal names to redirect to, for one forward hop.
-    fn redirect(&self) -> Option<NodeId> {
+    /// The leadership refusal of the node asked, when it refused the write
+    /// because it does not lead before it proposed the command
+    /// ([`Proposal::NotProposed`]): nothing of the write can commit, so it
+    /// may go on to another node. A refusal after the command was proposed
+    /// ([`Proposal::MayHaveCommitted`]) is none: that command may still
+    /// commit, so the refusal is the write's answer.
+    fn refused_unproposed(&self) -> Option<&LeadershipRefusal> {
         match self {
             Self::Leader { source, .. } => source
                 .not_leader()
-                .and_then(|refusal| refusal.leader.as_ref())
-                .map(|leader| NodeId::new(leader.node_id)),
+                .filter(|refusal| refusal.proposal == Proposal::NotProposed),
             Self::NoLeader
             | Self::Forward { .. }
             | Self::Refused(_)
@@ -134,25 +148,21 @@ impl MetaWriteError {
         }
     }
 
-    /// Whether the node asked refused the write because it does not lead,
-    /// before proposing it.
-    fn not_leader(&self) -> bool {
-        match self {
-            Self::Leader { source, .. } => source.not_leader().is_some(),
-            Self::NoLeader
-            | Self::Forward { .. }
-            | Self::Refused(_)
-            | Self::OtherNode { .. }
-            | Self::Stopped => false,
-        }
+    /// The leader an unproposed refusal names to redirect to, for one
+    /// forward hop.
+    fn redirect(&self) -> Option<NodeId> {
+        self.refused_unproposed()?
+            .leader
+            .as_ref()
+            .map(|leader| NodeId::new(leader.node_id))
     }
 
     /// Whether the node asked gave no answer of the meta group's and applied
     /// nothing, so the next candidate may be asked: it was not reached, or
-    /// it does not lead.
+    /// it refused before proposing because it does not lead.
     fn no_answer(&self) -> bool {
         match self {
-            Self::Leader { .. } => self.not_leader(),
+            Self::Leader { .. } => self.refused_unproposed().is_some(),
             Self::Forward { .. } => self.write_effect() == WriteEffect::NotApplied,
             Self::NoLeader | Self::Refused(_) | Self::OtherNode { .. } | Self::Stopped => false,
         }
@@ -256,10 +266,11 @@ impl<T: RecoveryTransport> MetaHandle<T> {
     }
 
     /// Writes `command` on `leader`, which another node's refusal named the
-    /// meta leader. When that is this node's id and its replica does not
-    /// lead, the leader is another process of this id, or the name is
-    /// stale: the write goes over the transport, to the process the id's
-    /// address reaches, which answers it as it answers any forward.
+    /// meta leader. When that is this node's id and its replica refused the
+    /// write before proposing it, the leader is another process of this id,
+    /// or the name is stale: the write goes over the transport, to the
+    /// process the id's address reaches, which answers it as it answers any
+    /// forward. A replica that proposed the write answers it.
     async fn write_redirected(
         &self,
         active: &ActiveMeta,
@@ -271,7 +282,9 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         }
         let answer = self.write_in_place(active, command.clone()).await;
         match &answer {
-            Err(error) if error.not_leader() => self.write_remote(leader, command).await,
+            Err(error) if error.refused_unproposed().is_some() => {
+                self.write_remote(leader, command).await
+            }
             _ => answer,
         }
     }
@@ -417,4 +430,49 @@ fn confirm(view: Arc<PlacementView>, bound: MetaLogId) -> Result<ConfirmedView, 
         history,
         applied: bound,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ursula_proto::placement::NodeId;
+    use ursula_proto::placement::WriteEffect;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::KnownLeader;
+    use ursula_runtime::LeadershipReason;
+    use ursula_runtime::LeadershipRefusal;
+    use ursula_runtime::Proposal;
+
+    use super::MetaWriteError;
+
+    fn refusal(proposal: Proposal, leader: Option<u64>) -> MetaWriteError {
+        MetaWriteError::Leader {
+            leader: NodeId::new(1),
+            source: GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: leader.map(|node_id| KnownLeader { node_id, term: 7 }),
+                proposal,
+                reason: LeadershipReason::SteppedDown,
+            }),
+        }
+    }
+
+    /// A leadership refusal sends the write on (a redirect, the own-id hop,
+    /// the next candidate) only when the command was not proposed. One that
+    /// may have committed is the write's answer, `MayHaveApplied`, whether
+    /// or not it names a leader.
+    #[test]
+    fn only_a_refusal_before_proposing_sends_the_write_on() {
+        for leader in [Some(2), None] {
+            let unproposed = refusal(Proposal::NotProposed, leader);
+            assert!(unproposed.refused_unproposed().is_some(), "{unproposed:?}");
+            assert_eq!(unproposed.redirect(), leader.map(NodeId::new));
+            assert!(unproposed.no_answer(), "{unproposed:?}");
+            assert_eq!(unproposed.write_effect(), WriteEffect::NotApplied);
+
+            let proposed = refusal(Proposal::MayHaveCommitted, leader);
+            assert!(proposed.refused_unproposed().is_none(), "{proposed:?}");
+            assert_eq!(proposed.redirect(), None);
+            assert!(!proposed.no_answer(), "{proposed:?}");
+            assert_eq!(proposed.write_effect(), WriteEffect::MayHaveApplied);
+        }
+    }
 }
