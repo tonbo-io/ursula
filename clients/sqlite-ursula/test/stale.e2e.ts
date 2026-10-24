@@ -256,9 +256,10 @@ describe("stale caches reopened across hosts", () => {
 	/**
 	 * Runs `sql` on `c`, which binds through the blackholed gate: the commit is local, and its
 	 * append is held, never forwarded. Returns once the gate holds it and `c` counts it pending,
-	 * with `c`'s status and rows then.
+	 * with `c`'s status and, unless `dump` is false (a table other than the cases' `t`), its rows
+	 * then.
 	 */
-	async function unsent(c: Child, sql: string): Promise<{ st: Status; rows: Row[] }> {
+	async function unsent(c: Child, sql: string, dump = true): Promise<{ st: Status; rows: Row[] }> {
 		const before = await held();
 		await mode("blackhole");
 		await c.exec(sql);
@@ -267,7 +268,7 @@ describe("stale caches reopened across hosts", () => {
 			const s = await status(c);
 			return s.commits.pending > 0 ? s : undefined;
 		});
-		return { st, rows: await rowsOf(c) };
+		return { st, rows: dump ? await rowsOf(c) : [] };
 	}
 
 	for (const larger of [false, true]) {
@@ -394,10 +395,12 @@ describe("stale caches reopened across hosts", () => {
 		// many records. Probes find both positions: a copy of a root opens, commits through the
 		// blackholed gate and dies, leaving the stream unchanged but for a claim, which no
 		// catch-up logs. Whichever root is behind is padded with an open until they meet. An open
-		// killed after it bound adds an even number of records to the gap (on the model server:
-		// the original's three less the copy's one, or the copy's two), so an odd gap is padded
-		// with an open that also closes cleanly, which logs an exact ACK besides. C's first
-		// padding open catches r2 up in place.
+		// changes the gap by an even amount (CI showed an open of the original adds three records
+		// to its log and one to the copy's, an open of the copy two to its own), so an open alone
+		// never closes an odd gap. An odd gap is first shifted with one synced commit by the
+		// original, which logs the commit and its ACK while the copy catches it up as one record.
+		// The shift must leave the gap even, or the test stops here instead of committing r3 on a
+		// position r4 cannot take. C's first padding open catches r2 up in place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
@@ -407,23 +410,34 @@ describe("stale caches reopened across hosts", () => {
 			return st.commits.logged;
 		};
 		let q = 0;
+		let shifted = false;
 		for (let pads = 0; ; pads++) {
 			q = await nextCommit(dirC);
 			const p = await nextCommit(dirA);
-			report(`S5: after ${pads} padding opens the copy commits next at ${q}, the original at ${p}`);
+			report(`S5: after ${pads} padding opens${shifted ? " and the parity commit" : ""} the copy commits next at ${q}, the original at ${p}`);
 			if (p === q) break;
 			expect(pads, "padding never met both positions").toBeLessThan(16);
+			if ((q - p) % 2 !== 0) {
+				expect(shifted, `the parity commit left the gap odd (copy ${q}, original ${p})`).toBe(false);
+				shifted = true;
+				const parity = host(`${front.url}${s.path}`, dirA);
+				expect((await parity.opened()).state).toBe("live");
+				await parity.exec(model.tx("parity", { updates: 1, inserts: 1 }));
+				await synced(parity);
+				await closeCleanly(parity);
+				continue;
+			}
 			const pad = host(`${front.url}${s.path}`, p < q ? dirA : dirC);
 			expect((await pad.opened()).state).toBe("live");
-			if ((q - p) % 2 === 0) await pad.stop("SIGKILL");
-			else await closeCleanly(pad);
+			await closeCleanly(pad);
 		}
 
 		// r3: held by the gate, at position q, and the host dies.
 		const original = host(`${front.url}${s.path}`, dirA);
 		await original.opened();
 		const r3 = await unsent(original, model.tx("r3", { updates: 1, inserts: 1 }, false));
-		expect(r3.st.commits.logged, "r3's position").toBe(q);
+		// The collision's precondition, before r4 depends on it: r3 sits where C commits next.
+		expect(r3.st.commits.logged, "r3's position, where the copy commits next").toBe(q);
 		await original.stop("SIGKILL");
 		await mode("forward");
 
@@ -490,7 +504,7 @@ describe("stale caches reopened across hosts", () => {
 				// An owner reports a catch-up in place as `resumed`.
 				const caught = host(`${front.url}${s.path}`, dirA);
 				const catchUpMs = await timed(caught, "resumed");
-				await unsent(caught, "INSERT INTO t VALUES (-2, NULL)");
+				await unsent(caught, "INSERT INTO t VALUES (-2, NULL)", false);
 				await caught.stop("SIGKILL");
 				await mode("forward");
 				const other = host(s.url, freshDir());
