@@ -164,52 +164,17 @@ jobs:
               print(f"  node{i+1}:", json.dumps(n, sort_keys=True))
           EOF
 
-      # Secret masking covers logs, not artifacts: the node logs can name the bucket, so replace
-      # the bucket, the role ARN and the account id in them before the upload.
-      - name: Redact AWS identifiers in the artifact
-        if: always() && env.URSULA_S3_PREFIX != ''
-        env:
-          DIR: ${{ runner.temp }}/soak-logs
-          ROLE_ARN: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
-        run: |
-          [ -d "$DIR" ] || exit 0
-          python3 - "$DIR" <<'EOF'
-          import os, pathlib, sys
-          arn = os.environ.get("ROLE_ARN", "")
-          account = arn.split(":")[4] if arn.count(":") >= 5 else ""
-          values = sorted({v for v in (arn, os.environ.get("URSULA_S3_BUCKET", ""), account) if v}, key=len, reverse=True)
-          for path in pathlib.Path(sys.argv[1]).rglob("*"):
-              if path.is_file():
-                  data = path.read_bytes()
-                  redacted = data
-                  for value in values:
-                      redacted = redacted.replace(value.encode(), b"<redacted>")
-                  if redacted != data:
-                      path.write_bytes(redacted)
-          EOF
-
-      - name: Check the artifact for AWS credentials and identifiers
+      # Secret masking covers logs, not artifacts: the node logs can name the bucket.
+      - name: Redact and check the artifact for AWS credentials and identifiers
         id: leak
         if: always() && env.URSULA_S3_PREFIX != ''
-        env:
-          DIR: ${{ runner.temp }}/soak-logs
-          ROLE_ARN: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
-        run: |
-          [ -d "$DIR" ] || exit 0
-          account="$(printf '%s' "$ROLE_ARN" | cut -d: -f5)"
-          patterns="$(for v in "${AWS_SECRET_ACCESS_KEY:-}" "${AWS_SESSION_TOKEN:-}" "$ROLE_ARN" "$account" "$URSULA_S3_BUCKET"; do [ -z "$v" ] || printf '%s\n' "$v"; done)"
-          [ -n "$patterns" ] || exit 0
-          set +e   # patterns come from a pipe, never argv; any grep error fails closed
-          grep -rlF -f <(printf '%s\n' "$patterns") -- "$DIR"; rc=$?
-          set -e
-          case $rc in
-            1) exit 0 ;;
-            0) echo "::error title=Credential leak guard::AWS credentials or identifiers appear in the files listed above; not uploading"; exit 1 ;;
-            *) echo "::error title=Credential leak guard::grep failed ($rc); not uploading"; exit 1 ;;
-          esac
+        uses: ./.github/actions/ci-s3-artifact-guard
+        with:
+          dir: ${{ runner.temp }}/soak-logs
+          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
 
       - name: Upload soak logs
-        if: always() && steps.leak.outcome != 'failure'
+        if: always() && (steps.leak.outcome == 'success' || env.URSULA_S3_PREFIX == '')
         uses: actions/upload-artifact@v6
         with:
           name: soak-logs

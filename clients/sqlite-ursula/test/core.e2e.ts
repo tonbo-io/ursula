@@ -445,13 +445,15 @@ describe("the 0.8 core on node:sqlite", () => {
 		expect(st.snapshot.error).toBeNull();
 		expect(st.reset).toBeNull();
 		expect((await retention(s.path)).snapshot).toBe(st.snapshot.offset);
-		// Above the node's 32 MiB request limit: at least two parts.
+		// Above the node's 32 MiB request limit, so above the smallest request limit on the path on every
+		// leg (the node's, or a gateway's lower one): at least two parts.
 		expect(await snapshotLength(s.path)).toBeGreaterThan(32 << 20);
 		const sql = "SELECT x, length(b) AS n, hex(substr(b, 1, 16)) AS head, hex(substr(b, -16)) AS tail FROM t ORDER BY x";
 		const rows = await owner.rows(sql);
 		expect(rows).toHaveLength(40);
 		await owner.stop();
-		// The fresh build reads the snapshot in two chunks of the node's limit.
+		// The fresh build reads the snapshot in ranges of the smallest request limit on the path, so in
+		// at least two.
 		expect(await fromStream(s.url, sql)).toEqual(rows);
 		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
 	});
