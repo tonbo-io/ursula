@@ -1687,8 +1687,8 @@ pub(super) struct HostingChecks {
     /// Each node whose role in a group the latest view took away, with
     /// the highest term the group's replicas held when it was first seen.
     lost: BTreeMap<(u32, u64), u64>,
-    /// The placement of each group in the latest view at the last
-    /// observation.
+    /// The furthest placement of each group, by its key, that the latest
+    /// view showed at an observation.
     last: BTreeMap<u32, ursula_control::GroupPlacement>,
     /// The nodes whose retirement records of each group the latest view
     /// kept at the last observation.
@@ -2034,10 +2034,30 @@ impl HostingChecks {
         let Some(placement) = cluster.placement(group) else {
             return;
         };
-        let previous = self.last.insert(group, placement.clone());
+        // The latest view falls behind the last one when the node whose meta
+        // replica applied the most stops, so only a placement keyed above the
+        // furthest one seen is new. A move's report is first seen when a new
+        // placement is settled and the furthest one before it was moving, or
+        // named another membership: only a converge changes `converged_at`,
+        // and a move planned and converged between two observations shows
+        // only its report.
+        let newer = self
+            .last
+            .get(&group)
+            .is_none_or(|last| last.since() < placement.since());
+        let previous = if newer {
+            self.last.insert(group, placement.clone())
+        } else {
+            None
+        };
         if let ursula_control::GroupPlacement::Live { converged_at, .. } = &placement
-            && let Some(previous @ ursula_control::GroupPlacement::Live { .. }) = &previous
-            && previous.moving().is_some()
+            && let Some(
+                previous @ ursula_control::GroupPlacement::Live {
+                    converged_at: converged_before,
+                    ..
+                },
+            ) = &previous
+            && (previous.moving().is_some() || converged_before != converged_at)
             && placement.moving().is_none()
         {
             let convergences = self.judged.convergences.entry(group).or_default();

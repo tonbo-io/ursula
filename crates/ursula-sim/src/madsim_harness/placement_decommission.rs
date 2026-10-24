@@ -543,19 +543,24 @@ mod tests {
     /// Family seeds whose shape is the decommission, with the windows each
     /// must reach: 1120 a live one of both groups, the meta leader killed
     /// while a group moves and the sweep held before a DELETE, the node
-    /// restarted after the sweep. 1138 a dead one of group 1, the sweep
-    /// held before a DELETE, the node restarted before any DELETE of the
-    /// sweep: no meta leadership begins between the removal and the
-    /// sweep's kill, so none sweeps first. 1152 a live one of both groups,
-    /// the sweep held before a LIST, the node restarted before the sweep.
+    /// restarted after the sweep. 1139 a dead one of group 1, the meta
+    /// leader killed while the group moves and the sweep held before a
+    /// LIST, the node restarted before the sweep. 1152 a live one of both
+    /// groups, the sweep held before a LIST, the node restarted before the
+    /// sweep. A seed that kills no meta leader before the sweep may have
+    /// its node swept before the script's kill: a dead node's groups move
+    /// away within half a second of its decommission, before the first
+    /// pass of the first meta leadership, which comes a second after the
+    /// leader's sweep task starts.
     const DECOMMISSIONS: [(u64, &[Window]); 3] = [
         (1120, &[
             Window::MovingKill,
             Window::SweepHold("BeforeDelete"),
             Window::Restarted("removed_node_restarted_swept"),
         ]),
-        (1138, &[
-            Window::SweepHold("BeforeDelete"),
+        (1139, &[
+            Window::MovingKill,
+            Window::SweepHold("List"),
             Window::Restarted("removed_node_restarted"),
         ]),
         (1152, &[
