@@ -310,14 +310,6 @@ export class Child {
 		return reply.rows as unknown[];
 	}
 
-	/**
-	 * Sends `signal` to the process and returns at once: `SIGSTOP` freezes it with its sockets
-	 * open, as a paused VM, and `SIGCONT` wakes it. {@link stop} still ends it.
-	 */
-	signal(signal: NodeJS.Signals): void {
-		this.proc.kill(signal);
-	}
-
 	/** Exits, cleanly (`exit`) or killed (`SIGKILL`). */
 	async stop(how: "exit" | "SIGKILL" = "exit"): Promise<void> {
 		if (this.proc.exitCode === null && this.proc.signalCode === null) {
