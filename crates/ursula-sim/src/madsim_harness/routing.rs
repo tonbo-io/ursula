@@ -7,11 +7,15 @@
 //!
 //! Each episode cuts the leader off while writes are in flight: the leader
 //! still leads in its own view, so it admits them and polls their bodies,
-//! which take a while to arrive. The others elect a new leader and the
-//! partition heals, so the old leader steps down and its view follows the
-//! new one. Writes whose head arrives now are redirected before their body;
-//! the writes in flight are refused after theirs. Then the runtime swaps to
-//! the new leader's engine and the old leader restarts as a follower.
+//! which take a while to arrive. Its lease lapses, so it refuses them after
+//! their bodies without naming a leader. Other writes it admits then are
+//! held at their body until it follows a successor. The others elect a new
+//! leader and the partition heals, so the old leader steps down and its
+//! view follows the new one. Writes whose head arrives now are redirected
+//! before their body. The held writes are refused after theirs, by a node
+//! that names its leader: the refusal that redirects before a body. Then
+//! the runtime swaps to the new leader's engine and the old leader restarts
+//! as a follower.
 //!
 //! Every request body records whether the server polled it. Writes go as
 //! HTTP/2 or with `Expect: 100-continue`, where a server that answers before
@@ -43,6 +47,8 @@ use axum::http::Response;
 use axum::http::Version;
 use axum::http::header::LOCATION;
 use axum::http::header::RETRY_AFTER;
+use futures_util::future::BoxFuture;
+use openraft::ServerState;
 use ursula_headers::Delivery;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
@@ -186,6 +192,9 @@ struct Episode {
     travel_ms: u64,
     /// Writes whose head reaches the old leader after it stepped down.
     late: Vec<Write>,
+    /// Writes the cut-off leader admits with the writes in flight, whose
+    /// body arrives only once it follows its successor ([`once_deposed`]).
+    held: Vec<Write>,
 }
 
 /// The plan of one run. The steady producers write one key at a time; each
@@ -231,7 +240,14 @@ impl RoutingPlan {
                 in_flight,
                 travel_ms,
                 late,
+                held: Vec::new(),
             });
+        }
+        // Drawn after the other writes of every episode, which keep their
+        // draws.
+        for episode in &mut episodes {
+            let held_count = 1_u64.saturating_add(rng.next_bounded(2));
+            episode.held = (0..held_count).map(|_| write(&mut rng, 10)).collect();
         }
         Self { episodes }
     }
@@ -252,8 +268,51 @@ struct Exchange {
     body_polled: bool,
 }
 
-/// Sends `write` once, with a body that records whether it was polled.
-async fn send_once(app: Router, path: String, incarnation: String, write: Write) -> Exchange {
+impl Exchange {
+    /// Whether the server refused the write after it polled the body, as
+    /// the rule prescribes: `503` with `Retry-After`.
+    fn refused_after_body(&self) -> bool {
+        self.body_polled
+            && self.response.status() == StatusCode::SERVICE_UNAVAILABLE
+            && self.response.headers().contains_key(RETRY_AFTER)
+    }
+}
+
+/// Resolves once the replica of `old_leader`, the leader that was cut off,
+/// no longer leads and names another node as its leader. A body that
+/// arrives then reaches a node that admitted the write's head while it led
+/// and now follows its successor, whose refusal names that leader.
+fn once_deposed(cluster: &Cluster, old_leader: u64) -> BoxFuture<'static, ()> {
+    let raft = cluster
+        .factory
+        .raft_handle(old_leader)
+        .expect("the cut-off leader's replica");
+    Box::pin(async move {
+        raft.wait(None)
+            .metrics(
+                |metrics| {
+                    metrics.state != ServerState::Leader
+                        && metrics
+                            .current_leader
+                            .is_some_and(|leader| leader != old_leader)
+                },
+                "the deposed leader names its successor",
+            )
+            .await
+            .expect("the deposed leader names its successor");
+    })
+}
+
+/// Sends `write` once, with a body that records whether it was polled. The
+/// body arrives `write.body_delay_ms` after the server polls it, and not
+/// before `release` resolved.
+async fn send_once(
+    app: Router,
+    path: String,
+    incarnation: String,
+    write: Write,
+    release: Option<BoxFuture<'static, ()>>,
+) -> Exchange {
     let label = write.label();
     let payload = label.body();
     let polled = Arc::new(AtomicBool::new(false));
@@ -262,6 +321,9 @@ async fn send_once(app: Router, path: String, incarnation: String, write: Write)
         let delay = Duration::from_millis(write.body_delay_ms);
         Body::from_stream(futures_util::stream::once(async move {
             polled.store(true, Ordering::SeqCst);
+            if let Some(release) = release {
+                release.await;
+            }
             if !delay.is_zero() {
                 madsim::time::sleep(delay).await;
             }
@@ -369,10 +431,7 @@ impl Ledger {
                 // toward the run's coverage: a `503` with `Retry-After`. Any
                 // other unknown outcome, a `500` included, is resent but
                 // shows nothing about the rule.
-                if *body_polled
-                    && status == StatusCode::SERVICE_UNAVAILABLE
-                    && response.headers().contains_key(RETRY_AFTER)
-                {
+                if exchange.refused_after_body() {
                     self.refused_after_body = self.refused_after_body.saturating_add(1);
                 }
                 return None;
@@ -462,6 +521,7 @@ async fn deliver(cluster: &Cluster, trace: &mut SimTrace, ledger: &mut Ledger, w
             cluster.path.clone(),
             cluster.incarnation.clone(),
             write,
+            None,
         )
         .await;
         if ledger.check(trace, &exchange).is_some() {
@@ -502,7 +562,8 @@ pub(super) async fn run_routing_before_body_inner(
         }
 
         // The leader is cut off and still leads in its own view: it admits
-        // the writes in flight and polls their bodies, which arrive late.
+        // the writes in flight and polls their bodies, which arrive late,
+        // and the held writes, whose bodies arrive once it stepped down.
         let old_leader = cluster
             .factory
             .leader_id(group)
@@ -520,6 +581,20 @@ pub(super) async fn run_routing_before_body_inner(
                     cluster.path.clone(),
                     cluster.incarnation.clone(),
                     *write,
+                    None,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let held = episode
+            .held
+            .iter()
+            .map(|write| {
+                madsim::task::spawn(send_once(
+                    cluster.app.clone(),
+                    cluster.path.clone(),
+                    cluster.incarnation.clone(),
+                    *write,
+                    Some(once_deposed(&cluster, old_leader)),
                 ))
             })
             .collect::<Vec<_>>();
@@ -561,6 +636,7 @@ pub(super) async fn run_routing_before_body_inner(
                 cluster.path.clone(),
                 cluster.incarnation.clone(),
                 *write,
+                None,
             )
             .await;
             if ledger.check(&mut trace, &exchange).is_none() {
@@ -573,6 +649,22 @@ pub(super) async fn run_routing_before_body_inner(
             if ledger.check(&mut trace, &exchange).is_none() {
                 unresolved.push(exchange.write);
             }
+        }
+        // The held writes resolve: the node that admitted each one refuses
+        // it after its body, naming its successor, so the rule alone keeps
+        // that refusal from redirecting.
+        for handle in held {
+            let exchange = handle.await.expect("held write task");
+            if ledger.check(&mut trace, &exchange).is_none() {
+                unresolved.push(exchange.write);
+            }
+            assert!(
+                exchange.refused_after_body(),
+                "seed {}: {:?}, whose body reached the deposed leader, was answered {}",
+                config.seed,
+                exchange.write,
+                exchange.response.status()
+            );
         }
 
         // The runtime drops the deposed engine and hosts the new leader's;
