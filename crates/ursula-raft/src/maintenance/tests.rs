@@ -103,7 +103,7 @@ fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
 /// healthy replica of each group it is placed in.
 struct Node {
     me: u64,
-    /// The root the node registered: the sample's.
+    /// The root this run of the node runs on: the one its record names.
     root: ursula_proto::placement::RootId,
     status: PlacementStatus,
     claim: GenesisClaim,
@@ -127,7 +127,7 @@ impl Node {
         let record = *cluster.node(me).unwrap();
         Self {
             me: id,
-            root: samples::root(id),
+            root: record.root.root(),
             status: PlacementStatus {
                 node: me,
                 applied: Some(samples::meta(1, 9)),

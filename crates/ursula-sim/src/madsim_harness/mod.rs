@@ -597,6 +597,7 @@ mod placed_removals;
 mod placement_decommission;
 mod placement_move;
 mod recovery_wiring;
+mod reused_id;
 mod routing;
 mod runtime_network;
 mod snapshot_checks;

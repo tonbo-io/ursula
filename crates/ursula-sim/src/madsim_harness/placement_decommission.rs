@@ -31,7 +31,11 @@
 //!   process, and closes each once its group answered (I13, which fails a
 //!   restart that opens nothing). Once they are swept it keeps closed for
 //!   5 s every replica whose snapshot object the sweep took, since its
-//!   restore finds the object gone (I13);
+//!   restore finds the object gone, or it is superseded, when its removal
+//!   completed meanwhile (I13);
+//! - on half the seeds then stops node 4, waits until its removal completed
+//!   and its id is vacant, starts a new disk under the id, which binds a
+//!   new root, and moves group 0 onto it ([`super::reused_id`]);
 //! - and every group settles live on its placement and every voter reads
 //!   every acknowledged append (I3, I1).
 //!
@@ -96,7 +100,7 @@ const DRIVERS: DriverPlan = DriverPlan {
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long node 4's removal may take: a move of each of its groups, one
 /// at a time, and a meta election.
-const REMOVAL_BOUND: Duration = Duration::from_secs(100);
+pub(super) const REMOVAL_BOUND: Duration = Duration::from_secs(100);
 /// How long a removed node restarted after the sweep is watched for a
 /// replica it opens.
 const KEPT_CLOSED: Duration = Duration::from_secs(5);
@@ -151,6 +155,8 @@ struct Draw {
     meta_kill: Option<MetaKill>,
     sweep_hold: Option<SweepHold>,
     restart: Restart,
+    /// Node 4's id runs again on a new disk once its removal completed.
+    reuse: bool,
 }
 
 impl Draw {
@@ -174,6 +180,8 @@ impl Draw {
         } else {
             Restart::AfterSweep
         };
+        // Drawn last, so every earlier draw of a seed stays.
+        let reuse = draws.next_bounded(2) == 0;
         Self {
             dead,
             both,
@@ -181,6 +189,7 @@ impl Draw {
             meta_kill,
             sweep_hold,
             restart,
+            reuse,
         }
     }
 }
@@ -228,6 +237,10 @@ pub(super) async fn decommission_family(
     if draw.restart == Restart::AfterSweep {
         run.restart_removed(LEAVING).await;
     }
+    if draw.reuse {
+        run.reuse(LEAVING, &format!("placement-move-{seed}-reused-{LEAVING}"))
+            .await;
+    }
     run.settle_and_read().await;
     run.removals.judged_the_removals(&mut run.trace, "finished");
     run.finish()
@@ -268,7 +281,7 @@ impl Run {
     /// Submits `change` of `node`'s lifecycle through the other running
     /// nodes in turn, as an operator retries a write that did not apply,
     /// until one applies.
-    async fn set_lifecycle(&mut self, phase: &str, node: u64, change: LifecycleChange) {
+    pub(super) async fn set_lifecycle(&mut self, phase: &str, node: u64, change: LifecycleChange) {
         let deadline = madsim::time::Instant::now() + BOUND;
         let via: Vec<u64> = self
             .cluster

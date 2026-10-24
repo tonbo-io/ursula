@@ -184,6 +184,15 @@ pub(super) enum Controls {
     /// took an entry, with each retirement in a new log generation (N6) on
     /// (`true`) or off.
     ReopenedRetiredLog { defended: bool },
+    /// A removed node id used again while a voter cut off from the group
+    /// keeps the membership that named the old life, with the empty
+    /// replica's screen on (`true`) or off ([`super::reused_id`]).
+    ReusedIdVote { defended: bool },
+    /// A removed node's old disk started again, cut off from every peer,
+    /// after a new life of its id stored an object, with snapshot DELETEs
+    /// waiting for the registration on (`true`) or off
+    /// ([`super::reused_id`]).
+    ReturningOldDisk { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
@@ -220,6 +229,8 @@ impl Switched {
         set_off(Defence::PlacementBarrier, false);
         set_off(Defence::ConvergeLeadershipProof, false);
         set_off(Defence::RetireAnswer, false);
+        set_off(Defence::EmptyReplicaVote, false);
+        set_off(Defence::DeleteAfterRegistration, false);
         Self
     }
 }
@@ -227,7 +238,7 @@ impl Switched {
 /// Turns `defence` off from here to the run's end when `off`, so a
 /// control's undefended run differs from its defended one only inside its
 /// script.
-fn defence_off_from_here(defence: Defence, off: bool) {
+pub(super) fn defence_off_from_here(defence: Defence, off: bool) {
     set_off(defence, off);
 }
 
@@ -242,6 +253,8 @@ impl Drop for Switched {
         set_off(Defence::ConvergeLeadershipProof, false);
         set_off(Defence::RetireAnswer, false);
         set_off(Defence::LogGeneration, false);
+        set_off(Defence::EmptyReplicaVote, false);
+        set_off(Defence::DeleteAfterRegistration, false);
     }
 }
 
@@ -435,8 +448,11 @@ pub(super) struct Run {
     pub(super) removals: RemovalChecks,
     /// The snapshot object checks, when the nodes run the snapshot store.
     pub(super) snapshots: Option<SnapshotChecks>,
+    /// The nodes the snapshot checks also leave out for now: a node whose
+    /// current disk is a removed life's ([`super::reused_id`]).
+    pub(super) excluded: BTreeSet<u64>,
     rng: SplitMix64,
-    seed: u64,
+    pub(super) seed: u64,
 }
 
 impl Run {
@@ -457,12 +473,40 @@ impl Run {
             hosting,
         )
         .await;
+        Self::over(seed, trace, cluster)
+    }
+
+    /// [`Self::start`] for nodes hosting by placement behind the identity
+    /// fence, as servers run ([`MetaCluster::start_fenced`]), each behind a
+    /// disk lease of `lease`.
+    pub(super) async fn start_fenced(
+        seed: u64,
+        nodes: u64,
+        fsync: WalFsync,
+        claims: BTreeMap<u64, ursula_proto::placement::GenesisClaim>,
+        lease: Duration,
+    ) -> Self {
+        let mut trace = SimTrace::default();
+        trace.push(SimEvent::ClusterBuilt { seed });
+        let cluster = MetaCluster::start_fenced(
+            &format!("placement-move-fenced-{seed}"),
+            JournalTuning::new(fsync),
+            nodes,
+            claims,
+            lease,
+        )
+        .await;
+        Self::over(seed, trace, cluster)
+    }
+
+    fn over(seed: u64, trace: SimTrace, cluster: MetaCluster) -> Self {
         let mut run = Self {
             cluster,
             trace,
             checks: MetaChecks::default(),
             removals: RemovalChecks::default(),
             snapshots: None,
+            excluded: BTreeSet::new(),
             rng: SplitMix64::new(seed ^ SALT),
             seed,
         };
@@ -485,7 +529,8 @@ impl Run {
         self.checks.observe(&self.cluster, &mut self.trace, phase);
         self.removals.observe(&self.cluster, &mut self.trace, phase);
         if let Some(snapshots) = self.snapshots.as_mut() {
-            let removed = self.cluster.removed_nodes();
+            let mut removed = self.cluster.removed_nodes();
+            removed.extend(self.excluded.iter().copied());
             snapshots.step_except(&self.cluster.data, &mut self.trace, phase, &removed);
         }
     }
@@ -948,7 +993,13 @@ impl Run {
     }
 
     /// [`Self::request`] of a move the meta group must accept.
-    async fn accepted(&mut self, phase: &str, group: u32, to: &BTreeSet<u64>, avoid: Option<u64>) {
+    pub(super) async fn accepted(
+        &mut self,
+        phase: &str,
+        group: u32,
+        to: &BTreeSet<u64>,
+        avoid: Option<u64>,
+    ) {
         if let Err(error) = self.request(phase, group, to, avoid).await {
             panic!("the move of group {group} to {to:?} was refused: {error}");
         }
@@ -1075,7 +1126,7 @@ impl Run {
 
     /// Hands `group`'s leadership from `from` to `to` through OpenRaft, and
     /// waits until `to` leads.
-    async fn transfer(&mut self, phase: &str, group: u32, from: u64, to: u64) {
+    pub(super) async fn transfer(&mut self, phase: &str, group: u32, from: u64, to: u64) {
         let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
         while self.cluster.leader_of(group) != Some(to) {
             if madsim::time::Instant::now() >= deadline {
@@ -1426,6 +1477,10 @@ pub(super) async fn run_placement_move_inner(
         Controls::DeposedReport { .. } => deposed_report(seed, controls).await,
         Controls::ReplacedMidTeardown { .. } => replaced_mid_teardown(seed, controls).await,
         Controls::ReopenedRetiredLog { .. } => reopened_retired_log(seed).await,
+        Controls::ReusedIdVote { .. } => super::reused_id::reused_id_vote(seed, controls).await,
+        Controls::ReturningOldDisk { .. } => {
+            super::reused_id::returning_old_disk(seed, controls).await
+        }
     }
 }
 
@@ -2232,5 +2287,46 @@ mod tests {
             "power_loss",
         );
         assert!(message.contains("acknowledged move limit"), "{message}");
+    }
+
+    /// A reused id's empty replica, unscreened, grants the vote of a
+    /// candidate whose membership still names the id's old life, so that
+    /// candidate leads without the group's committed history.
+    #[test]
+    fn negative_control_empty_replica_vote() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ReusedIdVote { defended: true },
+            Controls::ReusedIdVote { defended: false },
+            crate::madsim_harness::reused_id::REUSED_VOTE,
+            "stale_candidate",
+        );
+        assert!(message.starts_with("stale_candidate_won"), "{message}");
+    }
+
+    /// A removed node's old disk, never answered by the meta group, deletes
+    /// a new life's named object under the shared node directory once its
+    /// predecessor wait ended.
+    #[test]
+    fn negative_control_delete_after_registration() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ReturningOldDisk { defended: true },
+            Controls::ReturningOldDisk { defended: false },
+            crate::madsim_harness::snapshot_checks::NAMED_KEYS_EXIST,
+            "old_disk_returned",
+        );
+        let named = SimTrace::last_recorded()
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SimEvent::SnapshotKeysRestored { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .expect("the new life named its objects");
+        assert!(
+            named.iter().any(|key| message.contains(key.as_str())),
+            "{message} names none of the new life's keys {named:?}"
+        );
     }
 }
