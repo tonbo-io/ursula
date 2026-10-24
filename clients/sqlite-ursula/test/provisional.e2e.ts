@@ -8,9 +8,14 @@
 // none of its provisional commits reaches the stream, and that owner goes on, however many offline
 // opens came before. An owner that claimed and never wrote goes live the same way. Without a
 // cache the open waits for the stream and fails `unreachable` when its signal fires.
+//
+// S6 (test/stale.e2e.ts has S1, S2 and S5): a cache another host took over before the outage
+// opens provisionally and serves its stale rows. That exposure is pinned on purpose: only code
+// that waits for `synced()` is protected from it. Its commits stay local, `synced()` rejects
+// `fenced` once the stream answers, and the next explicit open rebuilds.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, UrsulaUnavailableError } from "../src/index.ts";
-import { Child, directUrl, ext, freshDir, fromStream, gate, killChildren, rejection, stream } from "./kit.ts";
+import { Child, directUrl, ext, freshDir, frames, fromStream, gate, killChildren, rejection, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -218,6 +223,65 @@ describe("provisional opens", () => {
 		await expectLive(other, 5);
 		await other.stop();
 		expect(await fromStream(s.url, "SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 4 }, { x: 5 }]);
+	});
+
+	it("S6: serves the stale rows of a cache another host took over, keeps its commits local, rejects synced() `fenced` once the stream answers, and rebuilds at the next open", async () => {
+		const s = stream("provisional-stale");
+		const dir = freshDir();
+		const a = new Child(`${front.url}${s.path}`, dir);
+		expect((await a.opened()).state).toBe("live");
+		await a.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1), (2)");
+		expect(await a.send({ synced: 30_000 })).toMatchObject({ ok: true, synced: { synced: true } });
+		await a.stop();
+		// Another host, a fresh root, takes the stream over and changes the rows.
+		const b = new Child(s.url, freshDir());
+		await b.opened();
+		await b.exec("DELETE FROM t WHERE x = 1; INSERT INTO t VALUES (3)");
+		expect(await b.send({ synced: 30_000 })).toMatchObject({ ok: true, synced: { synced: true } });
+		await b.stop();
+		const current = [{ x: 2 }, { x: 3 }];
+		const stale = [{ x: 1 }, { x: 2 }];
+		const before = await frames(s.path);
+
+		await mode("refuse");
+		const started = Date.now();
+		const c = new Child(`${front.url}${s.path}`, dir);
+		expect((await c.opened()).state).toBe("provisional");
+		const took = Date.now() - started;
+		expect(took, `the open took ${took} ms, the process start included`).toBeLessThan(OPEN_LIMIT_MS);
+		// The exposure: rows the stream no longer holds, served while provisional.
+		expect(await c.rows("SELECT x FROM t ORDER BY x")).toEqual(stale);
+		await c.exec("INSERT INTO t VALUES (9)");
+		expect(await c.send({ synced: 500 })).toMatchObject({ ok: true, synced: { synced: false } });
+		const deadline = Date.now() + 30_000;
+		for (;;) {
+			const st = (await c.send({ status: true })).status as { state: string; replication: { condition: string | null }; commits: { pending: number } };
+			if (st.replication.condition === "retrying") {
+				expect(st.state).toBe("provisional");
+				expect(st.commits.pending).toBeGreaterThan(0);
+				break;
+			}
+			expect(Date.now(), `never retrying: ${JSON.stringify(st)}`).toBeLessThan(deadline);
+			await sleep(50);
+		}
+		expect(await frames(s.path)).toEqual(before);
+
+		await mode("forward");
+		const gated = await c.send({ synced: 30_000 });
+		expect(gated.ok, JSON.stringify(gated)).toBe(false);
+		expect(String(gated.error)).toContain("ursula_synced: fenced: ");
+		expect(await c.send({ status: true })).toMatchObject({ ok: true, status: { state: "reset", reset: { kind: "fenced" } } });
+		await c.stop();
+		expect(await frames(s.path), "a provisional commit reached the stream").toEqual(before);
+
+		// The next explicit open discards the local tail and rebuilds.
+		const reopened = new Child(s.url, dir);
+		expect((await reopened.opened()).state).toBe("live");
+		expect(await reopened.send({ status: true })).toMatchObject({ ok: true, status: { state: "live", reset: null, salvage: [], attach: { local: "built" } } });
+		expect(await reopened.rows("SELECT x FROM t ORDER BY x")).toEqual(current);
+		expect(await reopened.rows("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+		await reopened.stop();
+		expect(await fromStream(s.url, "SELECT x FROM t ORDER BY x")).toEqual(current);
 	});
 
 	it("fails `unreachable` when its signal fires with no cache to open", async () => {
