@@ -386,13 +386,40 @@ struct Hosted {
     watcher: madsim::task::JoinHandle<()>,
 }
 
-/// What a replica's gate and vote show.
+/// What a replica's recovery gate shows, of either plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReplicaMarks {
+pub(super) struct GateMarks {
     /// Whether its vote gate is open.
     pub(super) gate_open: bool,
     /// Whether it holds a vote floor.
     pub(super) floor: bool,
+}
+
+impl GateMarks {
+    pub(super) fn of(rejoin: &GroupRejoin) -> Self {
+        Self {
+            gate_open: rejoin.vote_gate_open(),
+            floor: rejoin.holds_vote_floor(),
+        }
+    }
+
+    /// What the gate took since it showed `opened`, read now: it opened,
+    /// or it wrote a vote floor.
+    pub(super) fn taken_since(self, opened: Self) -> Option<&'static str> {
+        if self.gate_open && !opened.gate_open {
+            Some("opened its gate")
+        } else if self.floor && !opened.floor {
+            Some("wrote a vote floor")
+        } else {
+            None
+        }
+    }
+}
+
+/// What a data replica's gate and vote show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplicaMarks {
+    pub(super) gate: GateMarks,
     pub(super) vote: ursula_raft::UrsulaVote,
 }
 
@@ -402,8 +429,7 @@ impl ReplicaMarks {
         rejoin: &GroupRejoin,
     ) -> Self {
         Self {
-            gate_open: rejoin.vote_gate_open(),
-            floor: rejoin.holds_vote_floor(),
+            gate: GateMarks::of(rejoin),
             vote: openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).vote,
         }
     }
