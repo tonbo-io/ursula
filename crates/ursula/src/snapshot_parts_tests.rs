@@ -1787,7 +1787,7 @@ async fn usage_counts_a_committed_snapshot_once() {
     ];
     let report = usage_report(&app).await;
     assert_eq!(staged_bytes(&report), 11);
-    assert_eq!(snapshot_bytes(&report), 0);
+    assert_eq!(snapshot_bytes(&report), Some(0));
 
     let response = send(
         &app,
@@ -1799,7 +1799,7 @@ async fn usage_counts_a_committed_snapshot_once() {
     assert!(part_names(&cold_store).await.is_empty());
     let report = usage_report(&app).await;
     assert_eq!(staged_bytes(&report), 0);
-    assert_eq!(snapshot_bytes(&report), 11);
+    assert_eq!(snapshot_bytes(&report), Some(11));
 }
 
 /// #648 review: reading usage changes nothing a part or a count depends on,
