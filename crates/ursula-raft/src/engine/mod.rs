@@ -1622,6 +1622,7 @@ impl GroupEngine for RaftGroupEngine {
                             .last_applied_log_id
                             .map_or(0, |log_id| log_id.index()),
                         buckets: state_machine.engine.bucket_usage_report(),
+                        snapshot_bytes: state_machine.engine.snapshot_bytes_by_bucket(),
                     })
                 })
             })
