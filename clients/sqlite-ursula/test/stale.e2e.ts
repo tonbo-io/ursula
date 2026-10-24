@@ -17,8 +17,9 @@
 // The oracles, after every live reopen:
 // 1. With no writer running, the database's rows equal the seeded model, and a fresh build from
 //    the stream (a new process with a new root) equals the database.
-// 2. No commit id is in the stream twice. No frame of the superseded lineage is above its
-//    acknowledged position, or after the claim of the activation that took the stream over.
+// 2. Once the reopened process synced a commit and exited, no commit id is in the stream twice,
+//    and no frame of the superseded lineage is above its acknowledged position or after the
+//    claim of the activation that took the stream over.
 // 3. `integrity_check` passes and nothing is salvaged.
 // 4. Every row whose `synced()` resolved is there, unless a later writer changed it: the model
 //    applies exactly the synced transactions, so 1 checks it.
@@ -216,7 +217,9 @@ const isData = (f: OwnedFrame): f is Extract<OwnedFrame, { kind: "commit" | "par
 /**
  * Oracle 2 for a superseded owner of `lineage` that had `acknowledged` acknowledged: none of its
  * frames is above that, and none follows the first claim of an activation not in `known` (the
- * takeover), when retention kept that claim. `takeoverRetained` says it must have.
+ * takeover), when retention kept that claim. `takeoverRetained` says it must have. Call it once
+ * the process that reopened the owner's root synced a commit and exited, so no resend of the old
+ * tail, at the reopen or in the background after it, can still come from that process.
  */
 async function nothingSuperseded(path: string, lineage: string, acknowledged: number, known: ReadonlySet<string>, takeoverRetained: boolean): Promise<void> {
 	const fs = await ownedFrames(path);
@@ -365,8 +368,9 @@ describe("stale caches reopened across hosts", () => {
 				expect(snapshot).not.toBeNull();
 				expect(st.attach.snapshot_offset).toBe(snapshot);
 			}
-			await nothingSuperseded(s.path, x.st.lineage, x.st.commits.acknowledged, known, !behindRetention);
 			await converged(reopened, s.url, s.path, model, label);
+			// After `converged`, so the reopened process has synced a commit and exited.
+			await nothingSuperseded(s.path, x.st.lineage, x.st.commits.acknowledged, known, !behindRetention);
 		});
 	}
 
