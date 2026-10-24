@@ -8,7 +8,11 @@
 //! member yet, walks the meta candidates
 //! (`ursula_control::leader_candidates`, meta's voters first), following
 //! one `ForwardToLeader` hop, and the answer returns on the request's
-//! connection.
+//! connection. A hop that names this node's own id while its replica does
+//! not lead goes over the transport to the address `raft.peers` lists for
+//! the id: another process of this id leads there, as when a new disk
+//! starts under the id of a running meta leader, whose registration only
+//! that leader can refuse.
 //!
 //! A view is confirmed by a meta read barrier: on the leader its own, after
 //! its history fence, elsewhere the leader's over the recovery transport.
@@ -130,12 +134,25 @@ impl MetaWriteError {
         }
     }
 
+    /// Whether the node asked refused the write because it does not lead,
+    /// before proposing it.
+    fn not_leader(&self) -> bool {
+        match self {
+            Self::Leader { source, .. } => source.not_leader().is_some(),
+            Self::NoLeader
+            | Self::Forward { .. }
+            | Self::Refused(_)
+            | Self::OtherNode { .. }
+            | Self::Stopped => false,
+        }
+    }
+
     /// Whether the node asked gave no answer of the meta group's and applied
     /// nothing, so the next candidate may be asked: it was not reached, or
     /// it does not lead.
     fn no_answer(&self) -> bool {
         match self {
-            Self::Leader { source, .. } => source.not_leader().is_some(),
+            Self::Leader { .. } => self.not_leader(),
             Self::Forward { .. } => self.write_effect() == WriteEffect::NotApplied,
             Self::NoLeader | Self::Refused(_) | Self::OtherNode { .. } | Self::Stopped => false,
         }
@@ -233,8 +250,29 @@ impl<T: RecoveryTransport> MetaHandle<T> {
     ) -> Result<ControlApplied, MetaWriteError> {
         let answer = self.write_once(active, leader, command.clone()).await;
         match answer.as_ref().err().and_then(MetaWriteError::redirect) {
-            Some(next) if next != leader => self.write_once(active, next, command).await,
+            Some(next) if next != leader => self.write_redirected(active, next, command).await,
             Some(_) | None => answer,
+        }
+    }
+
+    /// Writes `command` on `leader`, which another node's refusal named the
+    /// meta leader. When that is this node's id and its replica does not
+    /// lead, the leader is another process of this id, or the name is
+    /// stale: the write goes over the transport, to the process the id's
+    /// address reaches, which answers it as it answers any forward.
+    async fn write_redirected(
+        &self,
+        active: &ActiveMeta,
+        leader: NodeId,
+        command: ControlCommand,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        if leader != self.me {
+            return self.write_remote(leader, command).await;
+        }
+        let answer = self.write_in_place(active, command.clone()).await;
+        match &answer {
+            Err(error) if error.not_leader() => self.write_remote(leader, command).await,
+            _ => answer,
         }
     }
 
@@ -245,27 +283,47 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         leader: NodeId,
         command: ControlCommand,
     ) -> Result<ControlApplied, MetaWriteError> {
-        let answer = if leader == self.me {
-            let answers = active
-                .write(
-                    vec![RaftCommand::Meta(MetaCommand::Control(command))],
-                    WriteOrigin::Local(self.me),
-                )
-                .await?;
-            crate::forward::single_control_answer(answers)
-                .map_err(|source| MetaWriteError::Leader { leader, source })?
+        if leader == self.me {
+            self.write_in_place(active, command).await
         } else {
-            self.transport
-                .forward_control(leader.get(), command)
-                .await
-                .map_err(|error| match error {
-                    MetaForwardError::Leader(source) => MetaWriteError::Leader { leader, source },
-                    MetaForwardError::Transport(source) => {
-                        MetaWriteError::Forward { leader, source }
-                    }
-                })?
-        };
-        answer.map_err(MetaWriteError::Refused)
+            self.write_remote(leader, command).await
+        }
+    }
+
+    /// Writes `command` on this node's meta replica.
+    async fn write_in_place(
+        &self,
+        active: &ActiveMeta,
+        command: ControlCommand,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        let answers = active
+            .write(
+                vec![RaftCommand::Meta(MetaCommand::Control(command))],
+                WriteOrigin::Local(self.me),
+            )
+            .await?;
+        crate::forward::single_control_answer(answers)
+            .map_err(|source| MetaWriteError::Leader {
+                leader: self.me,
+                source,
+            })?
+            .map_err(MetaWriteError::Refused)
+    }
+
+    /// Forwards `command` to `leader` over the transport.
+    async fn write_remote(
+        &self,
+        leader: NodeId,
+        command: ControlCommand,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.transport
+            .forward_control(leader.get(), command)
+            .await
+            .map_err(|error| match error {
+                MetaForwardError::Leader(source) => MetaWriteError::Leader { leader, source },
+                MetaForwardError::Transport(source) => MetaWriteError::Forward { leader, source },
+            })?
+            .map_err(MetaWriteError::Refused)
     }
 
     /// Asks `leader` for a fresh quorum barrier of `target` over this

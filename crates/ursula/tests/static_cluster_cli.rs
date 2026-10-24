@@ -9168,6 +9168,91 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     );
 }
 
+/// An empty disk under the id of the running meta leader (#768): a second
+/// process of that id starts on an empty WAL at an address no peer dials,
+/// with the cluster's `raft.peers`, while the id's process leads meta. No
+/// meta leader ever sends to it, and every peer it asks names its own id as
+/// the leader, so it reaches the leader only at the address `raft.peers`
+/// lists for its id. It is refused for the root the id is bound to, its
+/// data replicas take part in nothing, and the healthy nodes stay
+/// registered under the same meta leader. A registration that took a
+/// redirect to its own id for its own replica never reaches the leader and
+/// stays pending, which fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_an_empty_disk_under_the_meta_leaders_id_is_refused() {
+    use ursula_proto::placement::RootSlot;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta leader's new disk test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    let leader = known_meta_leader(&client, &mut procs, &nodes, &nodes[0]).await;
+    let bound = bound_root(&cluster, leader);
+
+    // 1. A second process of the leader's id, on an empty WAL.
+    let stranger = MetaNode {
+        id: leader,
+        port: free_port(),
+        admin_port: free_port(),
+        config: root.path().join(format!("node-{leader}-stranger.toml")),
+        wal: root.path().join(format!("node-{leader}-stranger-log")),
+        cold_root: None,
+    };
+    stranger.write(&peers, meta);
+    let mut strangers = Processes::default();
+    strangers.start(binary, &stranger);
+    wait_placement(
+        &client,
+        &mut strangers,
+        &stranger,
+        "is refused for the root its id is bound to",
+        |status| {
+            status.registration
+                == RegistrationStatus::RootRefused {
+                    slot: RootSlot::Bound(bound),
+                }
+        },
+    )
+    .await;
+    let held = try_node_metrics(&client, &stranger.url())
+        .await
+        .expect("the second process reports its replicas");
+    assert_data_held(&held, leader);
+
+    // 2. The healthy nodes stay registered, and the id's process still leads.
+    for node in &nodes {
+        let status = placement_status(&client, node)
+            .await
+            .expect("a healthy node's placement status");
+        assert!(
+            matches!(status.registration, RegistrationStatus::Answered(_)),
+            "node {} was refused beside the second process: {status:?}",
+            node.id
+        );
+    }
+    assert_eq!(
+        known_meta_leader(&client, &mut procs, &nodes, &nodes[0]).await,
+        leader
+    );
+    strangers.kill(leader);
+}
+
 /// Integration 12 (#768, design 10): a wiped voter is not ready before its
 /// groups. Node 3's Raft traffic goes through a proxy, and every group's
 /// leaders purge their logs through a snapshot, so a wiped replica catches
