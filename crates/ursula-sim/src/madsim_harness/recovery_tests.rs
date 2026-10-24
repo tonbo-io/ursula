@@ -1892,6 +1892,15 @@ fn a_five_voter_group_that_lost_three_voters_recovers_through_a_plan() {
 /// leadership or campaign: its durable vote for itself is uncommitted, it is
 /// elected only above the plan term, and the plan is satisfied. The plan is
 /// sent by hand, as the runbook does, over each replica's admin entry point.
+///
+/// Every group runs pre-vote (`ursula_raft::with_group_election_protocol`),
+/// so a voter cut off from its peers never campaigns on its own: its
+/// pre-votes fail and it stays a follower. It campaigns cut off when a real
+/// election started just before the cut, as a leadership transfer to it
+/// does, or once a pre-vote quorum answered and the vote requests were lost.
+/// The candidate variant starts that election on P after the cut. P then
+/// stays a candidate: its vote for itself stays uncommitted, and the
+/// pre-vote rounds that follow its election timeouts leave the vote alone.
 #[test]
 fn a_stale_leader_or_candidate_that_takes_a_plan_restarts_first() {
     let _guard = sim_test_guard();
@@ -1910,8 +1919,22 @@ fn a_stale_leader_or_candidate_that_takes_a_plan_restarts_first() {
                 cluster.policy.partition_bidirectional(P, node_id);
             }
             if !stale_leader {
-                // P campaigns alone while the others still lead.
-                madsim::time::sleep(Duration::from_secs(1)).await;
+                // P campaigns alone while the others still lead: a real
+                // election, as a transfer to it starts.
+                for group in JOURNAL_GROUPS {
+                    let raft = cluster.engines[&(group, P)].raft_handle();
+                    raft.trigger()
+                        .elect(false)
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                    raft.wait(Some(Duration::from_secs(5)))
+                        .metrics(
+                            |metrics| metrics.state == openraft::ServerState::Candidate,
+                            "P campaigns",
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                }
             }
             for node_id in [1, 2] {
                 cluster.stop_node(node_id).await;
