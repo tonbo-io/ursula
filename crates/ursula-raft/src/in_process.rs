@@ -1317,9 +1317,10 @@ pub enum InProcessRaftNetworkEvent {
     },
     /// A sender with a process incarnation of its own counted an answer of
     /// the target's process `responder`: its stamp passed the sender's
-    /// table. A `promise` grants a vote, acknowledges entries or installs a
-    /// snapshot. Recovery answers (barriers, probes, forwards) are no
-    /// promise.
+    /// table. A `promise` grants a vote or installs a snapshot, what a
+    /// predecessor wait holds. An acknowledgement of entries is none, since
+    /// a successor acknowledges during its wait, and recovery answers
+    /// (barriers, probes, forwards) are none either.
     AnswerAccepted {
         source: Option<u64>,
         target: u64,
@@ -1807,7 +1808,7 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
     /// The process fence of an answer ([`fence_answer`]). A discarded
     /// answer is lost. An accepted one is reported to the policy's observer
     /// ([`InProcessRaftNetworkEvent::AnswerAccepted`]), as a `promise` when
-    /// it grants a vote, acknowledges entries or installs a snapshot.
+    /// it grants a vote or installs a snapshot.
     fn answer(
         &self,
         target: Option<&SM::Endpoint>,
@@ -1924,11 +1925,7 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 RPCError::Network(NetworkError::from_string(message))
             }
         })?;
-        let acked = matches!(
-            response,
-            AppendEntriesResponse::Success | AppendEntriesResponse::PartialSuccess(_)
-        );
-        self.answer(Some(&target), acked)
+        self.answer(Some(&target), false)
             .map_err(RPCError::Unreachable)?;
         if matches!(response, AppendEntriesResponse::Conflict) {
             if let (Some(conflict_index), Some(matched_index)) = (conflict_index, matched)

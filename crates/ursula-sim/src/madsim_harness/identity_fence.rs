@@ -103,10 +103,18 @@
 //!   meta entries and confirms no view to create one by. In the new-disk
 //!   scripts I16 therefore judges the new disk's meta replica alone.
 //! - I17 ([`I17`]): no process counts an answer of a process of a node
-//!   given after a later process of that node made a promise (granted a
-//!   vote, acknowledged entries or installed a snapshot). It reads every
-//!   answer a process counted, the recovery calls' included, and runs at
-//!   the end of a run.
+//!   given after a later process of that node made a promise: granted a
+//!   vote or installed a snapshot (an answer a peer counted), or opened the
+//!   gate of its meta replica or of a data replica or wrote its vote floor
+//!   (seen at a step, and dated from the step before, the earliest it can
+//!   have happened). These are
+//!   what a predecessor wait holds. An acknowledgement of entries is no
+//!   promise: a successor acknowledges during its wait while its
+//!   predecessor may still be counted, which the fence allows (addendum
+//!   2.1 and 2.6), since under `always` both acknowledge only what they
+//!   synced and every leader the successor acknowledges was elected
+//!   without the node's vote. It reads every answer a process counted, the
+//!   recovery calls' included, and runs at the end of a run.
 //! - I18 ([`I18`]): no linearizable read invoked after a write was
 //!   acknowledged misses that write. It compares each read with its
 //!   invocation, so a read invoked before a write is free to miss it.
@@ -448,10 +456,13 @@ struct FenceChecks {
     /// The process that led each group in each term, by node: `(group,
     /// term, node)` to the process's tag.
     leaders: BTreeMap<(u32, u64, u64), u64>,
-    /// The first promise of each process, by tag, read from the answers
-    /// before `read_answers`.
+    /// The first promise of each process, by tag ([`I17`]): from the
+    /// answers before `read_answers`, and from the gates and floors the
+    /// observations saw.
     promised: BTreeMap<u64, madsim::time::Instant>,
     read_answers: usize,
+    /// When the last observation ran.
+    observed_at: Option<madsim::time::Instant>,
 }
 
 impl FenceChecks {
@@ -475,11 +486,14 @@ impl FenceChecks {
     /// replica by. Its meta replica is what a new disk's hold keeps out.
     fn observe(&mut self, cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
         let now = fence_now();
+        let observed_at = madsim::time::Instant::now();
+        let since = self.observed_at.replace(observed_at).unwrap_or(observed_at);
         for node_id in cluster.running() {
             let Some(process) = cluster.process(node_id) else {
                 continue;
             };
             self.one_leader_per_term(cluster, trace, after_event, node_id, process);
+            self.gate_promises(cluster, node_id, process, since);
             let wal = cluster.data.wals[&node_id].raft_wal();
             let fence = wal.fence();
             let bound_at = fence.bound_at();
@@ -579,18 +593,90 @@ impl FenceChecks {
         }
     }
 
-    /// Whether `process` made a promise a peer counted, reading the answers
-    /// counted since the last call.
-    fn promised(&mut self, cluster: &MetaCluster, process: u64) -> bool {
+    /// I17's promises at one step: `node_id`'s current process `process`
+    /// promised when its meta replica or one of its data replicas opened
+    /// its gate or wrote a vote floor since it opened, dated `since`, the
+    /// step before, which no gate seen closed or not yet hosted then can
+    /// precede.
+    fn gate_promises(
+        &mut self,
+        cluster: &MetaCluster,
+        node_id: u64,
+        process: u64,
+        since: madsim::time::Instant,
+    ) {
+        if self.promised.get(&process).is_some_and(|at| *at <= since) {
+            return;
+        }
+        let meta = cluster
+            .meta_gate(node_id)
+            .is_some_and(|meta| meta.now.taken_since(meta.opened).is_some());
+        let promised = meta
+            || cluster.hosted_replicas(node_id).iter().any(|replica| {
+                ReplicaMarks::of(&replica.raft, &replica.rejoin)
+                    .gate
+                    .taken_since(replica.opened.gate)
+                    .is_some()
+            });
+        if promised {
+            let first = self.promised.entry(process).or_insert(since);
+            *first = (*first).min(since);
+        }
+    }
+
+    /// Folds the promises among the answers counted since the last call
+    /// into `promised`: a granted vote or an installed snapshot.
+    fn answer_promises(&mut self, cluster: &MetaCluster) {
         let started = cluster.started_processes();
         let answers = cluster.data.answers.since(self.read_answers);
         self.read_answers = self.read_answers.saturating_add(answers.len());
         for answer in answers.iter().filter(|answer| answer.promise) {
             if let Some((tag, _)) = process_of(&started, &answer.responder) {
-                self.promised.entry(tag).or_insert(answer.at);
+                let first = self.promised.entry(tag).or_insert(answer.at);
+                *first = (*first).min(answer.at);
             }
         }
+    }
+
+    /// Whether `process` made a promise, reading the answers counted since
+    /// the last call.
+    fn promised(&mut self, cluster: &MetaCluster, process: u64) -> bool {
+        self.answer_promises(cluster);
         self.promised.contains_key(&process)
+    }
+
+    /// I17 over every answer a process counted: none came from a process
+    /// of a node after a later process of the node had made a promise.
+    fn answers_after_promises(
+        &mut self,
+        cluster: &MetaCluster,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        self.answer_promises(cluster);
+        let started = cluster.started_processes();
+        for answer in cluster.data.answers.answers() {
+            let Some((tag, node)) = process_of(&started, &answer.responder) else {
+                continue;
+            };
+            let successor = self.promised.iter().find(|(later, at)| {
+                **later > tag
+                    && answer.at > **at
+                    && started.get(later).is_some_and(|(of, _)| *of == node)
+            });
+            if let Some((later, at)) = successor {
+                fail(
+                    trace,
+                    I17,
+                    after_event,
+                    format!(
+                        "node {:?} counted an answer of node {node}'s process {tag} at {:?}, \
+                         after its successor process {later} made a promise at {at:?}",
+                        answer.source, answer.at
+                    ),
+                );
+            }
+        }
     }
 
     /// I18 over `reads` of `group`: each holds every write acknowledged
@@ -636,50 +722,6 @@ fn process_of(
         .iter()
         .find(|(_, (_, seen))| seen == incarnation)
         .map(|(tag, (node, _))| (*tag, *node))
-}
-
-/// When each process first made a promise a peer counted, by tag.
-fn promises(cluster: &MetaCluster) -> BTreeMap<u64, madsim::time::Instant> {
-    let started = cluster.started_processes();
-    let mut promised = BTreeMap::new();
-    for answer in cluster.data.answers.answers() {
-        if !answer.promise {
-            continue;
-        }
-        if let Some((tag, _)) = process_of(&started, &answer.responder) {
-            promised.entry(tag).or_insert(answer.at);
-        }
-    }
-    promised
-}
-
-/// I17 over every answer a process counted: none came from a process of a
-/// node after a later process of the node had made a promise.
-fn answers_after_promises(cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
-    let started = cluster.started_processes();
-    let promised = promises(cluster);
-    for answer in cluster.data.answers.answers() {
-        let Some((tag, node)) = process_of(&started, &answer.responder) else {
-            continue;
-        };
-        let successor = promised.iter().find(|(later, at)| {
-            **later > tag
-                && answer.at > **at
-                && started.get(later).is_some_and(|(of, _)| *of == node)
-        });
-        if let Some((later, at)) = successor {
-            fail(
-                trace,
-                I17,
-                after_event,
-                format!(
-                    "node {:?} counted an answer of node {node}'s process {tag} at {:?}, after its \
-                     successor process {later} made a promise at {at:?}",
-                    answer.source, answer.at
-                ),
-            );
-        }
-    }
 }
 
 /// Whether `bytes` holds `part`.
@@ -1543,7 +1585,8 @@ impl Run {
             madsim::time::sleep(STEP).await;
             self.observe(PHASE);
         }
-        answers_after_promises(&self.cluster, &mut self.trace, PHASE);
+        self.fence
+            .answers_after_promises(&self.cluster, &mut self.trace, PHASE);
         self.heal(vec![zombie]).await;
         for group in JOURNAL_GROUPS {
             self.resume(group, "release_broken_healed").await;
@@ -2495,7 +2538,8 @@ impl Run {
     /// such as new disks, which create none while held, passes with a held
     /// meta replica instead.
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
-        answers_after_promises(&self.cluster, &mut self.trace, "finished");
+        self.fence
+            .answers_after_promises(&self.cluster, &mut self.trace, "finished");
         let fence = &self.fence;
         if fence.held_observations == 0 {
             if fence.held_with_journal {
