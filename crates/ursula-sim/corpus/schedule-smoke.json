@@ -3820,7 +3820,7 @@
             "marker_lagged": false,
             "raised": false,
             "outside": 0,
-            "installed": 4,
+            "installed": 2,
             "fenced": 8,
             "plans": 2
           }
@@ -3845,7 +3845,7 @@
       "seed": 546,
       "leader_id": 3,
       "target_node_id": null,
-      "appended_log_index": 36,
+      "appended_log_index": 34,
       "trace": {
         "events": [
           {
@@ -3881,6 +3881,10 @@
             "node_id": 3
           },
           {
+            "event": "fault_applied",
+            "phase": "power_lost"
+          },
+          {
             "event": "node_restarted",
             "node_id": 3
           },
@@ -3889,21 +3893,17 @@
             "node_id": 2
           },
           {
-            "event": "fault_applied",
-            "phase": "power_lost"
-          },
-          {
             "event": "node_restarted",
             "node_id": 2
           },
           {
             "event": "snapshot_objects_owned",
-            "puts": 42,
-            "install_reads": 3,
+            "puts": 44,
+            "install_reads": 4,
             "restore_reads": 6,
-            "deletes": 38,
+            "deletes": 40,
             "late_puts_landed": 2,
-            "store_log_digest": "9646317617e474daab42460e2ef20b71558248ff1abee3dd6f386877c89a8a8b"
+            "store_log_digest": "bb6dcf038d5d7b54cc0ec2e8fea0e619b1595fa069d4b0afaf1f8acc7e2358bb"
           }
         ]
       }
