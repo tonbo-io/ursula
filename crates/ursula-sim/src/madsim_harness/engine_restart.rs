@@ -77,6 +77,7 @@ const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(600),
     keep: 8,
     interval: Duration::from_millis(200),
+    permits: 1,
 };
 
 /// How long after a replica's engine stopped the run looks again at what

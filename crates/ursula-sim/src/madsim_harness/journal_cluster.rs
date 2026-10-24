@@ -89,6 +89,9 @@ pub(super) struct DriverPlan {
     pub(super) keep: u64,
     /// The pause between the driver's ticks.
     pub(super) interval: Duration,
+    /// `raft.snapshot_build_max_concurrency`: the snapshot builds each node
+    /// runs at once, which the engine factory sets on the node's registry.
+    pub(super) permits: usize,
 }
 
 std::thread_local! {
@@ -221,13 +224,21 @@ pub(super) struct ReplicaStartRefused {
 }
 
 /// A node process's registry of its replicas, with the cluster's install
-/// timeout when it runs the snapshot store.
-fn node_registry(install_timeout: Option<Duration>) -> ursula_raft::RaftGroupHandleRegistry {
+/// timeout when it runs the snapshot store, and the drivers' build permits
+/// when it runs them.
+fn node_registry(
+    install_timeout: Option<Duration>,
+    drivers: Option<DriverPlan>,
+) -> ursula_raft::RaftGroupHandleRegistry {
     let registry = ursula_raft::RaftGroupHandleRegistry::default();
-    match install_timeout {
+    let registry = match install_timeout {
         Some(install_timeout) => registry.with_snapshot_install(1, install_timeout),
         None => registry,
+    };
+    if let Some(drivers) = drivers {
+        registry.set_snapshot_build_max_concurrency(drivers.permits);
     }
+    registry
 }
 
 /// The object key the snapshot record at `path` names for a restore, if
@@ -529,7 +540,7 @@ impl JournalCluster {
             spares,
             drivers,
             node_registries: (1..=nodes)
-                .map(|node_id| (node_id, node_registry(install_timeout)))
+                .map(|node_id| (node_id, node_registry(install_timeout, drivers)))
                 .collect(),
             driver_tasks: BTreeMap::new(),
             recovery_registries: (1..=nodes)
@@ -820,7 +831,7 @@ impl JournalCluster {
             objects.install_timeout
         });
         self.node_registries
-            .insert(node_id, node_registry(install_timeout));
+            .insert(node_id, node_registry(install_timeout, self.drivers));
     }
 
     /// What starting `node_id`'s replicas reads of the cluster, for a node

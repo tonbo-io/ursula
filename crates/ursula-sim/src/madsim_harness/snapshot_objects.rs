@@ -87,6 +87,7 @@ const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(12),
     keep: 4,
     interval: Duration::from_millis(100),
+    permits: 1,
 };
 /// `raft.install_snapshot_timeout` of every node: the wait of a group's
 /// second GC pass after a write that failed or a restore. A late PUT lands
