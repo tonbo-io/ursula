@@ -2,7 +2,8 @@ name: Integration
 
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against the
-# model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three.
+# model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three,
+# and its parts suites through three nodes behind the gateway with an S3 cold store.
 # S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
 # PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
@@ -298,16 +299,42 @@ jobs:
   # The same suites against the real server (E2E_SERVER=ursula): one node with an in-memory cold
   # store, and three nodes behind the gateway with no cold tier, where test/failover.e2e.ts kills
   # the leader of a stream's group during commits. A suite or case the real server cannot serve
-  # says so in its name and why. No S3 here.
+  # says so in its name and why. The third entry runs the parts suites (test/parts.e2e.ts,
+  # test/import.e2e.ts and the core's snapshot-parts cases) through three nodes behind a gateway
+  # whose request limit, 4 MiB, is below the test snapshots, with the CI S3 as the cold store: the
+  # path a deployment's snapshots in parts take. Its 4 MiB is the client's batch cap, so the PART
+  # runs keep their sizes. Another suite that needs three nodes, the gateway and a cold store joins
+  # that entry by adding its file to `suites`.
   sqlite-vfs-e2e-ursula:
-    name: sqlite-vfs e2e (ursula, ${{ matrix.nodes }} node${{ matrix.nodes == '3' && 's + gateway' || '' }})
+    name: sqlite-vfs e2e (ursula, ${{ matrix.label }})
     needs: [build-ursula, sqlite-vfs]
     strategy:
       fail-fast: false
       matrix:
-        nodes: ["1", "3"]
+        include:
+          - label: 1 node
+            nodes: "1"
+            cold: memory
+          - label: 3 nodes + gateway
+            nodes: "3"
+            cold: none
+          - label: 3 nodes + gateway + S3, snapshot parts
+            nodes: "3"
+            cold: s3
+            gateway-max-request-bytes: "4194304"
+            suites: test/parts.e2e.ts test/import.e2e.ts
+            # Run from test/core.e2e.ts by name; the step fails unless at least `core-min` pass.
+            core-cases: in parts
+            core-min: 2
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Keeps the job's OIDC request variables out of npm and test processes: a speed bump against
+      # env-scraping code, not a boundary.
+      NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
     steps:
       # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
       - name: Use the RunsOn cache
@@ -333,27 +360,81 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      - name: e2e (every suite, crashes, outages and Pi conformance included)
-        timeout-minutes: 35
-        env:
-          E2E_NODES: ${{ matrix.nodes }}
-          # No S3 here: one node keeps an in-memory cold store, three run with no cold tier.
-          URSULA_COLD: ${{ matrix.nodes == '3' && 'none' || 'memory' }}
+      # Before any AWS credential exists.
+      - name: Install and build the package
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
-          npm ci
-          npm run build
-          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+          $NO_OIDC npm ci
+          $NO_OIDC npm run build
+
+      # AWS S3 through the CI role (one prefix per job) on same-repo PRs and main, MinIO otherwise.
+      - name: S3 backend
+        id: s3
+        if: matrix.cold == 's3'
+        uses: ./.github/actions/ci-s3
+        with:
+          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
+          bucket: ${{ secrets.URSULA_CI_S3_BUCKET }}
+          region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
+          job-key: ${{ github.job }}-parts
+
+      - name: e2e (${{ matrix.suites && 'snapshot parts through the gateway' || 'every suite, crashes, outages and Pi conformance included' }})
+        timeout-minutes: 35
+        env:
+          E2E_SERVER: ursula
+          E2E_NODES: ${{ matrix.nodes }}
+          # memory: one node's in-memory cold store; none: no cold tier (three nodes cannot share an
+          # in-memory one); s3: the S3 backend above (test/stack.ts reads URSULA_S3_*).
+          URSULA_COLD: ${{ matrix.cold }}
+          E2E_GATEWAY_MAX_REQUEST_BYTES: ${{ matrix.gateway-max-request-bytes }}
+          SUITES: ${{ matrix.suites }}
+          CORE_CASES: ${{ matrix.core-cases }}
+          CORE_MIN: ${{ matrix.core-min }}
+        run: |
+          export E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so"
+          cd clients/sqlite-ursula
+          if [ -z "$SUITES" ]; then
+            $NO_OIDC npm run test:e2e
+            exit 0
+          fi
+          # shellcheck disable=SC2086 # SUITES is a space-separated list of files
+          $NO_OIDC npx vitest --run $SUITES
+          report="$RUNNER_TEMP/core-cases.json"
+          $NO_OIDC npx vitest --run test/core.e2e.ts -t "$CORE_CASES" --reporter=default --reporter=json --outputFile.json="$report"
+          node -e '
+            const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            const min = Number(process.argv[2]);
+            console.log(`test/core.e2e.ts -t "${process.argv[3]}": ${r.numPassedTests} passed, ${r.numPendingTests} skipped`);
+            if (!(r.numPassedTests >= min)) throw new Error(`expected at least ${min} core cases to pass`);
+          ' "$report" "$CORE_MIN" "$CORE_CASES"
+
+      # Secret masking covers logs, not artifacts: the node logs can name the bucket.
+      - name: Redact and check the server logs for AWS credentials and identifiers
+        id: leak
+        if: failure() && env.URSULA_S3_PREFIX != ''
+        uses: ./.github/actions/ci-s3-artifact-guard
+        with:
+          dir: ${{ runner.temp }}/e2e-logs
+          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
 
       - name: Upload the server logs
-        if: failure()
+        if: failure() && steps.leak.outcome != 'failure'
         uses: actions/upload-artifact@v6
         with:
-          name: sqlite-vfs-e2e-ursula-${{ matrix.nodes }}-logs
+          name: sqlite-vfs-e2e-ursula-${{ matrix.nodes }}-${{ matrix.cold }}-logs
           path: ${{ runner.temp }}/e2e-logs
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Delete this job's S3 prefix
+        if: always() && env.URSULA_S3_PREFIX != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env: { AWS_EC2_METADATA_DISABLED: "true" }
+        run: |
+          case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
+          aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors
 
   # M1 exit criterion: a commit's p50 on the VFS within 0.5 ms of B1, plain node:sqlite with WAL and
   # synchronous=NORMAL, on the same workload (clients/sqlite-ursula/bench/commit.ts). Latency on a

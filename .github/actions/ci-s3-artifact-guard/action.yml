@@ -1,0 +1,53 @@
+name: CI S3 artifact guard
+description: >-
+  Before a job that used .github/actions/ci-s3 in AWS mode uploads a directory: replaces the bucket,
+  the role ARN and the account id in its files with <redacted>, then fails if any of them, or the
+  session's AWS credentials, still appear. Secret masking covers logs, not artifacts, and server
+  logs can name the bucket. Run it only when URSULA_S3_PREFIX is set, and upload only when it did
+  not fail.
+inputs:
+  dir: { description: "The directory about to be uploaded (a missing one passes)", required: true }
+  role-arn: { description: "secrets.URSULA_CI_AWS_ROLE_ARN", required: false, default: "" }
+runs:
+  using: composite
+  steps:
+    - name: Redact AWS identifiers
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        ROLE_ARN: ${{ inputs.role-arn }}
+      run: |
+        [ -d "$DIR" ] || exit 0
+        python3 - "$DIR" <<'PY'
+        import os, pathlib, sys
+        arn = os.environ.get("ROLE_ARN", "")
+        account = arn.split(":")[4] if arn.count(":") >= 5 else ""
+        values = sorted({v for v in (arn, os.environ.get("URSULA_S3_BUCKET", ""), account) if v}, key=len, reverse=True)
+        for path in pathlib.Path(sys.argv[1]).rglob("*"):
+            if path.is_file():
+                data = path.read_bytes()
+                redacted = data
+                for value in values:
+                    redacted = redacted.replace(value.encode(), b"<redacted>")
+                if redacted != data:
+                    path.write_bytes(redacted)
+        PY
+
+    - name: Check for AWS credentials and identifiers
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        ROLE_ARN: ${{ inputs.role-arn }}
+      run: |
+        [ -d "$DIR" ] || exit 0
+        account="$(printf '%s' "$ROLE_ARN" | cut -d: -f5)"
+        patterns="$(for v in "${AWS_SECRET_ACCESS_KEY:-}" "${AWS_SESSION_TOKEN:-}" "$ROLE_ARN" "$account" "${URSULA_S3_BUCKET:-}"; do [ -z "$v" ] || printf '%s\n' "$v"; done)"
+        [ -n "$patterns" ] || exit 0
+        set +e   # patterns come from a pipe, never argv; any grep error fails closed
+        grep -rlF -f <(printf '%s\n' "$patterns") -- "$DIR"; rc=$?
+        set -e
+        case $rc in
+          1) exit 0 ;;
+          0) echo "::error title=Credential leak guard::AWS credentials or identifiers appear in the files listed above; not uploading"; exit 1 ;;
+          *) echo "::error title=Credential leak guard::grep failed ($rc); not uploading"; exit 1 ;;
+        esac
