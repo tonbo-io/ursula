@@ -1394,8 +1394,7 @@ Tests: `model/tests.rs` and `model/producer.rs` (one test per producer row, the 
 history events and inheritance, HEAD identity on `200` and `404`, typed `413`s, snapshots, parts
 and ranges), and `transport/http/tests.rs`
 `addendum_4_the_order_is_the_same_over_http_and_in_process`. The CI jobs `sqlite-vfs-e2e-ursula`
-run every e2e suite against one real node with an in-memory cold store and against three nodes
-behind the gateway.
+run every e2e suite against one real node with an in-memory cold store and against three nodes behind the gateway, and the parts suites against three nodes behind a gateway with a 4 MiB request limit and an S3 cold store ([Verification](#verification)).
 
 ## Formats
 
@@ -1431,9 +1430,7 @@ What CI runs (`.github/workflows/integration.yml`):
   and macOS.
 - `sqlite-vfs-e2e`: every e2e suite against the model server (`E2E_SERVER=model`) on Node 22.19.0
   and Node 22, and Pi conformance on the oldest supported Pi.
-- `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store
-  (with `test/history-real.e2e.ts`) and three nodes behind the gateway (with
-  `test/failover.e2e.ts`).
+- `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store (with `test/history-real.e2e.ts`) and three nodes behind the gateway with no cold tier (with `test/failover.e2e.ts`). A third entry runs `test/parts.e2e.ts`, `test/import.e2e.ts` and the snapshot-parts cases of `test/core.e2e.ts` (`-t "in parts"`) against three nodes behind a gateway started with `--max-request-body-bytes 4194304` (`E2E_GATEWAY_MAX_REQUEST_BYTES`), with the CI S3 as the cold store (`.github/actions/ci-s3`: AWS S3 on same-repo pull requests and main, MinIO otherwise). The gateway lowers HEAD's `Ursula-Max-Request-Bytes` to 4 MiB and passes the node's `Ursula-Max-Snapshot-Bytes` through, and the test setup refuses to start unless HEAD shows both, so every snapshot above 4 MiB goes up in parts through the gateway and is read back in 4 MiB ranges. 4 MiB is also the client's batch cap, so PART runs keep their sizes. A suite that needs three nodes, the gateway and a cold store joins this entry through its `suites` list.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)). It fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
 - `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a 600 s outage, daily, on pushes
