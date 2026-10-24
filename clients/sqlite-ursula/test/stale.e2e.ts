@@ -400,11 +400,14 @@ describe("stale caches reopened across hosts", () => {
 		// The open that commits r3 and C's open both find new claims (each other's and the probes'),
 		// so each measurement first lets a throwaway copy of the original claim the stream: the
 		// copy's probe then finds that claim and the original's probe the copy's, as the real opens
-		// will. With the catch-ups measured alike, an open that closes cleanly adds three records to
-		// a root (the catch-up's ACK, its CLAIM and the close's ACK) and one killed after it bound
-		// adds two, so the root that is behind is padded with those until both positions meet: by
-		// three while it is three or more behind, by two at two or four, and by three at one, which
-		// leaves the other root two behind. C's first padding open, if any, catches r2 up in place.
+		// will. Measured alike, every open of a root adds three records to it (the catch-up's ACK,
+		// its CLAIM and one more), whether it closes cleanly or is killed (CI runs 40111986003 and
+		// 40113019791), so opens alone keep the gap modulo three. A synced commit by the original
+		// shifts it by four or five: the original logs three records for the open and three for the
+		// commit, and the copy's catch-up grows by one commit (or by a commit and a BASE once it had
+		// only claims to catch up). So while the gap is not a multiple of three the original commits
+		// once more, and then the root that is behind is padded with opens until both positions
+		// meet. C's first padding open, if any, catches the original's commits up in place.
 		const nextCommit = async (dir: string): Promise<number> => {
 			const probe = host(`${front.url}${s.path}`, copyOf(dir));
 			expect((await probe.opened()).state).toBe("live");
@@ -419,18 +422,27 @@ describe("stale caches reopened across hosts", () => {
 			await throwaway.stop("SIGKILL");
 		};
 		let q = 0;
-		for (let pads = 0; ; pads++) {
+		let shifts = 0;
+		for (let steps = 0; ; steps++) {
 			await claimOnce(dirA);
 			q = await nextCommit(dirC);
 			const p = await nextCommit(dirA);
-			report(`S5: after ${pads} padding opens the copy commits next at ${q}, the original at ${p}`);
+			report(`S5: after ${steps} steps (${shifts} commits by the original) the copy commits next at ${q}, the original at ${p}`);
 			if (p === q) break;
-			expect(pads, "padding never met both positions").toBeLessThan(12);
-			const behind = Math.abs(p - q);
+			expect(steps, "the steps never met both positions").toBeLessThan(12);
+			if ((p - q) % 3 !== 0) {
+				expect(shifts, `the original's commits never made the gap a multiple of three (copy ${q}, original ${p})`).toBeLessThan(2);
+				shifts++;
+				const shift = host(`${front.url}${s.path}`, dirA);
+				expect((await shift.opened()).state).toBe("live");
+				await shift.exec(model.tx(`shift${shifts}`, { updates: 1, inserts: 1 }));
+				await synced(shift);
+				await closeCleanly(shift);
+				continue;
+			}
 			const pad = host(`${front.url}${s.path}`, p < q ? dirA : dirC);
 			expect((await pad.opened()).state).toBe("live");
-			if (behind === 2 || behind === 4) await pad.stop("SIGKILL");
-			else await closeCleanly(pad);
+			await closeCleanly(pad);
 		}
 
 		// r3: held by the gate, at position q, and the host dies.
