@@ -4,7 +4,7 @@
 // this module only decides when to call it and what to hold back, and calls nothing else of the
 // package.
 import type { UrsulaDatabase } from "./database.ts";
-import { UrsulaError } from "./errors.ts";
+import { findWrapped, UrsulaError } from "./errors.ts";
 
 /** {@link gate}'s options. */
 export interface GateOptions {
@@ -25,7 +25,8 @@ const READ_AHEAD_BYTES = 64 * 1024;
  * result, or an error, that rests on an unacknowledged commit or on ownership this process is about
  * to lose. A result that only read waits too: it may have read another call's pending commit.
  *
- * - An {@link UrsulaError} thrown by `work` is rethrown at once: it carries no application state. A
+ * - An {@link UrsulaError} thrown by `work` is rethrown at once, also when a library wrapped it (as
+ *   a `cause`, or in an AggregateError), as `work` threw it: it carries no application state. A
  *   refused write committed nothing, and a reset is what the wait would report. Every other error
  *   waits as a result does.
  * - A reset during the wait rejects with the `UrsulaResetError`, and the outcome is dropped.
@@ -50,7 +51,7 @@ export async function gate<T>(db: UrsulaDatabase | readonly UrsulaDatabase[], wo
 	try {
 		outcome = { ok: true, value: await work() };
 	} catch (error) {
-		if (error instanceof UrsulaError) throw error;
+		if (findWrapped(error, (next) => (next instanceof UrsulaError ? next : undefined)) !== undefined) throw error;
 		outcome = { ok: false, error };
 	}
 	const release = new Release(dbs);

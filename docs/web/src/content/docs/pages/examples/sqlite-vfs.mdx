@@ -69,11 +69,11 @@ const processor = (job: Job) => gate(db, () => applyJob(db, job));
 
 | what is held | released when | if a reset comes first | if `signal` fires first |
 | --- | --- | --- | --- |
-| the result of `work`, or its error unless that is an `UrsulaError` | a `synced()` call made after `work` settled resolves on every database | rejects with the `UrsulaResetError`, and the outcome is dropped | rejects with `signal.reason`, the outcome is dropped and a returned body is cancelled |
+| the result of `work`, or its error unless that is or wraps an `UrsulaError` | a `synced()` call made after `work` settled resolves on every database | rejects with the `UrsulaResetError`, and the outcome is dropped | rejects with `signal.reason`, the outcome is dropped and a returned body is cancelled |
 | each chunk of a returned `Response` body, and its end | a `synced()` call made after the chunk was read resolves | the body errors | not applied: cancel the body to stop it |
 
 - Reads wait too: a result may have read another call's pending commit, or state this process is about to lose to a takeover.
-- An `UrsulaError` thrown by `work` is rethrown at once: a refused write committed nothing, and a reset is what the wait would report.
+- An `UrsulaError` thrown by `work` is rethrown at once, also when a library wrapped it (as a `cause`, or in an `AggregateError`): a refused write committed nothing, and a reset is what the wait would report.
 - A gate has at most one `synced()` call in flight, and chunks read meanwhile wait for the next one, so a streamed body pays one round trip per batch, not per chunk. It reads ahead at most 64 KiB plus one chunk, and chunks leave in order.
 - A `node:http` response is not gated by itself: write it after the gate, as in `res.end(await gate(db, () => save(req)))`.
 

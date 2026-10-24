@@ -58,7 +58,7 @@ for await (const message of subscription) {
 
 - `db` is one database or an array of them. With several, the gate waits for all of them, in parallel.
 - Reads wait too: a result may have read another call's pending commit, or state this process is about to lose to a takeover.
-- `work`'s errors wait as its results do, except an `UrsulaError`, which is thrown at once: a refused write committed nothing, and a reset is what the wait would report. A reset during the wait rejects with the `UrsulaResetError`, and the outcome is dropped.
+- `work`'s errors wait as its results do, except an `UrsulaError`, which is thrown at once, also when a library wrapped it (as a `cause`, or in an `AggregateError`): a refused write committed nothing, and a reset is what the wait would report. A reset during the wait rejects with the `UrsulaResetError`, and the outcome is dropped.
 - When `work` returns a `Response` with a body, the gate resolves with one of the same status and headers whose body passes each chunk, and its end, on only once a `synced()` call made after the chunk was read resolved. One call covers every chunk read while the previous call was in flight, so a stream pays one round trip per batch, not per chunk, and the gate reads ahead at most 64 KiB plus one chunk. A reset errors the body.
 - `signal` bounds the wait for the outcome, which for a `Response` is its status and headers: the gate rejects with `signal.reason` and cancels a returned body, and the commits keep replicating. It does not cut short a body that has started. Cancel the body to stop it.
 - A `node:http` response is not gated by itself: write it after the gate, as in `res.end(await gate(db, () => save(req)))`.

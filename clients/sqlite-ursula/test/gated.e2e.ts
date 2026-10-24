@@ -96,7 +96,7 @@ describe("gate", () => {
 		db.close();
 	});
 
-	it("G3: holds work's own error as it holds a result, and rethrows a backlog_full refusal at once", async () => {
+	it("G3: holds work's own error as it holds a result, and rethrows a backlog_full refusal at once, also when a library wrapped it", async () => {
 		const { db } = await table("gate-error");
 		await fault("delay 1000", 1, "POST");
 		const started = Date.now();
@@ -122,6 +122,29 @@ describe("gate", () => {
 		expect(Date.now() - refusedAt).toBeLessThan(300);
 		expect(refused).toBeInstanceOf(UrsulaWriteRefusedError);
 		expect(refused).toMatchObject({ kind: "backlog_full", action: "retry" });
+		// Wrapped as drizzle wraps a driver's error (DrizzleQueryError's cause), and in an AggregateError
+		// (a failed ROLLBACK after it): rethrown at once, as work threw it.
+		const wraps: ((refusal: unknown) => Error)[] = [
+			(refusal) => new Error("Failed query: INSERT INTO t VALUES (3)", { cause: refusal }),
+			(refusal) => new AggregateError([new Error("cannot rollback - no transaction is active"), refusal], "COMMIT failed"),
+		];
+		for (const wrap of wraps) {
+			let wrapper: Error | undefined;
+			const wrappedAt = Date.now();
+			const wrapped = await rejection(
+				gate(bounded.db, () => {
+					try {
+						bounded.db.exec("INSERT INTO t VALUES (3)");
+					} catch (refusal) {
+						wrapper = wrap(refusal);
+						throw wrapper;
+					}
+				}),
+			);
+			expect(Date.now() - wrappedAt).toBeLessThan(300);
+			expect(wrapper).toBeDefined();
+			expect(wrapped).toBe(wrapper);
+		}
 		await bounded.db.synced();
 		expect(bounded.db.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
 		bounded.db.close();
@@ -333,5 +356,98 @@ describe("gate", () => {
 		expect(commits.acknowledged).toBeGreaterThanOrEqual(commits.logged);
 		idle.db.close();
 		busy.db.close();
+	});
+
+	it("G10: holds a body's end, and its error, until the commit before them is acknowledged", async () => {
+		const { db } = await table("gate-body-end");
+		const failure = new Error("the body's own error");
+		for (const ending of ["end", "error"] as const) {
+			const go = Promise.withResolvers<void>();
+			let position = 0;
+			let committedAt = 0;
+			const source = new ReadableStream<Uint8Array>({
+				async pull(controller) {
+					await go.promise;
+					db.exec("INSERT INTO t VALUES (1)");
+					position = db.status().commits.logged;
+					committedAt = Date.now();
+					if (ending === "end") controller.close();
+					else controller.error(failure);
+				},
+			});
+			const response = await gate(db, () => new Response(source));
+			// The commit before the end or the error is answered late.
+			await fault("delay 1000", 1, "POST");
+			go.resolve();
+			const { chunks, error } = await drain(response.body as ReadableStream<Uint8Array>);
+			expect(Date.now() - committedAt).toBeGreaterThanOrEqual(900);
+			expect(db.status().commits.acknowledged).toBeGreaterThanOrEqual(position);
+			expect(chunks).toEqual([]);
+			expect(error).toBe(ending === "end" ? undefined : failure);
+		}
+		db.close();
+	});
+
+	it("G11: a body cancelled while its synced() call is in flight cancels the source with the reason and leaves no call pending", async () => {
+		const { db } = await table("gate-body-cancel");
+		/** The synced() calls not settled yet. */
+		let inFlight = 0;
+		const synced = db.synced.bind(db);
+		db.synced = (options) => {
+			inFlight += 1;
+			return synced(options).finally(() => {
+				inFlight -= 1;
+			});
+		};
+		const go = Promise.withResolvers<void>();
+		const pulled = Promise.withResolvers<void>();
+		let cancelled: unknown;
+		let pulls = 0;
+		const source = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				pulls += 1;
+				// One chunk, then a source that has nothing more yet.
+				if (pulls > 1) return new Promise<void>(() => {});
+				await go.promise;
+				db.exec("INSERT INTO t VALUES (1)");
+				controller.enqueue(text.encode("held"));
+				pulled.resolve();
+			},
+			cancel(reason) {
+				cancelled = reason;
+			},
+		});
+		const response = await gate(db, () => new Response(source));
+		expect(inFlight).toBe(0);
+		// The chunk's commit is answered late, so its synced() call is in flight when the body is cancelled.
+		await fault("delay 1000", 1, "POST");
+		go.resolve();
+		await pulled.promise;
+		await sleep(100);
+		expect(inFlight).toBe(1);
+		const cancelledAt = Date.now();
+		const reason = new Error("the client went away");
+		await (response.body as ReadableStream<Uint8Array>).cancel(reason);
+		expect(cancelled).toBe(reason);
+		await sleep(100);
+		expect(inFlight).toBe(0);
+		expect(Date.now() - cancelledAt).toBeLessThan(500);
+		await db.synced();
+		db.close();
+	});
+
+	it("G12: errors a body with a TypeError when its source enqueues a chunk that is not bytes", async () => {
+		const { db } = await table("gate-body-type");
+		const source = new ReadableStream<unknown>({
+			start(controller) {
+				controller.enqueue("text");
+				controller.close();
+			},
+		});
+		const response = await gate(db, () => new Response(source as ReadableStream<Uint8Array>));
+		const { chunks, error } = await drain(response.body as ReadableStream<Uint8Array>);
+		expect(chunks).toEqual([]);
+		expect(error).toBeInstanceOf(TypeError);
+		db.close();
 	});
 });
