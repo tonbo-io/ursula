@@ -164,6 +164,142 @@ fn usage_counts_json_records_and_survives_snapshot_restore() {
     assert_eq!(usage.retained_bytes, 16);
 }
 
+fn publish_snapshot_external_cmd(
+    stream_id: BucketStreamId,
+    snapshot_offset: u64,
+    payload_len: u64,
+    object_size: u64,
+) -> StreamCommand {
+    StreamCommand::PublishSnapshotExternal {
+        stream_id,
+        snapshot_offset,
+        content_type: OCTET.to_owned(),
+        object: ExternalPayloadRef {
+            s3_path: format!("benchcmp/external/{snapshot_offset}.bin"),
+            payload_len,
+            object_size,
+        },
+        digest: format!("digest-{snapshot_offset}"),
+        now_ms: 0,
+        expected_incarnation: None,
+    }
+}
+
+fn snapshot_bytes(machine: &StreamStateMachine) -> BTreeMap<String, u64> {
+    machine.snapshot_bytes_by_bucket()
+}
+
+/// A bucket's snapshot bytes are the body lengths of its streams' latest
+/// snapshots: an inline body by its length, a cold body by `payload_len`
+/// (not `object_size`), a replacement instead of what it replaced, and an
+/// idempotent repeat once. A stream without a snapshot adds nothing, and a
+/// group snapshot restores the same value without persisting it.
+#[test]
+fn snapshot_bytes_count_each_streams_latest_body() {
+    let mut machine = machine();
+    for id in ["db", "other", "plain"] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream(id), Create {
+                payload: b"abcdefgh".to_vec(),
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+    assert!(snapshot_bytes(&machine).is_empty());
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("db"), 2, OCTET, b"inline", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(
+        snapshot_bytes(&machine),
+        BTreeMap::from([("benchcmp".to_owned(), 6)])
+    );
+    // An idempotent repeat leaves the value unchanged.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("db"), 2, OCTET, b"inline", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(snapshot_bytes(&machine)["benchcmp"], 6);
+
+    // A cold replacement counts its uploaded length instead.
+    assert!(matches!(
+        machine.apply(publish_snapshot_external_cmd(stream("db"), 4, 1000, 1024)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(snapshot_bytes(&machine)["benchcmp"], 1000);
+
+    // Streams of one bucket add up.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("other"), 8, OCTET, b"abc", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(snapshot_bytes(&machine)["benchcmp"], 1003);
+
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(snapshot_bytes(&restored), snapshot_bytes(&machine));
+
+    assert_eq!(
+        machine.apply(delete_cmd(stream("db"))),
+        StreamResponse::Deleted { expired: false }
+    );
+    assert_eq!(snapshot_bytes(&machine)["benchcmp"], 3);
+}
+
+/// TTL expiry and a bucket purge remove a stream's snapshot bytes with the
+/// stream, and only in its own bucket.
+#[test]
+fn snapshot_bytes_leave_with_expired_and_purged_streams() {
+    let mut machine = machine();
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "other-tenant".to_owned(),
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    let other = BucketStreamId::new("other-tenant", "db");
+    for (stream_id, ttl_seconds) in [
+        (stream("expiring"), Some(1)),
+        (stream("kept"), None),
+        (other.clone(), None),
+    ] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream_id.clone(), Create {
+                payload: b"abcd".to_vec(),
+                ttl_seconds,
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+        assert!(matches!(
+            machine.apply(publish_snapshot_cmd(stream_id, 4, OCTET, b"body", 0)),
+            StreamResponse::SnapshotPublished { .. }
+        ));
+    }
+    assert_eq!(
+        snapshot_bytes(&machine),
+        BTreeMap::from([("benchcmp".to_owned(), 8), ("other-tenant".to_owned(), 4)])
+    );
+
+    assert!(matches!(
+        machine.apply(expire_streams_cmd(10_000)),
+        StreamResponse::StreamsExpired { .. }
+    ));
+    assert_eq!(snapshot_bytes(&machine)["benchcmp"], 4);
+
+    assert!(matches!(
+        machine.apply(StreamCommand::PurgeBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketPurged { .. }
+    ));
+    assert_eq!(
+        snapshot_bytes(&machine),
+        BTreeMap::from([("other-tenant".to_owned(), 4)])
+    );
+}
+
 /// A fresh state machine with the shared `benchcmp` bucket created.
 fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();

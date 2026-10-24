@@ -25,6 +25,7 @@
 
 use std::cmp::Ordering;
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -434,6 +435,33 @@ impl StreamStateMachine {
             .collect::<Vec<_>>();
         report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
         report
+    }
+
+    /// Per bucket, the summed body length of each live stream's latest
+    /// visible snapshot, as uploaded: the inline payload's length, or
+    /// `payload_len` of the cold object that holds the body. A bucket
+    /// without a published snapshot is absent.
+    ///
+    /// Derived from the slots on every call (O(streams)), never kept in
+    /// replicated or persisted state, so it cannot drift from the streams
+    /// it describes and changes no format. A replaced body during its GC
+    /// grace, staged snapshot parts and Raft group snapshots do not count.
+    pub fn snapshot_bytes_by_bucket(&self) -> BTreeMap<String, u64> {
+        let mut bytes = BTreeMap::<String, u64>::new();
+        for slot in self.registry.slots() {
+            let Some(snapshot) = slot.visible_snapshot.as_ref() else {
+                continue;
+            };
+            let body_len = snapshot.object.as_ref().map_or_else(
+                || u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX),
+                |object| object.payload_len,
+            );
+            let total = bytes
+                .entry(slot.metadata.stream_id.bucket_id.clone())
+                .or_default();
+            *total = total.saturating_add(body_len);
+        }
+        bytes
     }
 
     fn refresh_ttl_entry(&mut self, stream_id: &BucketStreamId) {

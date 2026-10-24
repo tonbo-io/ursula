@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
@@ -836,6 +837,13 @@ impl InMemoryGroupEngine {
     /// Raft engine can serve usage reads from its applied state machine.
     pub fn bucket_usage_report(&self) -> Vec<ursula_stream::BucketUsageSnapshot> {
         self.state_machine.bucket_usage_report()
+    }
+
+    /// Per-bucket bytes of the latest visible snapshot bodies in this
+    /// group's state machine. Public so the Raft engine can serve usage
+    /// reads from its applied state machine.
+    pub fn snapshot_bytes_by_bucket(&self) -> BTreeMap<String, u64> {
+        self.state_machine.snapshot_bytes_by_bucket()
     }
 
     /// Bounded-state gauges of the applied state (Gauges in
@@ -1800,6 +1808,7 @@ impl GroupEngine for InMemoryGroupEngine {
             Ok(super::GroupBucketUsage {
                 applied_index: self.commit_index,
                 buckets: self.state_machine.bucket_usage_report(),
+                snapshot_bytes: self.state_machine.snapshot_bytes_by_bucket(),
             })
         })
     }
