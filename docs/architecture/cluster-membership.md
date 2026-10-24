@@ -507,8 +507,11 @@ meta learner join, vote floor and recovery gate as any new node: its
 replicas are created only by moves, and an empty replica refuses every vote
 and acknowledgement until a live leader's barrier gave it a floor and it
 caught up to the barrier. An empty log whose persisted vote is committed
-above genesis, which only such a floor writes, opens with its gate refusing
-every candidate, across a restart too (`GroupRejoin::durable`).
+above genesis, a live leader's (such a floor, or the vote OpenRaft saves
+before it appends a leader's entries), opens with its gate refusing every
+candidate, across a restart too (`GroupRejoin::durable`). A seed follower at
+genesis that saved a leader's vote before its first entry opens so as well:
+safe, at the cost of liveness in a narrow genesis corner.
 
 `ursulactl node replace-disk --node N --expect-root R` releases `R`
 through `POST /__ursula/placement/nodes/{node}/replace-disk` on another

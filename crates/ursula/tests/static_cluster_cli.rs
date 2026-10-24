@@ -9083,11 +9083,12 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
     .await;
     procs.kill(5);
     procs.start(binary, &old_disk);
-    // Past the predecessor wait the old disk owes, and its GC pass after
-    // the restore, the new disk's object stays.
+    // Past the predecessor wait the old disk owes, which refuses its start
+    // pass and its GC pass after the restore, and past the next attempt of
+    // each, 30 s later (the snapshot GC retry), the new disk's object stays.
     let kept_until = std::time::Instant::now()
         .checked_add(ursula_raft::predecessor_wait::PREDECESSOR_WAIT)
-        .and_then(|after| after.checked_add(Duration::from_secs(20)))
+        .and_then(|after| after.checked_add(Duration::from_secs(30 + 20)))
         .unwrap();
     while std::time::Instant::now() < kept_until {
         let objects = owned_objects(&cold_store, &prefix, 5, log_only)
@@ -9149,27 +9150,28 @@ async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_g
 ///    leadership moves, the new leader asks every group again, and reports
 ///    the leaderless group unconfirmed, so no removal completes. Node 5 is
 ///    killed and its WAL directory is moved aside (the old disk).
-/// 3. Node 5 starts on an empty WAL. Its registration and its readiness
-///    report `removal_pending` (503), and its data replicas take part in
-///    nothing. `verify-joinable` times out naming the leaderless group,
-///    which the meta leader's report lists as unconfirmed. The new disk is
-///    killed, its root still unbound.
-/// 4. The two nodes restart. `verify-joinable` passes once the removal
-///    completed: a confirmed view shows node 5 vacant on its old root
-///    released, and the meta leader reports no pending removal.
-/// 5. The old disk starts: it is refused for the released root and
-///    superseded, and the groups keep taking writes. It is killed.
-/// 6. The new disk starts again: it binds a new root, waits out its
-///    predecessor and turns ready with no group. Two groups move onto it,
-///    one of them is led by it, and every group takes a write that node 5
-///    reads.
-/// 7. Node 5 is killed and the old disk starts again: it is refused for
-///    the new root and superseded, while the groups on node 5 keep taking
-///    writes. Then the new disk rejoins with its log and serves its groups.
+/// 3. Node 5 starts on an empty WAL and keeps running. Its registration and
+///    its readiness report `removal_pending` (503), and its data replicas
+///    take part in nothing. `verify-joinable` times out naming the
+///    leaderless group, which the meta leader's report lists as unconfirmed,
+///    with no process of the old root answering: the new disk answers at
+///    node 5's address on another root.
+/// 4. The two nodes restart. The same process of the new disk binds a new
+///    root once the removal completed, with no restart, and while it waits
+///    the meta leader never counts it a process of the old root.
+///    `verify-joinable` passes and the meta leader reports no pending
+///    removal. (The S3 test of decision 15 starts the old disk on the
+///    vacant id.)
+/// 5. The new disk waits out its predecessor and turns ready with no group.
+///    Two groups move onto it, one of them is led by it, and every group
+///    takes a write that node 5 reads.
+/// 6. Node 5 is killed and the old disk starts: it is refused for the new
+///    root and superseded, while the groups on node 5 keep taking writes.
+///    Then the new disk rejoins with its log and serves its groups.
 ///
 /// A removal that never completes, a removed id that never binds again, an
-/// early disk that binds before the completion, or an old disk that takes
-/// part again fails it.
+/// early disk that binds before the completion or only after a restart, or
+/// an old disk that takes part again fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_removed_id_runs_again_on_a_new_disk() {
     use ursula_ctl::placement::lifecycle::LifecycleEnd;
@@ -9374,7 +9376,8 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
                 pending: Some(pending),
             }) if *node == NodeId::new(5)
                 && pending.root == old
-                && pending.unconfirmed.contains(&blocked) =>
+                && pending.unconfirmed.contains(&blocked)
+                && !pending.process_answers =>
             {
                 Ok(())
             }
@@ -9382,12 +9385,46 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
         }
     })
     .await;
-    procs.kill(5);
 
-    // 4. The removal completes once every group has a live leader.
+    // 4. The removal completes once every group has a live leader, and the
+    // new disk, still running, binds a new root.
     for id in down {
         procs.start(binary, node_of(&nodes, id));
     }
+    let record = eventually_for(
+        &mut procs,
+        "the running new disk binds a new root",
+        LIFECYCLE_WAIT,
+        async || {
+            let report = ursula_ctl::view::leader_status(&ctl_client(), &ctl_manifest(&nodes, &[]))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|status| status.leader_report);
+            if let Some(pending) = report
+                .as_ref()
+                .and_then(|report| report.removal_pending.get(&NodeId::new(5)))
+            {
+                assert!(
+                    !pending.process_answers,
+                    "the meta leader counts the new disk a process of the old root: {pending:?}"
+                );
+            }
+            match placement_status(&client, &nodes[4]).await?.registration {
+                RegistrationStatus::Answered(Registered::Unreferenced(record)) => Ok(record),
+                RegistrationStatus::Answered(other) => {
+                    panic!("the new life holds no role yet: {other:?}")
+                }
+                other => Err(format!("{other:?}, removal pending {report:?}")),
+            }
+        },
+    )
+    .await;
+    let new = match record.root {
+        RootSlot::Bound(new) if new != old => new,
+        other => panic!("the new disk binds a new root: {other:?}"),
+    };
+    assert_eq!(record.lifecycle, NodeLifecycle::Active, "{record:?}");
     let mut out = Vec::new();
     ursula_ctl::placement::lifecycle::verify_removal(
         &ctl_client(),
@@ -9405,23 +9442,14 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
             String::from_utf8_lossy(&out)
         )
     });
-    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[5]).await;
-    assert_eq!(
-        cluster
-            .node(NodeId::new(5))
-            .map(|record| (record.lifecycle, record.root)),
-        Some((NodeLifecycle::Vacant, RootSlot::Released(old))),
-        "{cluster:?}"
-    );
     eventually(
         &mut procs,
         "the meta leader reports no pending removal",
         async || {
-            let status =
-                ursula_ctl::view::leader_status(&ctl_client(), &ctl_manifest(&nodes, &[5]))
-                    .await
-                    .map_err(|err| err.to_string())?
-                    .map_err(|refusal| refusal.to_string())?;
+            let status = ursula_ctl::view::leader_status(&ctl_client(), &ctl_manifest(&nodes, &[]))
+                .await
+                .map_err(|err| err.to_string())?
+                .map_err(|refusal| refusal.to_string())?;
             match status.leader_report {
                 Some(report) if report.removal_pending.is_empty() => Ok(()),
                 other => Err(format!("{other:?}")),
@@ -9430,32 +9458,7 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
     )
     .await;
 
-    // 5. The old disk is refused for its released root.
-    procs.start(binary, &old_disk);
-    wait_superseded_for(&client, &mut procs, &old_disk, RootSlot::Released(old)).await;
-    for group in 0..groups {
-        append_until_done(&client, &mut procs, &url(&nodes[0], group), "old-disk-up;").await;
-    }
-    procs.kill(5);
-
-    // 6. The new disk binds a new root and takes groups.
-    procs.start(binary, &nodes[4]);
-    let bound = wait_placement(
-        &client,
-        &mut procs,
-        &nodes[4],
-        "binds a new root under its vacant id",
-        |status| matches!(status.registration, RegistrationStatus::Answered(_)),
-    )
-    .await;
-    let RegistrationStatus::Answered(Registered::Unreferenced(record)) = bound.registration else {
-        panic!("the new life holds no role yet: {bound:?}");
-    };
-    let new = match record.root {
-        RootSlot::Bound(new) if new != old => new,
-        other => panic!("the new disk binds a new root: {other:?}"),
-    };
-    assert_eq!(record.lifecycle, NodeLifecycle::Active, "{record:?}");
+    // 5. The new life turns ready and takes groups.
     wait_readiness_reason(&client, &mut procs, &nodes[4], None).await;
     wait_eligible(&mut procs, &nodes, &[], &[5]).await;
     let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
@@ -9503,7 +9506,7 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
         .await;
     }
 
-    // 7. The old disk is refused for the new root, and the new disk rejoins.
+    // 6. The old disk is refused for the new root, and the new disk rejoins.
     procs.kill(5);
     procs.start(binary, &old_disk);
     wait_superseded_for(&client, &mut procs, &old_disk, RootSlot::Bound(new)).await;
@@ -9526,7 +9529,7 @@ async fn cli_a_removed_id_runs_again_on_a_new_disk() {
             &client,
             &mut procs,
             &read(&nodes[4], group.0),
-            "before;old-disk-up;after-reuse;old-disk-again;",
+            "before;after-reuse;old-disk-again;",
         )
         .await;
     }

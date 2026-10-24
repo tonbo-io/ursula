@@ -60,13 +60,16 @@ rules:
     resourceNames: [{{ $sts | quote }}]
     verbs: ["get"]
   {{- $desired := .Values.server.replicaCount | int }}
-  {{- if ge $desired 3 }}
-  # The volumes of the ordinals a raise can start (a raise from 1 is
-  # refused, so ordinal 2 up): a vacant id's is deleted.
+  {{- if ge $desired 4 }}
+  # The volumes of the ordinals a raise can start: a vacant id's is
+  # deleted. A raise from 1 is refused and the chart refuses 2, so a raise
+  # starts from 3 pods, and the meta voters' ordinals 0 to 2 are never
+  # granted. get alone also waits out the deletion, which kubectl's own
+  # --wait would do with list and watch.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     resourceNames:
-      {{- range $ordinal := untilStep 2 $desired 1 }}
+      {{- range $ordinal := untilStep 3 $desired 1 }}
       - {{ printf "raft-data-%s-%d" $sts $ordinal | quote }}
       {{- end }}
     verbs: ["get", "delete"]
@@ -157,7 +160,20 @@ data:
         case "${status}" in
           0)
             echo "scale check: node ${id} is vacant, deleting its old volume ${pvc}"
-            kubectl --namespace {{ .Release.Namespace | quote }} delete persistentvolumeclaim "${pvc}" --wait=true
+            kubectl --namespace {{ .Release.Namespace | quote }} delete persistentvolumeclaim "${pvc}" --wait=false
+            # The claim stays, terminating, until its protection finalizer
+            # is removed, and a pod the raise starts before that would be
+            # stuck on it.
+            waited=0
+            while [ -n "$(kubectl --namespace {{ .Release.Namespace | quote }} get persistentvolumeclaim "${pvc}" \
+              --ignore-not-found --output name)" ]; do
+              if [ "${waited}" -ge 60 ]; then
+                echo "scale check: refused, ${pvc} is still there 60 seconds after its delete. Check its finalizers, then run the upgrade again" >&2
+                exit 1
+              fi
+              sleep 1
+              waited=$((waited + 1))
+            done
             ;;
           3)
             echo "scale check: node ${id} is in a life, keeping its volume ${pvc}"

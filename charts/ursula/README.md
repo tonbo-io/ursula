@@ -256,12 +256,16 @@ The meta voters (ids 1 to 3) are never decommissioned. To lower the count:
    It cordons every named node first, so no group moves onto a node that
    leaves too, and returns once the meta leader moved every group away and
    removed each node.
-2. Lower `server.replicaCount` with `helm upgrade`. The StatefulSet deletes the
-   dropped pods, which lets each removal complete, and keeps their PVCs.
+2. Lower `server.replicaCount` with `helm upgrade` right after the
+   decommission returns. The StatefulSet deletes the dropped pods, which lets
+   each removal complete, and keeps their PVCs. A dropped pod that restarts
+   before the lower count, after a removal pass ran while it was down, comes
+   back superseded: unready, and holding the disruption budget until the
+   count is lowered.
 
 A raise back deletes the old PVC of each started id that is vacant, so you
-need not delete them yourself. A raise binds its new ids, so a `helm rollback`
-to the lower count waits until they are decommissioned again.
+need not delete them yourself. A raise binds its new ids, so the hook refuses a `helm
+rollback` to the lower count until they are decommissioned again.
 
 A single pod never grows under the chart. A single node grows only with
 `raft.meta_voters` and `raft.placement.replication_factor` set on every node

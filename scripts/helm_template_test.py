@@ -244,12 +244,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         live: str,
         pvcs: tuple[str, ...] = (),
         vacant_exits: dict[int, int] | None = None,
+        terminating_gets: int = 1,
     ) -> tuple[subprocess.CompletedProcess, list[str]]:
         """Runs the hook's script with a kubectl that answers `live` replicas
         (empty: no StatefulSet) and lists the PVCs of `pvcs`, and an ursulactl
         whose `verify-vacant --node N` exits `vacant_exits[N]` (0 when absent).
-        Answers the result and every ursulactl and kubectl delete call, in
-        order."""
+        A deleted PVC still answers the next `terminating_gets` gets, as a
+        claim does until its protection finalizer is removed. Answers the
+        result and every ursulactl, kubectl delete and sleep call, in order."""
         rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={desired}")
         configmap = documents(rendered, "ConfigMap")["test-ursula-scale-check"]
         body = re.search(r"  scale-check\.sh: \|\n(?P<script>(?: {4}.*\n)+)", configmap).group("script")
@@ -263,11 +265,24 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 f"  *statefulset*) printf '%s' '{live}' ;;\n"
                 f'  *"get persistentvolumeclaim"*)\n'
                 f'    for pvc in {" ".join(pvcs)}; do\n'
-                f'      case "$*" in *" $pvc "*) printf "persistentvolumeclaim/%s" "$pvc" ;; esac\n'
+                f'      case "$*" in *" $pvc "*)\n'
+                f'        if [ -f "{tools}/deleted-$pvc" ]; then\n'
+                f'          left="$(cat "{tools}/deleted-$pvc")"\n'
+                f'          [ "$left" -gt 0 ] || exit 0\n'
+                f'          echo $((left - 1)) > "{tools}/deleted-$pvc"\n'
+                f"        fi\n"
+                f'        printf "persistentvolumeclaim/%s" "$pvc" ;;\n'
+                f"      esac\n"
                 f"    done ;;\n"
-                f'  *"delete persistentvolumeclaim"*) echo "kubectl $*" >> "{calls}" ;;\n'
+                f'  *"delete persistentvolumeclaim"*)\n'
+                f'    echo "kubectl $*" >> "{calls}"\n'
+                f'    for pvc in {" ".join(pvcs)}; do\n'
+                f'      case "$*" in *" $pvc "*) echo {terminating_gets} > "{tools}/deleted-$pvc" ;; esac\n'
+                f"    done ;;\n"
                 f"esac\n"
             )
+            # The wait for a deleted claim to go sleeps between its gets.
+            sleep = f'#!/bin/sh\necho "sleep $*" >> "{calls}"\n'
             ursulactl = (
                 "#!/bin/sh\n"
                 f'echo "ursulactl $*" >> "{calls}"\n'
@@ -277,7 +292,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 f"  done\n"
                 f"fi\n"
             )
-            for tool, text in (("kubectl", kubectl), ("ursulactl", ursulactl)):
+            for tool, text in (("kubectl", kubectl), ("ursulactl", ursulactl), ("sleep", sleep)):
                 path = os.path.join(tools, tool)
                 with open(path, "w") as stub:
                     stub.write(text)
@@ -329,9 +344,24 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(called, [
             joinable,
             vacant(4),
-            'kubectl --namespace default delete persistentvolumeclaim raft-data-test-ursula-3 --wait=true',
+            'kubectl --namespace default delete persistentvolumeclaim raft-data-test-ursula-3 --wait=false',
+            # The deleted claim is still there, terminating, at the first get:
+            # the hook waits until it is gone before it goes on.
+            "sleep 1",
             vacant(5),
         ])
+        # A claim still there after the bound refuses the raise, naming it.
+        result, called = self.run_scale_check(
+            5, "3", pvcs=("raft-data-test-ursula-3",), vacant_exits={4: 0}, terminating_gets=1000
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("raft-data-test-ursula-3 is still there 60 seconds after its delete", result.stderr)
+        self.assertEqual(called[:3], [
+            joinable,
+            vacant(4),
+            'kubectl --namespace default delete persistentvolumeclaim raft-data-test-ursula-3 --wait=false',
+        ])
+        self.assertEqual(called[3:], ["sleep 1"] * 60)
         # Any other answer refuses the raise and names the volume, deleting
         # nothing.
         result, called = self.run_scale_check(5, "3", pvcs=("raft-data-test-ursula-4",), vacant_exits={5: 2})
@@ -344,13 +374,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         role = documents(rendered, "Role")["test-ursula-scale-check"]
         self.assertIn(
             '  - apiGroups: [""]\n    resources: ["persistentvolumeclaims"]\n    resourceNames:\n'
-            '      - "raft-data-test-ursula-2"\n      - "raft-data-test-ursula-3"\n'
-            '      - "raft-data-test-ursula-4"\n    verbs: ["get", "delete"]\n',
+            '      - "raft-data-test-ursula-3"\n      - "raft-data-test-ursula-4"\n'
+            '    verbs: ["get", "delete"]\n',
             role,
         )
-        # No raise can start a pod of a count below 3, and an empty
-        # resourceNames would grant every volume.
-        for count in ("1",):
+        # A raise starts from 3 pods, so it never starts a meta voter's
+        # ordinal, and no count below 4 starts any. An empty resourceNames
+        # would grant every volume.
+        for count in ("1", "3"):
             role = documents(render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={count}"),
                              "Role")["test-ursula-scale-check"]
             self.assertNotIn("persistentvolumeclaims", role)

@@ -1262,10 +1262,13 @@ impl GroupRejoin {
                 VoteGate::closed(GroupEvidence::Initialized)
             }
             // A committed vote above genesis on an empty log is a live
-            // leader's, adopted as a barrier's floor: genesis votes are
-            // uncommitted and appends bring entries. The group holds
-            // entries, so the gate refuses every candidate, across a restart
-            // between the floor and the first entry too.
+            // leader's: a barrier's floor, or the vote OpenRaft saves before
+            // it appends a leader's entries, a conflicting probe's too. A
+            // genesis vote is uncommitted. The group then holds entries, so
+            // the gate refuses every candidate, across a restart between the
+            // vote and the first entry too. A seed follower at genesis that
+            // saved a leader's vote opens Initialized as well, which is safe
+            // and costs only liveness in a narrow genesis corner.
             (None, HeldLogState::Empty)
                 if store
                     .vote()

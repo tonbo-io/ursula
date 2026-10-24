@@ -295,17 +295,17 @@ pub(super) async fn reused_id_vote(seed: u64, controls: Controls) -> ThreeNodeRa
         controls == Controls::ReusedIdVote { defended: false },
     );
     run.cluster.start_node(LEAVING).await;
-    let pending = run
-        .within(PHASE, BOUND, |cluster| {
-            cluster.runtimes.get(&LEAVING).is_some_and(|runtime| {
-                runtime.status_reader().placement_status().registration
-                    == RegistrationStatus::RemovalPending
-            }) || record_of(cluster, LEAVING).is_some_and(|(lifecycle, _)| lifecycle.has_life())
-        })
-        .await;
-    run.trace.push(SimEvent::FaultApplied {
-        phase: format!("{PHASE}: the new disk saw its removal pending: {pending}"),
-    });
+    run.until(PHASE, I13, BOUND, |cluster| {
+        let waits = cluster.runtimes.get(&LEAVING).is_some_and(|runtime| {
+            runtime.status_reader().placement_status().registration
+                == RegistrationStatus::RemovalPending
+        });
+        let bound = record_of(cluster, LEAVING).is_some_and(|(lifecycle, _)| lifecycle.has_life());
+        (!waits && !bound)
+            .then(|| format!("node {LEAVING}'s new disk neither waited for its removal nor bound"))
+    })
+    .await;
+    run.step("the_new_disk_waits_or_bound");
     run.vacant(PHASE, LEAVING, old).await;
     run.bound_anew(PHASE, LEAVING, old).await;
     // No message of G passes between K and node 4, nor yet between S and

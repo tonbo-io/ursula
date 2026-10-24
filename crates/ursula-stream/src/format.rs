@@ -101,8 +101,9 @@
 //!   vacant id; a vacant id refuses every other command naming it with
 //!   `NodeVacant`;
 //! - a recovery gate rule: a replica whose log is empty and whose persisted
-//!   vote is committed above term 0, a live leader's vote adopted as a
-//!   barrier's floor, opens refusing every candidate;
+//!   vote is committed above term 0, a live leader's vote (a barrier's
+//!   floor, or the vote saved before a leader's entries), opens refusing
+//!   every candidate;
 //! - the Raft metadata of the process fence: `ursula-incarnation`,
 //!   `ursula-target-incarnation` and `ursula-fence` with its six refusals,
 //!   which a sender reads only after the mismatch text, a cluster refusal
