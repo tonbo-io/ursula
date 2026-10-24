@@ -304,7 +304,9 @@ describe("stale caches reopened across hosts", () => {
 				expect(st.attach.local).toBe("built");
 				expect(generationOf(again.path)).not.toBe(generationOf(first.path));
 			} else {
-				expect(st.attach.local).toBe("caught_up");
+				// An owner's open reports a catch-up in place as `resumed` (only a reader's reports
+				// `caught_up`): the same generation, now holding the other host's commits.
+				expect(st.attach.local).toBe("resumed");
 				expect(generationOf(again.path)).toBe(generationOf(first.path));
 			}
 			await converged(reopened, s.url, s.path, model, label);
@@ -394,7 +396,8 @@ describe("stale caches reopened across hosts", () => {
 		const c = host(s.url, dirC);
 		expect((await c.opened()).state).toBe("live");
 		const stC = await status(c);
-		expect(stC.attach.local).toBe("caught_up");
+		// Caught up in place, which an owner reports as `resumed`: the copy's lineage, not a rebuild.
+		expect(stC.attach.local).toBe("resumed");
 		expect(stC.lineage).toBe(r3.st.lineage);
 		expect(await rowsOf(c)).toEqual(model.dump());
 		await c.exec(model.tx("r4", { updates: 1, inserts: 1 }));
@@ -448,8 +451,9 @@ describe("stale caches reopened across hosts", () => {
 				await synced(fresh);
 				await fresh.stop();
 				// A stale catch-up, through the gate, which then holds a commit and the host dies.
+				// An owner reports a catch-up in place as `resumed`.
 				const caught = host(`${front.url}${s.path}`, dirA);
-				const catchUpMs = await timed(caught, "caught_up");
+				const catchUpMs = await timed(caught, "resumed");
 				await unsent(caught, "INSERT INTO t VALUES (-2, NULL)");
 				await caught.stop("SIGKILL");
 				await mode("forward");
