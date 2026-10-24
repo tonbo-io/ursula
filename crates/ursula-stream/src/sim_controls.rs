@@ -277,6 +277,18 @@ pub enum Defence {
     /// keeps the generation, and a reopened log replays its retired life's
     /// frames at its next start.
     LogGeneration,
+    /// A replica that holds nothing of its group refuses every vote, and
+    /// every candidate holding entries once a live leader's barrier gave it
+    /// a floor, until it applied that barrier (design 15, reuse of a node
+    /// id). Off, its whole screen passes a vote to OpenRaft, which grants a
+    /// candidate whose log beats its empty one.
+    EmptyReplicaVote,
+    /// A run deletes a snapshot object only once the meta group answered
+    /// its registration, and never once it knows itself removed (design 15,
+    /// B1). Off, the lease and the wait alone decide, so an old disk of a
+    /// removed node id, cut off from meta, collects a new life's objects
+    /// under the shared node directory.
+    DeleteAfterRegistration,
 }
 
 #[cfg(madsim)]
@@ -286,8 +298,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 55]> = const { Cell::new([false; 55]) };
-        static FIRED: Cell<[u64; 55]> = const { Cell::new([0; 55]) };
+        static OFF: Cell<[bool; 57]> = const { Cell::new([false; 57]) };
+        static FIRED: Cell<[u64; 57]> = const { Cell::new([0; 57]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -347,6 +359,8 @@ mod switches {
             Defence::ColdWriteCheck => 52,
             Defence::RetireAnswer => 53,
             Defence::LogGeneration => 54,
+            Defence::EmptyReplicaVote => 55,
+            Defence::DeleteAfterRegistration => 56,
         }
     }
 
@@ -369,7 +383,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 55]));
+        FIRED.with(|fired| fired.set([0; 57]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

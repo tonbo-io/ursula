@@ -37,6 +37,7 @@ use super::plan_hosting;
 use super::seed_role;
 use crate::placement::ConfirmedStamp;
 use crate::placement::ConfirmedView;
+use crate::placement::ControlCommand;
 use crate::placement::LifecycleChange;
 use crate::placement::PlacementView;
 use crate::placement::reconcile::MembershipConfig;
@@ -45,6 +46,7 @@ use crate::placement::samples::ids;
 use crate::placement::samples::meta;
 use crate::placement::samples::node;
 use crate::placement::samples::params;
+use crate::placement::samples::root;
 use crate::placement::samples::voters;
 
 const G0: RaftGroupId = RaftGroupId(0);
@@ -97,6 +99,7 @@ fn plan(
 ) -> HostingPlan {
     plan_hosting(&HostingInput {
         me: node(me),
+        root: root(me),
         standing,
         view,
         local,
@@ -294,10 +297,78 @@ fn a_removal_overrides_the_role_a_view_from_before_it_shows() {
     for group in [G1, G2, G3] {
         assert_eq!(cluster.role(group, node(4)), Some(ReplicaRole::Voter));
         assert_eq!(
-            Standing::Member.placed_role(cluster, group, node(4)),
+            Standing::Member.placed_role(cluster, group, node(4), root(4)),
             Some(ReplicaRole::Voter)
         );
-        assert_eq!(Standing::Removed.placed_role(cluster, group, node(4)), None);
+        assert_eq!(
+            Standing::Removed.placed_role(cluster, group, node(4), root(4)),
+            None
+        );
+    }
+}
+
+/// A node id runs one life per root: a view whose record of the node names
+/// another root is another life's, so it gives this run no role, and its
+/// removal is not this run's. A new disk catching up through the meta log
+/// passes views that show its id's removed life, bound to the old root,
+/// and then vacant on it released: neither latches the new life removed,
+/// nor places it. The old disk reads its own record removed, and vacant on
+/// its released root, as removed.
+#[test]
+fn a_view_of_another_life_gives_this_run_no_role_and_no_removal() {
+    let mut driver = Driver::live(&[1, 2, 3, 4], 4, 3);
+    let (old, new) = (root(4), root(44));
+    let cluster = driver.cluster().clone();
+    assert_eq!(
+        Standing::Member.placed_role(&cluster, G1, node(4), new),
+        None
+    );
+    assert!(!Standing::Member.knows_removed(Some(&cluster), node(4), new));
+    let view = confirmed(&driver);
+    let local = BTreeMap::from([(G1, replica(LocalLog::Holding))]);
+    let unplaced = HostingPlan {
+        admitted: BTreeMap::from([(G1, Admission::Open)]),
+        steps: Vec::new(),
+        unplaced: BTreeSet::from([G1]),
+    };
+    assert_eq!(
+        plan_hosting(&HostingInput {
+            me: node(4),
+            root: new,
+            standing: Standing::Member,
+            view: ViewInput::Confirmed(&view),
+            local: &local,
+        }),
+        unplaced
+    );
+    // Node 4 leaves every group and is removed, then its removal completes.
+    for group in [G0, G1, G2, G3] {
+        let target = driver.placement(group).target_voters().clone();
+        if !target.contains(node(4)) {
+            continue;
+        }
+        let missing = (1..=3).find(|id| !target.contains(node(*id))).unwrap();
+        let voters: Vec<u64> = target
+            .iter()
+            .map(|id| if id == node(4) { missing } else { id.get() })
+            .collect();
+        driver.request_move(group, &voters).unwrap();
+        driver.report(group, &voters).unwrap();
+    }
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    for vacancy in [false, true] {
+        if vacancy {
+            driver
+                .apply(ControlCommand::ReportRemovalComplete {
+                    node: node(4),
+                    root: old,
+                    now_ms: 90,
+                })
+                .unwrap();
+        }
+        let cluster = driver.cluster();
+        assert!(Standing::Member.knows_removed(Some(cluster), node(4), old));
+        assert!(!Standing::Member.knows_removed(Some(cluster), node(4), new));
     }
 }
 

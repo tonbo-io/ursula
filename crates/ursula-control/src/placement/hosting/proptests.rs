@@ -11,7 +11,6 @@ use proptest::prelude::ProptestConfig;
 use proptest::test_runner::RngSeed;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::NodeId;
-use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::ViewStage;
 use ursula_shard::RaftGroupId;
@@ -78,12 +77,13 @@ fn check_plan(
 ) -> Result<(), String> {
     let me = input.me;
     let cluster = view.cluster();
+    // The view's record of `me` is this run's only when it names the run's
+    // root: another life's record gives no role and no removal.
+    let own = cluster.and_then(|cluster| cluster.own_record(me, input.root));
     let removed = input.standing == Standing::Removed
-        || cluster
-            .and_then(|cluster| cluster.node(me))
-            .is_some_and(|record| record.lifecycle == NodeLifecycle::Removed);
+        || own.is_some_and(|record| !record.lifecycle.has_life());
     let is_confirmed = matches!(input.view, ViewInput::Confirmed(_));
-    let role = |group: RaftGroupId| cluster.and_then(|cluster| cluster.role(group, me));
+    let role = |group: RaftGroupId| own.and(cluster).and_then(|cluster| cluster.role(group, me));
     let local = |group: RaftGroupId| input.local.get(&group);
     let held = |group: RaftGroupId| local(group).is_some_and(|replica| replica.log.is_held());
     let teardown = |group: RaftGroupId| local(group).and_then(|replica| replica.teardown);
@@ -202,6 +202,18 @@ fn check_plan(
             || format!("unplaced group {}", group.0),
         )?;
     }
+    if own.is_none() {
+        // A view with no record of this life plans as one that has not
+        // bootstrapped.
+        return ensure(
+            plan.steps.is_empty()
+                && plan
+                    .admitted
+                    .values()
+                    .all(|admission| *admission == Admission::Open),
+            || format!("a view of another life planned {plan:?}"),
+        );
+    }
     if is_confirmed {
         // The rules are complete: what they call for is planned.
         for (group, placement) in cluster.groups().iter() {
@@ -302,6 +314,7 @@ proptest::proptest! {
             (
                 1_u64..=7,
                 proptest::bool::weighted(0.1),
+                proptest::bool::weighted(0.15),
                 0_u8..5,
                 proptest::collection::vec(
                     proptest::option::of((0_u8..4, proptest::bool::ANY, 0_u8..5)),
@@ -314,7 +327,7 @@ proptest::proptest! {
         let driver = reachable(node_count, group_count, rf, live, &steps);
         let applied = meta(driver.term, driver.index);
         let history = meta(1, 0);
-        for (me, removed, kind, replicas) in inputs {
+        for (me, removed, other_root, kind, replicas) in inputs {
             let state = match kind {
                 0 => None,
                 1 => Some(ControlPlaneState::default()),
@@ -342,9 +355,15 @@ proptest::proptest! {
                 Some(ViewInput::Unconfirmed(&view)),
                 confirmed.as_ref().map(ViewInput::Confirmed),
             ];
+            // Mostly the root the record names, sometimes another life's.
+            let root = match driver.state.cluster().and_then(|cluster| cluster.node(node(me))) {
+                Some(record) if !other_root => record.root.root(),
+                Some(_) | None => super::super::samples::root(me.checked_add(500).unwrap()),
+            };
             for input_view in views.into_iter().flatten() {
                 let input = HostingInput {
                     me: node(me),
+                    root,
                     standing,
                     view: input_view,
                     local: &local,

@@ -218,6 +218,7 @@ where
         let mut runtime = Self {
             reader: MetaStatusReader::new(
                 me,
+                wal.incarnation().root,
                 config.claim.clone(),
                 status.clone(),
                 registry.clone(),
@@ -332,13 +333,13 @@ where
             pauses,
             stopped.clone(),
         )));
-        let (sweep_pending, sweep_pending_rx) = watch::channel(Default::default());
+        let (removal_pending, removal_pending_rx) = watch::channel(Default::default());
         let sweep = RemovedSweep {
             me,
             reader: runtime.reader.clone(),
             registry: registry.clone(),
             fence,
-            pending: sweep_pending,
+            pending: removal_pending,
         };
         runtime
             .tasks
@@ -349,7 +350,7 @@ where
             registry: registry.clone(),
             liveness: Liveness::new(me, registry.clone(), config.wal_disk_sheds),
             bootstrap_refusal: runtime.status.bootstrap_refusal.clone(),
-            sweep_pending: sweep_pending_rx,
+            removal_pending: removal_pending_rx,
             report: leader_report,
         };
         runtime

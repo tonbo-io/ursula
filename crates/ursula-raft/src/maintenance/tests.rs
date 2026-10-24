@@ -103,6 +103,8 @@ fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
 /// healthy replica of each group it is placed in.
 struct Node {
     me: u64,
+    /// The root the node registered: the sample's.
+    root: ursula_proto::placement::RootId,
     status: PlacementStatus,
     claim: GenesisClaim,
     leaderless_for: Option<Duration>,
@@ -125,6 +127,7 @@ impl Node {
         let record = *cluster.node(me).unwrap();
         Self {
             me: id,
+            root: samples::root(id),
             status: PlacementStatus {
                 node: me,
                 applied: Some(samples::meta(1, 9)),
@@ -196,6 +199,7 @@ impl Node {
                 hosting: &self.hosting,
                 // A test's run learned no more than its registration says.
                 standing: self.status.registration.standing(),
+                root: self.root,
             }),
         })
     }

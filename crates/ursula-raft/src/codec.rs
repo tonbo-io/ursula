@@ -674,6 +674,7 @@ mod tests {
             NodeLifecycle::Decommissioning => "placement_node_lifecycle_decommissioning":
                 NodeLifecycle::Decommissioning,
             NodeLifecycle::Removed => "placement_node_lifecycle_removed": NodeLifecycle::Removed,
+            NodeLifecycle::Vacant => "placement_node_lifecycle_vacant": NodeLifecycle::Vacant,
         });
         for (name, lifecycle) in &lifecycles {
             add(samples, name, lifecycle);

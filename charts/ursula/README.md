@@ -234,7 +234,8 @@ would need both pods. Production clusters should use `3` or more.
 
 Raising `server.replicaCount` on a cluster of three or more pods adds pods that
 register with the meta group and hold no group: the placement keeps every
-group on its voters. Move groups onto them with `ursulactl placement move`.
+group on its voters. Move groups onto them with `ursulactl placement move`,
+which stays manual.
 
 The gateway's generated upstream list names every server pod, so any change of
 `server.replicaCount` also rolls the gateway Deployment. Each terminating
@@ -242,9 +243,12 @@ gateway pod keeps serving for `gateway.preStopDelaySeconds` before it gets
 `SIGTERM`, so that the Service stops sending it new connections first, and then
 drains within `gateway.gracefulShutdownTimeoutSeconds`.
 
-A scale-down is permanent. Node ids are the pod ordinal plus one, so a lower
-count drops the highest ids, and a dropped id never holds a group again. The
-meta voters (ids 1 to 3) are never decommissioned. To lower the count:
+Node ids are the pod ordinal plus one, so a lower count drops the highest ids.
+A dropped node's process and disk never take part again, but its id does: once
+the meta leader completed the node's removal (every group confirmed it no
+member, its snapshot objects are gone and no process of it answers), the id is
+`vacant`, and a later raise starts it again on an empty volume as a new node.
+The meta voters (ids 1 to 3) are never decommissioned. To lower the count:
 
 1. Decommission every id above the new count, from a manifest that reaches
    the admin plane (see [Access Locally](#access-locally)):
@@ -252,8 +256,12 @@ meta voters (ids 1 to 3) are never decommissioned. To lower the count:
    It cordons every named node first, so no group moves onto a node that
    leaves too, and returns once the meta leader moved every group away and
    removed each node.
-2. Lower `server.replicaCount` with `helm upgrade`.
-3. Delete the PVCs of the dropped pods.
+2. Lower `server.replicaCount` with `helm upgrade`. The StatefulSet deletes the
+   dropped pods, which lets each removal complete, and keeps their PVCs.
+
+A raise back deletes the old PVC of each started id that is vacant, so you
+need not delete them yourself. A raise binds its new ids, so a `helm rollback`
+to the lower count waits until they are decommissioned again.
 
 A single pod never grows under the chart. A single node grows only with
 `raft.meta_voters` and `raft.placement.replication_factor` set on every node
@@ -266,10 +274,17 @@ Before every upgrade and rollback the `scale-check` hook compares the live
 StatefulSet's replicas with the new count. No StatefulSet and an unchanged
 count pass, so an image-only upgrade always proceeds. A raise from 1 is
 refused. A lower count runs `ursulactl node verify-removed` for every dropped
-id, and a higher count runs `ursulactl node verify-not-removed` for every
-added id. The hook reads the live count with `kubectl`, through a
-ServiceAccount allowed only to `get` this release's StatefulSet, and reaches
-the pods' client plane, which the NetworkPolicy admits it to. Set
+id. A higher count runs `ursulactl node verify-joinable` for every added id,
+which waits up to 200 seconds for each removal to complete, then checks each
+added ordinal's PVC that still exists with `ursulactl node verify-vacant` and
+acts on its exit status alone: it deletes the PVC of a vacant id, which holds a
+removed node's disk, keeps the PVC of an id in a life, so a scale-down that
+skipped the hook comes back on its volumes, and refuses the raise, naming the
+PVC, for anything else. The hook runs within Helm's default 5 minute
+`--timeout`. It reads the live count with `kubectl`, through a ServiceAccount
+allowed to `get` this release's StatefulSet and to `get` and `delete` the
+`raft-data` PVCs of the ordinals a raise can start, and reaches the pods'
+client plane, which the NetworkPolicy admits it to. Set
 `server.scaleCheck.enabled=false` to skip it.
 
 ## Replacing A Lost Volume
@@ -476,7 +491,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `server.replicaCount` | `3` | Server pod count: `1`, or `3` and more (`2` is refused). Raising it from `3` or more adds pods that hold no group. Lowering it needs every dropped id decommissioned first and is permanent, and a single pod never grows ([Scaling](#scaling-and-serverreplicacount)). |
+| `server.replicaCount` | `3` | Server pod count: `1`, or `3` and more (`2` is refused). Raising it from `3` or more adds pods that hold no group. Lowering it needs every dropped id decommissioned first, a later raise starts those ids again as new nodes, and a single pod never grows ([Scaling](#scaling-and-serverreplicacount)). |
 | `server.terminationGracePeriodSeconds` | `30` | Must exceed the server's overall 20-second shutdown budget, including up to 5 seconds for leadership handoff before Raft transport closes. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
 | `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |
@@ -490,7 +505,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and, with `server.clusterListen=true`, `server.ports.cluster`. It uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
 | `server.networkPolicy.enabled` | `false` | Render an ingress NetworkPolicy for the server pods. The cluster port admits only this release's server pods. The admin plane stays on loopback and needs no rule, and rendering fails when `server.adminListen` is off loopback. Needs a CNI that enforces NetworkPolicy. |
 | `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway, Helm test and scale-check pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
-| `server.scaleCheck.enabled` | `true` | Render the `pre-upgrade,pre-rollback` hook that checks a change of `server.replicaCount` ([Scaling](#scaling-and-serverreplicacount)): a ServiceAccount, a Role allowed to `get` this release's StatefulSet, a ConfigMap and a Job. |
+| `server.scaleCheck.enabled` | `true` | Render the `pre-upgrade,pre-rollback` hook that checks a change of `server.replicaCount` ([Scaling](#scaling-and-serverreplicacount)): a ServiceAccount, a Role allowed to `get` this release's StatefulSet and to `get` and `delete` the `raft-data` PVCs a raise can start, a ConfigMap and a Job. |
 | `server.scaleCheck.activeDeadlineSeconds` | `300` | Deadline of the hook's Job. |
 | `server.scaleCheck.kubectlImage` | `alpine/k8s:1.33.3` | `repository`, `tag` and `pullPolicy` of the image `kubectl` is copied from into the hook's Ursula container. |
 | `server.scaleCheck.resources` | `{}` | Resources of the hook's container. |

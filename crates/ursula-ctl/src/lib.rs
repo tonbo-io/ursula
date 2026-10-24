@@ -17,7 +17,8 @@
 //!   read.
 //! - [`placement`]: placement views, `placement status`, `move`, `cancel`
 //!   and `set-move-limit`, the node lifecycle verbs (`node cordon`,
-//!   `uncordon`, `decommission`, `verify-removed`, `verify-not-removed`),
+//!   `uncordon`, `decommission`, `verify-removed`, `verify-joinable`,
+//!   `verify-vacant`),
 //!   and `node replace-disk`.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.

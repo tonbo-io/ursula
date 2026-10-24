@@ -211,7 +211,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 self.assertEqual(hooks[(kind, name)]["helm.sh/hook"], "pre-upgrade,pre-rollback")
         self.assertEqual(hooks[("Job", name)]["helm.sh/hook-weight"], '"0"')
         self.assertEqual(hooks[("Role", name)]["helm.sh/hook-weight"], '"-10"')
-        # The one permission: get this release's StatefulSet.
+        # Two permissions: get this release's StatefulSet, and get or
+        # delete the volumes a raise starts.
         role = documents(rendered, "Role")[name]
         self.assertIn(
             "rules:\n  # The live replica count, of this release's StatefulSet only.\n"
@@ -219,7 +220,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
             '    resourceNames: ["test-ursula"]\n    verbs: ["get"]\n',
             role,
         )
-        self.assertEqual(role.count("verbs:"), 1)
+        self.assertEqual(role.count("verbs:"), 2)
         job = documents(rendered, "Job")[name]
         self.assertIn('image: "alpine/k8s:9.9.9"', job)
         self.assertIn(f"serviceAccountName: {name}\n", job)
@@ -237,19 +238,46 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn(name, render_chart(*NAMED, "--set", "s3.bucket=bkt",
                                             "--set", "server.scaleCheck.enabled=false"))
 
-    def run_scale_check(self, desired: int, live: str) -> tuple[subprocess.CompletedProcess, str]:
+    def run_scale_check(
+        self,
+        desired: int,
+        live: str,
+        pvcs: tuple[str, ...] = (),
+        vacant_exits: dict[int, int] | None = None,
+    ) -> tuple[subprocess.CompletedProcess, list[str]]:
         """Runs the hook's script with a kubectl that answers `live` replicas
-        (empty: no StatefulSet) and an ursulactl that records its arguments."""
+        (empty: no StatefulSet) and lists the PVCs of `pvcs`, and an ursulactl
+        whose `verify-vacant --node N` exits `vacant_exits[N]` (0 when absent).
+        Answers the result and every ursulactl and kubectl delete call, in
+        order."""
         rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={desired}")
         configmap = documents(rendered, "ConfigMap")["test-ursula-scale-check"]
         body = re.search(r"  scale-check\.sh: \|\n(?P<script>(?: {4}.*\n)+)", configmap).group("script")
         script = "".join(line[4:] + "\n" for line in body.splitlines())
+        exits = " ".join(f"{node}={code}" for node, code in (vacant_exits or {}).items())
         with tempfile.TemporaryDirectory() as tools:
             calls = os.path.join(tools, "calls")
-            for tool, text in (
-                ("kubectl", f"#!/bin/sh\nprintf '%s' '{live}'\n"),
-                ("ursulactl", f'#!/bin/sh\necho "$@" > "{calls}"\n'),
-            ):
+            kubectl = (
+                "#!/bin/sh\n"
+                f'case "$*" in\n'
+                f"  *statefulset*) printf '%s' '{live}' ;;\n"
+                f'  *"get persistentvolumeclaim"*)\n'
+                f'    for pvc in {" ".join(pvcs)}; do\n'
+                f'      case "$*" in *" $pvc "*) printf "persistentvolumeclaim/%s" "$pvc" ;; esac\n'
+                f"    done ;;\n"
+                f'  *"delete persistentvolumeclaim"*) echo "kubectl $*" >> "{calls}" ;;\n'
+                f"esac\n"
+            )
+            ursulactl = (
+                "#!/bin/sh\n"
+                f'echo "ursulactl $*" >> "{calls}"\n'
+                f'if [ "$2" = verify-vacant ]; then\n'
+                f'  for pair in {exits}; do\n'
+                f'    case "$*" in *"--node ${{pair%%=*}}"*) exit "${{pair#*=}}" ;; esac\n'
+                f"  done\n"
+                f"fi\n"
+            )
+            for tool, text in (("kubectl", kubectl), ("ursulactl", ursulactl)):
                 path = os.path.join(tools, tool)
                 with open(path, "w") as stub:
                     stub.write(text)
@@ -260,10 +288,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            called = ""
+            called = []
             if os.path.exists(calls):
                 with open(calls) as recorded:
-                    called = recorded.read().strip()
+                    called = [line.strip() for line in recorded if line.strip()]
         return result, called
 
     def test_scale_check_passes_an_unchanged_count_and_refuses_a_raise_from_one(self) -> None:
@@ -271,20 +299,61 @@ class HelmTemplateConfigTest(unittest.TestCase):
             with self.subTest(desired=desired, live=live):
                 result, called = self.run_scale_check(desired, live)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(called, "")
+                self.assertEqual(called, [])
         result, called = self.run_scale_check(3, "1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("never grows", result.stderr)
-        self.assertEqual(called, "")
+        self.assertEqual(called, [])
 
     def test_scale_check_verifies_every_id_a_count_change_drops_or_starts(self) -> None:
         manifest = "--config /etc/ursula/scale-check/cluster-manifest.json"
         result, called = self.run_scale_check(3, "5")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(called, f"node verify-removed {manifest} --node 4 --node 5")
+        self.assertEqual(called, [f"ursulactl node verify-removed {manifest} --node 4 --node 5"])
+        # A raise with no volume left waits for each started id to be
+        # joinable, and touches no volume.
         result, called = self.run_scale_check(5, "3")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(called, f"node verify-not-removed {manifest} --node 4 --node 5")
+        self.assertEqual(called, [f"ursulactl node verify-joinable {manifest} --timeout-secs 200 --node 4 --node 5"])
+
+    def test_a_raise_deletes_only_a_vacant_ids_volume_and_keeps_a_live_ones(self) -> None:
+        manifest = "--config /etc/ursula/scale-check/cluster-manifest.json"
+        joinable = f"ursulactl node verify-joinable {manifest} --timeout-secs 200 --node 4 --node 5"
+        vacant = lambda node: f"ursulactl node verify-vacant {manifest} --timeout-secs 30 --node {node}"
+        # Node 4's volume is a removed life's: deleted. Node 5's is its
+        # own, kept: a scale-down that skipped the hook comes back on it.
+        result, called = self.run_scale_check(
+            5, "3", pvcs=("raft-data-test-ursula-3", "raft-data-test-ursula-4"), vacant_exits={4: 0, 5: 3}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(called, [
+            joinable,
+            vacant(4),
+            'kubectl --namespace default delete persistentvolumeclaim raft-data-test-ursula-3 --wait=true',
+            vacant(5),
+        ])
+        # Any other answer refuses the raise and names the volume, deleting
+        # nothing.
+        result, called = self.run_scale_check(5, "3", pvcs=("raft-data-test-ursula-4",), vacant_exits={5: 2})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("raft-data-test-ursula-4", result.stderr)
+        self.assertEqual(called, [joinable, vacant(5)])
+
+    def test_scale_check_may_delete_only_the_volumes_a_raise_starts(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.replicaCount=5")
+        role = documents(rendered, "Role")["test-ursula-scale-check"]
+        self.assertIn(
+            '  - apiGroups: [""]\n    resources: ["persistentvolumeclaims"]\n    resourceNames:\n'
+            '      - "raft-data-test-ursula-2"\n      - "raft-data-test-ursula-3"\n'
+            '      - "raft-data-test-ursula-4"\n    verbs: ["get", "delete"]\n',
+            role,
+        )
+        # No raise can start a pod of a count below 3, and an empty
+        # resourceNames would grant every volume.
+        for count in ("1",):
+            role = documents(render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={count}"),
+                             "Role")["test-ursula-scale-check"]
+            self.assertNotIn("persistentvolumeclaims", role)
 
     def test_removed_rollout_values_are_refused(self) -> None:
         # The schema refuses every removed value, so an old values file fails

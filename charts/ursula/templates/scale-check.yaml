@@ -4,20 +4,30 @@
 {{/*
 Scale check, before an upgrade or a rollback changes server.replicaCount.
 
-Node ids are ordinal + 1, so a lower count drops the highest ids for good,
-and a higher count starts ids again. The hook reads the live StatefulSet's
+Node ids are ordinal + 1, so a lower count drops the highest ids, and a
+higher count starts those ids again. The hook reads the live StatefulSet's
 replicas with kubectl, since Helm's lookup is empty under Argo CD, and
 passes when there is none (a fresh install, Argo CD's first PreSync) or the
 count is unchanged, so an image-only upgrade of an unhealthy cluster passes.
 A raise from 1 is refused: the chart sets neither raft.meta_voters nor
 raft.placement.replication_factor, which a growing single node needs, so the
 pods of a raised count would claim the defaults and report
-replication_factor_mismatch. Otherwise it runs `ursulactl node verify-removed`
-for every id a lower count drops, which passes once `ursulactl node
-decommission --wait` removed them, and `verify-not-removed` for every id a
-higher count starts, since a removed id never holds a group again. ursulactl
-reads the meta leader's view over the pods' client plane, which the
-NetworkPolicy opens to this hook's label.
+replication_factor_mismatch.
+
+A lower count runs `ursulactl node verify-removed` for every id it drops,
+which passes once `ursulactl node decommission --wait` removed them.
+
+A higher count runs `ursulactl node verify-joinable` for every id it starts,
+which waits (up to 200 s) for a removed id's removal to complete, until the
+meta leader marks the id vacant. Then, for each started ordinal whose PVC
+still exists, it runs `ursulactl node verify-vacant` and acts on its exit
+status alone: 0, the id is vacant, so the volume holds a removed life's disk
+and is deleted, and the pod starts on an empty one that registers as a new
+node; 3, the id is in a life, so the volume is that life's own and is kept
+(a scale-down that skipped this hook comes back on its volumes); anything
+else refuses the raise and names the PVC. ursulactl reads the meta leader's
+view over the pods' client plane, which the NetworkPolicy opens to this
+hook's label.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -49,6 +59,18 @@ rules:
     resources: ["statefulsets"]
     resourceNames: [{{ $sts | quote }}]
     verbs: ["get"]
+  {{- $desired := .Values.server.replicaCount | int }}
+  {{- if ge $desired 3 }}
+  # The volumes of the ordinals a raise can start (a raise from 1 is
+  # refused, so ordinal 2 up): a vacant id's is deleted.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    resourceNames:
+      {{- range $ordinal := untilStep 2 $desired 1 }}
+      - {{ printf "raft-data-%s-%d" $sts $ordinal | quote }}
+      {{- end }}
+    verbs: ["get", "delete"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -103,12 +125,11 @@ data:
       echo "scale check: refused, server.replicaCount ${live} to ${desired}: a single pod never grows under this chart, which sets neither raft.meta_voters nor raft.placement.replication_factor. Install a new release and restore a backup into it" >&2
       exit 1
     fi
+    manifest=/etc/ursula/scale-check/cluster-manifest.json
     if [ "${desired}" -lt "${live}" ]; then
-      verb=verify-removed
       first=$((desired + 1))
       last="${live}"
     else
-      verb=verify-not-removed
       first=$((live + 1))
       last="${desired}"
     fi
@@ -118,8 +139,37 @@ data:
       set -- "$@" --node "${id}"
       id=$((id + 1))
     done
-    echo "scale check: server.replicaCount ${live} to ${desired}, ursulactl node ${verb}" "$@"
-    exec ursulactl node "${verb}" --config /etc/ursula/scale-check/cluster-manifest.json "$@"
+    if [ "${desired}" -lt "${live}" ]; then
+      echo "scale check: server.replicaCount ${live} to ${desired}, ursulactl node verify-removed" "$@"
+      exec ursulactl node verify-removed --config "${manifest}" "$@"
+    fi
+    echo "scale check: server.replicaCount ${live} to ${desired}, ursulactl node verify-joinable" "$@"
+    ursulactl node verify-joinable --config "${manifest}" --timeout-secs 200 "$@"
+    ordinal="${live}"
+    while [ "${ordinal}" -lt "${desired}" ]; do
+      id=$((ordinal + 1))
+      pvc="raft-data-{{ $sts }}-${ordinal}"
+      found="$(kubectl --namespace {{ .Release.Namespace | quote }} get persistentvolumeclaim "${pvc}" \
+        --ignore-not-found --output name)"
+      if [ -n "${found}" ]; then
+        status=0
+        ursulactl node verify-vacant --config "${manifest}" --timeout-secs 30 --node "${id}" || status=$?
+        case "${status}" in
+          0)
+            echo "scale check: node ${id} is vacant, deleting its old volume ${pvc}"
+            kubectl --namespace {{ .Release.Namespace | quote }} delete persistentvolumeclaim "${pvc}" --wait=true
+            ;;
+          3)
+            echo "scale check: node ${id} is in a life, keeping its volume ${pvc}"
+            ;;
+          *)
+            echo "scale check: refused, ${pvc} holds a disk under node ${id}, which is neither vacant nor in a life. Delete it only if it holds nothing of this cluster" >&2
+            exit 1
+            ;;
+        esac
+      fi
+      ordinal=$((ordinal + 1))
+    done
 ---
 apiVersion: batch/v1
 kind: Job

@@ -89,6 +89,18 @@ pub enum ControlCommand {
         node: NodeId,
         root: RootId,
     },
+    /// The meta leader reports that the removal of `node`'s life on `root`
+    /// completed: every group confirmed the node no member, the meta group
+    /// lists it in neither membership, its snapshot objects are swept and no
+    /// process of `root` answers. A compare-and-set on the removed record
+    /// and its root: the id turns `Vacant` on `root` released, and an empty
+    /// root may register under it as a new life. `now_ms` dates the
+    /// vacancy.
+    ReportRemovalComplete {
+        node: NodeId,
+        root: RootId,
+        now_ms: u64,
+    },
 }
 
 impl ControlCommand {
@@ -102,7 +114,8 @@ impl ControlCommand {
             | Self::Bootstrap { .. }
             | Self::SetNodeLifecycle { .. }
             | Self::SetMoveLimit { .. }
-            | Self::ReleaseRoot { .. } => None,
+            | Self::ReleaseRoot { .. }
+            | Self::ReportRemovalComplete { .. } => None,
         }
     }
 }
@@ -181,6 +194,8 @@ pub enum ControlApplied {
     /// the record Bootstrap gives the node: `Active`, since its
     /// registration.
     RootReleased(NodeRecord),
+    /// The node's vacant record: its removal completed.
+    RemovalCompleted(NodeRecord),
 }
 
 /// Why the state machine refused a command. The first failing check is the
@@ -205,6 +220,11 @@ pub enum ControlError {
     UnknownNode { node: NodeId },
     #[error("node {node} is removed")]
     NodeRemoved { node: NodeId },
+    #[error(
+        "node {node} is vacant: its removal completed, and an empty disk started under the id \
+         registers as a new node"
+    )]
+    NodeVacant { node: NodeId },
     #[error("the placement of group {} is at {}", .group.0, .current.since())]
     StalePlacement {
         group: RaftGroupId,
@@ -253,9 +273,16 @@ pub enum ControlError {
          with replace-disk once its disk is revoked"
     )]
     OtherRoot { node: NodeId, slot: RootSlot },
-    /// A release of a root the node id is not bound to.
+    /// A release of a root the node id is not bound to, or a removal
+    /// report of a root its slot does not name.
     #[error("node {node} is not bound to the root named, its slot is {slot}: read the slot again")]
     StaleRoot { node: NodeId, slot: RootSlot },
+    /// A removal report of a node that is in a life.
+    #[error("node {node} is {lifecycle}, not removed")]
+    NotRemoved {
+        node: NodeId,
+        lifecycle: NodeLifecycle,
+    },
 }
 
 /// What a caller does after the state machine refused its command. Never
@@ -286,12 +313,14 @@ impl ControlError {
             | Self::UnknownNode { .. }
             | Self::GroupNotLive { .. }
             | Self::NotMoving { .. }
-            | Self::IneligibleTarget { .. } => Requeue::ConfirmView,
+            | Self::IneligibleTarget { .. }
+            | Self::NotRemoved { .. } => Requeue::ConfirmView,
             Self::AlreadyBootstrapped
             | Self::FormationCut
             | Self::InvalidBootstrap { .. }
             | Self::UnknownGroup { .. }
             | Self::NodeRemoved { .. }
+            | Self::NodeVacant { .. }
             | Self::NoChange { .. }
             | Self::ReplicationFactorChange { .. }
             | Self::NotTarget { .. }

@@ -14,9 +14,8 @@
 //!
 //! Each pass publishes the [`MetaLeaderReport`]: the eligibility it planned
 //! with, the groups the plan could not move, the age of the oldest move,
-//! the last refusal of this node's `Bootstrap` and the groups the
-//! removed-node sweep left ([`super::sweep`]). A node that does not lead
-//! publishes none.
+//! the last refusal of this node's `Bootstrap` and what each removal still
+//! waits for ([`super::sweep`]). A node that does not lead publishes none.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,7 +32,7 @@ use ursula_proto::placement::NodeId;
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
 use super::liveness::Liveness;
-use super::sweep::SweepPending;
+use super::sweep::RemovalPending;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
 use crate::rt::sync::watch;
@@ -50,9 +49,9 @@ pub(crate) struct DecommissionDriver<T> {
     /// The last refusal of this node's `Bootstrap`, which the report
     /// carries.
     pub(crate) bootstrap_refusal: watch::Receiver<Option<ControlError>>,
-    /// What the removed-node sweep left ([`super::sweep`]), which the
+    /// What each removal still waits for ([`super::sweep`]), which the
     /// report carries.
-    pub(crate) sweep_pending: watch::Receiver<SweepPending>,
+    pub(crate) removal_pending: watch::Receiver<RemovalPending>,
     pub(crate) report: watch::Sender<Option<MetaLeaderReport>>,
 }
 
@@ -122,7 +121,7 @@ impl<T: RecoveryTransport> DecommissionDriver<T> {
                 leader_since_ms: since_ms,
                 eligibility,
                 decommission_blocked: blocked,
-                sweep_pending: self.sweep_pending.borrow().clone(),
+                removal_pending: self.removal_pending.borrow().clone(),
                 last_bootstrap_refusal: self.bootstrap_refusal.borrow().clone(),
                 oldest_move_age_ms: oldest_move_since_ms
                     .map(|since_ms| now_ms.saturating_sub(since_ms)),

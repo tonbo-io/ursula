@@ -354,6 +354,16 @@ impl<T: RecoveryTransport> MetaHandle<T> {
             .map_err(Into::into)
     }
 
+    /// Asks `peer` with the genesis probe `probe` (see
+    /// [`crate::RecoveryTransport::genesis_probe`]).
+    pub(crate) async fn genesis_probe(
+        &self,
+        peer: NodeId,
+        probe: &super::genesis::GenesisProbe,
+    ) -> Option<crate::rejoin::PeerGroupLog> {
+        self.transport.genesis_probe(peer.get(), probe).await
+    }
+
     /// Confirms this node's placement view by a meta read barrier (see the
     /// module docs).
     pub async fn confirm_view(&self) -> Result<ConfirmedView, MetaBarrierError> {

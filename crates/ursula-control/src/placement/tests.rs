@@ -628,6 +628,148 @@ fn stale_root_refuses_a_release_of_another_root() {
     assert!(matches!(error, ControlError::NodeRemoved { node: n } if n == node(4)));
 }
 
+fn report_removal(id: u64, root_id: u64) -> ControlCommand {
+    ControlCommand::ReportRemovalComplete {
+        node: node(id),
+        root: root(root_id),
+        now_ms: 80,
+    }
+}
+
+/// The table of design 2.2: a removed node's removal report names its
+/// slot's root (a compare-and-set), turns the id vacant on that root
+/// released and answers the vacant record, and a repeat changes nothing.
+/// A vacant id refuses every command but the registration of an empty root
+/// other than the released one, which begins a new life on a fresh record,
+/// and the old root stays refused. The new life is placed like any node.
+#[test]
+fn node_vacant_refuses_every_command_but_a_new_lifes_registration() {
+    let mut driver = Driver::live(&[1, 2, 3, 4], 1, 3);
+    // Group 0 is seeded on {1, 2, 3}: node 4 has no role and is removed at once.
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    let error = driver.refused(report_removal(4, 41));
+    assert!(
+        matches!(error, ControlError::StaleRoot { node: n, slot } if n == node(4) && slot == RootSlot::Bound(root(4))),
+        "{error:?}"
+    );
+    let vacant = NodeRecord {
+        lifecycle: NodeLifecycle::Vacant,
+        since_ms: 80,
+        root: RootSlot::Released(root(4)),
+    };
+    assert_eq!(
+        driver.apply(report_removal(4, 4)),
+        Ok(ControlApplied::RemovalCompleted(vacant))
+    );
+    let before = driver.state.clone();
+    assert_eq!(
+        driver.apply(report_removal(4, 4)),
+        Ok(ControlApplied::RemovalCompleted(vacant))
+    );
+    assert_eq!(driver.state, before);
+    for change in [
+        LifecycleChange::Cordon,
+        LifecycleChange::Uncordon,
+        LifecycleChange::Decommission,
+    ] {
+        let error = driver.refused(ControlCommand::SetNodeLifecycle {
+            node: node(4),
+            change,
+            now_ms: 81,
+        });
+        assert!(matches!(error, ControlError::NodeVacant { node: n } if n == node(4)));
+        assert_eq!(error.requeue(), super::Requeue::Permanent);
+    }
+    let error = driver.refused(release(4, 4));
+    assert!(
+        matches!(error, ControlError::NodeVacant { .. }),
+        "{error:?}"
+    );
+    let error = driver.refused(ControlCommand::ReportTornDown {
+        group: G0,
+        node: node(4),
+        created_at: meta(1, 1),
+    });
+    assert!(
+        matches!(error, ControlError::NodeVacant { .. }),
+        "{error:?}"
+    );
+    let expected = driver.since(G0);
+    let error = driver.refused(ControlCommand::RequestMove {
+        group: G0,
+        expected,
+        to: voters(&[1, 2, 4]),
+        now_ms: 82,
+    });
+    assert!(
+        matches!(error, ControlError::NodeVacant { .. }),
+        "{error:?}"
+    );
+    // The old root never binds again, and a root that holds state never
+    // takes the slot.
+    for (root_id, empty) in [(4, false), (4, true), (41, false)] {
+        let error = driver.refused(register_root(4, root_id, empty));
+        assert!(
+            matches!(error, ControlError::OtherRoot { node: n, slot } if n == node(4) && slot == vacant.root),
+            "{error:?}"
+        );
+    }
+    // An empty root begins a new life on a fresh record.
+    let fresh = NodeRecord {
+        lifecycle: NodeLifecycle::Active,
+        since_ms: 70,
+        root: RootSlot::Bound(root(41)),
+    };
+    assert_eq!(
+        driver.apply(register_root(4, 41, true)),
+        Ok(ControlApplied::NodeRegistered(Registered::Unreferenced(
+            fresh
+        )))
+    );
+    assert_eq!(driver.cluster().node(node(4)), Some(&fresh));
+    // The new life holds state from now on, and the old root stays refused.
+    driver.apply(register_root(4, 41, false)).unwrap();
+    let error = driver.refused(register_root(4, 4, true));
+    assert!(
+        matches!(error, ControlError::OtherRoot { slot, .. } if slot == fresh.root),
+        "{error:?}"
+    );
+    // A removal report of the old life matches nothing of the new one.
+    let error = driver.refused(report_removal(4, 4));
+    assert!(matches!(error, ControlError::StaleRoot { .. }), "{error:?}");
+    driver.request_move(G0, &[1, 2, 4]).unwrap();
+    assert_eq!(
+        driver.cluster().role(G0, node(4)),
+        Some(ReplicaRole::Incoming)
+    );
+    // A node that never registered is unknown to a report.
+    let error = driver.refused(report_removal(9, 9));
+    assert!(
+        matches!(error, ControlError::UnknownNode { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn not_removed_refuses_a_removal_report_of_a_node_in_a_life() {
+    let mut driver = Driver::live(&[1, 2, 3, 4, 5], 1, 3);
+    driver.request_move(G0, &[1, 2, 4]).unwrap();
+    driver.lifecycle(5, LifecycleChange::Cordon).unwrap();
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    for (id, lifecycle) in [
+        (2, NodeLifecycle::Active),
+        (5, NodeLifecycle::Cordoned),
+        (4, NodeLifecycle::Decommissioning),
+    ] {
+        let error = driver.refused(report_removal(id, id));
+        assert!(
+            matches!(error, ControlError::NotRemoved { node: n, lifecycle: l } if n == node(id) && l == lifecycle),
+            "{error:?}"
+        );
+        assert_eq!(error.requeue(), super::Requeue::ConfirmView);
+    }
+}
+
 #[test]
 fn every_error_variant_has_a_unit_test_named_after_it() {
     // One name per variant, in a match that fails to compile when a variant
@@ -643,6 +785,7 @@ fn every_error_variant_has_a_unit_test_named_after_it() {
             ControlError::UnknownGroup { .. } => "unknown_group",
             ControlError::UnknownNode { .. } => "unknown_node",
             ControlError::NodeRemoved { .. } => "node_removed",
+            ControlError::NodeVacant { .. } => "node_vacant",
             ControlError::StalePlacement { .. } => "stale_placement",
             ControlError::GroupNotLive { .. } => "group_not_live",
             ControlError::NotMoving { .. } => "not_moving",
@@ -656,6 +799,7 @@ fn every_error_variant_has_a_unit_test_named_after_it() {
             ControlError::Decommissioning { .. } => "decommissioning",
             ControlError::OtherRoot { .. } => "other_root",
             ControlError::StaleRoot { .. } => "stale_root",
+            ControlError::NotRemoved { .. } => "not_removed",
         })
         .collect();
     let source = include_str!("tests.rs");
@@ -1029,7 +1173,7 @@ fn every_root_round_trips_through_messagepack_and_json() {
         leader_since_ms: 0,
         eligibility: BTreeMap::new(),
         decommission_blocked: Vec::new(),
-        sweep_pending: BTreeMap::new(),
+        removal_pending: BTreeMap::new(),
         last_bootstrap_refusal: None,
         oldest_move_age_ms: None,
     });
@@ -1099,6 +1243,18 @@ fn sample_leader_report() -> MetaLeaderReport {
             | BlockReason::Unknown => {}
         }
     }
+    let directories = [
+        super::RemovalDirectory::Unlisted,
+        super::RemovalDirectory::Unswept(BTreeSet::from([RaftGroupId(9)])),
+        super::RemovalDirectory::Swept,
+    ];
+    for directory in &directories {
+        match directory {
+            super::RemovalDirectory::Unlisted
+            | super::RemovalDirectory::Unswept(_)
+            | super::RemovalDirectory::Swept => {}
+        }
+    }
     MetaLeaderReport {
         leader: node(2),
         leader_since_ms: 71,
@@ -1109,10 +1265,19 @@ fn sample_leader_report() -> MetaLeaderReport {
             .zip(reasons)
             .map(|(group, reason)| BlockedMove { group, reason })
             .collect(),
-        sweep_pending: BTreeMap::from([(
-            node(6),
-            BTreeSet::from([RaftGroupId(1), RaftGroupId(7)]),
-        )]),
+        removal_pending: directories
+            .into_iter()
+            .zip([6, 7, 8])
+            .map(|(directory, id)| {
+                (node(id), super::PendingRemoval {
+                    root: super::samples::wide_root(id.checked_add(0x70).unwrap()),
+                    unconfirmed: BTreeSet::from([RaftGroupId(1), RaftGroupId(7)]),
+                    directory,
+                    meta_member: id == 6,
+                    process_answers: id == 7,
+                })
+            })
+            .collect(),
         last_bootstrap_refusal: Some(ControlError::InvalidBootstrap {
             problem: BootstrapProblem::ReplicationFactorAboveNodes,
         }),
@@ -1158,6 +1323,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
         RegistrationStatus::RootRefused {
             slot: RootSlot::Released(root(6)),
         },
+        RegistrationStatus::RemovalPending,
         RegistrationStatus::Refused(ControlError::FormationCut),
         RegistrationStatus::Removed,
     ];
@@ -1202,6 +1368,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
                 Registered::Forming | Registered::Referenced(_) | Registered::Unreferenced(_),
             )
             | RegistrationStatus::RootRefused { .. }
+            | RegistrationStatus::RemovalPending
             | RegistrationStatus::Refused(_)
             | RegistrationStatus::Removed => {}
         }
@@ -1288,7 +1455,7 @@ fn planner_enums_in_admin_json_decode_an_unknown_variant() {
         BlockReason::Unknown
     );
     let report: MetaLeaderReport = serde_json::from_str(
-        r#"{"leader":2,"leader_since_ms":7,"eligibility":{"3":"draining","4":"eligible"},"decommission_blocked":[{"group":5,"reason":"move_limit"}],"sweep_pending":{},"last_bootstrap_refusal":null,"oldest_move_age_ms":null}"#,
+        r#"{"leader":2,"leader_since_ms":7,"eligibility":{"3":"draining","4":"eligible"},"decommission_blocked":[{"group":5,"reason":"move_limit"}],"removal_pending":{},"last_bootstrap_refusal":null,"oldest_move_age_ms":null}"#,
     )
     .unwrap();
     assert_eq!(
@@ -1304,7 +1471,7 @@ fn planner_enums_in_admin_json_decode_an_unknown_variant() {
     }]);
     // An `Option` field is required, also when `null`.
     serde_json::from_str::<MetaLeaderReport>(
-        r#"{"leader":2,"leader_since_ms":7,"eligibility":{},"decommission_blocked":[],"sweep_pending":{},"last_bootstrap_refusal":null}"#,
+        r#"{"leader":2,"leader_since_ms":7,"eligibility":{},"decommission_blocked":[],"removal_pending":{},"last_bootstrap_refusal":null}"#,
     )
     .expect_err("a missing `oldest_move_age_ms` does not decode");
 }

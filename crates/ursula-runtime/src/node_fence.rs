@@ -33,13 +33,22 @@
 //! are: a meta leader's barrier would let it take a meta floor beside the
 //! old process before meta answered its registration.
 //!
+//! The fence also carries the run's delete standing ([`DeleteStanding`]):
+//! a run deletes a snapshot object only once the meta group answered its
+//! registration in this run, and never again once it knows itself removed.
+//! Snapshot objects live under a node directory, which a later life of the
+//! node id shares: an old disk of a removed life, started again where it
+//! reaches the object store but not the meta group, would otherwise collect
+//! the new life's objects as its own garbage.
+//!
 //! A process without a WAL root, or a test, runs [`NodeFence::unleased`]:
-//! no lease and no wait, only the shutdown's close.
+//! no lease, no wait and no delete hold, only the shutdown's close.
 
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -80,6 +89,50 @@ fn wait_covers_objects() -> bool {
         return false;
     }
     true
+}
+
+/// Whether a held process's snapshot DELETEs wait for its registration's
+/// answer and stop for good at its removal, read only when one would be
+/// refused. A negative control turns it off
+/// (`Defence::DeleteAfterRegistration`), and the lease and the wait alone
+/// then decide.
+fn deletes_wait_for_registration() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::DeleteAfterRegistration) {
+        ursula_stream::sim_controls::note_fired(Defence::DeleteAfterRegistration);
+        return false;
+    }
+    true
+}
+
+/// Whether this run may delete snapshot objects (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteStanding {
+    /// The meta group has not answered this run's registration yet.
+    Unregistered,
+    /// The meta group answered this run's registration.
+    Registered,
+    /// The run knows itself removed: its objects are the meta leader's
+    /// sweep's for good.
+    Removed,
+}
+
+impl DeleteStanding {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Unregistered => 0,
+            Self::Registered => 1,
+            Self::Removed => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Self {
+        match value {
+            0 => Self::Unregistered,
+            1 => Self::Registered,
+            _ => Self::Removed,
+        }
+    }
 }
 
 /// A probe's outcome.
@@ -203,6 +256,11 @@ pub enum WriteRefusal {
     /// A snapshot object, while a predecessor wait is owed or an unbound
     /// root awaits its binding.
     PredecessorWait,
+    /// A snapshot DELETE before the meta group answered this run's
+    /// registration.
+    Unregistered,
+    /// A snapshot DELETE of a run that knows itself removed.
+    Removed,
 }
 
 /// A PUT or DELETE the fence refused before it was sent. The store call
@@ -238,6 +296,8 @@ struct FenceState {
     owes_wait: AtomicBool,
     /// A root that the meta group has not bound yet.
     awaits_binding: AtomicBool,
+    /// The run's [`DeleteStanding`], encoded.
+    deletes: AtomicU8,
     /// When a bootstrapped cluster's meta group bound this run's unbound
     /// root, in nanoseconds after `origin`, plus one. 0 for none. Only the
     /// simulation's checks read it ([`NodeFence::bound_at`]).
@@ -263,6 +323,14 @@ impl NodeFence {
             superseded: AtomicBool::new(false),
             owes_wait: AtomicBool::new(false),
             awaits_binding: AtomicBool::new(false),
+            deletes: AtomicU8::new(
+                if lease.is_some() {
+                    DeleteStanding::Unregistered
+                } else {
+                    DeleteStanding::Registered
+                }
+                .encode(),
+            ),
             #[cfg(madsim)]
             bound: AtomicU64::new(0),
             waited: crate::rt::sync::Notify::new(),
@@ -399,6 +467,55 @@ impl NodeFence {
         })
     }
 
+    /// The check before a store call that DELETEs the snapshot object at
+    /// `path`: the write check, then the run's delete standing.
+    pub fn check_snapshot_delete(&self, path: &str) -> Result<(), FencedWrite> {
+        self.check_write(FencedObject::Snapshot, "DELETE", path)?;
+        self.check_delete_standing(path)
+    }
+
+    /// The delete standing's part of [`Self::check_snapshot_delete`]
+    /// alone: a DELETE passes only while the run is
+    /// [`DeleteStanding::Registered`].
+    pub fn check_delete_standing(&self, path: &str) -> Result<(), FencedWrite> {
+        let refusal = match self.delete_standing() {
+            DeleteStanding::Registered => return Ok(()),
+            DeleteStanding::Unregistered => WriteRefusal::Unregistered,
+            DeleteStanding::Removed => WriteRefusal::Removed,
+        };
+        if !deletes_wait_for_registration() {
+            return Ok(());
+        }
+        Err(FencedWrite {
+            refusal,
+            operation: "DELETE",
+            path: path.to_owned(),
+        })
+    }
+
+    /// The run's delete standing.
+    pub fn delete_standing(&self) -> DeleteStanding {
+        DeleteStanding::decode(self.0.deletes.load(Ordering::Acquire))
+    }
+
+    /// The meta group answered this run's registration: its snapshot
+    /// DELETEs pass from now on, unless it knows itself removed.
+    pub fn registered(&self) {
+        let _was = self.0.deletes.compare_exchange(
+            DeleteStanding::Unregistered.encode(),
+            DeleteStanding::Registered.encode(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// The run knows itself removed: it deletes no snapshot object again.
+    pub fn removed(&self) {
+        self.0
+            .deletes
+            .store(DeleteStanding::Removed.encode(), Ordering::Release);
+    }
+
     /// Closes the fence for good: a shutdown does it before it records a
     /// clean end of the run.
     pub fn close(&self) {
@@ -514,6 +631,7 @@ impl NodeFence {
 mod tests {
     use std::time::Duration;
 
+    use super::DeleteStanding;
     use super::DiskLease;
     use super::FenceStatus;
     use super::FencedObject;
@@ -675,6 +793,53 @@ mod tests {
             .check_write(FencedObject::Cold, "DELETE", "cold/x")
             .unwrap_err();
         assert_eq!(refused.refusal, WriteRefusal::Closed);
+    }
+
+    /// A leased run deletes no snapshot object before its registration's
+    /// answer, and none once it knows itself removed, whatever a later
+    /// answer says. PUTs and cold writes do not wait for the answer, and an
+    /// unleased fence deletes from its start.
+    #[test]
+    fn a_snapshot_delete_waits_for_the_registration_and_stops_at_the_removal() {
+        let fence = NodeFence::leased(L);
+        let t = fence_now();
+        fence.record_probe(t, ProbeOutcome::Synced, t);
+        assert_eq!(fence.delete_standing(), DeleteStanding::Unregistered);
+        assert_eq!(
+            fence
+                .check_snapshot_delete("snapshots/x")
+                .unwrap_err()
+                .refusal,
+            WriteRefusal::Unregistered
+        );
+        fence
+            .check_write(FencedObject::Snapshot, "PUT", "snapshots/x")
+            .unwrap();
+        fence
+            .check_write(FencedObject::Cold, "DELETE", "cold/x")
+            .unwrap();
+        fence.registered();
+        fence.check_snapshot_delete("snapshots/x").unwrap();
+        fence.removed();
+        fence.registered();
+        assert_eq!(fence.delete_standing(), DeleteStanding::Removed);
+        assert_eq!(
+            fence
+                .check_snapshot_delete("snapshots/x")
+                .unwrap_err()
+                .refusal,
+            WriteRefusal::Removed
+        );
+        let unleased = NodeFence::unleased();
+        unleased.check_snapshot_delete("snapshots/x").unwrap();
+        unleased.removed();
+        assert_eq!(
+            unleased
+                .check_snapshot_delete("snapshots/x")
+                .unwrap_err()
+                .refusal,
+            WriteRefusal::Removed
+        );
     }
 
     /// An unbound root awaiting its binding holds data replicas and snapshot

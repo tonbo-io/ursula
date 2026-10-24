@@ -1047,7 +1047,9 @@ pub trait SnapshotStore: Send + Sync + Debug {
 pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
 
 /// A snapshot store whose object PUTs and DELETEs are sent only while the
-/// node fence admits them and no predecessor wait is owed. The check runs
+/// node fence admits them and no predecessor wait is owed, and whose
+/// DELETEs only once the meta group answered the run's registration and
+/// while the run does not know itself removed (`NodeFence::check_snapshot_delete`). The check runs
 /// before each store call, after the LIST or state read it rests on
 /// returned (the store's own retries of one call are not checked again), so a garbage pass that began inside the lease deletes nothing
 /// once it ended.
@@ -1079,13 +1081,14 @@ impl FencedSnapshotStore {
             .check_write(crate::node_fence::FencedObject::Snapshot, operation, path)?)
     }
 
-    /// The check before a DELETE of `object`.
+    /// The check before a DELETE of `object`: the write check, then the
+    /// run's delete standing (`NodeFence::check_snapshot_delete`).
     fn check_delete(&self, object: &OwnedObject) -> Result<(), SnapshotStoreError> {
         let checked = self.check("DELETE", object.path());
-        if checked.is_err() && self.deletes_by_listing(object) {
-            return Ok(());
+        if checked.is_err() && !self.deletes_by_listing(object) {
+            return checked;
         }
-        checked
+        Ok(self.fence.check_delete_standing(object.path())?)
     }
 
     /// Whether a refused DELETE of `object` follows what the fence said
@@ -1196,7 +1199,7 @@ impl SnapshotStore for FencedSnapshotStore {
 
     fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
         Box::pin(async move {
-            self.check("DELETE", object.path())?;
+            self.fence.check_snapshot_delete(object.path())?;
             self.inner.delete_node_object(object).await
         })
     }

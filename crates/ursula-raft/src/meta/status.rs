@@ -47,6 +47,7 @@ use ursula_shard::RaftTarget;
 
 use super::confirm::BarrierFailure;
 use super::confirm::MetaBarrierError;
+use super::genesis::GenesisProbe;
 use super::genesis_driver::GenesisStatus;
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
@@ -62,6 +63,7 @@ pub(crate) type Confirmation<'a> =
 type Submission<'a> =
     Pin<Box<dyn Future<Output = Result<ControlApplied, MetaWriteError>> + Send + 'a>>;
 type Barrier<'a> = Pin<Box<dyn Future<Output = Result<BarrierAnswer, BarrierFailure>> + Send + 'a>>;
+type Probe<'a> = Pin<Box<dyn Future<Output = Option<crate::rejoin::PeerGroupLog>> + Send + 'a>>;
 
 /// Why [`MetaStatusReader::group_status`] answered with no group status.
 #[derive(Debug, thiserror::Error)]
@@ -75,12 +77,13 @@ pub enum GroupStatusError {
     Refused(#[source] ControlError),
 }
 
-/// A meta read barrier on this node's view, a write to the meta group and a
-/// barrier of any group, whatever the transport.
+/// A meta read barrier on this node's view, a write to the meta group, a
+/// barrier of any group and a genesis probe, whatever the transport.
 trait MetaAccess: Send + Sync {
     fn confirm_view(&self) -> Confirmation<'_>;
     fn submit(&self, command: ControlCommand) -> Submission<'_>;
     fn barrier(&self, leader: NodeId, target: RaftTarget) -> Barrier<'_>;
+    fn genesis_probe<'a>(&'a self, peer: NodeId, probe: &'a GenesisProbe) -> Probe<'a>;
 }
 
 impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
@@ -95,6 +98,10 @@ impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
     fn barrier(&self, leader: NodeId, target: RaftTarget) -> Barrier<'_> {
         Box::pin(MetaHandle::barrier(self, leader, target))
     }
+
+    fn genesis_probe<'a>(&'a self, peer: NodeId, probe: &'a GenesisProbe) -> Probe<'a> {
+        Box::pin(MetaHandle::genesis_probe(self, peer, probe))
+    }
 }
 
 /// What a placement status reads of this node's meta runtime. Cheap to
@@ -102,6 +109,8 @@ impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
 #[derive(Clone)]
 pub struct MetaStatusReader {
     node: NodeId,
+    /// The WAL root this run of the node runs on.
+    root: RootId,
     claim: GenesisClaim,
     status: MetaRuntimeStatus,
     registry: RaftGroupHandleRegistry,
@@ -119,6 +128,7 @@ impl std::fmt::Debug for MetaStatusReader {
 impl MetaStatusReader {
     pub(crate) fn new<T: RecoveryTransport>(
         node: NodeId,
+        root: RootId,
         claim: GenesisClaim,
         status: MetaRuntimeStatus,
         registry: RaftGroupHandleRegistry,
@@ -126,6 +136,7 @@ impl MetaStatusReader {
     ) -> Self {
         Self {
             node,
+            root,
             claim,
             status,
             registry,
@@ -141,6 +152,13 @@ impl MetaStatusReader {
     /// The node the status is of.
     pub(crate) fn node(&self) -> NodeId {
         self.node
+    }
+
+    /// The WAL root this run of the node runs on: the view's record of the
+    /// node is this run's only when its slot names it
+    /// (`ursula_control::Cluster::own_record`).
+    pub fn root(&self) -> RootId {
+        self.root
     }
 
     pub(crate) fn registry(&self) -> &RaftGroupHandleRegistry {
@@ -333,6 +351,37 @@ impl MetaStatusReader {
                 group,
                 node: self.node,
                 created_at,
+            })
+            .await
+    }
+
+    /// Whether a process of the root `node` is bound to in this node's view
+    /// answers at `node`'s `raft.peers` address: it answered this node's
+    /// genesis probe, the one read-only meta-plane request, and its answer
+    /// passed the responder check, which counts only an answer stamped by a
+    /// process of the root the view binds the id to
+    /// (`crate::PeerCluster::accept_responder`). A refusal, no answer, or an
+    /// answer of another root is no process of it.
+    pub(crate) async fn bound_process_answers(&self, node: NodeId) -> bool {
+        let probe = GenesisProbe {
+            claim: self.claim.clone(),
+            vote: crate::rejoin::bootstrap_probe_vote(),
+        };
+        self.meta.genesis_probe(node, &probe).await.is_some()
+    }
+
+    /// Reports through the meta leader that the removal of `node`'s life on
+    /// `root` completed (`ControlCommand::ReportRemovalComplete`).
+    pub(crate) async fn report_removal_complete(
+        &self,
+        node: NodeId,
+        root: RootId,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::ReportRemovalComplete {
+                node,
+                root,
+                now_ms: ursula_runtime::unix_time_ms(),
             })
             .await
     }

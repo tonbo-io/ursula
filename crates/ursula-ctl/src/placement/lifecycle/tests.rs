@@ -16,6 +16,7 @@ use ursula_control::samples::node;
 use ursula_control::samples::node_set;
 use ursula_control::samples::params;
 use ursula_control::samples::register;
+use ursula_control::samples::root;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::WriteEffect;
@@ -191,8 +192,10 @@ fn cordon_and_uncordon_send_only_what_the_kernel_takes() {
     );
 }
 
-/// Catches a scale-down that drops a node still holding a role, and a
-/// scale-up that starts a removed id.
+/// Each check over every lifecycle, a node that never registered and a
+/// cluster that has not bootstrapped. Catches a scale-down that drops a
+/// node still in a life, a scale-up that starts an id whose removal has not
+/// completed, and a volume deleted under an id that is not vacant.
 #[test]
 fn removal_checks_read_each_nodes_lifecycle() {
     let mut meta = Meta::new();
@@ -200,34 +203,73 @@ fn removal_checks_read_each_nodes_lifecycle() {
     let roleless = meta.other(false);
     meta.change(roleless, LifecycleChange::Decommission);
     meta.change(with_role, LifecycleChange::Decommission);
+    assert_eq!(meta.lifecycle(roleless), NodeLifecycle::Removed);
+    assert_eq!(meta.lifecycle(with_role), NodeLifecycle::Decommissioning);
+    let mut vacated = Meta::new();
+    let vacant = vacated.other(false);
+    vacated.change(vacant, LifecycleChange::Decommission);
+    vacated.apply(ControlCommand::ReportRemovalComplete {
+        node: node(vacant),
+        root: root(vacant),
+        now_ms: 40,
+    });
+    assert_eq!(vacated.lifecycle(vacant), NodeLifecycle::Vacant);
     let cluster = meta.state.cluster();
+    let pending = |id| {
+        Err(RemovalRefusal::RemovalPending {
+            node: node(id),
+            pending: None,
+        })
+    };
     // 9 never registered: it holds nothing.
     assert_eq!(
-        check_removal(cluster, &ids(&[roleless, 9]), Removal::Removed),
+        check_removal(cluster, &ids(&[roleless, 9]), Removal::Leaving),
         Ok(())
     );
     assert_eq!(
-        check_removal(cluster, &ids(&[roleless, with_role]), Removal::Removed),
+        check_removal(cluster, &ids(&[roleless, with_role]), Removal::Leaving),
         Err(RemovalRefusal::NotRemoved {
             node: node(with_role),
             lifecycle: NodeLifecycle::Decommissioning,
         })
     );
     assert_eq!(
-        check_removal(cluster, &ids(&[with_role, 9]), Removal::NotRemoved),
+        check_removal(cluster, &ids(&[with_role, 1, 9]), Removal::Joining),
         Ok(())
     );
     assert_eq!(
-        check_removal(cluster, &ids(&[roleless]), Removal::NotRemoved),
-        Err(RemovalRefusal::Removed {
-            node: node(roleless)
+        check_removal(cluster, &ids(&[roleless]), Removal::Joining),
+        pending(roleless)
+    );
+    assert_eq!(
+        check_removal(cluster, &ids(&[roleless]), Removal::Vacant),
+        pending(roleless)
+    );
+    assert_eq!(
+        check_removal(cluster, &ids(&[with_role]), Removal::Vacant),
+        Err(RemovalRefusal::InLife {
+            node: node(with_role),
+            lifecycle: NodeLifecycle::Decommissioning,
         })
     );
     assert_eq!(
-        check_removal(None, &ids(&[5]), Removal::Removed),
+        check_removal(cluster, &ids(&[9]), Removal::Vacant),
+        Err(RemovalRefusal::NotRegistered { node: node(9) })
+    );
+    // A vacant id passes every check.
+    let cluster = vacated.state.cluster();
+    for removal in [Removal::Leaving, Removal::Joining, Removal::Vacant] {
+        assert_eq!(check_removal(cluster, &ids(&[vacant]), removal), Ok(()));
+    }
+    assert_eq!(
+        check_removal(None, &ids(&[5]), Removal::Leaving),
         Err(RemovalRefusal::NotBootstrapped)
     );
-    assert_eq!(check_removal(None, &ids(&[5]), Removal::NotRemoved), Ok(()));
+    assert_eq!(check_removal(None, &ids(&[5]), Removal::Joining), Ok(()));
+    assert_eq!(
+        check_removal(None, &ids(&[5]), Removal::Vacant),
+        Err(RemovalRefusal::NotRegistered { node: node(5) })
+    );
 }
 
 /// Catches a refusal that may pass on a later view ending the command, and

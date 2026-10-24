@@ -1400,6 +1400,13 @@ pub enum ServingReadinessReason {
     /// and the predecessor wait from the binding ends. The placement status
     /// names it.
     RootRefused,
+    /// This node's id is removed and its removal has not completed, and
+    /// this node runs on an unbound root: its data replicas grant no vote
+    /// and keep their recovery gates closed until the meta leader marks the
+    /// id vacant, and the node then binds with no restart. The placement
+    /// status names it, and the meta leader's report what the removal waits
+    /// for.
+    RemovalPending,
     /// A process of an earlier run of this root may still run: this node
     /// grants no vote and opens no recovery gate until the wait ends.
     PredecessorWait,
@@ -1461,6 +1468,7 @@ mod serving_readiness_tests {
             (ServingReadinessReason::DiskLeaseLost, "disk_lease_lost"),
             (ServingReadinessReason::Superseded, "superseded"),
             (ServingReadinessReason::RootRefused, "root_refused"),
+            (ServingReadinessReason::RemovalPending, "removal_pending"),
             (ServingReadinessReason::PredecessorWait, "predecessor_wait"),
             (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
             (

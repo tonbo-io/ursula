@@ -93,6 +93,16 @@
 //!   released slot names never binds again (the release rule, a disk
 //!   revoked, keeps a root released earlier out), and `OtherRoot` is
 //!   retried while `StaleRoot` confirms a view;
+//! - a node id between lives: the lifecycle `Vacant`, which only
+//!   `ReportRemovalComplete` writes, a compare-and-set on a `Removed` record
+//!   and its slot's root that releases that root (`RemovalCompleted`,
+//!   `NotRemoved`, `StaleRoot`), and a `RegisterNode` of an `empty` root
+//!   other than the released one that begins a fresh `Active` record on a
+//!   vacant id; a vacant id refuses every other command naming it with
+//!   `NodeVacant`;
+//! - a recovery gate rule: a replica whose log is empty and whose persisted
+//!   vote is committed above term 0, a live leader's vote adopted as a
+//!   barrier's floor, opens refusing every candidate;
 //! - the Raft metadata of the process fence: `ursula-incarnation`,
 //!   `ursula-target-incarnation` and `ursula-fence` with its six refusals,
 //!   which a sender reads only after the mismatch text, a cluster refusal

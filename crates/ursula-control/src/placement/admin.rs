@@ -92,16 +92,63 @@ pub struct MetaLeaderReport {
     /// The decommissioning nodes' groups the last decommission pass could
     /// not move.
     pub decommission_blocked: Vec<BlockedMove>,
-    /// The groups whose snapshot objects the removed-node sweep's last
-    /// pass left, by removed node. A node removed after that pass is absent
-    /// until the next pass.
-    pub sweep_pending: BTreeMap<NodeId, BTreeSet<RaftGroupId>>,
+    /// What each removed node's removal still waits for, as the last
+    /// removal-completion pass found it. A node removed after that pass is
+    /// absent until the next pass, and a node whose removal completed is
+    /// `vacant` and absent.
+    pub removal_pending: BTreeMap<NodeId, PendingRemoval>,
     /// Why the meta leader's last `Bootstrap` was refused, if it was.
     #[serde(deserialize_with = "required_option")]
     pub last_bootstrap_refusal: Option<ControlError>,
     /// The age of the oldest move in progress (display only).
     #[serde(deserialize_with = "required_option")]
     pub oldest_move_age_ms: Option<u64>,
+}
+
+/// What a removed node's removal still waits for before the meta leader
+/// marks its id `vacant` (`ControlCommand::ReportRemovalComplete`). The
+/// removal completes once every field says so: every group confirmed,
+/// the directory swept, the meta memberships free of the node and no
+/// process of the removed root answering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRemoval {
+    /// The root of the removed life.
+    pub root: RootId,
+    /// The groups whose live leader has not answered, in this meta
+    /// leadership, that the node is no member of them: no live leader
+    /// answered (the group is down or lost its quorum), or the answer still
+    /// counts the node.
+    pub unconfirmed: BTreeSet<RaftGroupId>,
+    /// The node's snapshot directory.
+    pub directory: RemovalDirectory,
+    /// Whether the meta group's committed or effective membership still
+    /// lists the node.
+    pub meta_member: bool,
+    /// Whether a process of the removed root still answers at the node's
+    /// `raft.peers` address: stop it for the removal to complete.
+    pub process_answers: bool,
+}
+
+impl PendingRemoval {
+    /// Whether nothing holds the removal any more.
+    pub fn is_complete(&self) -> bool {
+        self.unconfirmed.is_empty()
+            && self.directory == RemovalDirectory::Swept
+            && !self.meta_member
+            && !self.process_answers
+    }
+}
+
+/// A removed node's snapshot directory, as the last pass found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalDirectory {
+    /// The directory did not list.
+    Unlisted,
+    /// The directory still holds the node's objects of these groups.
+    Unswept(BTreeSet<RaftGroupId>),
+    /// The directory holds no object of the node.
+    Swept,
 }
 
 /// Why this node runs no meta replica in this run, while it keeps its meta
@@ -181,6 +228,12 @@ pub enum RegistrationStatus {
     /// again until an operator releases that root
     /// (`ursulactl node replace-disk`).
     RootRefused { slot: RootSlot },
+    /// The meta group refused the unbound root this node runs on because
+    /// its node id is removed and the removal has not completed: the node's
+    /// data replicas grant no vote and keep their recovery gates closed, and
+    /// the node registers again until the meta leader marks the id vacant,
+    /// then binds with no restart.
+    RemovalPending,
     /// The meta group refused the node for good: it registers again only
     /// after a restart.
     Refused(ControlError),
@@ -195,9 +248,11 @@ impl RegistrationStatus {
     pub fn standing(&self) -> Standing {
         match self {
             Self::Removed => Standing::Removed,
-            Self::Pending | Self::Answered(_) | Self::RootRefused { .. } | Self::Refused(_) => {
-                Standing::Member
-            }
+            Self::Pending
+            | Self::Answered(_)
+            | Self::RootRefused { .. }
+            | Self::RemovalPending
+            | Self::Refused(_) => Standing::Member,
         }
     }
 }

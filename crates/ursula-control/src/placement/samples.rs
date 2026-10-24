@@ -341,6 +341,11 @@ pub fn sample_state() -> ControlPlaneState {
                 since_ms: 15,
                 root: RootSlot::Bound(wide_root(0x15)),
             }),
+            (node(6), NodeRecord {
+                lifecycle: NodeLifecycle::Vacant,
+                since_ms: 16,
+                root: RootSlot::Released(wide_root(0x16)),
+            }),
         ]),
         groups: Placements(groups),
         // Group 1 is the stable group.
@@ -436,6 +441,11 @@ pub fn sample_commands() -> Vec<ControlCommand> {
             node: node(22),
             root: wide_root(0x60),
         },
+        ControlCommand::ReportRemovalComplete { .. } => ControlCommand::ReportRemovalComplete {
+            node: node(23),
+            root: wide_root(0x62),
+            now_ms: 63,
+        },
     })
 }
 
@@ -482,6 +492,11 @@ pub fn sample_responses() -> Vec<ControlResponse> {
             since_ms: 61,
             root: RootSlot::Released(wide_root(0x61)),
         }),
+        ControlApplied::RemovalCompleted(_) => ControlApplied::RemovalCompleted(NodeRecord {
+            lifecycle: NodeLifecycle::Vacant,
+            since_ms: 64,
+            root: RootSlot::Released(wide_root(0x64)),
+        }),
     });
     applied
         .into_iter()
@@ -504,6 +519,7 @@ pub fn sample_errors() -> Vec<ControlError> {
         },
         ControlError::UnknownNode { .. } => ControlError::UnknownNode { node: node(11) },
         ControlError::NodeRemoved { .. } => ControlError::NodeRemoved { node: node(12) },
+        ControlError::NodeVacant { .. } => ControlError::NodeVacant { node: node(28) },
         ControlError::StalePlacement { .. } => ControlError::StalePlacement {
             group: RaftGroupId(9),
             current: Box::new(GroupPlacement::Seeded {
@@ -552,6 +568,10 @@ pub fn sample_errors() -> Vec<ControlError> {
         ControlError::StaleRoot { .. } => ControlError::StaleRoot {
             node: node(27),
             slot: RootSlot::Released(wide_root(0x27)),
+        },
+        ControlError::NotRemoved { .. } => ControlError::NotRemoved {
+            node: node(29),
+            lifecycle: NodeLifecycle::Cordoned,
         },
     });
     errors.extend(

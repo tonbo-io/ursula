@@ -2,8 +2,10 @@
 //! reconcile shell pursues on the meta leader.
 //!
 //! The target keeps meta's committed voters, so the shell never changes a
-//! meta voter, and adds every registered node, every node that is not
-//! `Removed` once bootstrapped, as a learner. Its stage is always
+//! meta voter, and adds every registered node, every node in a life (not
+//! `Removed` or `Vacant`, `NodeLifecycle::has_life`) once bootstrapped, as a
+//! learner. A removal completes only once the meta memberships list the
+//! node in neither, so a new life of the id joins as a new learner. Its stage is always
 //! `Settled`, and meta has no peer gates, since meta never promotes. An
 //! empty view and a cut formation give no target: a meta recovery plan's
 //! cut leaves the membership as the plan made it.
@@ -19,7 +21,6 @@ use ursula_control::MembershipTarget;
 use ursula_control::PlacementView;
 use ursula_control::TargetStage;
 use ursula_proto::placement::NodeId;
-use ursula_proto::placement::NodeLifecycle;
 
 use super::confirm::MetaBarrierError;
 use super::handle::MetaHandle;
@@ -99,7 +100,7 @@ pub(crate) fn meta_target(
         ControlPlaneState::Bootstrapped(cluster) => cluster
             .nodes()
             .iter()
-            .filter(|(_, record)| record.lifecycle != NodeLifecycle::Removed)
+            .filter(|(_, record)| record.lifecycle.has_life())
             .map(|(node, _)| *node)
             .collect(),
     };
@@ -176,10 +177,11 @@ mod tests {
         assert_eq!(read.target.stage, TargetStage::Settled);
 
         // The sample cluster: 1 active, 2 cordoned, 3 decommissioning, 4
-        // removed and 5 active, with meta voters {1,2} in its params. The
-        // committed voters {1,5} differ from those, and stay the target's:
-        // read from the view, the target would be voters {1,2} with
-        // learners {3,5}. The removed node is no learner.
+        // removed, 5 active and 6 vacant, with meta voters {1,2} in its
+        // params. The committed voters {1,5} differ from those, and stay the
+        // target's: read from the view, the target would be voters {1,2}
+        // with learners {3,5}. Neither the removed nor the vacant node is a
+        // learner.
         let committed = MembershipConfig::Uniform {
             voters: samples::voters(&[1, 5]),
             learners: samples::ids(&[2]),

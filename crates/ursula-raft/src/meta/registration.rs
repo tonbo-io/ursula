@@ -16,7 +16,16 @@
 //! votes too and registers until an operator releases the slot, so it
 //! binds within [`RETRY_MAX`] of the release with no restart, and a bound
 //! root, one whose replicas may hold state, fences itself for good.
-//! `NodeRemoved` makes the node treat itself as removed until it restarts.
+//! `NodeRemoved` is judged by the standing too: a bound root is the removed
+//! life's own process, which treats itself as removed until it restarts,
+//! and an unbound root is a new disk started under the id before its
+//! removal completed, which is held out like a refused root and registers
+//! again with a back-off capped at [`REMOVAL_PENDING_RETRY_MAX`], so it
+//! binds with no restart once the id is vacant.
+//!
+//! The first answer of a run also lets the run delete snapshot objects
+//! (`NodeFence::registered`), and a removal stops it for good
+//! (`NodeFence::removed`).
 
 use std::sync::Arc;
 use std::sync::Weak;
@@ -55,6 +64,11 @@ pub const REREGISTER_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const RETRY_MIN: Duration = Duration::from_millis(200);
 /// The longest pause before a registration is sent again.
 pub(crate) const RETRY_MAX: Duration = Duration::from_secs(5);
+/// The longest pause before a registration refused for a pending removal
+/// is sent again: the meta leader completes a removal on a pass every
+/// `meta::sweep::REMOVAL_RETRY`, and each refused registration is a meta
+/// entry.
+pub(crate) const REMOVAL_PENDING_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// The next pause of a capped back-off.
 pub(crate) fn back_off(pause: Duration) -> Duration {
@@ -78,9 +92,13 @@ pub(crate) enum Verdict {
     /// An unbound root refused for the slot: hold it out and register
     /// again.
     RootRefused(RootSlot),
+    /// An unbound root under a removed id whose removal has not completed:
+    /// hold it out and register again.
+    RemovalPending,
     /// A bound root refused for the slot: fence the process for good.
     Superseded(RootSlot),
-    /// The node is removed: it treats itself so until it restarts.
+    /// The bound root of a removed node: it treats itself so until it
+    /// restarts.
     Removed,
     /// Refused for good.
     Refused(ControlError),
@@ -99,7 +117,10 @@ pub(crate) fn judge_answer(
     match answer {
         Ok(ControlApplied::NodeRegistered(registered)) => Verdict::Registered(registered),
         Ok(other) => Verdict::Unexpected(other),
-        Err(MetaWriteError::Refused(ControlError::NodeRemoved { .. })) => Verdict::Removed,
+        Err(MetaWriteError::Refused(ControlError::NodeRemoved { .. })) => match standing {
+            RootStanding::Unbound => Verdict::RemovalPending,
+            RootStanding::Bound => Verdict::Removed,
+        },
         Err(MetaWriteError::Refused(ControlError::OtherRoot { slot, .. })) => match standing {
             RootStanding::Unbound => Verdict::RootRefused(slot),
             RootStanding::Bound => Verdict::Superseded(slot),
@@ -156,6 +177,7 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
                         continue;
                     }
                 }
+                guard.registered();
                 status.send_replace(RegistrationStatus::Answered(registered));
                 pause = RETRY_MIN;
                 wait_without_leader(&mut leaderless, REREGISTER_AFTER).await;
@@ -173,6 +195,20 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
                 guard.hold_out();
                 status.send_replace(RegistrationStatus::RootRefused { slot });
             }
+            Verdict::RemovalPending => {
+                tracing::warn!(
+                    node = %me,
+                    root = %registrant.root,
+                    "meta registration: this node id is removed and its removal has not \
+                     completed. Its data replicas stay held out and it registers again until \
+                     the meta leader marks the id vacant"
+                );
+                guard.hold_out();
+                status.send_replace(RegistrationStatus::RemovalPending);
+                crate::rt::time::sleep(pause).await;
+                pause = pause.saturating_mul(2).min(REMOVAL_PENDING_RETRY_MAX);
+                continue;
+            }
             Verdict::Superseded(slot) => {
                 guard.supersede(Supersession::OtherRoot { slot });
                 status.send_replace(RegistrationStatus::Refused(ControlError::OtherRoot {
@@ -183,6 +219,7 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
             }
             Verdict::Removed => {
                 tracing::warn!(node = %me, "meta registration: this node is removed");
+                guard.removed();
                 status.send_replace(RegistrationStatus::Removed);
                 return;
             }
@@ -329,9 +366,11 @@ mod tests {
     use super::Verdict;
     use super::judge_answer;
 
-    /// Each answer, to each standing on the root: only `OtherRoot` depends
-    /// on it, holding an unbound root out and superseding a bound
-    /// one, whichever slot it names. A transient refusal is retried and a
+    /// Each answer, to each standing on the root: only `OtherRoot` and
+    /// `NodeRemoved` depend on it, holding an unbound root out and
+    /// superseding a bound one, whichever slot it names, and holding an
+    /// unbound root out while a removal is pending, where a bound root is
+    /// the removed life's. A transient refusal is retried and a
     /// permanent one ends the registration, for both.
     #[test]
     fn an_other_root_answer_holds_an_unbound_root_out_and_supersedes_a_bound_one() {
@@ -361,14 +400,29 @@ mod tests {
                 ),
                 Verdict::Registered(Registered::Forming)
             ));
-            assert!(matches!(
+            // A removal is the removed life's own for a bound root, and a
+            // pending one for a new disk.
+            match (
+                standing,
                 judge_answer(
                     standing,
                     Err(MetaWriteError::Refused(ControlError::NodeRemoved {
+                        node: samples::node(3),
+                    })),
+                ),
+            ) {
+                (RootStanding::Unbound, Verdict::RemovalPending)
+                | (RootStanding::Bound, Verdict::Removed) => {}
+                (standing, verdict) => panic!("{standing:?} removed: {verdict:?}"),
+            }
+            assert!(matches!(
+                judge_answer(
+                    standing,
+                    Err(MetaWriteError::Refused(ControlError::NodeVacant {
                         node: samples::node(3)
                     }))
                 ),
-                Verdict::Removed
+                Verdict::Refused(ControlError::NodeVacant { .. })
             ));
             assert!(matches!(
                 judge_answer(

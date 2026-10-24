@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
-use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::RootId;
 use ursula_proto::placement::TeardownStage;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
@@ -57,32 +57,36 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// Whether node `me` knows itself removed (design 8.1): its standing
-    /// says so, or `cluster`, its bootstrapped view, shows it `Removed`. The
-    /// one reading of a removal, for the node's hosting plan, its
-    /// leadership shed and its readiness. The hosting driver latches it for
-    /// the rest of the run, since a later view may no longer show it.
-    pub fn knows_removed(self, cluster: Option<&Cluster>, me: NodeId) -> bool {
+    /// Whether node `me`, running on `root`, knows itself removed (design
+    /// 8.1): its standing says so, or `cluster`, its bootstrapped view,
+    /// shows its own record ([`Cluster::own_record`]) with no life, `Removed` or
+    /// `Vacant`. The one reading of a removal, for the node's hosting plan,
+    /// its leadership shed and its readiness. The hosting driver latches it
+    /// for the rest of the run, since a later view may no longer show it.
+    pub fn knows_removed(self, cluster: Option<&Cluster>, me: NodeId, root: RootId) -> bool {
         self == Self::Removed
             || cluster
-                .and_then(|cluster| cluster.node(me))
-                .is_some_and(|record| record.lifecycle == NodeLifecycle::Removed)
+                .and_then(|cluster| cluster.own_record(me, root))
+                .is_some_and(|record| !record.lifecycle.has_life())
     }
 
-    /// Node `me`'s role in `group` by `cluster`, read with this standing:
-    /// none once the node knows itself removed ([`Self::knows_removed`]),
-    /// whatever role a view that predates the removal still shows. A
-    /// removed node hears no more meta entries, so restarted with its disk
-    /// it keeps a view that places it. The one reading of a node's own
-    /// placed role for the voter predicate ([`counts_as_voter`]), the
-    /// membership asker and the readiness inventory (design 8.1).
+    /// Node `me`'s role in `group` by `cluster`, read with this standing on
+    /// `root`: none once the node knows itself removed
+    /// ([`Self::knows_removed`]), whatever role a view that predates the
+    /// removal still shows, and none while the view's record of `me` is
+    /// another life's ([`Cluster::own_record`]). A removed node hears no more meta
+    /// entries, so restarted with its disk it keeps a view that places it.
+    /// The one reading of a node's own placed role for the voter predicate
+    /// ([`counts_as_voter`]), the membership asker and the readiness
+    /// inventory (design 8.1).
     pub fn placed_role(
         self,
         cluster: &Cluster,
         group: RaftGroupId,
         me: NodeId,
+        root: RootId,
     ) -> Option<ReplicaRole> {
-        if self.knows_removed(Some(cluster), me) {
+        if self.knows_removed(Some(cluster), me, root) || cluster.own_record(me, root).is_none() {
             None
         } else {
             cluster.role(group, me)
@@ -302,6 +306,9 @@ impl LocalReplica {
 #[derive(Debug, Clone, Copy)]
 pub struct HostingInput<'a> {
     pub me: NodeId,
+    /// The WAL root this run of `me` runs on: the view's record of `me` is
+    /// this run's only when its slot names it ([`Cluster::own_record`]).
+    pub root: RootId,
     pub standing: Standing,
     pub view: ViewInput<'a>,
     pub local: &'a BTreeMap<RaftGroupId, LocalReplica>,
@@ -363,19 +370,23 @@ pub struct HostingPlan {
 ///   `Abandoned` role only opens a held log. A role cancels a teardown at
 ///   its first step.
 ///
+/// A view whose record of the node is another life's ([`Cluster::own_record`]) is
+/// read as one that has not bootstrapped: it gives this run no role.
+///
 /// A replica whose teardown passed its first step is never admitted.
 pub fn plan_hosting(input: &HostingInput<'_>) -> HostingPlan {
+    let (me, root) = (input.me, input.root);
     if input
         .standing
-        .knows_removed(input.view.view().cluster(), input.me)
+        .knows_removed(input.view.view().cluster(), me, root)
     {
         return plan_removed(input.local);
     }
     match input.view {
-        ViewInput::Confirmed(confirmed) => plan_member(input.me, confirmed.view(), input.local),
+        ViewInput::Confirmed(confirmed) => plan_member(me, root, confirmed.view(), input.local),
         ViewInput::Unconfirmed(view) => {
-            let mut plan = plan_held(view, input.me, input.local);
-            let confirmed = plan_member(input.me, view, input.local);
+            let mut plan = plan_held(view, me, root, input.local);
+            let confirmed = plan_member(me, root, view, input.local);
             #[cfg(test)]
             if !enforced(Rule::ConfirmedCreation) {
                 for (group, admission) in &confirmed.admitted {
@@ -415,6 +426,7 @@ fn plan_removed(local: &BTreeMap<RaftGroupId, LocalReplica>) -> HostingPlan {
 fn plan_held(
     view: &PlacementView,
     me: NodeId,
+    root: RootId,
     local: &BTreeMap<RaftGroupId, LocalReplica>,
 ) -> HostingPlan {
     let mut plan = HostingPlan::default();
@@ -424,7 +436,9 @@ fn plan_held(
         }
         if let Some(cluster) = view.cluster()
             && replica.log.is_held()
-            && cluster.role(*group, me).is_none()
+            && Standing::Member
+                .placed_role(cluster, *group, me, root)
+                .is_none()
         {
             plan.unplaced.insert(*group);
         }
@@ -435,11 +449,15 @@ fn plan_held(
 /// A member's plan from `view` taken as confirmed.
 fn plan_member(
     me: NodeId,
+    root: RootId,
     view: &PlacementView,
     local: &BTreeMap<RaftGroupId, LocalReplica>,
 ) -> HostingPlan {
-    let Some(cluster) = view.cluster() else {
-        return plan_held(view, me, local);
+    let Some(cluster) = view
+        .cluster()
+        .filter(|cluster| cluster.own_record(me, root).is_some())
+    else {
+        return plan_held(view, me, root, local);
     };
     let mut groups: BTreeSet<RaftGroupId> = local.keys().copied().collect();
     groups.extend(
