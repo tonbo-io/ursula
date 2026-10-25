@@ -4,9 +4,9 @@
 //!
 //! Every type of this module itself but [`MetaForwardError`], which stays
 //! in the forwarding process, and of [`genesis`] and [`snapshot`], is
-//! format (format epoch 6): persisted in the meta log and its snapshot
-//! record, replicated, or sent between nodes, so its field order and
-//! variant names are the encoding (`ursula_stream::msgpack`). No type here
+//! format, frozen with the format epoch: persisted in the meta log and its
+//! snapshot record, replicated, or sent between nodes, so its field order
+//! and variant names are the encoding (`ursula_stream::msgpack`). No type here
 //! uses `default`, `skip_serializing_if`, `flatten` or an untagged enum. The
 //! persisted-envelopes and commands-and-responses fixtures pin each root.
 //! The replica, its state machine and its views ([`replica`],

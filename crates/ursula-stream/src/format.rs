@@ -123,6 +123,11 @@
 //!   names, because one serde form serves both their admin JSON and their
 //!   MessagePack. Neither is converted to the other.
 //!
+//! Epoch 7 is the format of Ursula 0.11. It keeps the encodings and
+//! apply-time rules of epoch 6, and every version number below reads 7, so
+//! 0.11 refuses the data and peers of 0.10 as it refuses those of any other
+//! epoch.
+//!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert
 //! them.
@@ -140,8 +145,8 @@
 //! pages and the cold key layout), in encoding and in meaning. It is the
 //! format epoch that last changed one of them, so it never exceeds
 //! [`FORMAT_EPOCH`]. Backup format 4 is written by 0.8, backup format 5 by
-//! 0.9 and 0.10. From backup format 5 on, a group object's first field is its
-//! backup format.
+//! 0.9, 0.10 and 0.11. From backup format 5 on, a group object's first field
+//! is its backup format.
 //!
 //! Policy:
 //!
@@ -157,18 +162,19 @@
 //! - There is no migration between epochs. Data of an older epoch moves by
 //!   `ursulactl` backup and restore when its backup format is this binary's,
 //!   and otherwise by export and re-import through the applications that own
-//!   it. Neither the server nor `ursulactl` converts it. 0.10 refuses every
-//!   epoch-5 data directory, object-storage prefix, peer and group snapshot.
-//!   It restores backups of backup format 5, which epoch 6 did not change.
+//!   it. Neither the server nor `ursulactl` converts it. 0.11 refuses every
+//!   epoch-6 data directory, object-storage prefix, peer and group snapshot.
+//!   It restores backups of backup format 5, which epochs 6 and 7 did not
+//!   change.
 //! - Epoch 2 was frozen when 0.6.0 was tagged, epoch 3 when 0.7.0 was tagged,
-//!   epoch 4 when 0.8.0 was tagged, epoch 5 when 0.9.0 was tagged. Epoch 6 is
-//!   frozen when 0.10.0 is tagged.
+//!   epoch 4 when 0.8.0 was tagged, epoch 5 when 0.9.0 was tagged, epoch 6
+//!   when 0.10.0 was tagged. Epoch 7 is frozen when 0.11.0 is tagged.
 //!   Main builds before that tag are not supported on each other's data;
 //!   every deployment of such a build starts from fresh prefixes and empty
 //!   data directories.
 
 /// The format epoch this binary reads and writes.
-pub const FORMAT_EPOCH: u32 = 6;
+pub const FORMAT_EPOCH: u32 = 7;
 
 /// The backup format this binary reads and writes: the format epoch that last
 /// changed what a backup holds.
@@ -179,7 +185,7 @@ const _: () = assert!(BACKUP_FORMAT_VERSION <= FORMAT_EPOCH);
 /// The text of every refusal of data of another format epoch:
 /// `{subject} {found}`, the epoch this binary reads, that nothing converts
 /// between epochs, and how data moves instead: by backup and restore when
-/// its backup format is this binary's, as epoch-5 data's is, and otherwise
+/// its backup format is this binary's, as epoch-6 data's is, and otherwise
 /// by export and re-import. Messages name epochs, never the binary's own
 /// crate version.
 pub fn format_epoch_refusal(subject: &str, found: &str) -> String {

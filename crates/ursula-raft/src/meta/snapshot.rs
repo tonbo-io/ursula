@@ -42,8 +42,8 @@ pub const META_SNAPSHOT_STATE_BYTES_PER_GROUP: u64 = 4 * 1024;
 /// `FullSnapshot` RPC. A build whose state exceeds it is refused rather than
 /// written, and a pointer that names more is refused rather than restored.
 ///
-/// The bound is part of format epoch 6 and fixed for the epoch, because a
-/// node refuses a meta record or install above it. A patch that raised it
+/// The bound is frozen with the format epoch, because a node refuses a meta
+/// record or install above it. A patch that raised it
 /// would build meta snapshots that an earlier patch of the same minor
 /// refuses to install during a rolling upgrade.
 pub const META_SNAPSHOT_MAX_STATE_BYTES: u64 =

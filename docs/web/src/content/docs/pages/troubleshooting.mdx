@@ -218,11 +218,11 @@ The node keeps serving, but maintenance readiness fails, so `ursulactl drain` an
 
 ### `raft WAL directory … holds data without a format marker`
 
-The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 6 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
+The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 7 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
 
 ### `raft WAL directory … is format epoch N`
 
-The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 6 only. Format epoch 5 is Ursula 0.9, whose data moves to this release by backup and restore ([Upgrading to 0.10](/docs/operations#upgrading-to-010)). Format epoch 4 is Ursula 0.8. Run the release that wrote it, or start on an empty directory.
+The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 7 only. Format epoch 6 is Ursula 0.10, whose data moves to this release by backup and restore ([Upgrading to 0.11](/docs/operations#upgrading-to-011)). Format epoch 5 is Ursula 0.9 and format epoch 4 is Ursula 0.8. Run the release that wrote it, or start on an empty directory.
 
 ### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
 
@@ -230,15 +230,15 @@ The cold root (or, with cold storage off, the S3 snapshot namespace) holds objec
 
 ### `object storage s3://… is format epoch N`
 
-The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.9 cluster (format epoch 5) moves to this release by backup and restore, with its cold objects copied into the new prefix without the marker ([Upgrading to 0.10](/docs/operations#upgrading-to-010)).
+The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.10 cluster (format epoch 6) moves to this release by backup and restore, with its cold objects copied into the new prefix without the marker ([Upgrading to 0.11](/docs/operations#upgrading-to-011)).
 
 ### `journal … uses Ursula WAL version N`
 
-A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6, version 3 is 0.7, version 4 is 0.8, version 5 is 0.9. This release reads format epoch 6 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
+A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6, version 3 is 0.7, version 4 is 0.8, version 5 is 0.9, version 6 is 0.10. This release reads format epoch 7 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
 
-### `peer N (…) refused Raft protocol 6`
+### `peer N (…) refused Raft protocol 7`
 
-A configured peer runs a release of another format epoch (Ursula 0.9 speaks protocol 5, 0.8 protocol 4, 0.7 protocol 3, 0.6 protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
+A configured peer runs a release of another format epoch (Ursula 0.10 speaks protocol 6, 0.9 protocol 5, 0.8 protocol 4, 0.7 protocol 3, 0.6 protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
 
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 

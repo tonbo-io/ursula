@@ -29,7 +29,7 @@ type Membership = StoredMembershipOf<UrsulaRaftTypeConfig>;
 
 /// The committed and the effective membership of a leader view, as a
 /// barrier answer carries them (`RejoinBarrierResponseV1.memberships`,
-/// MessagePack, required). Format epoch 6.
+/// MessagePack, required), frozen with the format epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderMemberships {
     pub committed: Membership,

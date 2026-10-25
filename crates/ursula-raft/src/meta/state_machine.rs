@@ -1,7 +1,7 @@
 //! The meta group's state machine: its dispatch of [`RaftCommand`], its
 //! inline snapshot record, and the views it publishes.
 //!
-//! Its dispatch is frozen with format epoch 6, like the kernel it applies:
+//! Its dispatch is frozen with the format epoch, like the kernel it applies:
 //!
 //! - a stream entry stops the apply, as a meta entry stops a data group's;
 //! - a history event whose `previous` is not the current history, or whose

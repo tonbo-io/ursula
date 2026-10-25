@@ -5,7 +5,7 @@
 //! and its ack keep their shape. Its request is a [`GenesisProbe`] in
 //! `GenesisProbeRequestV1.probe` and its answer a [`GenesisAnswer`] in
 //! `GenesisProbeAckV1.answer`, each one MessagePack value in a required
-//! field. Both are format (format epoch 6).
+//! field. Both are format, frozen with the format epoch.
 
 use serde::Deserialize;
 use serde::Serialize;

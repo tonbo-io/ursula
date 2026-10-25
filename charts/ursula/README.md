@@ -438,21 +438,16 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
-Ursula 0.10 (format epoch 6) cannot read the data of a 0.9 release. Install it
-fresh, as a new release with new PVCs and a new `s3.prefix` (and, with cold
-storage off and S3 snapshots, a new `snapshotStore.prefix`), with the 0.9
-release's `server.clusterId` and `raft.groupCount`. `helm upgrade` from 0.9
+Ursula 0.11 (format epoch 7) cannot read the data of a 0.10 release. Install
+it fresh, as a new release with new PVCs and a new `s3.prefix` (and, with cold
+storage off and S3 snapshots, a new `snapshotStore.prefix`), with the 0.10
+release's `server.clusterId` and `raft.groupCount`. `helm upgrade` from 0.10
 stops before a second voter is replaced, because the first new pod finds the
-0.9 data on its volume and exits at startup. Recover with `helm rollback`. A
-values file that still sets a value 0.10 removed (`server.updateStrategy`,
-`server.podManagementPolicy`, `server.probes.readiness.enabled`,
-`server.onDeleteMigration`, `server.startupOwnership`,
-`server.gracefulRollout`, `raft.initMembership`, `raft.initMembershipPerGroup`)
-fails validation first. Backups keep format 5, so move the data with
-`ursulactl backup-create` of 0.9, a copy of the 0.9 cold objects into the new
-prefix and `ursulactl restore` of 0.10. Then delete the 0.9 release's
-`<StatefulSet>-rollout-state` and `<StatefulSet>-maintenance` ConfigMaps with
-its other resources. See the operations guide's "Upgrading to 0.10".
+0.10 data on its volume and exits at startup. Recover with `helm rollback`.
+Backups keep format 5, so move the data with `ursulactl backup-create` of 0.10,
+a copy of the 0.10 cold objects into the new prefix and `ursulactl restore` of
+0.11. See the operations guide's "Upgrading to 0.11". A 0.9 release moves the
+same way, once its values drop what "Upgrading to 0.10" lists as removed.
 
 The StatefulSet updates by `RollingUpdate` and never changes Raft membership.
 Each replaced voter hands off its leaderships on `SIGTERM`, and the controller

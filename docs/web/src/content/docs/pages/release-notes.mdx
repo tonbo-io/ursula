@@ -3,6 +3,23 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.11.0
+
+**0.11.0 is a breaking release.** It moves the storage and protocol format to format epoch 7. A 0.11 node refuses epoch-6 Raft WAL directories and object-storage prefixes at startup and refuses 0.10 peers, and a 0.10 node refuses 0.11 peers. The backup format stays 5, so `ursulactl restore` of 0.11 restores a 0.10 backup. There is no in-place upgrade, no rolling upgrade and no rollback.
+
+- **If you cannot move your data yet, stay on 0.10.1.**
+- **Deploy 0.11 fresh:** empty PVCs and never-used object-storage prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.10, or a failed upgrade attempt, wrote to.
+- **Move your data with a backup, and keep the 0.10 `server.cluster_id` and `raft.group_count`.** Stop client writes and every SQLite session, back up 0.10 with `ursulactl backup-create` and `backup-verify` of 0.10, stop the 0.10 nodes, copy their cold objects into the 0.11 cold root, skipping `URSULA_FORMAT_EPOCH` and `snapshots/`, and run `ursulactl restore` of 0.11, which checks the copy first. Every restored stream answers with a new `Stream-Incarnation`, as after any restore.
+- **`helm upgrade` from 0.10 stops at the first pod.** The new pod finds the 0.10 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`.
+- **Keep the peer lists of 0.10 and 0.11 nodes apart.** A node that exchanges a Raft RPC with a node of the other release answers `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts.
+
+See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
+
+### Formats
+
+- **Format epoch 7.** The Raft WAL journals and state files, the meta journal, the WAL directory and object-storage markers, group snapshots and the Raft gRPC protocol carry format epoch 7. A node refuses data and peers of another epoch.
+- **Backup format 5.** Unchanged: a backup holds each group's stream snapshot, and a 0.10 backup restores on 0.11.
+
 ## 0.10.1
 
 0.10.1 is a patch of 0.10 and interoperates with 0.10.0: format epoch 6, backup format 5 and every storage, wire and protocol format are unchanged, and the usage report only gains an optional field. 0.10.0 and 0.10.1 nodes run in one cluster during a rolling upgrade, and 0.10.0 and 0.10.1 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.10.0 is safe.

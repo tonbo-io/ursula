@@ -1,5 +1,5 @@
-//! The typed target of a Raft RPC (format epoch 6): the plane and group a
-//! request names, and the node it is for.
+//! The typed target of a Raft RPC, frozen with the format epoch: the plane
+//! and group a request names, and the node it is for.
 //!
 //! Every Raft request carries the plane next to its frozen `raft_group_id`
 //! (`RaftPlaneV1`, where `UNSPECIFIED` is refused) and the node it is for
@@ -257,7 +257,7 @@ pub const TARGET_INCARNATION_METADATA: &str = "ursula-target-incarnation";
 pub const FENCE_METADATA: &str = "ursula-fence";
 
 /// Why a receiver's process fence refused a Raft RPC: a closed set, frozen
-/// with format epoch 6. A refusal is `FAILED_PRECONDITION` without the
+/// with the format epoch. A refusal is `FAILED_PRECONDITION` without the
 /// protocol-mismatch text, so it is never a format-epoch mismatch, and only
 /// [`fence_refusal`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

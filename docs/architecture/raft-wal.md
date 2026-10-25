@@ -224,7 +224,7 @@ log state), the meta group opens recovering, so its replica rejoins the meta
 group as a wiped voter does instead of forming a second one. A meta snapshot
 record left without its journal opens the group recovering too.
 
-The journal and state-file version is the format epoch, 6. There is no
+The journal and state-file version is the format epoch, 7. There is no
 migration: other epochs and files without the Ursula magic are refused, and the
 `FORMAT_EPOCH` marker refuses a directory of another epoch before any journal
 opens. The decoder bounds a frame payload at 512 MiB and a state file at 64 MiB
