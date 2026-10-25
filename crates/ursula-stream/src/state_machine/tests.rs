@@ -4189,6 +4189,95 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     }));
 }
 
+/// Replicas apply the same log, but each registry iterates its streams in
+/// the order of its own hash seed. A purge removes the bucket's streams in
+/// stream-id order, so every replica stamps the same cold-GC sequence number
+/// on the same stream's objects, and a replicated `AckColdGc` drains the
+/// same entries on each.
+#[test]
+fn purge_bucket_numbers_cold_gc_entries_alike_on_replicas_that_hash_differently() {
+    // Created in reverse, so the log does not follow the stream-id order.
+    let stream_ids = (0..16)
+        .rev()
+        .map(|index| stream(&format!("s-{index:02}")))
+        .collect::<Vec<_>>();
+    let log = std::iter::once(StreamCommand::CreateBucket {
+        bucket_id: "benchcmp".to_owned(),
+    })
+    .chain(
+        stream_ids
+            .iter()
+            .map(|stream_id| StreamCommand::CreateExternal {
+                stream_id: stream_id.clone(),
+                content_type: OCTET.to_owned(),
+                initial_payload: ExternalPayloadRef {
+                    s3_path: format!("staged/{}", stream_id.stream_id),
+                    payload_len: 7,
+                    object_size: 7,
+                },
+                message_count: 0,
+                close_after: false,
+                stream_seq: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                now_ms: 1,
+            }),
+    )
+    .collect::<Vec<_>>();
+    let replica = || {
+        let mut machine = StreamStateMachine::new();
+        for command in &log {
+            assert!(matches!(
+                machine.apply(command.clone()),
+                StreamResponse::BucketCreated { .. } | StreamResponse::Created { .. }
+            ));
+        }
+        machine
+    };
+    let registry_order = |machine: &StreamStateMachine| {
+        machine
+            .registry
+            .stream_ids_in_hash_order()
+            .filter(|stream_id| stream_id.bucket_id == "benchcmp")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut first = replica();
+    let mut second = std::iter::repeat_with(replica)
+        .take(64)
+        .find(|candidate| registry_order(candidate) != registry_order(&first))
+        .expect("a replica whose registry iterates in another order");
+
+    let purge = StreamCommand::PurgeBucket {
+        bucket_id: "benchcmp".to_owned(),
+    };
+    let purged = first.apply(purge.clone());
+    assert_eq!(second.apply(purge), purged);
+    assert!(matches!(purged, StreamResponse::BucketPurged {
+        removed_streams: 16,
+        pending_cold_gc_entries: 32,
+        ..
+    }));
+
+    let entries = first.pending_cold_gc_batch(usize::MAX);
+    assert_eq!(second.pending_cold_gc_batch(usize::MAX), entries);
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].seq.checked_add(1) == Some(pair[1].seq))
+    );
+    let removal_order = entries
+        .iter()
+        .filter_map(|entry| match &entry.target {
+            ColdGcTarget::Stream(stream_id) => Some(stream_id.clone()),
+            ColdGcTarget::Paths(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut sorted = stream_ids;
+    sorted.sort_by(compare_stream_ids);
+    assert_eq!(removal_order, sorted);
+}
+
 #[test]
 fn restore_refuses_another_backup_format() {
     for found in [
