@@ -15,11 +15,6 @@ on:
         description: Type publish-stable-release
         required: true
         type: string
-      dst_waiver:
-        description: Leave empty, or type waive-dst-nightly to release without a successful DST Nightly run
-        required: false
-        default: ""
-        type: string
 
 permissions:
   actions: read
@@ -54,7 +49,6 @@ jobs:
         id: release
         env:
           CONFIRM: ${{ inputs.confirm }}
-          DST_WAIVER: ${{ inputs.dst_waiver }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
           REPOSITORY: ${{ github.repository }}
@@ -64,13 +58,6 @@ jobs:
         run: |
           set -euo pipefail
           test "$CONFIRM" = publish-stable-release
-          case "$DST_WAIVER" in
-            "" | waive-dst-nightly) ;;
-            *)
-              echo "dst_waiver must be empty or waive-dst-nightly" >&2
-              exit 1
-              ;;
-          esac
           ./scripts/validate-release-version.sh "$RELEASE_VERSION" >/dev/null
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
@@ -104,21 +91,16 @@ jobs:
 
           # Pull requests do not run deterministic simulation, and the
           # nightly cron runs only on the default branch, so dispatch DST
-          # Nightly on the release HEAD and wait for it to pass first. The
-          # dst_waiver input skips only this check, and the run summary says so.
-          if test "$DST_WAIVER" = waive-dst-nightly; then
-            echo "DST Nightly waived for $SOURCE_REVISION: released without a successful DST Nightly run" >>"$GITHUB_STEP_SUMMARY"
-          else
-            successful_dst="$(gh run list \
-              --repo "$REPOSITORY" \
-              --workflow "DST Nightly" \
-              --commit "$SOURCE_REVISION" \
-              --status success \
-              --limit 20 \
-              --json conclusion,headSha \
-              --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
-            test "$successful_dst" -ge 1
-          fi
+          # Nightly on the release HEAD and wait for it to pass first.
+          successful_dst="$(gh run list \
+            --repo "$REPOSITORY" \
+            --workflow "DST Nightly" \
+            --commit "$SOURCE_REVISION" \
+            --status success \
+            --limit 20 \
+            --json conclusion,headSha \
+            --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
+          test "$successful_dst" -ge 1
 
           # The memory soak and the SQLite VFS's 600 s outage (its M1 exit
           # criterion) run daily on the default branch and on dispatch, not
