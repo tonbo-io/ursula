@@ -38,7 +38,7 @@
 //! `GenesisAnswer`), which keep serde's default `PascalCase` names as 0.9's
 //! `StreamCommand` does. The types here and those of `ursula_control` are
 //! `snake_case` because one serde form serves both the admin JSON and the
-//! MessagePack closure. Each casing is frozen with format epoch 6, and
+//! MessagePack closure. Each casing is frozen with the format epoch, and
 //! neither is converted to the other. No type here uses `default`,
 //! `skip_serializing_if`, `flatten` or an untagged enum. Newtypes are
 //! transparent but for [`RootId`], which writes its hex string, and a set

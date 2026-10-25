@@ -1,6 +1,6 @@
-//! The process fence on Raft RPCs (format epoch 6): every request names the
-//! process that sends it and the process it is for, and every answer the
-//! process that gives it.
+//! The process fence on Raft RPCs, frozen with the format epoch: every
+//! request names the process that sends it and the process it is for, and
+//! every answer the process that gives it.
 //!
 //! A process is a [`ProcessIncarnation`]: its WAL root, the run of that
 //! root, and a nonce. A request carries the sender's in

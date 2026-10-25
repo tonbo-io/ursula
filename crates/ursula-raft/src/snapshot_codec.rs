@@ -668,7 +668,7 @@ mod tests {
 
     use super::*;
 
-    /// The history event in a snapshot's header frame, as format epoch 6
+    /// The history event in a snapshot's header frame, as this format epoch
     /// writes it (#613): a recovery's event, with the history it replaced,
     /// the index it kept and its leader. A frame without any of them is
     /// refused.

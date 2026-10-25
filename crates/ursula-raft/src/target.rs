@@ -1,5 +1,5 @@
-//! The typed target of a Raft RPC (format epoch 6): the plane and group a
-//! request names, and the node it is for.
+//! The typed target of a Raft RPC, frozen with the format epoch: the plane
+//! and group a request names, and the node it is for.
 //!
 //! Every Raft request carries the plane next to its frozen `raft_group_id`
 //! (`RaftPlaneV1`, where `UNSPECIFIED` is refused) and the node it is for
@@ -257,7 +257,7 @@ pub const TARGET_INCARNATION_METADATA: &str = "ursula-target-incarnation";
 pub const FENCE_METADATA: &str = "ursula-fence";
 
 /// Why a receiver's process fence refused a Raft RPC: a closed set, frozen
-/// with format epoch 6. A refusal is `FAILED_PRECONDITION` without the
+/// with the format epoch. A refusal is `FAILED_PRECONDITION` without the
 /// protocol-mismatch text, so it is never a format-epoch mismatch, and only
 /// [`fence_refusal`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,6 +410,7 @@ mod tests {
     use super::WireTarget;
     use super::fence_refusal;
     use super::refusing_node;
+    use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
     use crate::raft_internal_proto as pb;
 
     /// One request of each kind, with every other field set, stamped for
@@ -433,7 +434,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::RaftRpcEnvelopeV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         payload: vec![1].into(),
                         ..Default::default()
                     },
@@ -445,7 +446,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::RaftFullSnapshotRequestV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         vote: vec![2].into(),
                         ..Default::default()
                     },
@@ -457,7 +458,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::RaftTransferLeaderRequestV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         request: vec![3].into(),
                         ..Default::default()
                     },
@@ -469,7 +470,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::GroupWriteRequestV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         command_payloads: vec![vec![4].into()],
                         ..Default::default()
                     },
@@ -481,7 +482,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::GroupReadRequestV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         bucket_id: "bucket".to_owned(),
                         ..Default::default()
                     },
@@ -493,7 +494,7 @@ mod tests {
             parsed(
                 stamped(
                     pb::RejoinBarrierRequestV1 {
-                        protocol_version: 6,
+                        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
                         ..Default::default()
                     },
                     target,

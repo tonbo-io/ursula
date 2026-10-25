@@ -10,8 +10,10 @@
 //! variant keeps its name, so field order is part of the wire form and every
 //! field is required. Within a minor the wire form of `GroupEngineError` and
 //! of every type it carries is frozen: the `group-engine-errors-epoch<N>.json`
-//! fixture shows any change, and the persisted-envelopes and
-//! commands-and-responses fixtures show a change to every other root.
+//! fixture shows any change, the persisted-envelopes and
+//! commands-and-responses fixtures show a change to every other root of the
+//! format epoch, and the `backup-format-<N>.json` fixture shows a change to
+//! a backup's group object.
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -134,7 +136,7 @@ mod tests {
 
     /// What the persisted-envelopes fixture says produced it.
     const ENVELOPES_PRODUCER: &str =
-        "ursula_stream::msgpack, format epoch 6, openraft 0.10.0-alpha.37";
+        "ursula_stream::msgpack, format epoch 7, openraft 0.10.0-alpha.37";
 
     fn log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
         openraft::LogId {
@@ -233,13 +235,13 @@ mod tests {
         add(samples, &format!("{value:?}"), value);
     }
 
-    /// Every root that format epoch 6 writes to disk or sends to a peer
-    /// apart from the replicated commands and their answers: the OpenRaft
-    /// envelopes (votes, log ids, memberships, entries, snapshot metadata
-    /// and every RPC message), each record of the WAL journal, the WAL's
-    /// state files (core metadata, run state and topology, each as a whole
-    /// file), the snapshot record, the snapshot pointers and a full backup
-    /// snapshot.
+    /// Every root that this format epoch writes to disk or sends to a peer
+    /// apart from the replicated commands and their answers and the backup
+    /// ([`backup_format_samples`]): the OpenRaft envelopes (votes, log ids,
+    /// memberships, entries, snapshot metadata and every RPC message), each
+    /// record of the WAL journal, the WAL's state files (core metadata, run
+    /// state and topology, each as a whole file), the snapshot record and
+    /// the snapshot pointers.
     fn persisted_envelopes() -> std::collections::BTreeMap<String, Vec<u8>> {
         use ursula_stream::StreamCommand;
 
@@ -505,13 +507,6 @@ mod tests {
             add(samples, name, response);
         }
 
-        // A backup snapshot with a value in every field.
-        add(
-            samples,
-            "stream_snapshot",
-            &ursula_runtime::wire_samples::stream_snapshot(),
-        );
-
         meta_envelopes(samples);
         placement_vocabulary(samples);
         envelopes
@@ -731,15 +726,15 @@ mod tests {
         }
     }
 
-    /// Every root that format epoch 6 writes to disk or sends to a peer
-    /// apart from the commands and their answers ([`persisted_envelopes`])
-    /// encodes to the fixture's bytes, and decoding and re-encoding them
-    /// reproduces each value and each byte. Each sample sets every field,
+    /// Every root that this format epoch writes to disk or sends to a peer
+    /// apart from the commands, their answers and the backup
+    /// ([`persisted_envelopes`]) encodes to the fixture's bytes, and decoding
+    /// and re-encoding them reproduces each value and each byte. Each sample sets every field,
     /// and fields of one type hold distinct values, so a change of a field's
     /// name or place changes the fixture. A change to the fixture is a
     /// change to the format.
     #[test]
-    fn epoch6_persisted_envelopes_are_stable() {
+    fn epoch7_persisted_envelopes_are_stable() {
         let mut actual: std::collections::BTreeMap<String, serde_json::Value> =
             persisted_envelopes()
                 .into_iter()
@@ -747,7 +742,7 @@ mod tests {
                 .collect();
         actual.insert("producer".to_owned(), ENVELOPES_PRODUCER.into());
         let fixture: std::collections::BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch6.json"))
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch7.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
@@ -771,6 +766,53 @@ mod tests {
             ),
             (2, ursula_shard::RaftGroupId(0), 19)
         );
+    }
+
+    /// What a backup holds in compact MessagePack: the group object of one
+    /// group, its `StreamSnapshot` with a value in every field. It is pinned
+    /// apart from the roots of the format epoch, because a backup keeps its
+    /// format across epochs ([`ursula_stream::BACKUP_FORMAT_VERSION`]).
+    fn backup_format_samples() -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut samples = std::collections::BTreeMap::new();
+        add(
+            &mut samples,
+            "stream_snapshot",
+            &ursula_runtime::wire_samples::stream_snapshot(),
+        );
+        samples
+    }
+
+    /// A group object of backup format 5 encodes to the fixture's bytes, and
+    /// the decoder a restore reads it with (`decode_backup_snapshot`) turns
+    /// the fixture's bytes back into the same snapshot. The fixture moves
+    /// only when the backup format does, never with a format epoch, so a
+    /// group object of this backup format that a release of an earlier epoch
+    /// wrote decodes, through the restore's decoder, to the same snapshot. It
+    /// pins neither the backup manifest nor the cold key layout. A change to the fixture is a change to the
+    /// backup format: it sets `BACKUP_FORMAT_VERSION` to the format epoch,
+    /// and the new format gets a fixture of its own.
+    #[test]
+    fn backup_format_5_group_object_is_stable() {
+        assert_eq!(
+            ursula_stream::BACKUP_FORMAT_VERSION,
+            5,
+            "backup-format-5.json pins backup format 5 only"
+        );
+        let actual = backup_format_samples();
+        let fixture: std::collections::BTreeMap<String, Vec<u8>> =
+            serde_json::from_str(include_str!("fixtures/backup-format-5.json"))
+                .expect("the fixture parses");
+        assert!(
+            fixture == actual,
+            "the backup group object differs from the fixture; the samples encode as:\n{}",
+            one_entry_per_line(&actual)
+        );
+        let group_object = fixture
+            .get("stream_snapshot")
+            .expect("the fixture holds a group object");
+        let restored = ursula_stream::decode_backup_snapshot(group_object)
+            .expect("a group object of backup format 5 restores");
+        assert_eq!(restored, ursula_runtime::wire_samples::stream_snapshot());
     }
 
     /// Every replicated command of both planes, in the [`RaftCommand`] a
@@ -872,10 +914,10 @@ mod tests {
     /// distinct values, so a change of a field's name or place changes the
     /// fixture. A change to the fixture is a change to the format.
     #[test]
-    fn commands_and_responses_epoch6_wire_form_is_stable() {
+    fn commands_and_responses_epoch7_wire_form_is_stable() {
         let actual = commands_and_responses();
         let fixture: std::collections::BTreeMap<String, Vec<u8>> =
-            serde_json::from_str(include_str!("fixtures/commands-and-responses-epoch6.json"))
+            serde_json::from_str(include_str!("fixtures/commands-and-responses-epoch7.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
@@ -893,7 +935,7 @@ mod tests {
     /// decoding and re-encoding them reproduces each byte for byte. A change
     /// to the fixture is a change to the protocol.
     #[test]
-    fn group_engine_errors_epoch6_wire_form_is_stable() {
+    fn group_engine_errors_epoch7_wire_form_is_stable() {
         let actual: std::collections::BTreeMap<String, Vec<u8>> =
             ursula_runtime::group_engine_error_samples()
                 .iter()
@@ -906,7 +948,7 @@ mod tests {
             assert_eq!(&format!("{decoded:?}"), name);
         }
         let fixture: std::collections::BTreeMap<String, Vec<u8>> =
-            serde_json::from_str(include_str!("fixtures/group-engine-errors-epoch6.json"))
+            serde_json::from_str(include_str!("fixtures/group-engine-errors-epoch7.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
