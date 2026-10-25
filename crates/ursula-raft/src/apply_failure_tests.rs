@@ -783,12 +783,15 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
         .expect("elected leader establishes a fresh quorum before the fault");
         let leader = &engines[index];
         if !corrected {
-            leader
+            // The entry the write applied, from its own answer: the leader's
+            // metrics may not show it applied yet, and a poison index below
+            // the next entry would never be applied.
+            let previous = leader
                 .raft
                 .client_write(create_stream("acknowledged-before-poison"))
                 .await
-                .unwrap();
-            let previous = leader.raft.metrics().borrow_watched().last_applied.unwrap();
+                .unwrap()
+                .log_id;
             let next = previous.index().checked_add(1).unwrap();
             poison_index = Some(next);
             for engine in &engines {
