@@ -99,7 +99,7 @@ use crate::wire::Target;
 pub(crate) const MAX_REQUEST_BYTES: u64 = ursula_headers::MAX_REQUEST_BYTES;
 
 /// The largest snapshot accepted in parts, with a cold store (extensions: Server Metadata).
-pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
+pub(crate) const MAX_SNAPSHOT_BYTES: u64 = ursula_headers::MAX_SNAPSHOT_BYTES;
 
 /// How long a staged part waits for a commit before the sweep reclaims it (extensions: Publish
 /// Snapshot).

@@ -3467,22 +3467,120 @@ async fn gateway_gives_long_poll_response_headers_timeout_headroom() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
+/// The head of a request with `headers`, as the gateway forwards it.
+fn request_parts(
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::http::request::Parts {
+    let mut request = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.body(()).expect("build request").into_parts().0
+}
+
 #[test]
 fn gateway_caps_long_poll_timeout_headroom_at_server_limit() {
     let gateway =
         gateway_with_response_header_timeout("http://127.0.0.1:1", Duration::from_secs(30));
 
     assert_eq!(
-        gateway.response_header_timeout_for_url(
-            "http://127.0.0.1:1/bucket/stream?live=long-poll&timeout_ms=999999"
+        gateway.response_header_timeout_for(
+            &request_parts(
+                Method::GET,
+                "/bucket/stream?live=long-poll&timeout_ms=999999",
+                &[]
+            ),
+            0
         ),
         Duration::from_secs(62)
     );
     assert_eq!(
-        gateway.response_header_timeout_for_url(
-            "http://127.0.0.1:1/bucket/stream?live=sse&timeout_ms=999999"
+        gateway.response_header_timeout_for(
+            &request_parts(Method::GET, "/bucket/stream?live=sse&timeout_ms=999999", &[
+            ]),
+            0
         ),
         Duration::from_secs(30)
+    );
+}
+
+/// #891: every request waits the base timeout plus the bytes the node may
+/// store or copy before it answers, at 8 MiB/s. A request counts its body,
+/// and a parts commit its parts at the request limit each, up to the
+/// snapshot limit. A long-poll waits at least its own timeout plus 2 s.
+#[test]
+fn a_request_gets_a_response_header_allowance_by_its_size() {
+    const MIB: u64 = 1 << 20;
+    const DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let base = Duration::from_secs(3);
+    let gateway = gateway_with_response_header_timeout("http://127.0.0.1:1", base);
+    let timeout = |method: Method, uri: &str, headers: &[(&str, &str)], body_len: u64| {
+        gateway.response_header_timeout_for(&request_parts(method, uri, headers), body_len)
+    };
+    let commit = |parts: &'static str| {
+        [
+            ("stream-snapshot-parts", parts),
+            ("stream-snapshot-digest", DIGEST),
+        ]
+    };
+    let secs = Duration::from_secs;
+
+    // A single-request publish: its body, 32 MiB at most.
+    let publish = "/b/s/snapshot/7";
+    assert_eq!(timeout(Method::PUT, publish, &[], 32 * MIB), base + secs(4));
+    assert_eq!(
+        timeout(Method::PUT, publish, &[], 4 * MIB),
+        base + Duration::from_millis(500)
+    );
+    assert_eq!(timeout(Method::PUT, publish, &[], 0), base);
+    // A part upload: its body.
+    assert_eq!(
+        timeout(Method::POST, "/b/s/snapshot/7/parts", &[], 8 * MIB),
+        base + secs(1)
+    );
+    // A commit: its parts at the request limit each, whatever the
+    // manifest's size, up to the 1 GiB snapshot limit.
+    assert_eq!(
+        timeout(Method::PUT, publish, &commit("1"), 40),
+        base + secs(4)
+    );
+    assert_eq!(
+        timeout(Method::PUT, publish, &commit("3"), 120),
+        base + secs(12)
+    );
+    assert_eq!(
+        timeout(Method::PUT, publish, &commit("32"), 1_300),
+        base + secs(128)
+    );
+    assert_eq!(
+        timeout(Method::PUT, publish, &commit("4096"), 160_000),
+        base + secs(128)
+    );
+    // Parts headers the node refuses before it copies: no allowance for a
+    // copy, only for the manifest.
+    assert_eq!(
+        timeout(Method::PUT, publish, &[("stream-snapshot-parts", "3")], MIB),
+        base + Duration::from_millis(125)
+    );
+    assert_eq!(timeout(Method::PUT, publish, &commit("0"), 0), base);
+    // An append or a create, which a node with a cold store writes to
+    // object storage whole when it is large: its body.
+    assert_eq!(timeout(Method::POST, "/b/s", &[], 32 * MIB), base + secs(4));
+    assert_eq!(timeout(Method::PUT, "/b/s", &[], 16 * MIB), base + secs(2));
+    // A request without a body keeps the base.
+    assert_eq!(timeout(Method::DELETE, "/b/s/snapshot/parts", &[], 0), base);
+    assert_eq!(timeout(Method::GET, publish, &[], 0), base);
+    assert_eq!(timeout(Method::PUT, "/b/s/retention/7", &[], 0), base);
+    // A long-poll: its own timeout plus 2 s, when that is longer.
+    assert_eq!(
+        timeout(Method::GET, "/b/s?live=long-poll&timeout_ms=10000", &[], 0),
+        secs(12)
+    );
+    assert_eq!(
+        timeout(Method::GET, "/b/s?live=long-poll&timeout_ms=500", &[], 0),
+        base
     );
 }
 

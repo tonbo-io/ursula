@@ -373,8 +373,11 @@ gateway:
   # Timeout for upstream response headers in seconds. A read or a producer
   # append that gets no answer within it goes on to another upstream, and any
   # other write is answered 504. A missing answer ejects nothing: the probes
-  # decide which upstreams answer. Keep it under the clients' timeouts and
-  # above a node's 3 s leader lease.
+  # decide which upstreams answer. Every request gets the time its bytes take
+  # at 8 MiB/s on top: its body (4 s for 32 MiB), or the parts a snapshot
+  # commit copies (up to 128 s). Keep it under the clients' timeouts and
+  # above a node's 3 s leader lease, and raise it for an object store slower
+  # than 8 MiB/s.
   responseHeaderTimeoutSeconds: 5
   # Seconds data sent to an upstream may stay unacknowledged before the
   # connection closes and its request fails with 502 (Linux TCP_USER_TIMEOUT).
@@ -401,7 +404,10 @@ gateway:
   preStopDelaySeconds: 10
   # Maximum graceful drain time after SIGTERM, in seconds: requests in flight
   # finish within it, and live reads end at it. Keep it above
-  # responseHeaderTimeoutSeconds so that a forwarded write is answered.
+  # responseHeaderTimeoutSeconds plus 4 s, the allowance of a 32 MiB body, so
+  # that a forwarded write is answered. A snapshot parts commit waits up to
+  # the base plus 128 s, so one in flight when the drain ends loses its
+  # answer, and repeating the commit gets the answer from its key.
   gracefulShutdownTimeoutSeconds: 45
   # Pod grace period. Must exceed preStopDelaySeconds plus
   # gracefulShutdownTimeoutSeconds, or the kubelet kills a drain in progress.

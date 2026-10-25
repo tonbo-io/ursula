@@ -77,6 +77,9 @@
 //! - [`range`]: [`ByteRange`], the range a snapshot read honors, and
 //!   [`ContentRange`], its answer.
 //! - [`limit`]: [`MAX_REQUEST_BYTES`], the protocol's request limit,
+//!   [`MAX_SNAPSHOT_BYTES`], a node's snapshot limit,
+//!   [`answer_allowance`], the time a node's answer may take for the bytes
+//!   it stores first, at [`STORE_FLOOR_BYTES_PER_SECOND`],
 //!   [`SizeLimit`], the limit a `413` applied,
 //!   [`StagedPartsLimit`], the staged-parts limit a `429` applied, and
 //!   [`lowered_request_limit`], the request limit an intermediary forwards.
@@ -137,8 +140,11 @@ pub use immutable::OriginScheme;
 pub use immutable::ReadOrigin;
 pub use immutable::ResourceKind;
 pub use limit::MAX_REQUEST_BYTES;
+pub use limit::MAX_SNAPSHOT_BYTES;
+pub use limit::STORE_FLOOR_BYTES_PER_SECOND;
 pub use limit::SizeLimit;
 pub use limit::StagedPartsLimit;
+pub use limit::answer_allowance;
 pub use limit::lowered_request_limit;
 pub use range::ACCEPT_RANGES_BYTES;
 pub use range::ByteRange;

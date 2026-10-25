@@ -70,7 +70,6 @@ pub use model::ContentFault;
 pub use model::ExternalPayloadRef;
 pub use model::HotPayloadSegment;
 pub use model::IncarnationCheck;
-pub use model::MAX_COLD_SNAPSHOT_BYTES;
 pub use model::ObjectPayloadRef;
 pub use model::Opened;
 pub use model::ProducerReceipt;
