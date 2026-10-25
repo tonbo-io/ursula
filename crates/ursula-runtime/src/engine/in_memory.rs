@@ -104,7 +104,6 @@ use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
-use crate::request::ExpireStreamsResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::GroupReadStreamParts;
@@ -124,6 +123,7 @@ use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::RouteWriteRequest;
 use crate::request::StreamAppendCount;
+use crate::request::SweepResponse;
 use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
@@ -152,6 +152,10 @@ pub struct InMemoryGroupEngine {
     /// The applied history, published after every command and snapshot
     /// install (#581 section 4.7).
     pub(crate) history: super::HistoryPublisher,
+    /// When this replica's end records are due (F20): node-local, sampled
+    /// on every tidy pass, on every replica, and reset by a snapshot
+    /// install.
+    pub(crate) retirement: crate::expiry_sweep::RetirementClock,
 }
 
 impl InMemoryGroupEngine {
@@ -581,13 +585,14 @@ impl InMemoryGroupEngine {
                     group_commit_index: self.commit_index,
                 }))
             }
-            StreamResponse::StreamsExpired { removed } => {
-                if removed > 0 {
+            StreamResponse::Swept { expired, retired } => {
+                if expired > 0 || retired > 0 {
                     self.advance_commit_index();
                 }
-                Ok(GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+                Ok(GroupWriteResponse::Sweep(SweepResponse {
                     placement,
-                    removed,
+                    expired,
+                    retired,
                     group_commit_index: self.commit_index,
                 }))
             }
@@ -863,11 +868,35 @@ impl InMemoryGroupEngine {
         self.state_machine.tidy_candidates(now_ms, limit)
     }
 
-    /// Whether a stream of the group may have expired at `now_ms`, so that
-    /// the leader's expiry sweep proposes `ExpireStreams`
-    /// ([`crate::expiry_sweep`]). `false` is exact.
-    pub fn expiry_due(&self, now_ms: u64) -> bool {
-        self.state_machine.expiry_due(now_ms)
+    /// Whether the leader's group sweep proposes `Sweep` at `now_ms` and
+    /// `retire_through` ([`crate::expiry_sweep`]): a stream may have
+    /// expired, or an end record is due. `false` is exact.
+    pub fn sweep_due(&self, now_ms: u64, retire_through: u64) -> bool {
+        self.state_machine.sweep_due(now_ms, retire_through)
+    }
+
+    /// Samples the group's usage seq on this replica's retirement clock at
+    /// `now`, and returns the usage seq through which its end records are
+    /// due, which the leader's sweep folds through (F20,
+    /// [`crate::expiry_sweep::RetirementClock`]). Every replica samples, so
+    /// a new leader retires on time. `now_ms`, the pass's wall clock less
+    /// `retain`, dates the seed after a start, an install or a history
+    /// change.
+    pub fn sample_retirement(
+        &mut self,
+        now: crate::rt::time::Instant,
+        now_ms: u64,
+        retain: std::time::Duration,
+    ) -> u64 {
+        let sample = crate::expiry_sweep::RetirementSample {
+            history: self.state_machine.history_id(),
+            usage_seq: self.state_machine.usage_seq(),
+        };
+        let state_machine = &self.state_machine;
+        self.retirement.sample(now, sample, retain, || {
+            let retain_ms = u64::try_from(retain.as_millis()).unwrap_or(u64::MAX);
+            state_machine.end_records_ended_by(now_ms.saturating_sub(retain_ms))
+        })
     }
 
     pub fn head_stream_after_access(
@@ -1424,6 +1453,9 @@ impl InMemoryGroupEngine {
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
+        // The installed state is another lineage's as far as the clock
+        // knows: it seeds again from the end records' times.
+        self.retirement = crate::expiry_sweep::RetirementClock::default();
         // The installed state may follow page rewrites (clips, compaction)
         // this replica never applied; cached pages could predate them.
         if let Some(cache) = self.cold_index_cache.as_ref() {
@@ -1627,18 +1659,24 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move {
             let mut report = TidyStreamsResponse::default();
+            let retire_through = self.sample_retirement(
+                crate::rt::time::Instant::now(),
+                request.now_ms,
+                request.end_record_retain,
+            );
             if request.max_expiry_sweeps > 0 && crate::expiry_sweep::enabled() {
                 let now_ms = crate::expiry_sweep::sweep_now_ms(request.now_ms);
                 let max = u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX);
-                while self.expiry_due(now_ms) {
+                while self.sweep_due(now_ms, retire_through) {
                     if report.expiry_sweeps >= max {
                         crate::expiry_sweep::capped(&mut report);
                         break;
                     }
-                    let removed = match crate::expiry_sweep::settle(
-                        self.apply_committed_write(crate::expiry_sweep::command(now_ms), placement),
-                    ) {
-                        Ok(removed) => removed,
+                    let swept = match crate::expiry_sweep::settle(self.apply_committed_write(
+                        crate::expiry_sweep::command(now_ms, retire_through),
+                        placement,
+                    )) {
+                        Ok(swept) => swept,
                         Err(err) => {
                             crate::expiry_sweep::interrupted(
                                 placement.raft_group_id,
@@ -1648,7 +1686,7 @@ impl GroupEngine for InMemoryGroupEngine {
                             break;
                         }
                     };
-                    crate::expiry_sweep::applied(&mut report, removed);
+                    crate::expiry_sweep::applied(&mut report, &swept);
                 }
             }
             let mut error = None;
@@ -2258,7 +2296,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::NewHistory { .. }
-        | StreamCommand::ExpireStreams { .. } => None,
+        | StreamCommand::Sweep { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

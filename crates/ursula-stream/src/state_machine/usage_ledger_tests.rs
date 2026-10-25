@@ -423,11 +423,15 @@ fn every_removal_of_an_expired_stream_ends_it_expired() {
         create_expiring(&mut machine, name, 10, 1);
     }
     assert_eq!(
-        machine.apply(StreamCommand::ExpireStreams {
+        machine.apply(StreamCommand::Sweep {
             now_ms: 11,
             limit: NonZeroU32::MIN,
+            retire_through: 0,
         }),
-        StreamResponse::StreamsExpired { removed: 1 }
+        StreamResponse::Swept {
+            expired: 1,
+            retired: 0,
+        }
     );
     assert_eq!(
         machine.apply(StreamCommand::DeleteStream {
@@ -549,6 +553,139 @@ fn a_removal_past_the_cap_folds_the_oldest_end_record_first() {
     assert_eq!(removed.end_records, 1);
     assert_eq!(removed.end_records_early, 1);
     assert_eq!(committed_of(bucket_row(&machine)), before);
+}
+
+fn delete(machine: &mut StreamStateMachine, name: &str, now_ms: u64) {
+    assert_eq!(
+        machine.apply(StreamCommand::DeleteStream {
+            stream_id: sid(name),
+            now_ms,
+        }),
+        StreamResponse::Deleted { expired: false }
+    );
+}
+
+fn sweep(machine: &mut StreamStateMachine, limit: u32, retire_through: u64) -> StreamResponse {
+    machine.apply(StreamCommand::Sweep {
+        now_ms: 100,
+        limit: NonZeroU32::new(limit).expect("a non-zero limit"),
+        retire_through,
+    })
+}
+
+/// The sweep folds the end records at or below its `retire_through` into
+/// their bucket's retired usage, lowest seq first and at most its limit,
+/// and `retired_through` stays the seq of the newest one folded. Each fold
+/// counts as a removal, not an early one, and no total changes.
+#[test]
+fn the_sweep_folds_end_records_through_its_watermark() {
+    let mut machine = group(7);
+    for name in ["a", "b", "c", "d"] {
+        create(&mut machine, name, b"abc", 1);
+    }
+    for (name, now_ms) in [("a", 2), ("b", 3), ("c", 4), ("d", 5)] {
+        delete(&mut machine, name, now_ms);
+    }
+    let seqs = machine
+        .end_records()
+        .map(|record| record.seq)
+        .collect::<Vec<_>>();
+    assert_eq!(seqs, [5, 6, 7, 8]);
+    let before = bucket_row(&machine);
+    assert!(!machine.sweep_due(100, 4));
+    assert!(machine.sweep_due(100, 5));
+
+    // A watermark between two end records folds the ones below it, at most
+    // the limit, lowest seq first.
+    assert_eq!(sweep(&mut machine, 1, 7), StreamResponse::Swept {
+        expired: 0,
+        retired: 1,
+    });
+    assert_eq!(machine.usage_retired_through(), 5);
+    assert_eq!(sweep(&mut machine, 16, 7), StreamResponse::Swept {
+        expired: 0,
+        retired: 2,
+    });
+    assert_eq!(machine.usage_retired_through(), 7);
+    let left = machine
+        .end_records()
+        .map(|record| record.stream_id.stream_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(left, ["d"]);
+    assert!(!machine.sweep_due(100, 7));
+    assert_eq!(sweep(&mut machine, 16, 7), StreamResponse::Swept {
+        expired: 0,
+        retired: 0,
+    });
+    // Seqs and the totals stay: a fold stamps nothing and only moves usage.
+    assert_eq!(machine.usage_seq(), 8);
+    assert_eq!(bucket_row(&machine), before);
+    let removed = machine.removed_state();
+    assert_eq!(removed.streams, 4);
+    assert_eq!(removed.end_records, 3);
+    assert_eq!(removed.end_records_early, 0);
+
+    // A snapshot round trip keeps the totals (the backup restore retires
+    // every end record).
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(committed_of(bucket_row(&restored)), committed_of(before));
+}
+
+/// One `Sweep` first removes the expired streams, then folds only end
+/// records the group held before the entry: a watermark above the group's
+/// usage seq never folds the entry's own removals, whatever the proposer
+/// sampled.
+#[test]
+fn a_sweep_never_folds_its_own_removals() {
+    let mut machine = group(7);
+    create(&mut machine, "deleted", b"abc", 1);
+    delete(&mut machine, "deleted", 2);
+    create_expiring(&mut machine, "expired", 50, 3);
+    assert_eq!(machine.usage_seq(), 3);
+    assert_eq!(sweep(&mut machine, 16, u64::MAX), StreamResponse::Swept {
+        expired: 1,
+        retired: 1,
+    });
+    let ends = machine
+        .end_records()
+        .map(|record| (record.seq, record.stream_id.stream_id.as_str(), record.end))
+        .collect::<Vec<_>>();
+    assert_eq!(ends, [(4, "expired", StreamEnd::Expired)]);
+    assert_eq!(machine.usage_retired_through(), 2);
+    // The next entry folds it.
+    assert_eq!(sweep(&mut machine, 16, u64::MAX), StreamResponse::Swept {
+        expired: 0,
+        retired: 1,
+    });
+    assert_eq!(machine.end_records().len(), 0);
+    assert_eq!(machine.usage_retired_through(), 4);
+    assert_eq!(machine.state_gauges().bucket_usage_rows, 1);
+}
+
+/// A restarted replica's retirement clock seeds from the end records'
+/// removal times: the highest seq through which every end record ended at
+/// or before a time, the folded watermark when the lowest did not.
+#[test]
+fn end_records_ended_by_a_time_stop_at_the_first_later_one() {
+    let mut machine = group(7);
+    for name in ["a", "b", "c", "d"] {
+        create(&mut machine, name, b"abc", 1);
+    }
+    // Removed out of clock order: `c` by a node whose clock was ahead.
+    for (name, now_ms) in [("a", 10), ("b", 20), ("c", 90), ("d", 30)] {
+        delete(&mut machine, name, now_ms);
+    }
+    assert_eq!(machine.end_records_ended_by(9), 0);
+    assert_eq!(machine.end_records_ended_by(10), 5);
+    assert_eq!(machine.end_records_ended_by(30), 6);
+    assert_eq!(machine.end_records_ended_by(89), 6);
+    assert_eq!(machine.end_records_ended_by(90), 8);
+    assert_eq!(sweep(&mut machine, 16, 6), StreamResponse::Swept {
+        expired: 0,
+        retired: 2,
+    });
+    assert_eq!(machine.end_records_ended_by(9), 6);
+    assert_eq!(machine.end_records_ended_by(90), 8);
 }
 
 /// The genesis records the group's genesis id, and a later event keeps

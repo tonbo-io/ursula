@@ -208,8 +208,12 @@ deleted_data_max_age = "30m"
         )
         .expect("deleted_data_max_age parses");
         assert_eq!(
-            config.raft.effective_deleted_data_max_age(),
+            config.effective_deleted_data_max_age(),
             std::time::Duration::from_secs(1_800)
+        );
+        assert_eq!(
+            config.end_record_retention(),
+            std::time::Duration::from_secs(900)
         );
     }
 

@@ -235,6 +235,47 @@ impl StreamStateMachine {
         });
     }
 
+    /// The sweep's fold (F20): folds the lowest-seq end records at or
+    /// below `retire_through` into their buckets' retired usage, at most
+    /// `limit` of them, and returns how many it folded. `retired_through`
+    /// ends at the seq of the newest one folded, so it stays a watermark.
+    pub(super) fn retire_end_records(&mut self, retire_through: u64, limit: u64) -> u64 {
+        let mut retired = 0u64;
+        while retired < limit && self.end_record_due(retire_through) {
+            let Some(folded) = self.usage.fold_first_end_record() else {
+                break;
+            };
+            self.record_folded(&folded);
+            retired = retired.saturating_add(1);
+        }
+        retired
+    }
+
+    /// Whether the group holds an end record at or below `retire_through`.
+    /// O(1): the lowest seq.
+    pub(super) fn end_record_due(&self, retire_through: u64) -> bool {
+        self.usage
+            .ends
+            .first_key_value()
+            .is_some_and(|(seq, _)| *seq <= retire_through)
+    }
+
+    /// The highest seq through which every end record of the group ended
+    /// at or before `at_ms`, by its `ended_at_ms`: the seq of the last one
+    /// of the run from the lowest seq that did, or `retired_through` when
+    /// the lowest did not. It seeds a replica's retirement clock after a
+    /// start, an install or a history change, so an end record keeps its
+    /// age across them when the nodes' clocks agree. A scan from the lowest
+    /// seq that stops at the first end record dated after `at_ms`.
+    pub fn end_records_ended_by(&self, at_ms: u64) -> u64 {
+        self.usage
+            .ends
+            .values()
+            .take_while(|record| record.ended_at_ms <= at_ms)
+            .last()
+            .map_or(self.usage.retired_through, |record| record.seq)
+    }
+
     /// Counts a folded end record and what it held in a group snapshot
     /// (#669).
     fn record_folded(&mut self, record: &EndRecord) {

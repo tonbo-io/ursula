@@ -59,14 +59,23 @@ impl StreamStateMachine {
     }
 
     /// Whether a stream of the group may have expired at `now_ms`, so that
-    /// a leader's background sweep proposes
-    /// [`crate::StreamCommand::ExpireStreams`] (bounded-stream-state F0).
+    /// a leader's background sweep proposes [`crate::StreamCommand::Sweep`]
+    /// (bounded-stream-state F0).
     /// O(1): the front of the TTL index. `false` is exact. `true` may come
     /// from a stale front, of a stream removed or renewed since its entry
     /// was armed. The command still discards or re-arms that front, so each
     /// command makes progress.
     pub fn expiry_due(&self, now_ms: u64) -> bool {
         self.registry.ttl_front_due(now_ms)
+    }
+
+    /// Whether a leader's sweep proposes [`crate::StreamCommand::Sweep`] at
+    /// `now_ms` and `retire_through` (bounded-stream-state F0, F20): a
+    /// stream may have expired ([`Self::expiry_due`]), or an end record is
+    /// at or below `retire_through`. O(1), two front reads. `false` is
+    /// exact.
+    pub fn sweep_due(&self, now_ms: u64, retire_through: u64) -> bool {
+        self.expiry_due(now_ms) || self.end_record_due(retire_through)
     }
 
     /// Up to `max` stream ids strictly after `after`, in (bucket, stream)

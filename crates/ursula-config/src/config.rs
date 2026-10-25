@@ -254,10 +254,15 @@ pub struct RaftConfig {
     /// (#669). The snapshot driver snapshots a group a quarter of this
     /// after its oldest removal no snapshot covers, sooner when the removed
     /// bytes reach the group's snapshot threshold, and then purges the
-    /// group's log through that snapshot. Unset, it is the larger of one
-    /// hour and eight times `install_snapshot_timeout`
-    /// ([`RaftConfig::effective_deleted_data_max_age`]). A set value must be
-    /// at least eight times `install_snapshot_timeout`.
+    /// group's log through that snapshot. A removal also leaves an end
+    /// record with the stream's id and final usage, which the group's
+    /// leader folds into its bucket's usage half of this after the removal
+    /// (bounded-stream-state F20), and the fold counts as a removal. The
+    /// group sweep runs every sixteenth of it, between one second and one
+    /// minute ([`RaftConfig::sweep_interval`]). Unset, it is the larger of
+    /// one hour and the floor ([`UrsulaConfig::effective_deleted_data_max_age`]).
+    /// A set value must be at least the floor
+    /// ([`UrsulaConfig::min_deleted_data_max_age`]).
     pub deleted_data_max_age: Option<HumanDuration>,
 }
 
@@ -279,10 +284,27 @@ impl RaftConfig {
     /// of its own, 30 seconds doubled per failure up to 15 minutes, which
     /// this margin covers only for the first retries.
     pub const DELETED_DATA_MAX_AGE_INSTALLS: u32 = 8;
-    /// `deleted_data_max_age` when it is unset and the install timeout
-    /// allows it.
+    /// `deleted_data_max_age` when it is unset and the floor allows it.
     pub const DEFAULT_DELETED_DATA_MAX_AGE: std::time::Duration =
         std::time::Duration::from_secs(60 * 60);
+    /// The shortest pause between group sweeps (F0, F20).
+    pub const SWEEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// The longest pause between group sweeps.
+    pub const SWEEP_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    /// The pause between group sweeps is `deleted_data_max_age` divided by
+    /// this, within its limits.
+    pub const SWEEP_INTERVALS_PER_MAX_AGE: u32 = 16;
+
+    /// The pause between group sweeps for `deleted_data_max_age`: a
+    /// sixteenth of it, between [`Self::SWEEP_MIN_INTERVAL`] and
+    /// [`Self::SWEEP_MAX_INTERVAL`]. The sweep removes expired streams and
+    /// folds the end records that are due (F0, F20).
+    pub fn sweep_interval(deleted_data_max_age: std::time::Duration) -> std::time::Duration {
+        deleted_data_max_age
+            .checked_div(Self::SWEEP_INTERVALS_PER_MAX_AGE)
+            .unwrap_or(Self::SWEEP_MAX_INTERVAL)
+            .clamp(Self::SWEEP_MIN_INTERVAL, Self::SWEEP_MAX_INTERVAL)
+    }
 
     /// The group count the node runs: `group_count`, or, unset,
     /// `core_count * 16` of this host within
@@ -324,24 +346,85 @@ impl RaftConfig {
             WalFsync::Never
         }
     }
+}
 
-    /// The shortest `deleted_data_max_age` this config allows.
-    pub fn min_deleted_data_max_age(&self) -> std::time::Duration {
-        self.install_snapshot_timeout
-            .as_duration()
-            .saturating_mul(Self::DELETED_DATA_MAX_AGE_INSTALLS)
+impl UrsulaConfig {
+    /// The shortest `raft.deleted_data_max_age` this config allows: the
+    /// larger of [`RaftConfig::DELETED_DATA_MAX_AGE_INSTALLS`] install
+    /// timeouts and [`end_record_residence_floor`] of the snapshot drive
+    /// interval plus the install timeout.
+    pub fn min_deleted_data_max_age(&self) -> Duration {
+        let install = self.raft.install_snapshot_timeout.as_duration();
+        let drive = self.storage.snapshot.effective_drive_interval(
+            self.storage
+                .snapshot
+                .backend
+                .resolve(self.storage.cold.backend),
+        );
+        install
+            .saturating_mul(RaftConfig::DELETED_DATA_MAX_AGE_INSTALLS)
+            .max(end_record_residence_floor(drive.saturating_add(install)))
     }
 
     /// The bound on deleted data the node keeps: the configured
-    /// `deleted_data_max_age`, or, unset, the larger of one hour and
-    /// [`RaftConfig::min_deleted_data_max_age`], so a config without it
-    /// stays valid whatever its install timeout.
-    pub fn effective_deleted_data_max_age(&self) -> std::time::Duration {
-        self.deleted_data_max_age.map_or_else(
-            || Self::DEFAULT_DELETED_DATA_MAX_AGE.max(self.min_deleted_data_max_age()),
+    /// `raft.deleted_data_max_age`, or, unset, the larger of one hour and
+    /// [`Self::min_deleted_data_max_age`], so a config without it stays
+    /// valid whatever its install timeout and drive interval.
+    pub fn effective_deleted_data_max_age(&self) -> Duration {
+        self.raft.deleted_data_max_age.map_or_else(
+            || RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE.max(self.min_deleted_data_max_age()),
             |configured| configured.as_duration(),
         )
     }
+
+    /// How long an end record stays before the group sweep folds it into
+    /// its bucket's usage (bounded-stream-state F20): half of
+    /// [`Self::effective_deleted_data_max_age`]. The one source of it: the
+    /// node's tidy driver passes it to every group's sweep.
+    pub fn end_record_retention(&self) -> Duration {
+        self.effective_deleted_data_max_age()
+            .checked_div(2)
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// The smallest `raft.deleted_data_max_age` `A` within which a removed
+/// stream's end record leaves a replica's state, snapshot and log, with `S`
+/// the snapshot drive interval plus the install timeout
+/// (bounded-stream-state F20). The record waits `A/2` by the leader's clock
+/// and up to two sweep intervals `P` (until a sample covers it, then until
+/// the pass that folds it), the fold's snapshot follows `A/4` later, within
+/// a drive interval, and the object it replaced is deleted within an
+/// install timeout after that. So it is gone by `A/2 + 2P + A/4 + S`,
+/// within `A` exactly when `2P + S <= A/4`. With
+/// `P = clamp(A/16, 1 s, 60 s)` ([`RaftConfig::sweep_interval`]), the left
+/// side minus the right falls as `A` grows, so the floor is the root, one
+/// per range of `P`:
+///
+/// - `A = 4(2 s + S)`, where `P` is its minimum, when `S <= 2 s`.
+/// - `A = 8S`, where `P = A/16`, when `2 s <= S <= 120 s`.
+/// - `A = 4(120 s + S)`, where `P` is its maximum, otherwise.
+pub fn end_record_residence_floor(drive_and_install: Duration) -> Duration {
+    let quarter_at = |sweep: Duration| {
+        sweep
+            .saturating_mul(2)
+            .saturating_add(drive_and_install)
+            .saturating_mul(4)
+    };
+    let shortest = quarter_at(RaftConfig::SWEEP_MIN_INTERVAL);
+    if shortest
+        <= RaftConfig::SWEEP_MIN_INTERVAL.saturating_mul(RaftConfig::SWEEP_INTERVALS_PER_MAX_AGE)
+    {
+        return shortest;
+    }
+    // `A/4 = 2A/16 + S`, so `A/8 = S`.
+    let proportional = drive_and_install.saturating_mul(8);
+    if proportional
+        <= RaftConfig::SWEEP_MAX_INTERVAL.saturating_mul(RaftConfig::SWEEP_INTERVALS_PER_MAX_AGE)
+    {
+        return proportional;
+    }
+    quarter_at(RaftConfig::SWEEP_MAX_INTERVAL)
 }
 
 impl Default for RaftConfig {
@@ -788,6 +871,28 @@ impl RaftSnapshotConfig {
     /// copy, a second PUT under a new name when the first one's name is
     /// taken, and the HEAD that checks the copy.
     pub const INSTALL_COPY_REQUESTS: u32 = 4;
+    /// The driver interval with an S3 snapshot store when `drive_interval`
+    /// is unset: the store's health gate ticks on the same interval.
+    pub const DEFAULT_S3_DRIVE_INTERVAL: Duration = Duration::from_secs(5);
+    /// The driver interval with inline snapshots when `drive_interval` is
+    /// unset.
+    pub const DEFAULT_INLINE_DRIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The snapshot driver's interval on a node whose snapshot backend
+    /// resolved to `backend`: `drive_interval`, which config validation
+    /// keeps non-zero, else [`Self::DEFAULT_S3_DRIVE_INTERVAL`] with S3
+    /// snapshots and [`Self::DEFAULT_INLINE_DRIVE_INTERVAL`] inline.
+    pub fn effective_drive_interval(&self, backend: RaftSnapshotBackend) -> Duration {
+        self.drive_interval.map_or(
+            match backend {
+                RaftSnapshotBackend::S3 => Self::DEFAULT_S3_DRIVE_INTERVAL,
+                RaftSnapshotBackend::Auto | RaftSnapshotBackend::Inline => {
+                    Self::DEFAULT_INLINE_DRIVE_INTERVAL
+                }
+            },
+            |configured| configured.as_duration(),
+        )
+    }
 
     /// The snapshot prefix this config names, `snapshots` when unset.
     pub fn snapshot_prefix(&self) -> SnapshotPrefix {

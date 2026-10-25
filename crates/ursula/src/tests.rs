@@ -7414,7 +7414,6 @@ mod snapshot_driver {
     use crate::bootstrap::plan_purges;
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
-    use crate::bootstrap::resolve_snapshot_drive_interval;
     use crate::bootstrap::snapshot_cadence;
     use crate::bootstrap::spawn_snapshot_driver;
     use crate::bootstrap::trigger_snapshot_build;
@@ -7486,45 +7485,23 @@ mod snapshot_driver {
         );
     }
 
-    #[test]
-    fn snapshot_driver_default_interval_follows_external_store() {
-        // F12e: the inline backend runs the byte-based driver too.
-        let fifteen = Duration::from_secs(15);
-        assert_eq!(
-            resolve_snapshot_drive_interval(None, false),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(None, true),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(Some(fifteen), false),
-            fifteen
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(Some(fifteen), true),
-            fifteen
-        );
-    }
-
     /// #669: every Raft node, a single node included, drives its snapshots
     /// under one cadence of `raft.snapshot_log_budget` and
     /// `raft.snapshot_backstop_logs`.
     #[test]
     fn every_raft_node_drives_its_snapshots_under_one_cadence() {
-        let mut raft = ursula_config::RaftConfig::default();
-        let cadence = snapshot_cadence(&raft, 64);
+        let mut config = ursula_config::UrsulaConfig::default();
+        let cadence = snapshot_cadence(&config, 64);
         assert_eq!(cadence.backstop_entries, 100_000);
         assert_eq!(cadence.floor_bytes, 8 * MIB);
         assert_eq!(
             cadence.removal_floor,
-            SnapshotCadence::new(raft.snapshot_log_budget.as_bytes(), 64, 100_000)
-                .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+            SnapshotCadence::new(config.raft.snapshot_log_budget.as_bytes(), 64, 100_000)
+                .with_deleted_data_max_age(config.effective_deleted_data_max_age())
                 .removal_floor
         );
-        raft.snapshot_backstop_logs = 1_000;
-        assert_eq!(snapshot_cadence(&raft, 64).backstop_entries, 1_000);
+        config.raft.snapshot_backstop_logs = 1_000;
+        assert_eq!(snapshot_cadence(&config, 64).backstop_entries, 1_000);
     }
 
     #[test]
@@ -8360,7 +8337,7 @@ mod snapshot_driver {
         .expect("spawn a single node");
         // No meta runs here, so the test settles the fresh root's binding.
         spawned.bind_without_meta();
-        (spawned, root, config.raft.effective_deleted_data_max_age())
+        (spawned, root, config.effective_deleted_data_max_age())
     }
 
     /// Creates `stream_id`, expiring at `expires_at_ms` when set, and appends

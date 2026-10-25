@@ -391,23 +391,33 @@ impl StreamStateMachine {
         false
     }
 
-    /// Applies [`StreamCommand::ExpireStreams`]: removes up to `limit`
-    /// streams expired at `now_ms`, in the TTL index's (expiry, bucket,
-    /// stream) order, each ending `Expired`. Every side effect of a removal
-    /// (cold GC, its end record, the removal tally) happens here, as for any
-    /// removal.
-    pub(super) fn expire_streams(&mut self, now_ms: u64, limit: NonZeroU32) -> StreamResponse {
+    /// Applies [`StreamCommand::Sweep`]: removes up to `limit` streams
+    /// expired at `now_ms`, in the TTL index's (expiry, bucket, stream)
+    /// order, each ending `Expired`, then folds up to `limit` end records
+    /// at or below `retire_through` that the group held before the entry
+    /// (F20). Every side effect of a removal (cold GC, its end record, the
+    /// removal tally) happens here, as for any removal.
+    pub(super) fn sweep(
+        &mut self,
+        now_ms: u64,
+        limit: NonZeroU32,
+        retire_through: u64,
+    ) -> StreamResponse {
+        // The entry's own removals take seqs above it, so it never folds
+        // them, whatever the proposer sampled.
+        let retire_through = retire_through.min(self.usage_seq());
         let limit = u64::from(limit.get());
-        let mut removed = 0u64;
-        while removed < limit {
+        let mut expired = 0u64;
+        while expired < limit {
             let Some(stream_id) = self.registry.pop_expired(now_ms) else {
                 break;
             };
             if self.remove_stream_state(&stream_id, StreamEnd::Expired, now_ms) {
-                removed = removed.saturating_add(1);
+                expired = expired.saturating_add(1);
             }
         }
-        StreamResponse::StreamsExpired { removed }
+        let retired = self.retire_end_records(retire_through, limit);
+        StreamResponse::Swept { expired, retired }
     }
 
     /// Removes the stream `stream_id`, which ended as `end` at `now_ms`, the

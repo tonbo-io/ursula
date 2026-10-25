@@ -108,10 +108,11 @@ pub enum Defence {
     /// the journal's size frees segments, so a small journal keeps a
     /// removed stream's records in its files.
     WalDirtyAge,
-    /// Each group's leader proposes `ExpireStreams` for the streams that
-    /// expired in its group, in its background tidy pass (#669). Off, an
-    /// expired stream that no request names stays in its group: no other
-    /// command removes a stream it does not name.
+    /// Each group's leader proposes `Sweep` entries in its background tidy
+    /// pass (#669, F20): they remove the streams that expired in its group
+    /// and fold its due end records. Off, an expired stream that no request
+    /// names stays in its group, since no other command removes a stream it
+    /// does not name, and end records fold only at the cap.
     ExpirySweep,
     /// A group engine's shutdown returns only once the work OpenRaft runs
     /// for it on tasks of its own ended: its state-machine worker, the

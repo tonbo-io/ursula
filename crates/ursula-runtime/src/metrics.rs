@@ -466,9 +466,9 @@ runtime_metrics! {
     // open back-off until their core opens them again (#687): 1 per group
     // while it waits.
     sum open_backoff_groups: group per_group_open_backoff;
-    // The leader's background expiry sweep (#669): the `ExpireStreams`
-    // entries its passes committed, the expired streams they removed, and
-    // the groups the latest pass left with expired streams for the next one.
+    // The leader's background group sweep (#669): the `Sweep` entries its
+    // passes committed, the expired streams they removed, and the groups
+    // the latest pass left due for the next one.
     counter ttl_expiry_sweeps;
     counter ttl_expiry_swept_streams;
     counter ttl_expiry_sweep_due_groups;

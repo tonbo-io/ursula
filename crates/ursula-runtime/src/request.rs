@@ -526,11 +526,14 @@ pub struct AdvanceRetentionResponse {
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
-/// One leader-side tidy pass over a group (bounded-state F0). The engine
-/// first sweeps expired streams: while the group's TTL front is due at
-/// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms`, it proposes
-/// `ExpireStreams`, at most `max_expiry_sweeps` entries, and on an engine
-/// with a log starts none after `expiry_sweep_budget`
+/// One tidy pass over a group (bounded-state F0, F20). Every replica first
+/// samples its group's retirement clock
+/// ([`crate::expiry_sweep::RetirementClock`]), which gives the usage seq
+/// through which end records at least `end_record_retain` old are due. A
+/// leader then runs the group sweep: while the group's TTL front is due at
+/// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms` or an end record is
+/// due, it proposes `Sweep`, at most `max_expiry_sweeps` entries, and on an
+/// engine with a log starts none after `expiry_sweep_budget`
 /// ([`crate::expiry_sweep`]). It then proposes `TidyStream` for at most
 /// `max_streams` streams with normalization debt at `now_ms`. Followers
 /// propose nothing.
@@ -542,6 +545,10 @@ pub struct TidyStreamsRequest {
     /// [`crate::expiry_sweep::RERUN_BUDGET`] for one that drains a capped
     /// group.
     pub expiry_sweep_budget: std::time::Duration,
+    /// How long an end record stays before the sweep folds it: the node's
+    /// `UrsulaConfig::end_record_retention`, half of
+    /// `raft.deleted_data_max_age`.
+    pub end_record_retain: std::time::Duration,
     pub now_ms: u64,
 }
 
@@ -579,12 +586,15 @@ pub struct TidyStreamsResponse {
     pub tidied: u64,
     /// Tidied streams that still report debt after their command.
     pub debt_remaining: u64,
-    /// `ExpireStreams` entries committed by this pass.
+    /// `Sweep` entries committed by this pass.
     pub expiry_sweeps: u64,
     /// Expired streams those entries removed.
     pub expiry_swept_streams: u64,
+    /// End records those entries folded into their buckets' usage (F20).
+    pub end_records_retired: u64,
     /// Groups whose sweep stopped at its entry cap, its time budget or an
-    /// error while expired streams remained (0 or 1 for one group).
+    /// error while expired streams or due end records remained (0 or 1 for
+    /// one group).
     pub expiry_due_groups: u64,
     /// Of those, the groups whose sweep stopped at its entry cap or its time
     /// budget, not at an error: the tidy driver sweeps them again a second
@@ -601,6 +611,9 @@ impl TidyStreamsResponse {
         self.expiry_swept_streams = self
             .expiry_swept_streams
             .saturating_add(other.expiry_swept_streams);
+        self.end_records_retired = self
+            .end_records_retired
+            .saturating_add(other.end_records_retired);
         self.expiry_due_groups = self
             .expiry_due_groups
             .saturating_add(other.expiry_due_groups);
@@ -610,12 +623,14 @@ impl TidyStreamsResponse {
     }
 }
 
-/// Result of one replicated `ExpireStreams` entry.
+/// Result of one replicated `Sweep` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExpireStreamsResponse {
+pub struct SweepResponse {
     pub placement: ShardPlacement,
-    /// Expired streams the entry removed, at most its limit.
-    pub removed: u64,
+    /// Streams the entry removed, at most its limit.
+    pub expired: u64,
+    /// End records the entry folded, at most its limit.
+    pub retired: u64,
     pub group_commit_index: u64,
 }
 

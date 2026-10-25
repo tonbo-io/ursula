@@ -193,10 +193,11 @@ they stay at 0 in the in-memory mode, which runs no Raft. Alert when `raft_delet
 
 Each group's leader removes expired streams in the background (see
 [Deleted data](/docs/operations#deleted-data)). `ttl_expiry_sweeps` counts the
-`ExpireStreams` entries the node's leaders committed, each of which removes up
-to 256 expired streams, and `ttl_expiry_swept_streams` the expired streams
-they removed. `ttl_expiry_sweep_due_groups` reports the groups the latest pass
-left with expired streams. A group the pass stopped at its 16 entries or its
+`Sweep` entries the node's leaders committed, each of which removes up to 256
+expired streams and folds up to 256 due end records, and
+`ttl_expiry_swept_streams` the expired streams they removed.
+`ttl_expiry_sweep_due_groups` reports the groups the latest pass left with
+expired streams or due end records. A group the pass stopped at its 16 entries or its
 250 ms is swept again a second later, with 50 ms per group, so the gauge
 returns to 0 once its backlog drains. A value that stays above 0 across many
 passes means a group expires streams faster than its re-runs remove them, that

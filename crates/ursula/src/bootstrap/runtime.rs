@@ -180,7 +180,8 @@ fn spawn_with_inputs(
     };
     ursula_runtime::tidy_worker::spawn_tidy_worker(
         &spawned.runtime,
-        config.raft.effective_deleted_data_max_age(),
+        config.effective_deleted_data_max_age(),
+        config.end_record_retention(),
     );
     if spawned.runtime.has_cold_store() {
         spawn_cold_flush_worker_if_configured(&spawned.runtime, &config.storage.cold);
@@ -228,15 +229,16 @@ fn spawn_raft_node(
                 message: ursula_runtime::ErrorChain(&err).to_string(),
             })?;
     let engine_config = RaftEngineConfig::from(&config.raft);
-    let snapshot_drive_interval = snapshot::resolve_snapshot_drive_interval(
+    let snapshot_drive_interval =
         config
             .storage
             .snapshot
-            .drive_interval
-            .map(|interval| interval.as_duration()),
-        snapshot_store.is_some(),
-    );
-    let cadence = snapshot::snapshot_cadence(&config.raft, group_count);
+            .effective_drive_interval(if snapshot_store.is_some() {
+                ursula_config::RaftSnapshotBackend::S3
+            } else {
+                ursula_config::RaftSnapshotBackend::Inline
+            });
+    let cadence = snapshot::snapshot_cadence(config, group_count);
     let registry = RaftGroupHandleRegistry::default()
         .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
         .with_snapshot_install(

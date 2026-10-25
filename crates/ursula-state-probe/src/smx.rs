@@ -19,13 +19,34 @@ pub const T0: u64 = 1_759_300_000_000;
 pub const MIB: usize = 1 << 20;
 pub const JSON: &str = "application/json";
 
-/// One `ExpireStreams` entry at `now_ms`, as the leader's sweep proposes
-/// it ([`ursula_runtime::expiry_sweep::command`]).
-pub fn expire_streams(m: &mut StreamStateMachine, now_ms: u64) -> StreamResponse {
-    m.apply(StreamCommand::ExpireStreams {
+/// One `Sweep` entry at `now_ms` that folds through `retire_through`, as
+/// the leader's sweep proposes it ([`ursula_runtime::expiry_sweep::command`]).
+pub fn sweep(m: &mut StreamStateMachine, now_ms: u64, retire_through: u64) -> StreamResponse {
+    m.apply(StreamCommand::Sweep {
         now_ms,
         limit: ursula_runtime::expiry_sweep::STREAMS_PER_COMMAND,
+        retire_through,
     })
+}
+
+/// Folds every end record the group holds with `Sweep` entries at `now_ms`
+/// that fold through its latest usage seq, as the leader's sweep does once
+/// the retention passed (F20). Returns how many it folded.
+pub fn retire_all(m: &mut StreamStateMachine, now_ms: u64) -> Result<u64> {
+    let limit = u64::from(ursula_runtime::expiry_sweep::STREAMS_PER_COMMAND.get());
+    let mut folded = 0u64;
+    loop {
+        let retire_through = m.usage_seq();
+        match ok(sweep(m, now_ms, retire_through), "retire end records")? {
+            StreamResponse::Swept { retired, .. } => {
+                folded = folded.saturating_add(retired);
+                if retired < limit {
+                    return Ok(folded);
+                }
+            }
+            other => bail!("retire end records: {other:?}"),
+        }
+    }
 }
 
 pub fn ok(response: StreamResponse, what: &str) -> Result<StreamResponse> {

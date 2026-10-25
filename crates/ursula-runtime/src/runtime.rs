@@ -1072,12 +1072,11 @@ impl ShardRuntime {
         report
     }
 
-    /// One leader-side tidy pass over every Raft group this node hosts
-    /// (bounded-state F0):
-    /// each group this node leads first sweeps expired streams with at most
-    /// `request.max_expiry_sweeps` `ExpireStreams` entries
-    /// ([`crate::expiry_sweep`]), then proposes `TidyStream` for at most
-    /// `request.max_streams` streams with normalization debt. A failing
+    /// One tidy pass over every Raft group this node hosts (bounded-state
+    /// F0, F20): every group samples its retirement clock, and each group
+    /// this node leads first sweeps with at most `request.max_expiry_sweeps`
+    /// `Sweep` entries ([`crate::expiry_sweep`]), then proposes `TidyStream`
+    /// for at most `request.max_streams` streams with normalization debt. A failing
     /// group does not stop the others. The pass returns the totals of every
     /// group, those whose pass failed included, with the first error.
     pub async fn tidy_streams_all_groups_once(

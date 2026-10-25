@@ -624,7 +624,11 @@ impl StreamStateMachine {
                 leader,
             } => self.new_history(index, history, previous, kept, leader, now_ms),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
-            StreamCommand::ExpireStreams { now_ms, limit } => self.expire_streams(now_ms, limit),
+            StreamCommand::Sweep {
+                now_ms,
+                limit,
+                retire_through,
+            } => self.sweep(now_ms, limit, retire_through),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
             }

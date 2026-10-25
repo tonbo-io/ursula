@@ -339,13 +339,16 @@ pub(crate) fn deleted_data_sample<'a>(
 
 /// The snapshot policy of a node, a single node's as a cluster node's
 /// (F12e, #519, #669).
-pub(crate) fn snapshot_cadence(raft: &ursula_config::RaftConfig, groups: usize) -> SnapshotCadence {
+pub(crate) fn snapshot_cadence(
+    config: &ursula_config::UrsulaConfig,
+    groups: usize,
+) -> SnapshotCadence {
     SnapshotCadence::new(
-        raft.snapshot_log_budget.as_bytes(),
+        config.raft.snapshot_log_budget.as_bytes(),
         groups,
-        raft.snapshot_backstop_logs,
+        config.raft.snapshot_backstop_logs,
     )
-    .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+    .with_deleted_data_max_age(config.effective_deleted_data_max_age())
 }
 
 /// Sets the coordinator's log-pressure flag, which HTTP admission reads,
@@ -395,20 +398,6 @@ fn spawn_log_pressure_monitor(
             tokio::time::sleep(LOG_PRESSURE_POLL).await;
         }
     });
-}
-
-/// The driver interval: the configured one, which config validation keeps
-/// non-zero, else 5 s with an external snapshot store, whose health gate
-/// ticks on the same interval, and 1 s inline.
-pub(crate) fn resolve_snapshot_drive_interval(
-    configured: Option<Duration>,
-    snapshot_store_configured: bool,
-) -> Duration {
-    configured.unwrap_or(if snapshot_store_configured {
-        Duration::from_secs(5)
-    } else {
-        Duration::from_secs(1)
-    })
 }
 
 /// One group's log progress as the driver sees it (F12e): the state

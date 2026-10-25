@@ -74,7 +74,6 @@ mod test_reexports {
     pub(crate) use super::snapshot::plan_purges;
     pub(crate) use super::snapshot::plan_scrub_purges;
     pub(crate) use super::snapshot::plan_snapshot_drive;
-    pub(crate) use super::snapshot::resolve_snapshot_drive_interval;
     pub(crate) use super::snapshot::snapshot_cadence;
     pub(crate) use super::snapshot::spawn_snapshot_driver;
     pub(crate) use super::snapshot::trigger_snapshot_build;

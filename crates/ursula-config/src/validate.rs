@@ -83,10 +83,15 @@ pub enum ValidationError {
          cold backend"
     )]
     InflightBodyBudgetTooSmall { budget: u64, minimum: u64 },
-    /// A bound on deleted data shorter than eight snapshot installs (#669).
+    /// A bound on deleted data below its floor
+    /// ([`UrsulaConfig::min_deleted_data_max_age`]): shorter than eight
+    /// snapshot installs (#669), or too short for a removed stream's end
+    /// record to leave within it (F20).
     #[error(
-        "raft.deleted_data_max_age ({value:?}) must be at least {minimum:?}, eight times \
-         raft.install_snapshot_timeout"
+        "raft.deleted_data_max_age ({value:?}) must be at least {minimum:?}: eight times \
+         raft.install_snapshot_timeout, and long enough that a removed stream's end record \
+         leaves within it, which takes half of it, two sweep intervals, a quarter of it, \
+         storage.snapshot.drive_interval and raft.install_snapshot_timeout"
     )]
     DeletedDataMaxAgeTooShort {
         value: std::time::Duration,
@@ -220,7 +225,7 @@ impl UrsulaConfig {
         // Only a set value is checked: unset, the bound follows the install
         // timeout, so a config without the key stays valid.
         if let Some(value) = self.raft.deleted_data_max_age.map(|age| age.as_duration()) {
-            let minimum = self.raft.min_deleted_data_max_age();
+            let minimum = self.min_deleted_data_max_age();
             if value < minimum {
                 return Err(ValidationError::DeletedDataMaxAgeTooShort { value, minimum });
             }
@@ -405,11 +410,15 @@ impl UrsulaConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::S3HealthSetting;
     use super::ValidationError;
     use crate::HumanDuration;
     use crate::S3Config;
     use crate::UrsulaConfig;
+    use crate::config::RaftConfig;
+    use crate::config::end_record_residence_floor;
     use crate::human::HumanSize;
 
     #[test]
@@ -522,42 +531,132 @@ mod tests {
         assert!(error.to_string().contains("max_hot_size_per_group"));
     }
 
-    /// #669: the bound on deleted data is at least eight snapshot installs.
+    /// #669, F20: the bound on deleted data is at least eight snapshot
+    /// installs and long enough for an end record to leave within it. With
+    /// the default install timeout of 120 s, that is 964 s inline (a 1 s
+    /// drive interval) and 980 s with S3 snapshots (5 s).
     #[test]
-    fn deleted_data_max_age_is_at_least_eight_installs() {
+    fn deleted_data_max_age_is_at_least_its_floor() {
         let mut config = UrsulaConfig::default();
         config.raft.node_id = 1;
         assert_eq!(config.raft.deleted_data_max_age, None);
         assert_eq!(
-            config.raft.effective_deleted_data_max_age(),
-            std::time::Duration::from_secs(3_600)
+            config.effective_deleted_data_max_age(),
+            Duration::from_secs(3_600)
         );
+        assert_eq!(config.end_record_retention(), Duration::from_secs(1_800));
         config.validate().expect("the defaults are valid");
-        config.raft.deleted_data_max_age = Some(HumanDuration::min(16));
-        config
-            .validate()
-            .expect("eight times the default install timeout");
-        config.raft.deleted_data_max_age = Some(HumanDuration::sec(959));
-        let err = config.validate().expect_err("shorter than eight installs");
+        assert_eq!(config.min_deleted_data_max_age(), Duration::from_secs(964));
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(964));
+        config.validate().expect("the floor itself");
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(963));
+        let err = config.validate().expect_err("below the floor");
         assert!(
             matches!(
                 err,
                 ValidationError::DeletedDataMaxAgeTooShort { value, minimum }
-                    if value == std::time::Duration::from_secs(959)
-                        && minimum == std::time::Duration::from_secs(960)
+                    if value == Duration::from_secs(963) && minimum == Duration::from_secs(964)
             ),
             "{err}"
         );
+        // 0.10 accepted eight installs, 960 s.
+        config.raft.deleted_data_max_age = Some(HumanDuration::min(16));
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::DeletedDataMaxAgeTooShort { .. })
+        ));
+
+        let mut s3 = s3_snapshot_cluster_node();
+        assert_eq!(s3.min_deleted_data_max_age(), Duration::from_secs(980));
+        s3.raft.deleted_data_max_age = Some(HumanDuration::sec(979));
+        assert!(matches!(
+            s3.validate(),
+            Err(ValidationError::DeletedDataMaxAgeTooShort { minimum, .. })
+                if minimum == Duration::from_secs(980)
+        ));
+
+        // A short install timeout: 8 * (1 s + 10 s), above eight installs.
         config.raft.install_snapshot_timeout = HumanDuration::sec(10);
-        config.raft.deleted_data_max_age = Some(HumanDuration::sec(80));
+        assert_eq!(config.min_deleted_data_max_age(), Duration::from_secs(88));
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(88));
         config
             .validate()
-            .expect("eight times a shorter install timeout");
+            .expect("the floor of a shorter install timeout");
+        // A long one: eight installs are the larger term.
+        config.raft.install_snapshot_timeout = HumanDuration::min(10);
+        assert_eq!(
+            config.min_deleted_data_max_age(),
+            Duration::from_secs(80 * 60)
+        );
     }
 
-    /// #669: a 0.8.0 config with a long install timeout and no
-    /// `deleted_data_max_age` stays valid: the unset bound follows the
-    /// install timeout.
+    /// F20: the floor is the smallest bound `A` with
+    /// `2 * sweep_interval(A) + S <= A / 4`, in each range of the sweep
+    /// interval and across their edges.
+    #[test]
+    fn the_residence_floor_is_the_root_of_its_condition() {
+        let fits = |age: Duration, slack: Duration| {
+            RaftConfig::sweep_interval(age)
+                .saturating_mul(2)
+                .saturating_add(slack)
+                <= age.checked_div(4).expect("non-zero divisor")
+        };
+        let millis = [
+            0_u64, 1, 500, 1_999, 2_000, 2_001, 5_000, 61_000, 119_999, 120_000, 120_001, 125_000,
+            121_000, 3_600_000,
+        ];
+        for slack in millis.map(Duration::from_millis) {
+            let floor = end_record_residence_floor(slack);
+            assert!(fits(floor, slack), "{slack:?}: {floor:?} does not fit");
+            let below = floor.saturating_sub(Duration::from_millis(1));
+            assert!(!fits(below, slack), "{slack:?}: {below:?} fits");
+        }
+        assert_eq!(
+            end_record_residence_floor(Duration::ZERO),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            end_record_residence_floor(Duration::from_secs(11)),
+            Duration::from_secs(88)
+        );
+        assert_eq!(
+            end_record_residence_floor(Duration::from_secs(125)),
+            Duration::from_secs(980)
+        );
+    }
+
+    /// F20: the sweep runs every sixteenth of the bound, between one second
+    /// and one minute.
+    #[test]
+    fn the_sweep_interval_is_a_sixteenth_of_the_bound_within_its_limits() {
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::from_secs(3_600)),
+            RaftConfig::SWEEP_MAX_INTERVAL
+        );
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::from_secs(960)),
+            RaftConfig::SWEEP_MAX_INTERVAL
+        );
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::from_secs(480)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::from_secs(48)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::from_secs(8)),
+            RaftConfig::SWEEP_MIN_INTERVAL
+        );
+        assert_eq!(
+            RaftConfig::sweep_interval(Duration::ZERO),
+            RaftConfig::SWEEP_MIN_INTERVAL
+        );
+    }
+
+    /// An unset `deleted_data_max_age` stays valid: the unset bound follows
+    /// the floor, here eight times a long install timeout.
     #[test]
     fn an_unset_deleted_data_max_age_follows_a_long_install_timeout() {
         let mut config = UrsulaConfig::default();
@@ -567,9 +666,43 @@ mod tests {
             .validate()
             .expect("an unset bound never refuses a config");
         assert_eq!(
-            config.raft.effective_deleted_data_max_age(),
-            std::time::Duration::from_secs(80 * 60)
+            config.effective_deleted_data_max_age(),
+            Duration::from_secs(80 * 60)
         );
+        // And the floor of a long drive interval: 4 * (120 s + 1 h + 600 s).
+        config.storage.snapshot.drive_interval = Some(HumanDuration::hour(1));
+        config
+            .validate()
+            .expect("an unset bound never refuses a config");
+        assert_eq!(
+            config.effective_deleted_data_max_age(),
+            Duration::from_secs(4 * (120 + 3_600 + 600))
+        );
+    }
+
+    /// The drive interval: the configured one, else 5 s with S3 snapshots
+    /// and 1 s inline.
+    #[test]
+    fn the_drive_interval_default_follows_the_snapshot_backend() {
+        let mut snapshot = crate::RaftSnapshotConfig::default();
+        assert_eq!(
+            snapshot.effective_drive_interval(crate::RaftSnapshotBackend::Inline),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            snapshot.effective_drive_interval(crate::RaftSnapshotBackend::S3),
+            Duration::from_secs(5)
+        );
+        snapshot.drive_interval = Some(HumanDuration::sec(15));
+        for backend in [
+            crate::RaftSnapshotBackend::Inline,
+            crate::RaftSnapshotBackend::S3,
+        ] {
+            assert_eq!(
+                snapshot.effective_drive_interval(backend),
+                Duration::from_secs(15)
+            );
+        }
     }
 
     /// A cluster node of one peer, itself, with S3 snapshots: the node
@@ -656,7 +789,8 @@ mod tests {
 
         let mut config = s3_snapshot_cluster_node();
         config.raft.install_snapshot_timeout = HumanDuration::sec(60);
-        config.raft.deleted_data_max_age = Some(HumanDuration::min(8));
+        // The floor with S3 snapshots: 8 * (5 s + 60 s).
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(520));
         assert!(matches!(
             config.validate(),
             Err(ValidationError::SnapshotCopyOutlastsInstall { .. })

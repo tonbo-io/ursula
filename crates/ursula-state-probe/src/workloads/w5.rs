@@ -3,7 +3,7 @@
 //! - `delete`: create N streams per cycle (appends + drain flush), delete all,
 //!   drain cold GC; repeated cycles.
 //! - `ttl-expire`: N streams with sliding TTL, then let them expire and remove
-//!   them with `ExpireStreams` entries, as the leader's sweep does.
+//!   them with `Sweep` entries, as the leader's sweep does.
 //! - `ttl-heap`: one long-lived stream, A appends, TTL none / sliding /
 //!   absolute: TTL heap growth per append.
 //! - `purge`: B buckets with one stream each, `PurgeBucket` each.
@@ -136,6 +136,8 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         created_total = created_total.saturating_add(args.streams);
         let pending = m.pending_cold_gc_len();
         smx::ack_all_cold_gc(&mut m)?;
+        // The deleted streams' end records fold once their retention passed.
+        smx::retire_all(&mut m, now)?;
         let after_gc = measure_sm(&m, &base, Vec::new(), false)?;
         sink.row(&json!({
             "cycle": cycle, "streams_created_total": created_total,
@@ -200,12 +202,15 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         .unwrap_or(u64::MAX)
         .saturating_add(2);
     while commands <= limit && m.expiry_due(later) {
-        smx::ok(smx::expire_streams(&mut m, later), "expire streams")?;
+        // The expiry half only: no end record is due yet.
+        smx::ok(smx::sweep(&mut m, later, 0), "expire streams")?;
         commands = commands.saturating_add(1);
     }
     let left = ids.iter().filter(|id| m.head(id).is_some()).count();
     let pending = m.pending_cold_gc_len();
     smx::ack_all_cold_gc(&mut m)?;
+    // The expired streams' end records fold once their retention passed.
+    smx::retire_all(&mut m, later)?;
     let after = measure_sm(&m, &base, Vec::new(), false)?;
     formula::per_stream_checks(&mut outcome, &after, 0);
     sink.row(
@@ -359,6 +364,8 @@ fn purge(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             "purge",
         )?;
     }
+    // The purged streams' end records fold once their retention passed.
+    smx::retire_all(&mut m, smx::T0)?;
     let measured = measure_sm(&m, &base, Vec::new(), false)?;
     let heap = u64::try_from(measured.heap.bytes.max(0))?;
     sink.row(&json!({"phase": "after purging every bucket", "buckets_purged": buckets,

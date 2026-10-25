@@ -1,5 +1,5 @@
 //! Bounded-state F0: expired streams leave a group through
-//! [`StreamCommand::ExpireStreams`] alone. Each entry removes up to its
+//! [`StreamCommand::Sweep`] alone. Each entry removes up to its
 //! `limit` streams expired at its `now_ms`, earliest expiry first, then by
 //! bucket and stream id. Every other command removes at most the stream it
 //! names, and only when that stream was deleted or had expired at the
@@ -122,9 +122,10 @@ fn append_external(stream_id: BucketStreamId, now_ms: u64) -> StreamCommand {
 }
 
 fn expire(now_ms: u64, max: u32) -> StreamCommand {
-    StreamCommand::ExpireStreams {
+    StreamCommand::Sweep {
         now_ms,
         limit: limit(max),
+        retire_through: 0,
     }
 }
 
@@ -489,7 +490,7 @@ fn read_class(machine: &StreamStateMachine, stream_id: &BucketStreamId, now_ms: 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
-    /// Each `ExpireStreams` removes exactly the first `min(limit, due)`
+    /// Each `Sweep` removes exactly the first `min(limit, due)`
     /// streams expired at its clock in (expiry, bucket, stream) order and
     /// changes nothing of a live stream. A leader that proposes it until an
     /// entry removes fewer than `limit` leaves nothing due, in at most one
@@ -538,7 +539,7 @@ proptest! {
         }
     }
 
-    /// An `ExpireStreams` applied to a state and to that state restored
+    /// A `Sweep` applied to a state and to that state restored
     /// from its snapshot gives the same answer and the same snapshot: a
     /// replica that restored and one that replayed agree.
     #[test]
@@ -560,7 +561,7 @@ proptest! {
     /// The key regression of bounded-state F0: a command that names a
     /// stream removes at most that stream, and only when it was deleted or
     /// had expired at the command's `now_ms`. A purge removes streams of
-    /// its bucket only. Only `ExpireStreams` removes streams it does not
+    /// its bucket only. Only `Sweep` removes streams it does not
     /// name.
     #[test]
     fn no_command_removes_a_stream_it_does_not_name(
@@ -605,7 +606,7 @@ proptest! {
     }
 
     /// Two replicas of one workload, one that never sweeps and one with
-    /// `ExpireStreams` entries in between, give a client the same answers:
+    /// `Sweep` entries in between, give a client the same answers:
     /// `HEAD`, reads, liveness, producer early answers and every write,
     /// producer writes, writes under `Stream-Incarnation` and `DELETE`
     /// included. Only a purge's count of removed streams and usage depend
@@ -730,7 +731,10 @@ fn a_stale_due_front_removes_nothing_and_clears() {
         assert!(machine.expiry_due(2_500), "{stale}: the front is stale");
         assert_eq!(
             machine.apply(expire(2_500, 256)),
-            StreamResponse::StreamsExpired { removed: 0 },
+            StreamResponse::Swept {
+                expired: 0,
+                retired: 0,
+            },
             "{stale}"
         );
         assert_eq!(machine.snapshot(), before, "{stale}");
@@ -738,7 +742,7 @@ fn a_stale_due_front_removes_nothing_and_clears() {
     }
 }
 
-/// `ExpireStreams` never renews a live stream's sliding TTL.
+/// `Sweep` never renews a live stream's sliding TTL.
 #[test]
 fn expire_streams_never_renews_a_ttl() {
     let mut machine = machine();
@@ -746,20 +750,20 @@ fn expire_streams_never_renews_a_ttl() {
     machine.apply(create(named.clone(), Some(10), None, 1_000));
     let before = live(&machine)[&named].clone();
     for now_ms in [4_000, 8_000, 10_999] {
-        assert_eq!(
-            machine.apply(expire(now_ms, 256)),
-            StreamResponse::StreamsExpired { removed: 0 }
-        );
+        assert_eq!(machine.apply(expire(now_ms, 256)), StreamResponse::Swept {
+            expired: 0,
+            retired: 0,
+        });
         assert_eq!(live(&machine)[&named], before);
     }
-    assert_eq!(
-        machine.apply(expire(11_000, 256)),
-        StreamResponse::StreamsExpired { removed: 1 }
-    );
+    assert_eq!(machine.apply(expire(11_000, 256)), StreamResponse::Swept {
+        expired: 1,
+        retired: 0,
+    });
     assert!(!live(&machine).contains_key(&named));
 }
 
-/// With nothing due, `ExpireStreams` changes nothing.
+/// With nothing due, `Sweep` changes nothing.
 #[test]
 fn nothing_due_changes_nothing() {
     let mut machine = machine();
@@ -768,10 +772,10 @@ fn nothing_due_changes_nothing() {
     machine.apply(create(stream(1, 1), None, None, 1_000));
     let before = machine.snapshot();
     assert!(!machine.expiry_due(5_000));
-    assert_eq!(
-        machine.apply(expire(5_000, 256)),
-        StreamResponse::StreamsExpired { removed: 0 }
-    );
+    assert_eq!(machine.apply(expire(5_000, 256)), StreamResponse::Swept {
+        expired: 0,
+        retired: 0,
+    });
     assert_eq!(machine.snapshot(), before);
     assert_eq!(machine.removed_state().streams, 0);
 }
@@ -871,7 +875,7 @@ fn a_delete_of_an_expired_stream_answers_not_found() {
 }
 
 /// A create, an append and a close at a clock past every expiry remove
-/// none of the expired streams they do not name. `ExpireStreams` does, in
+/// none of the expired streams they do not name. `Sweep` does, in
 /// batches of its limit.
 #[test]
 fn writes_never_remove_expired_streams_they_do_not_name() {
@@ -894,14 +898,14 @@ fn writes_never_remove_expired_streams_they_do_not_name() {
         assert!(removed_by(&mut machine, command).is_empty());
     }
     assert_eq!(machine.removed_state().streams, 0);
-    assert_eq!(
-        machine.apply(expire(5_000, 256)),
-        StreamResponse::StreamsExpired { removed: 256 }
-    );
-    assert_eq!(
-        machine.apply(expire(5_000, 256)),
-        StreamResponse::StreamsExpired { removed: 44 }
-    );
+    assert_eq!(machine.apply(expire(5_000, 256)), StreamResponse::Swept {
+        expired: 256,
+        retired: 0,
+    });
+    assert_eq!(machine.apply(expire(5_000, 256)), StreamResponse::Swept {
+        expired: 44,
+        retired: 0,
+    });
     let remaining = live(&machine).into_keys().collect::<HashSet<_>>();
     assert_eq!(remaining, HashSet::from([writer]));
 }

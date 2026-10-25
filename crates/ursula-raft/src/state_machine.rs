@@ -2634,7 +2634,10 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                         }
                         Ok(result) => {
                             let removed = self.engine.removed_state().since(removed_before);
-                            if removed.streams > 0 {
+                            // A fold of end records counts as a removal
+                            // (F20): the ids they held leave the snapshot
+                            // and the log on the removal cadence.
+                            if removed.streams > 0 || removed.end_records > 0 {
                                 self.log_gauge.record_removal(removed.bytes);
                             }
                             RaftGroupResponse::Write(result)

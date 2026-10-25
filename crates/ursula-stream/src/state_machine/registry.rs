@@ -198,7 +198,7 @@ impl StreamRegistry {
     /// `false` is exact: every live stream with an expiry has one armed
     /// entry at or before its true expiry, so a front past `now_ms` means
     /// no stream has expired. `true` may come from a stale entry, of a
-    /// stream that was removed or renewed since. An `ExpireStreams` at
+    /// stream that was removed or renewed since. A `Sweep` at
     /// `now_ms` still makes progress on it: [`Self::pop_expired`] discards
     /// or re-arms that front.
     pub(super) fn ttl_front_due(&self, now_ms: u64) -> bool {

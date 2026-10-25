@@ -143,6 +143,11 @@
 //!   holds at most `MAX_END_RECORDS`: a removal past that first folds the
 //!   lowest-seq end record into its bucket's retired usage.
 //! - `PurgeBucket` carries the purge request's `now_ms`.
+//! - `Sweep { now_ms, limit, retire_through }` in place of `ExpireStreams`:
+//!   it removes up to `limit` expired streams, then folds up to `limit` end
+//!   records at or below `retire_through` that the group held before the
+//!   entry. It answers `Swept { expired, retired }`, and the group write
+//!   answer and `ResponseKind` follow.
 //! - an import gives every restored version zero counters, counted since
 //!   the import's history, and retires the backup's bucket totals. A
 //!   restore refuses a backup with two usage rows of one bucket

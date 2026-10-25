@@ -772,7 +772,7 @@ pub enum SimEvent {
     },
     /// `deleted_data_leaves_within_bound` held for an expired stream
     /// (#669): the group's leader swept it in the background with `sweeps`
-    /// `ExpireStreams` entries, the first replica to drop it applied through
+    /// `Sweep` entries, the first replica to drop it applied through
     /// `removal_index`, and within `raft.deleted_data_max_age` of dropping it
     /// each of `replicas` replicas held it in neither its current snapshot,
     /// its retained log nor its files, and read it as not found. `traffic`

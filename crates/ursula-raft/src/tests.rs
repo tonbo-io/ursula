@@ -5117,12 +5117,16 @@ fn expiring_create(stream_id: ursula_shard::BucketStreamId, expires_at_ms: u64) 
     RaftCommand::Stream(StreamCommand::from(request))
 }
 
+/// The end-record retention of the default `raft.deleted_data_max_age`.
+const END_RECORD_RETAIN: Duration = Duration::from_secs(30 * 60);
+
 /// #669: a group's leader sweeps the streams that expired in it in its
-/// tidy pass, and the only entries the sweep appends are `ExpireStreams` at
-/// its clock less the grace, each removing up to 256 streams.
+/// tidy pass, and the only entries the sweep appends are `Sweep` at its
+/// clock less the grace, each removing up to 256 streams. Their end
+/// records are not due yet, so the entries fold nothing.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
+async fn a_leader_sweeps_expired_streams_with_sweep_entries() {
     let (_wal_root, wal) = fresh_wal();
     let log_store = reopen_journal_store(&wal);
     let mut engine =
@@ -5162,6 +5166,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                end_record_retain: END_RECORD_RETAIN,
                 now_ms: 20_000,
             },
             placement(),
@@ -5189,9 +5194,10 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
             matches!(
                 &entry.payload,
                 EntryPayload::Normal(RaftCommand::Stream(
-                    ursula_stream::StreamCommand::ExpireStreams {
+                    ursula_stream::StreamCommand::Sweep {
                         now_ms: 19_000,
                         limit,
+                        retire_through: 0,
                     }
                 )) if limit.get() == 256
             ),
@@ -5209,6 +5215,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                end_record_retain: END_RECORD_RETAIN,
                 now_ms: 20_000,
             },
             placement(),
@@ -5248,6 +5255,7 @@ async fn a_follower_proposes_no_expiry_sweep() {
         max_streams: 0,
         max_expiry_sweeps: 16,
         expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+        end_record_retain: END_RECORD_RETAIN,
         now_ms: 20_000,
     };
     let report = engines[follower_index]
@@ -5286,6 +5294,106 @@ async fn a_follower_proposes_no_expiry_sweep() {
             "the replica still holds the expired stream: {read:?}"
         );
     }
+    shutdown_all(&engines).await;
+}
+
+/// F20: the leader's sweep folds the end records its replica's retirement
+/// clock finds due, with the watermark in the entry, and every replica
+/// folds the same ones. The clock seeds from the end records' removal
+/// times at its first sample, so records removed the retention before the
+/// pass fold in that pass, and later ones stay.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_leader_retires_due_end_records_on_every_replica() {
+    let (_registry, mut engines, leader_id, _wal_roots) =
+        build_three_node_cluster("ursula-end-record-retirement-test", None).await;
+    let leader_index = usize::try_from(leader_id.saturating_sub(1)).expect("leader id fits usize");
+    let follower_index = if leader_index == 0 { 1 } else { 0 };
+    wait_history(&engines[leader_index]).await;
+    let mut last_index = 0;
+    for (index, deleted_at_ms) in [(0, 10_000), (1, 10_000), (2, 90_000)] {
+        let stream_id = bsid(&format!("deleted-{index}"));
+        engines[leader_index]
+            .raft
+            .client_write(create_command(stream_id.clone()))
+            .await
+            .expect("create a stream");
+        last_index = engines[leader_index]
+            .raft
+            .client_write(RaftCommand::Stream(
+                ursula_stream::StreamCommand::DeleteStream {
+                    stream_id,
+                    now_ms: deleted_at_ms,
+                },
+            ))
+            .await
+            .expect("delete the stream")
+            .log_id
+            .index();
+    }
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(last_index), "deletes replicated")
+            .await
+            .expect("wait for the deletes");
+    }
+    // A minute's retention at a clock of 70 s: the two records removed at
+    // 10 s are due, the one removed at 90 s is not.
+    let request = ursula_runtime::TidyStreamsRequest {
+        max_streams: 0,
+        max_expiry_sweeps: 16,
+        expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+        end_record_retain: Duration::from_secs(60),
+        now_ms: 70_000,
+    };
+    let report = engines[follower_index]
+        .tidy_streams(request, placement())
+        .await
+        .into_result()
+        .expect("a follower's pass");
+    assert_eq!(report, ursula_runtime::TidyStreamsResponse::default());
+    let report = engines[leader_index]
+        .tidy_streams(request, placement())
+        .await
+        .into_result()
+        .expect("the leader's pass");
+    assert_eq!(report.expiry_sweeps, 1, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 0, "{report:?}");
+    assert_eq!(report.end_records_retired, 2, "{report:?}");
+    assert_eq!(report.expiry_due_groups, 0, "{report:?}");
+    let swept = last_index.saturating_add(1);
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(swept), "sweep replicated")
+            .await
+            .expect("wait for the sweep");
+        let removed = engine
+            .with_applied_state(|state_machine| {
+                Box::pin(async move { state_machine.engine.removed_state() })
+            })
+            .await
+            .expect("access the state machine");
+        assert_eq!(removed.end_records, 2, "{removed:?}");
+        assert_eq!(removed.end_records_early, 0, "{removed:?}");
+    }
+    // The last record is not due on the leader's clock: the next pass
+    // proposes nothing, whatever its wall clock.
+    let report = engines[leader_index]
+        .tidy_streams(
+            ursula_runtime::TidyStreamsRequest {
+                now_ms: 1_000_000,
+                ..request
+            },
+            placement(),
+        )
+        .await
+        .into_result()
+        .expect("an idle pass");
+    assert_eq!(report.expiry_sweeps, 0, "{report:?}");
     shutdown_all(&engines).await;
 }
 

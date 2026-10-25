@@ -275,8 +275,8 @@ pub enum GroupWriteResponse {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
-    /// An `ExpireStreams` entry of the leader's expiry sweep applied.
-    ExpireStreams(crate::request::ExpireStreamsResponse),
+    /// A `Sweep` entry of the leader's group sweep applied.
+    Sweep(crate::request::SweepResponse),
 }
 
 /// `GroupWriteResponse::kind` and one `TryFrom<GroupWriteResponse>` per
@@ -329,7 +329,7 @@ group_write_responses! {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
-    ExpireStreams(crate::request::ExpireStreamsResponse),
+    Sweep(crate::request::SweepResponse),
 }
 
 /// The error of a [`GroupEngine`] operation the engine leaves
@@ -515,11 +515,12 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(unsupported(EngineOperation::TidyStream)) })
     }
 
-    /// One leader-side tidy pass (bounded-state F0): first the expiry sweep
-    /// ([`crate::expiry_sweep`]), at most `request.max_expiry_sweeps`
-    /// `ExpireStreams` entries, then `TidyStream`
-    /// for up to `request.max_streams` streams with debt. A follower or an
-    /// engine without support proposes nothing.
+    /// One tidy pass (bounded-state F0, F20). Every replica first samples
+    /// its group's retirement clock ([`crate::expiry_sweep::RetirementClock`]).
+    /// A leader then runs the group sweep ([`crate::expiry_sweep`]), at most
+    /// `request.max_expiry_sweeps` `Sweep` entries, and `TidyStream` for up
+    /// to `request.max_streams` streams with debt. A follower or an engine
+    /// without support proposes nothing.
     fn tidy_streams<'a>(
         &'a mut self,
         _request: crate::request::TidyStreamsRequest,

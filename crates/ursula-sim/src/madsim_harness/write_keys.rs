@@ -1016,6 +1016,8 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
                 max_streams: 16,
                 max_expiry_sweeps: 0,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                // The default bound's: this pass sweeps nothing.
+                end_record_retain: Duration::from_secs(30 * 60),
                 now_ms: idle_now,
             })
             .await
