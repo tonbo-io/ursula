@@ -717,6 +717,8 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 `helm upgrade` from 0.9 stops at the first pod. A values file that still sets a removed chart value fails validation, and nothing changes. Otherwise the new pod finds the 0.9 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`. If the 0.9 release ran `OnDelete`, also delete the refused pod after the rollback so that it starts from the 0.9 template again. The 0.9 cluster and its prefix stay as they were, so they remain a way back until clients switch. Keep the peer lists of 0.9 and 0.10 nodes apart.
 
+0.10.1 upgrades 0.10.0 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.10.1 release notes](/docs/release-notes#0101).
+
 ## Upgrading to 0.9
 
 **0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5 and the backup format to 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. 0.9 does not restore 0.8 backups. There is no in-place upgrade, no rolling upgrade, no backup migration and no rollback. If you cannot move your data yet, stay on 0.8.2.
