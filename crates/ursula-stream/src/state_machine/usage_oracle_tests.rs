@@ -31,9 +31,9 @@ use crate::usage::LastWrite;
 use crate::usage::VersionCounters;
 
 const OCTET: &str = "application/octet-stream";
-const BUCKETS: [&str; 2] = ["ua", "ub"];
+const BUCKETS: [&str; 2] = ["usage-a", "usage-b"];
 /// The bucket the purge step purges.
-const PURGED: &str = "ub";
+const PURGED: &str = "usage-b";
 const STREAMS: usize = 6;
 const GENESIS: u64 = 0x0007;
 

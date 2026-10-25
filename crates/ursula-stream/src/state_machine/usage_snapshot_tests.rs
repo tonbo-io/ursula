@@ -62,17 +62,17 @@ fn ledger_group() -> StreamStateMachine {
             node_id: 1,
         },
     });
-    for bucket in ["one", "two"] {
+    for bucket in ["bucket-one", "bucket-two"] {
         apply_ok(&mut machine, StreamCommand::CreateBucket {
             bucket_id: bucket.to_owned(),
         });
     }
     for (bucket, name, body) in [
-        ("one", "a", &b"aaa"[..]),
-        ("one", "b", b"bb"),
-        ("one", "c", b""),
-        ("two", "d", b"dddd"),
-        ("two", "e", b"e"),
+        ("bucket-one", "a", &b"aaa"[..]),
+        ("bucket-one", "b", b"bb"),
+        ("bucket-one", "c", b""),
+        ("bucket-two", "d", b"dddd"),
+        ("bucket-two", "e", b"e"),
     ] {
         create(&mut machine, sid(bucket, name), body);
     }
@@ -87,7 +87,7 @@ fn ledger_group() -> StreamStateMachine {
         },
     });
     apply_ok(&mut machine, StreamCommand::Append {
-        stream_id: sid("one", "b"),
+        stream_id: sid("bucket-one", "b"),
         content_type: Some(OCTET.to_owned()),
         payload: Bytes::from_static(b"more"),
         close_after: false,
@@ -95,7 +95,11 @@ fn ledger_group() -> StreamStateMachine {
         producer: None,
         now_ms: 2,
     });
-    for (bucket, name, now_ms) in [("one", "a", 3), ("two", "e", 4), ("one", "c", 5)] {
+    for (bucket, name, now_ms) in [
+        ("bucket-one", "a", 3),
+        ("bucket-two", "e", 4),
+        ("bucket-one", "c", 5),
+    ] {
         apply_ok(&mut machine, StreamCommand::DeleteStream {
             stream_id: sid(bucket, name),
             now_ms,
@@ -198,7 +202,7 @@ fn a_restore_refuses_a_usage_of_the_wrong_shape() {
             usage.retired.push(row);
         })),
         UsageSnapshotError::DuplicateRetired {
-            bucket_id: "one".to_owned(),
+            bucket_id: "bucket-one".to_owned(),
         }
     );
     let error = usage_error(refused(|_, usage| {
@@ -270,24 +274,24 @@ fn a_restore_refuses_totals_that_are_not_the_sum_of_their_parts() {
     };
     assert_eq!(
         disagree(refused(|snapshot, _| {
-            let at = row(snapshot, "one");
+            let at = row(snapshot, "bucket-one");
             snapshot.bucket_usage[at].usage.committed_append_bytes += 1;
         })),
-        ("one".to_owned(), UsageCounter::AppendBytes)
+        ("bucket-one".to_owned(), UsageCounter::AppendBytes)
     );
     assert_eq!(
         disagree(refused(|snapshot, _| {
-            let at = row(snapshot, "two");
+            let at = row(snapshot, "bucket-two");
             snapshot.bucket_usage[at].usage.committed_records -= 1;
         })),
-        ("two".to_owned(), UsageCounter::Records)
+        ("bucket-two".to_owned(), UsageCounter::Records)
     );
     assert_eq!(
         disagree(refused(|snapshot, _| {
-            let at = row(snapshot, "two");
+            let at = row(snapshot, "bucket-two");
             snapshot.bucket_usage[at].usage.committed_write_units += 1;
         })),
-        ("two".to_owned(), UsageCounter::WriteUnits)
+        ("bucket-two".to_owned(), UsageCounter::WriteUnits)
     );
     // A dropped end record, a dropped retired row and a version whose
     // counters were lost each leave a total above its parts.
@@ -300,9 +304,9 @@ fn a_restore_refuses_totals_that_are_not_the_sum_of_their_parts() {
     );
     assert_eq!(
         disagree(refused(|_, usage| {
-            usage.retired.retain(|row| row.bucket_id != "one");
+            usage.retired.retain(|row| row.bucket_id != "bucket-one");
         })),
-        ("one".to_owned(), UsageCounter::AppendBytes)
+        ("bucket-one".to_owned(), UsageCounter::AppendBytes)
     );
     assert_eq!(
         disagree(refused(|_, usage| {
@@ -314,9 +318,11 @@ fn a_restore_refuses_totals_that_are_not_the_sum_of_their_parts() {
     // A total missing for a bucket with usage reads as zero.
     assert_eq!(
         disagree(refused(|snapshot, _| {
-            snapshot.bucket_usage.retain(|row| row.bucket_id != "two");
+            snapshot
+                .bucket_usage
+                .retain(|row| row.bucket_id != "bucket-two");
         })),
-        ("two".to_owned(), UsageCounter::AppendBytes)
+        ("bucket-two".to_owned(), UsageCounter::AppendBytes)
     );
 }
 
@@ -333,6 +339,6 @@ fn a_group_restore_refuses_two_total_rows_of_one_bucket() {
     });
     assert_eq!(
         error,
-        StreamSnapshotError::DuplicateBucketUsage("one".to_owned())
+        StreamSnapshotError::DuplicateBucketUsage("bucket-one".to_owned())
     );
 }
