@@ -379,7 +379,6 @@ pub use ursula_stream::GroupStateGauges;
 pub use ursula_stream::HistoryEvent;
 pub use ursula_stream::HistoryLeader;
 pub use ursula_stream::InheritedReport;
-pub use ursula_stream::MAX_COLD_SNAPSHOT_BYTES;
 pub use ursula_stream::ProducerAck;
 pub use ursula_stream::ProducerDelivery;
 pub use ursula_stream::ProducerEarlyAnswer;

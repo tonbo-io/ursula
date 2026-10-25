@@ -8,6 +8,8 @@ use std::fmt;
 use crate::error::HeaderError;
 use crate::fields;
 use crate::fields::Emit;
+use crate::limit::MAX_REQUEST_BYTES;
+use crate::limit::MAX_SNAPSHOT_BYTES;
 use crate::names;
 use crate::value::Incarnation;
 use crate::value::Offset;
@@ -252,6 +254,15 @@ pub struct PartCount(u32);
 impl PartCount {
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    /// The most bytes a commit of this many parts makes a node copy: each
+    /// part at the [`MAX_REQUEST_BYTES`] request limit, and at most the
+    /// [`MAX_SNAPSHOT_BYTES`] snapshot limit in all.
+    pub fn copy_bytes(self) -> u64 {
+        u64::from(self.0)
+            .saturating_mul(MAX_REQUEST_BYTES)
+            .min(MAX_SNAPSHOT_BYTES)
     }
 
     fn checked(value: u64) -> Result<Self, HeaderError> {

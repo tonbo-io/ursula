@@ -51,10 +51,10 @@ use std::time::Duration;
 use groups::GroupCounts;
 pub(crate) use groups::GroupReport;
 use tokio::time::Instant;
+use ursula_headers::MAX_SNAPSHOT_BYTES;
 use ursula_headers::MAX_SNAPSHOT_PARTS;
 use ursula_headers::StagedPartsLimit;
 use ursula_runtime::ColdStoreHandle;
-use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::SweptPart;
 use ursula_runtime::SweptPartsObserver;
 use ursula_runtime::cold_object_written_unix_ms;
@@ -70,7 +70,7 @@ pub(crate) const MAX_STAGED_PARTS: u64 = 2 * MAX_SNAPSHOT_PARTS as u64;
 
 /// The most bytes of staged, unused parts a stream holds: two snapshots of
 /// the snapshot limit.
-pub(crate) const MAX_STAGED_BYTES: u64 = 2 * MAX_COLD_SNAPSHOT_BYTES;
+pub(crate) const MAX_STAGED_BYTES: u64 = 2 * MAX_SNAPSHOT_BYTES;
 
 /// The streams a node tracks at once that no request holds, about 400
 /// bytes each.

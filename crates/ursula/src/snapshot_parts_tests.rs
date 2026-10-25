@@ -14,6 +14,7 @@ use axum::body::to_bytes;
 use axum::http::Request;
 use axum::http::header::RETRY_AFTER;
 use tower::ServiceExt;
+use ursula_headers::MAX_SNAPSHOT_BYTES;
 use ursula_headers::PartId;
 use ursula_headers::PartStaged;
 use ursula_headers::PartsCommit;
@@ -27,6 +28,7 @@ use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdStore;
+use ursula_runtime::ColdStoreOperation;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
@@ -54,7 +56,6 @@ use ursula_runtime::InMemoryGroupEngine;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LeadershipRefusal;
-use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -197,7 +198,7 @@ async fn parts_commit_a_snapshot_above_the_request_limit() {
     create(&app, "/parts/s").await;
     let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
     let head = StreamHead::parse(pairs(&response)).expect("stream head");
-    assert_eq!(head.max_snapshot_bytes(), Some(MAX_COLD_SNAPSHOT_BYTES));
+    assert_eq!(head.max_snapshot_bytes(), Some(MAX_SNAPSHOT_BYTES));
 
     let chunks = [
         bytes(13 * MIB, 1),
@@ -481,14 +482,13 @@ async fn a_node_without_a_cold_store_takes_no_parts() {
     );
 }
 
-/// End to end through a gateway that lowers the request limit (#581
-/// section 10, end to end): HEAD advertises the gateway's limit and the
-/// node's snapshot limit, a snapshot above the gateway's limit is refused in
-/// one request and goes up in parts, each under it, and reads back by range.
-#[tokio::test]
-async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
-    const GATEWAY_LIMIT: usize = 4 * MIB;
-    let (app, _cold_store) = cold_app();
+/// `app` served on its own TCP listener, and a gateway in front of it with
+/// `response_header_timeout` and a request limit of `request_limit`.
+async fn behind_a_gateway(
+    app: Router,
+    response_header_timeout: Duration,
+    request_limit: usize,
+) -> (ursula_gateway::Gateway, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind node");
@@ -499,12 +499,12 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
     let gateway = ursula_gateway::Gateway::new(ursula_gateway::GatewayConfig {
         listen: "127.0.0.1:0".parse().expect("listen"),
         upstreams: vec![node],
-        response_header_timeout: std::time::Duration::from_secs(30),
-        connect_timeout: std::time::Duration::from_secs(5),
+        response_header_timeout,
+        connect_timeout: Duration::from_secs(5),
         upstream_tcp_user_timeout_secs: std::num::NonZeroU64::new(30).expect("non-zero"),
         uploads: ursula_gateway::uploads::UploadLimits::try_from(
             ursula_gateway::uploads::UploadLimitsSpec {
-                max_request_body_bytes: GATEWAY_LIMIT,
+                max_request_body_bytes: request_limit,
                 ..ursula_gateway::uploads::UploadLimitsSpec::default()
             },
         )
@@ -513,6 +513,18 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
         cors_allowed_origins: Vec::new(),
         usage_chunk_bytes: None,
     });
+    (gateway, server)
+}
+
+/// End to end through a gateway that lowers the request limit (#581
+/// section 10, end to end): HEAD advertises the gateway's limit and the
+/// node's snapshot limit, a snapshot above the gateway's limit is refused in
+/// one request and goes up in parts, each under it, and reads back by range.
+#[tokio::test]
+async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
+    const GATEWAY_LIMIT: usize = 4 * MIB;
+    let (app, _cold_store) = cold_app();
+    let (gateway, server) = behind_a_gateway(app, Duration::from_secs(30), GATEWAY_LIMIT).await;
 
     let response = gateway
         .handle(
@@ -528,7 +540,7 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
         .await;
     let head = StreamHead::parse(pairs(&response)).expect("stream head");
     assert_eq!(head.max_request_bytes(), GATEWAY_LIMIT as u64);
-    assert_eq!(head.max_snapshot_bytes(), Some(MAX_COLD_SNAPSHOT_BYTES));
+    assert_eq!(head.max_snapshot_bytes(), Some(MAX_SNAPSHOT_BYTES));
 
     let snapshot = bytes(10 * MIB + 17, 9);
     let response = gateway
@@ -583,6 +595,154 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
         digest
     );
     assert!(body_of(response).await == snapshot[snapshot.len() - 17..]);
+    server.abort();
+}
+
+/// The gateway's base response header timeout in the #891 tests, well
+/// below the time the node takes for the snapshots they send.
+const GATEWAY_BASE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// How long the #891 tests hold a snapshot's bytes at the node before they
+/// let it go on: twice [`GATEWAY_BASE_TIMEOUT`].
+const HELD_PAST_THE_BASE: Duration = Duration::from_millis(600);
+
+/// #891 end to end: a parts commit through a gateway gets time for the
+/// bytes it copies on top of the gateway's response header timeout, 4 s for
+/// one part of up to the request limit. The commit holds at its part read
+/// until the gateway's base timeout has passed twice, so a gateway that
+/// waited only that long answered it `504` while the node still worked on
+/// it. Now the node's `204` reaches the client.
+#[tokio::test]
+async fn a_commit_that_outlasts_a_gateways_timeout_gets_its_answer_through_it() {
+    let (app, cold_store) = cold_app();
+    let (gateway, server) = behind_a_gateway(app, GATEWAY_BASE_TIMEOUT, MAX_HTTP_BODY_BYTES).await;
+    let response = gateway
+        .handle(
+            Request::put("/parts/s")
+                .header(CONTENT_TYPE, OCTET)
+                .body(Body::from("abc"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let snapshot = bytes(2 * MIB, 5);
+    let response = gateway
+        .handle(
+            Request::post("/parts/s/snapshot/3/parts")
+                .header(CONTENT_LENGTH, snapshot.len())
+                .body(Body::from(snapshot.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let part = PartStaged::parse(pairs(&response)).expect("a part id").part;
+    let digest = digest_of(&snapshot);
+
+    let gate = Gate::on_part_reads(&cold_store);
+    let started = tokio::time::Instant::now();
+    let (response, ()) = tokio::join!(
+        gateway.handle(commit_request("/parts/s", &[part], digest)),
+        async {
+            gate.reached(1).await;
+            tokio::time::sleep(HELD_PAST_THE_BASE).await;
+            gate.open();
+        }
+    );
+    assert!(started.elapsed() >= HELD_PAST_THE_BASE);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(matches!(
+        SnapshotPublishAnswer::parse(204, pairs(&response)),
+        Ok(Some(SnapshotPublishAnswer::Published { .. }))
+    ));
+    let response = gateway
+        .handle(
+            Request::get("/parts/s/snapshot/3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_of(response).await == snapshot);
+    server.abort();
+}
+
+/// #891 end to end for a snapshot in one request: its body gets time for
+/// its size on top of the gateway's response header timeout, at 8 MiB/s,
+/// and no more. The node holds each body as it starts to store it. One of
+/// 16 MiB (2 s more), held until the base timeout has passed twice, gets
+/// the node's `204`, where a gateway that waited only the base answered
+/// `504`. One of 2 MiB (250 ms more), held for good, as a node that stopped
+/// answering holds it, gets the gateway's `504` once its allowance ran out,
+/// not before.
+#[tokio::test]
+async fn a_snapshot_body_gets_time_for_its_size_through_a_gateway_and_no_more() {
+    let (app, cold_store) = cold_app();
+    let (gateway, server) = behind_a_gateway(app, GATEWAY_BASE_TIMEOUT, MAX_HTTP_BODY_BYTES).await;
+    for stream in ["/parts/s", "/parts/t"] {
+        let response = gateway
+            .handle(
+                Request::put(stream)
+                    .header(CONTENT_TYPE, OCTET)
+                    .body(Body::from("abc"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{stream}");
+    }
+    let publish = |stream: &str, body: Vec<u8>| {
+        Request::put(format!("{stream}/snapshot/3"))
+            .header(CONTENT_TYPE, OCTET)
+            .header(CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let snapshot = bytes(16 * MIB, 7);
+    let gate = Gate::on(&cold_store, ColdStoreOperation::WriteChunk, "/external/");
+    let started = tokio::time::Instant::now();
+    let (response, ()) = tokio::join!(
+        gateway.handle(publish("/parts/s", snapshot.clone())),
+        async {
+            gate.reached(1).await;
+            tokio::time::sleep(HELD_PAST_THE_BASE).await;
+            gate.open();
+        }
+    );
+    assert!(started.elapsed() >= HELD_PAST_THE_BASE);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = gateway
+        .handle(
+            Request::get("/parts/s/snapshot/3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_of(response).await == snapshot);
+
+    // A node that holds the body for good: the gateway answers `504` once
+    // the base and the body's 250 ms ran out.
+    let held = Gate::on(&cold_store, ColdStoreOperation::WriteChunk, "/external/");
+    let started = tokio::time::Instant::now();
+    let (response, ()) = tokio::join!(
+        gateway.handle(publish("/parts/t", bytes(2 * MIB, 8))),
+        held.reached(1)
+    );
+    let waited = started.elapsed();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::UpstreamTimeout
+    );
+    let deadline = GATEWAY_BASE_TIMEOUT.saturating_add(Duration::from_millis(250));
+    assert!(
+        waited >= deadline,
+        "answered after {waited:?}, before {deadline:?}"
+    );
+    assert!(
+        waited < deadline.saturating_add(Duration::from_secs(1)),
+        "answered after {waited:?}, long after {deadline:?}"
+    );
     server.abort();
 }
 
@@ -858,12 +1018,17 @@ pub(crate) struct Gate {
 
 impl Gate {
     pub(crate) fn on_part_reads(cold_store: &ColdStore) -> Self {
+        Self::on(cold_store, ColdStoreOperation::ReadObjectRange, "/_parts/")
+    }
+
+    /// Holds every `operation` on a path that contains `path_part`, as
+    /// [`Gate::on_part_reads`] holds part reads.
+    fn on(cold_store: &ColdStore, operation: ColdStoreOperation, path_part: &'static str) -> Self {
         let permits = Arc::new(tokio::sync::Semaphore::new(0));
         let waiting = Arc::new(AtomicUsize::new(0));
-        cold_store.set_fault_policy(|context| {
-            (context.operation == ursula_runtime::ColdStoreOperation::ReadObjectRange
-                && context.path.contains("/_parts/"))
-            .then(|| ursula_runtime::ColdStoreFaultEffect::delay(Duration::from_millis(1)))
+        cold_store.set_fault_policy(move |context| {
+            (context.operation == operation && context.path.contains(path_part))
+                .then(|| ursula_runtime::ColdStoreFaultEffect::delay(Duration::from_millis(1)))
         });
         let (gate, count) = (Arc::clone(&permits), Arc::clone(&waiting));
         cold_store.set_delay_fn(move |_| {

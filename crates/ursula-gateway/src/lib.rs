@@ -100,8 +100,11 @@ use tracing::debug;
 use tracing::error;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
+use ursula_headers::PartCount;
+use ursula_headers::PartsCommit;
 use ursula_headers::RoutingAnswer;
 use ursula_headers::SizeLimit;
+use ursula_headers::answer_allowance;
 use ursula_headers::immutable;
 use ursula_headers::lowered_request_limit;
 use ursula_headers::names;
@@ -284,7 +287,10 @@ struct GatewayMetricsSnapshot {
 pub struct GatewayConfig {
     pub listen: SocketAddr,
     pub upstreams: Vec<String>,
-    /// Covers only response headers so SSE bodies stay open.
+    /// Covers only response headers so SSE bodies stay open. A long-poll
+    /// waits at least its own timeout plus 2 s, and every request gets the
+    /// time its bytes take to store or copy on top (#891,
+    /// [`ursula_headers::answer_allowance`]).
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
     /// Seconds data sent to an upstream may stay unacknowledged before the
@@ -1007,13 +1013,15 @@ impl Gateway {
             .unwrap_or("/");
         let pin_key = upstream_pin_key(&parts.uri, self.shard_map.as_ref());
         let replay = Replay::of(parts);
+        let timeout =
+            self.response_header_timeout_for(parts, u64::try_from(body.len()).unwrap_or(u64::MAX));
         let started = Instant::now();
         let mut chain = Chain::new(upstream);
         loop {
             let target = chain.target.clone();
             let target_url = format!("{}{}", target.trim_end_matches('/'), path_and_query);
             let sent = self
-                .send_hop(&chain, replay, &target_url, parts, body.clone())
+                .send_hop(&chain, replay, &target_url, parts, body.clone(), timeout)
                 .await;
             let response = match sent {
                 Ok(response) => response,
@@ -1238,8 +1246,9 @@ impl Gateway {
     /// accepting ([`Ejection::StoppedAccepting`]) still answers what it
     /// accepted, as a draining node does for its drain, so a producer append
     /// waits for that answer, and a read goes on. Any other hop waits for
-    /// its answer up to that timeout, as an answer that comes then still
-    /// settles a write whose repeat is not safe.
+    /// its answer up to `timeout`
+    /// ([`Gateway::response_header_timeout_for`]), as an answer that comes
+    /// then still settles a write whose repeat is not safe.
     async fn send_hop(
         &self,
         chain: &Chain,
@@ -1247,9 +1256,10 @@ impl Gateway {
         url: &str,
         parts: &axum::http::request::Parts,
         body: bytes::Bytes,
+        timeout: Duration,
     ) -> Result<reqwest::Response, GatewayError> {
         let target = chain.target.as_str();
-        let send = self.send_request(chain.hop(), target, url, parts, body);
+        let send = self.send_request(chain.hop(), target, url, parts, body, timeout);
         if replay == Replay::Never || !chain.may_replay() {
             return send.await;
         }
@@ -1266,7 +1276,8 @@ impl Gateway {
         }
     }
 
-    /// Covers only response headers so SSE bodies stay open.
+    /// `timeout` covers sending the request and receiving the response
+    /// headers, not the response body, so SSE bodies stay open.
     async fn send_request(
         &self,
         hop: Hop,
@@ -1274,10 +1285,10 @@ impl Gateway {
         url: &str,
         parts: &axum::http::request::Parts,
         body: bytes::Bytes,
+        timeout: Duration,
     ) -> Result<reqwest::Response, GatewayError> {
         debug!(method = %parts.method, url = %url, "sending upstream request");
 
-        let timeout = self.response_header_timeout_for_url(url);
         tokio::time::timeout(
             timeout,
             self.client
@@ -1313,28 +1324,30 @@ impl Gateway {
         self.ejections.readmit(upstream);
     }
 
-    fn response_header_timeout_for_url(&self, url: &str) -> Duration {
-        let Ok(url) = reqwest::Url::parse(url) else {
-            return self.response_header_timeout;
-        };
-        let mut is_long_poll = false;
-        let mut requested_timeout_ms = None;
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "live" if value == "long-poll" => is_long_poll = true,
-                "timeout_ms" => requested_timeout_ms = value.parse::<u64>().ok(),
-                _ => {}
+    /// How long each hop of a request whose body is `body_len` bytes waits
+    /// for its response headers: the response header timeout plus the time
+    /// the node may take to store or copy the request's bytes before it
+    /// answers ([`answer_allowance`], #891). That is the body, which a node
+    /// with a cold store writes to object storage whole when it is large,
+    /// or for a parts commit ([`parts_commit`]) the parts it copies. A
+    /// large body or commit then does not answer `504` while the node still
+    /// works on it, and the base can stay just above the leader lease. A
+    /// long-poll waits at least its own timeout plus
+    /// [`LONG_POLL_RESPONSE_HEADER_GRACE`].
+    fn response_header_timeout_for(
+        &self,
+        parts: &axum::http::request::Parts,
+        body_len: u64,
+    ) -> Duration {
+        let timeout = self
+            .response_header_timeout
+            .saturating_add(answer_allowance(body_len, parts_commit(parts)));
+        match long_poll_timeout(&parts.uri) {
+            Some(upstream_timeout) => {
+                timeout.max(upstream_timeout.saturating_add(LONG_POLL_RESPONSE_HEADER_GRACE))
             }
+            None => timeout,
         }
-        if !is_long_poll {
-            return self.response_header_timeout;
-        }
-        let upstream_timeout = requested_timeout_ms
-            .unwrap_or(1_000)
-            .clamp(1, MAX_LONG_POLL_TIMEOUT_MS);
-        self.response_header_timeout.max(
-            Duration::from_millis(upstream_timeout).saturating_add(LONG_POLL_RESPONSE_HEADER_GRACE),
-        )
     }
 
     fn build_response(
@@ -2502,14 +2515,62 @@ fn decode_path_segment(segment: &str) -> Option<String> {
         .map(|decoded| decoded.into_owned())
 }
 
-fn query_has_live_mode(uri: &Uri) -> bool {
-    uri.query().is_some_and(|query| {
-        query.split('&').any(|pair| {
+/// The decoded name and value of each pair of `uri`'s query. A pair that
+/// does not decode as UTF-8 is left out.
+fn query_pairs(uri: &Uri) -> impl Iterator<Item = (String, String)> + '_ {
+    uri.query()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            decode_path_segment(name).as_deref() == Some("live")
-                && decode_path_segment(value).is_some_and(|value| !value.is_empty())
+            Some((decode_path_segment(name)?, decode_path_segment(value)?))
         })
+}
+
+fn query_has_live_mode(uri: &Uri) -> bool {
+    query_pairs(uri).any(|(name, value)| name == "live" && !value.is_empty())
+}
+
+/// How long the node holds a long-poll read (`live=long-poll`) before it
+/// answers: its `timeout_ms`, 1 s without one, at most
+/// [`MAX_LONG_POLL_TIMEOUT_MS`]. `None` for any other request.
+fn long_poll_timeout(uri: &Uri) -> Option<Duration> {
+    let mut is_long_poll = false;
+    let mut requested_timeout_ms = None;
+    for (name, value) in query_pairs(uri) {
+        match name.as_str() {
+            "live" if value == "long-poll" => is_long_poll = true,
+            "timeout_ms" => requested_timeout_ms = value.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    is_long_poll.then(|| {
+        Duration::from_millis(
+            requested_timeout_ms
+                .unwrap_or(1_000)
+                .clamp(1, MAX_LONG_POLL_TIMEOUT_MS),
+        )
     })
+}
+
+/// The part count of a parts commit, a snapshot publish
+/// (`PUT {stream}/snapshot/{offset}`) with `Stream-Snapshot-Parts: N`,
+/// whose short manifest body makes the node copy up to `N` parts into one
+/// object. `None` for any other request, and for a commit whose parts
+/// headers do not parse, which the node refuses before it copies anything.
+fn parts_commit(parts: &axum::http::request::Parts) -> Option<PartCount> {
+    let request = classify_request(&parts.method, &parts.uri, &parts.headers)?;
+    if request.action != Action::PublishSnapshot || parts.method != Method::PUT {
+        return None;
+    }
+    let commit = PartsCommit::parse(
+        parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .ok()??;
+    Some(commit.parts)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<Option<&str>, ()> {

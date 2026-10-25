@@ -3,10 +3,13 @@
 //! a stream that holds as many staged snapshot parts as it may (Section 2.2)
 //! names its limit the same way.
 
+use std::time::Duration;
+
 use crate::error::HeaderError;
 use crate::error_body::ErrorCode;
 use crate::fields;
 use crate::names;
+use crate::snapshot::PartCount;
 
 /// The request limit of the protocol, `Ursula-Max-Request-Bytes` (32 MiB):
 /// the largest request body any request to any stream may carry. A node
@@ -16,6 +19,29 @@ use crate::names;
 /// before reading the body and the intermediary, still sending it, may see
 /// a reset instead (extensions Section 10).
 pub const MAX_REQUEST_BYTES: u64 = 32 << 20;
+
+/// The snapshot limit of an Ursula node with a cold store,
+/// `Ursula-Max-Snapshot-Bytes` (1 GiB): the largest snapshot it accepts in
+/// parts (extensions Section 10). A node without a cold store sends none.
+pub const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
+
+/// The slowest pace at which a node is expected to store or copy the bytes
+/// a request makes it write before it answers (8 MiB/s): a body it writes
+/// to object storage whole, or the parts a commit copies. Whoever waits for
+/// an answer's head, a gateway or a client, waits its own base wait plus
+/// [`answer_allowance`].
+pub const STORE_FLOOR_BYTES_PER_SECOND: u64 = 8 << 20;
+
+/// How much longer than a base wait the head of a request's answer may
+/// take while the node stores or copies the request's bytes at
+/// [`STORE_FLOOR_BYTES_PER_SECOND`], to the millisecond. The bytes are its
+/// `body_bytes`, or for a parts commit of `commit` parts the most it copies
+/// ([`PartCount::copy_bytes`]). A 32 MiB body gets 4 s, and a commit of 32
+/// parts or more 128 s.
+pub fn answer_allowance(body_bytes: u64, commit: Option<PartCount>) -> Duration {
+    let bytes = commit.map_or(body_bytes, PartCount::copy_bytes);
+    Duration::from_millis(bytes.saturating_mul(1_000) / STORE_FLOOR_BYTES_PER_SECOND)
+}
 
 /// The limit a `413 Payload Too Large` applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

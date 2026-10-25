@@ -332,10 +332,6 @@ pub struct StreamVisibleSnapshot {
     pub object: Option<ExternalPayloadRef>,
 }
 
-/// Largest snapshot body Ursula stores as a cold-tier object (F16). Inline
-/// bodies stay bounded by the HTTP body cap.
-pub const MAX_COLD_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
-
 /// Incremental form of the snapshot digest: BLAKE3 over the content type's
 /// length, the content type and the body. The HTTP layer feeds a staged
 /// body through it piece by piece; apply uses it for inline bodies.

@@ -560,8 +560,8 @@ of the durable acknowledged position the `410` rule compares with.
   effort. Nothing of a staging survives the attempt.
 - **Answers.** Only a `204` naming `W` and the digest, or a `409` naming them as the latest,
   confirms. A commit whose answer is lost or retryable (a timeout, `502`, `503`) is repeated
-  unchanged for up to 30 minutes, and its answer head may take `t / 16 MiB/s` longer for `t`
-  bytes. A `409` with a later offset means superseded. One at `W` with another digest stops
+  unchanged for up to 30 minutes, and its answer head may take its parts' copy longer (see
+  Transport). A `409` with a later offset means superseded. One at `W` with another digest stops
   snapshots (`stream_state`).
 - **Not published.** A body above `Ursula-Max-Snapshot-Bytes`, or above `L` on a server without a
   cold store (parts answered `501`), is not published, and status reports `snapshot.error`.
@@ -605,8 +605,11 @@ Tests:
   90 s after its last request (`URSULA_VFS_IDLE_MS`), snapshot transfers use another. Both keep up
   to 256 idle connections per host and 1,024 in all.
 - Per-attempt limits scale with size: connect 5 s, request head 5 s, request body
-  `5 s + n / 256 KiB/s` (`URSULA_VFS_MIN_UPLOAD_KBPS`), response head 15 s, response body
-  `10 s + m / 256 KiB/s`. A timeout is another lost attempt.
+  `5 s + n / 256 KiB/s` (`URSULA_VFS_MIN_UPLOAD_KBPS`), response head `15 s + n / 8 MiB/s`,
+  response body `10 s + m / 256 KiB/s`. For a parts commit `n` counts each part at the 32 MiB
+  request limit, at most 1 GiB in all (`ursula_headers::answer_allowance`). A gateway in front of
+  the node adds the same allowance to its own lower base, so the VFS waits longer than the
+  gateway. A timeout is another lost attempt.
 - A failure is "not sent" only when the resolver or the connector failed, decided by where it
   failed. Every other failure is lost, and its retry goes out on a fresh connection.
 - Every request with a body carries `Content-Length`, so a node can answer `413` or an early answer

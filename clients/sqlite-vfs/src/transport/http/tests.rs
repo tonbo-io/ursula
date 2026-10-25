@@ -9,7 +9,10 @@ use ursula_headers::ClusterId;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
+use ursula_headers::PartCount;
+use ursula_headers::PartsCommit;
 use ursula_headers::ProducerRequestHeaders;
+use ursula_headers::SnapshotDigest;
 
 use super::HttpTransport;
 use super::Timeouts;
@@ -420,15 +423,19 @@ fn time_limits_scale_with_the_body_and_the_answer() {
         Duration::from_secs(9)
     );
     assert_eq!(Timeouts::new(1024, 0, 0).send_body, Duration::from_secs(6));
-    // A commit of 1 GiB in parts: its answer may come 64 s after the 15 s.
+    // A commit of 64 parts, up to the 1 GiB snapshot limit: its answer may come 128 s after
+    // the 15 s, as a gateway in front of the node waits 128 s after its own lower base.
     let commit = Request {
-        wait_bytes: 1 << 30,
+        parts: Some(Box::new(PartsCommit {
+            parts: PartCount::try_from(64_u32).unwrap(),
+            digest: SnapshotDigest::from_bytes([9; 32]),
+        })),
         ..Request::new(Method::Put, Target::Snapshot {
             offset: Offset::from_u64(1),
         })
     };
     let waiting = Timeouts::new(0, 0, 256).waiting(commit.answer_wait());
-    assert_eq!(waiting.recv_response, Duration::from_secs(79));
+    assert_eq!(waiting.recv_response, Duration::from_secs(143));
     assert_eq!(waiting.send_body, Duration::from_secs(5));
 }
 

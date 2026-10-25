@@ -20,6 +20,20 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 - **Format epoch 7.** The Raft WAL journals and state files, the meta journal, the WAL directory and object-storage markers, group snapshots and the Raft gRPC protocol carry format epoch 7. A node refuses data and peers of another epoch.
 - **Backup format 5.** Unchanged: a backup holds each group's stream snapshot, and a 0.10 backup restores on 0.11.
 
+### Gateway
+
+- **A request gets time for its size** ([#891](https://github.com/tonbo-io/ursula/issues/891)). The gateway waits for a node's answer for `--response-header-timeout` (`gateway.responseHeaderTimeoutSeconds`) plus the time the node may take to store or copy the request's bytes before it answers, at 8 MiB per second. A request counts its body, which a node with a cold store writes to object storage whole when it is large, and a snapshot parts commit counts its parts at the 32 MiB request limit each, up to the 1 GiB snapshot limit. A 32 MiB body waits 4 s longer, and a commit of 32 parts or more 128 s longer. A large append, create, snapshot or commit no longer answers `504` while the node still works on it, so the base timeout can stay just above the leader lease. An object store slower than 8 MiB per second still needs a higher timeout. A node that stops answering is still cut off at the end of the longer wait, and the probes eject it within 1.75 s as before.
+- **A gateway drain can cut a large commit's answer.** A commit waits up to the base plus 128 s, longer than the chart's 45 s `gateway.gracefulShutdownTimeoutSeconds`. A commit in flight when the drain ends loses its answer, and repeating it gets the answer from its key. Every other write waits at most the base plus 4 s.
+
+### SQLite VFS
+
+- **The VFS waits for an answer as the gateway does.** Its 15 s wait for an answer's head grows by the same 8 MiB per second allowance, for its body or for the parts a commit copies, counted as the gateway counts them. It waited 16 MiB per second for a commit's actual bytes, which gave up before a gateway in front of the node for a commit of more than five full parts.
+
+### Rust library APIs
+
+- **`ursula_headers::MAX_SNAPSHOT_BYTES`** is new: the 1 GiB snapshot limit a node with a cold store advertises in `Ursula-Max-Snapshot-Bytes`. `ursula_stream::MAX_COLD_SNAPSHOT_BYTES` and its `ursula_runtime` re-export are removed. Use `ursula_headers::MAX_SNAPSHOT_BYTES`.
+- **`ursula_headers::answer_allowance`, `STORE_FLOOR_BYTES_PER_SECOND` and `PartCount::copy_bytes`** are new: the time beyond a base wait a node's answer may take for the bytes it stores or copies first, which the gateway and the VFS both add.
+
 ## 0.10.1
 
 0.10.1 is a patch of 0.10 and interoperates with 0.10.0: format epoch 6, backup format 5 and every storage, wire and protocol format are unchanged, and the usage report only gains an optional field. 0.10.0 and 0.10.1 nodes run in one cluster during a rolling upgrade, and 0.10.0 and 0.10.1 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.10.0 is safe.

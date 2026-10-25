@@ -1315,14 +1315,13 @@ fn stage_parts(
 
 /// Sends the commit of `manifest` until a definite answer (S4): the identical request, keyed by
 /// `(W, digest)`, after every answer that decides nothing, for up to [`COMMIT_DEADLINE`]. Its
-/// answer may wait for the server to copy the whole body (`wait_bytes`).
+/// answer may wait for the server to copy its parts ([`Request::answer_wait`]).
 fn commit_parts(p: &Publish<'_>, manifest: &PartsManifest) -> Result<Answer, SnapshotFailure> {
     let request = Request {
         keys: p.remote.keys(),
         content_type: Some(CONTENT_TYPE.to_owned()),
         parts: Some(Box::new(PartsCommit::for_manifest(manifest, p.digest))),
         body: Arc::from(manifest.render().into_bytes()),
-        wait_bytes: p.len,
         ..Request::new(Method::Put, Target::Snapshot { offset: p.offset })
     };
     let now = Instant::now();

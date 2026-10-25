@@ -79,10 +79,6 @@ const PARTS: &str = "/parts";
 /// The path suffix of the stream's staged parts, discarded together.
 const STAGED_PARTS: &str = "/snapshot/parts";
 
-/// The rate a parts commit's answer is waited for at: a server copies the parts before it
-/// answers, in time with their total.
-const COMMIT_COPY_BYTES_PER_SECOND: u64 = 16 << 20;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
     Head,
@@ -247,9 +243,6 @@ pub(crate) struct Request {
     /// `Range` of a snapshot read: a server answers these bytes (`206`), or the whole body
     /// (`200`) when it ignores `Range`.
     pub(crate) range: Option<ByteRange>,
-    /// The bytes a server works through before it answers (a parts commit copies its parts): it
-    /// scales the time the answer's head may take. Not sent.
-    pub(crate) wait_bytes: u64,
 }
 
 /// Which part of a snapshot a read asks for.
@@ -299,19 +292,19 @@ impl Request {
             body: Arc::from(Vec::new()),
             answer_bytes: 0,
             range: None,
-            wait_bytes: 0,
         }
     }
 
-    /// How long the answer's head may take beyond the base wait: the [`Request::wait_bytes`] a
-    /// server copies, at 16 MiB/s.
+    /// How long the answer's head may take beyond the base wait while the server stores or
+    /// copies the request's bytes: the body, or the parts a commit copies, at the pace every
+    /// waiter in front of a node assumes ([`ursula_headers::answer_allowance`]). A gateway adds
+    /// the same allowance to its own base, which stays below the VFS's, so the VFS waits longer
+    /// than a gateway in front of the node.
     pub(crate) fn answer_wait(&self) -> Duration {
-        let millis = self
-            .wait_bytes
-            .saturating_mul(1000)
-            .checked_div(COMMIT_COPY_BYTES_PER_SECOND)
-            .unwrap_or(0);
-        Duration::from_millis(millis)
+        ursula_headers::answer_allowance(
+            u64::try_from(self.body.len()).unwrap_or(u64::MAX),
+            self.parts.as_ref().map(|commit| commit.parts),
+        )
     }
 
     /// A read from `from`, expecting up to `answer_bytes` (the read's chunk) in the answer.
@@ -411,7 +404,6 @@ impl Request {
             body: Arc::from(body),
             answer_bytes: 0,
             range,
-            wait_bytes: 0,
         })
     }
 }
@@ -1007,17 +999,35 @@ mod tests {
         );
     }
 
-    // A commit's answer may wait for the copy of its parts: 16 MiB/s beyond the base wait.
+    // An answer may wait beyond the base for the server to store the body, or for a commit to
+    // copy its parts, each at the 32 MiB request limit: 8 MiB/s, as a gateway waits.
     #[test]
-    fn a_commit_waits_for_its_copy() {
+    fn an_answer_waits_for_the_bytes_the_server_stores() {
+        let manifest = PartsManifest::new(vec![
+            PartId::new("a.part").unwrap(),
+            PartId::new("b.part").unwrap(),
+        ])
+        .unwrap();
         let commit = Request {
-            wait_bytes: 64 << 20,
+            parts: Some(Box::new(PartsCommit::for_manifest(
+                &manifest,
+                SnapshotDigest::from_bytes([9; 32]),
+            ))),
+            body: Arc::from(manifest.render().into_bytes()),
             ..Request::new(Method::Put, Target::Snapshot {
                 offset: Offset::from_u64(64),
             })
         };
-        assert_eq!(commit.answer_wait(), std::time::Duration::from_secs(4));
-        assert!(rendered(&commit).is_empty());
+        assert_eq!(commit.answer_wait(), std::time::Duration::from_secs(8));
+        let part = Request {
+            body: Arc::from(vec![0; 4 << 20]),
+            ..Request::new(Method::Post, Target::SnapshotParts {
+                offset: Offset::from_u64(64),
+            })
+        };
+        assert_eq!(part.answer_wait(), std::time::Duration::from_millis(500));
+        let read = Request::read(None, true, 1 << 20);
+        assert_eq!(read.answer_wait(), std::time::Duration::ZERO);
     }
 
     #[test]

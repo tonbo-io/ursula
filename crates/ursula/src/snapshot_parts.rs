@@ -56,6 +56,7 @@ use futures_util::stream;
 use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
 use ursula_headers::MAX_MANIFEST_BYTES;
+use ursula_headers::MAX_SNAPSHOT_BYTES;
 use ursula_headers::PartId;
 use ursula_headers::PartStaged;
 use ursula_headers::PartsCommit;
@@ -70,7 +71,6 @@ use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
-use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::ProposedUpload;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::UploadFence;
@@ -643,7 +643,7 @@ async fn run_commit(
             .0,
         incarnation: target.if_incarnation.unwrap_or(0),
     };
-    let parts = match resolve(cold_store, owner, manifest, MAX_COLD_SNAPSHOT_BYTES).await {
+    let parts = match resolve(cold_store, owner, manifest, MAX_SNAPSHOT_BYTES).await {
         Ok(parts) => parts,
         // A part is gone: a commit of the same key may have published the
         // snapshot and deleted its parts after this one's key check.
@@ -1137,11 +1137,11 @@ mod tests {
 
     use axum::response::IntoResponse;
     use ursula_headers::ErrorCode;
+    use ursula_headers::MAX_SNAPSHOT_BYTES;
     use ursula_headers::PartId;
     use ursula_headers::PartsManifest;
     use ursula_headers::SizeLimit;
     use ursula_runtime::ColdStore;
-    use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
     use ursula_runtime::new_snapshot_part_id;
     use ursula_shard::BucketStreamId;
 
@@ -1202,7 +1202,7 @@ mod tests {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_bytes()))
             ),
-            Ok(Some(SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES)))
+            Ok(Some(SizeLimit::Snapshot(MAX_SNAPSHOT_BYTES)))
         );
         assert_eq!(
             crate::render::error_code_of(response).await,

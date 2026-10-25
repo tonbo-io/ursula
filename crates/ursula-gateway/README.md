@@ -529,10 +529,18 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.
     Streamed response bodies such as SSE live reads are not covered, and a
-    long-poll gets its own timeout plus 2 s. An upstream that answers nothing
-    within it is ejected, and a read or a producer append goes on to another
-    upstream (see Redirects). Keep it under the clients' timeouts and above
-    a node's 3 s leader lease. Defaults to 5. 0.9 used 30.
+    long-poll gets its own timeout plus 2 s. Every request gets the time the
+    node may need to store or copy its bytes before it answers on top, at
+    8 MiB/s: its body, which a node with a cold store writes to object
+    storage whole when it is large, and for a snapshot parts commit its parts
+    at the 32 MiB request limit each, up to the 1 GiB snapshot limit. A
+    32 MiB body gets 4 s more, a commit of 4 parts 16 s more and one of 32
+    parts or more 128 s more. The VFS adds the same allowance to its own
+    15 s. An upstream that answers nothing within the timeout is not ejected
+    for it, and a read or a producer append goes on to another upstream (see
+    Redirects). Keep it under the clients' timeouts and above a node's 3 s
+    leader lease, and raise it for an object store slower than 8 MiB/s.
+    Defaults to 5. 0.9 used 30.
 
 --connect-timeout <SECONDS>
     TCP connect timeout per upstream request attempt. Defaults to 5.

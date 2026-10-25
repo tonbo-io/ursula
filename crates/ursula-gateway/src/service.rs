@@ -302,8 +302,10 @@ pub struct GatewayArgs {
     /// Streamed response bodies such as SSE live reads are not covered by this timeout. A
     /// request that gets no answer within it ejects nothing (the probes decide which upstreams
     /// answer); a read or a producer append then goes to another upstream, and any other write
-    /// is answered `504`. Keep it under the clients' own timeouts and above a node's leader
-    /// lease (3 s).
+    /// is answered `504`. A long-poll gets its own timeout plus 2 s, and every request gets the
+    /// time its bytes take at 8 MiB/s on top: its body, or the parts a snapshot commit copies.
+    /// Keep it under the clients' own timeouts and above a node's leader lease (3 s), and raise it
+    /// for an object store slower than 8 MiB/s.
     #[arg(long, default_value_t = 5)]
     response_header_timeout: u64,
 

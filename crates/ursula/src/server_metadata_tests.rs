@@ -17,6 +17,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use tower::ServiceExt;
 use ursula_headers::ErrorCode;
+use ursula_headers::MAX_SNAPSHOT_BYTES;
 use ursula_headers::PROTOCOL_VERSION;
 use ursula_headers::ServerIdentity;
 use ursula_headers::SizeLimit;
@@ -24,7 +25,6 @@ use ursula_headers::StreamHead;
 use ursula_headers::value::Offset;
 use ursula_runtime::ColdStore;
 use ursula_runtime::InMemoryGroupEngineFactory;
-use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
@@ -186,7 +186,7 @@ async fn head_advertises_the_snapshot_limit_with_a_cold_store() {
     assert_eq!(response.status(), StatusCode::OK);
     let head = StreamHead::parse(pairs(&response)).expect("stream head");
     assert_eq!(head.max_request_bytes(), REQUEST_LIMIT);
-    assert_eq!(head.max_snapshot_bytes(), Some(MAX_COLD_SNAPSHOT_BYTES));
+    assert_eq!(head.max_snapshot_bytes(), Some(MAX_SNAPSHOT_BYTES));
     assert_eq!(
         head.snapshot().map(|snapshot| snapshot.offset),
         Some(Offset::from_u64(2))
@@ -265,7 +265,7 @@ async fn a_chunked_body_crossing_the_request_limit_names_it() {
 async fn a_snapshot_over_the_request_limit_names_the_request_limit_with_or_without_a_cold_store() {
     for (store, app) in [("no cold store", app()), ("cold store", cold_app())] {
         create(&app, "/limits/s").await;
-        for declared in [REQUEST_LIMIT + 1, MAX_COLD_SNAPSHOT_BYTES + 1] {
+        for declared in [REQUEST_LIMIT + 1, MAX_SNAPSHOT_BYTES + 1] {
             let polled = Arc::new(AtomicBool::new(false));
             let response = send(
                 &app,
