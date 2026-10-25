@@ -8326,7 +8326,10 @@ mod snapshot_driver {
         let root = super::TestWalRoot::new();
         let mut config = super::test_config(1, 2);
         config.raft.install_snapshot_timeout = ursula_config::HumanDuration::sec(1);
-        config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
+        // The floor for a 1 s install timeout with inline snapshots: eight
+        // times the drive interval and the install timeout, so an end
+        // record's fold also leaves within the bound (F20).
+        config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(16));
         config.raft.max_in_snapshot_log_to_keep = 8;
         config.raft.wal.segment_size = ursula_config::HumanSize::kib(64);
         let spawned = crate::bootstrap::spawn_runtime_with_placement(
@@ -8399,7 +8402,8 @@ mod snapshot_driver {
     /// #669: a single node runs the snapshot driver. A deleted stream and an
     /// expired stream that nothing reads, in groups that take no other write,
     /// leave the node's snapshots, its logs and every file under its WAL root
-    /// within `raft.deleted_data_max_age`, its gauges go back to 0, and reads
+    /// within `raft.deleted_data_max_age`, and so do their end records (F20),
+    /// whose fold is a removal of its own. The gauges go back to 0, and reads
     /// of them answer 404.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_single_node_scrubs_deleted_and_expired_streams_within_the_bound() {
@@ -8496,18 +8500,32 @@ mod snapshot_driver {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(2))
+        // The end records fold half the bound after their removals, and the
+        // folds leave the snapshots and the logs within the bound too.
+        let deadline = expired_at
+            .checked_add(max_age.saturating_add(Duration::from_secs(2)))
             .expect("deadline");
         loop {
             let metrics = runtime.metrics().snapshot();
-            if metrics.raft_deleted_data_oldest_age_ms == 0
+            let end_records = runtime
+                .state_gauges_all_groups()
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == deleted_group || *id == expiring_group)
+                .map(|(_, gauges)| gauges.map_or(u64::MAX, |gauges| gauges.end_records))
+                .fold(0u64, u64::saturating_add);
+            if end_records == 0
+                && metrics.usage_end_records_retired >= 2
+                && metrics.raft_deleted_data_oldest_age_ms == 0
                 && metrics.raft_deleted_data_overdue_groups == 0
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "the removals are still reported");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                Instant::now() < deadline,
+                "the removals are still reported: {end_records} end records"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let app = crate::router(runtime.clone());
         for stream_id in [&deleted, &expiring] {
