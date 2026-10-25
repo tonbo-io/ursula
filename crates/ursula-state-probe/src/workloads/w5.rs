@@ -352,7 +352,10 @@ fn purge(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         let record = payload::json_record(&mut rng, 0, 200);
         smx::ok(smx::append(&mut m, &id, record, None, smx::T0), "append")?;
         smx::ok(
-            m.apply(StreamCommand::PurgeBucket { bucket_id: bucket }),
+            m.apply(StreamCommand::PurgeBucket {
+                bucket_id: bucket,
+                now_ms: smx::T0,
+            }),
             "purge",
         )?;
     }

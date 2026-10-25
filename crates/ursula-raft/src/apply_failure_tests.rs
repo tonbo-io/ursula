@@ -50,7 +50,7 @@ fn create_stream_command(name: &str) -> ursula_stream::StreamCommand {
 async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_wal() {
     crate::rt::time::timeout(
         Duration::from_secs(30),
-        poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_wal_drill(),
+        Box::pin(poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_wal_drill()),
     )
     .await
     .expect("bounded apply recovery drill");

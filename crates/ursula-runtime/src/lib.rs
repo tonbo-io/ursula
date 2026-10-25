@@ -291,6 +291,7 @@ pub use request::PlanGroupColdFlushRequest;
 pub use request::ProducerEarlyAnswerRequest;
 pub use request::PublishSnapshotRequest;
 pub use request::PublishSnapshotResponse;
+pub use request::PurgeBucketRequest;
 pub use request::PurgeBucketResponse;
 pub use request::ReadEnd;
 pub use request::ReadSnapshotRequest;

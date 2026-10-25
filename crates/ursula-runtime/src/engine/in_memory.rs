@@ -117,6 +117,7 @@ use crate::request::PlanGroupColdFlushRequest;
 use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketRequest;
 use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
@@ -1835,12 +1836,12 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn purge_bucket<'a>(
         &'a mut self,
-        bucket_id: String,
+        request: PurgeBucketRequest,
         placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
             PurgeBucketResponse::try_from(
-                self.apply_committed_write(StreamCommand::PurgeBucket { bucket_id }, placement)?,
+                self.apply_committed_write(StreamCommand::from(request), placement)?,
             )
         })
     }

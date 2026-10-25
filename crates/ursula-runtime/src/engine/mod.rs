@@ -86,6 +86,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketRequest;
 use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
@@ -599,11 +600,12 @@ pub trait GroupEngine: Send + 'static {
     }
 
     /// Replicated tenant offboarding: removes every stream in the bucket and
-    /// the bucket in this group. Monotonic aggregate usage remains
-    /// available to asynchronous accounting readers. Default unsupported.
+    /// the bucket in this group, each stream ending at the request's
+    /// `now_ms`. Monotonic aggregate usage remains available to
+    /// asynchronous accounting readers. Default unsupported.
     fn purge_bucket<'a>(
         &'a mut self,
-        _bucket_id: String,
+        _request: PurgeBucketRequest,
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async { Err(unsupported(EngineOperation::PurgeBucket)) })

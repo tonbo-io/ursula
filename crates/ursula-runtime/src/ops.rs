@@ -372,10 +372,10 @@ macro_rules! runtime_operations {
                 client { group fn defer_cold_gc }
             }
             op PurgeBucket {
-                fields { bucket_id: String }
+                fields { request: PurgeBucketRequest }
                 reply { response_tx: PurgeBucketResponse }
                 guard { none }
-                handle { call purge_bucket(engine, bucket_id, placement) }
+                handle { call purge_bucket(engine, request, placement) }
                 client { pub group fn purge_bucket }
             }
             op Append {

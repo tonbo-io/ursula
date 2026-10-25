@@ -25,7 +25,8 @@
 //!   staged external-ref offload discovery ([`StagedExternalRefCandidate`],
 //!   F5).
 //! - [`usage`]: per-stream usage (F20): each version's committed counters
-//!   and applied appends, counted at the bucket counter's call sites.
+//!   and applied appends, counted at the bucket counter's call sites, and
+//!   the end record a removal leaves.
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
@@ -112,6 +113,7 @@ pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
+pub use state_machine::MAX_END_RECORDS;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
 pub use state_machine::RemovedState;
@@ -125,7 +127,9 @@ pub use state_machine::StagedExternalRefCandidate;
 pub use state_machine::StreamStateMachine;
 pub use state_machine::plan_shared_ref_run;
 pub use usage::CommittedUsage;
+pub use usage::EndRecord;
 pub use usage::LastWrite;
+pub use usage::StreamEnd;
 pub use usage::VersionCounters;
 pub use usage::VersionUsage;
 pub use validate::validate_bucket_id;

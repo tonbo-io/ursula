@@ -21,6 +21,7 @@ use super::StreamSlot;
 use super::StreamStateMachine;
 use crate::history::InheritedReport;
 use crate::history::incarnation_token;
+use crate::usage::VersionCounters;
 
 /// Whether a stream whose bytes last changed in history `stream_history`
 /// was written since its group's latest history event, `group_history`. A
@@ -144,6 +145,18 @@ impl StreamSlot {
             });
             self.usage.history_baseline = self.usage.counters;
             self.history = group;
+        }
+    }
+
+    /// The version's counters when the group's history `group` began for
+    /// it: its recorded baseline when it was created, restored or written
+    /// in `group`, else its counters, which nothing changed since `group`
+    /// began.
+    pub(super) fn history_baseline_in(&self, group: u64) -> VersionCounters {
+        if written_since_event(self.history, group) {
+            self.usage.history_baseline
+        } else {
+            self.usage.counters
         }
     }
 }

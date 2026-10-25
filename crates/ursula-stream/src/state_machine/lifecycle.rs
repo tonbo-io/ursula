@@ -28,6 +28,7 @@ use super::validate_bucket_id;
 use super::validate_external_payload_ref;
 use super::validate_message_count;
 use super::validate_stream_id;
+use crate::usage::StreamEnd;
 
 impl StreamStateMachine {
     pub(super) fn create_bucket(&mut self, bucket_id: String) -> StreamResponse {
@@ -50,12 +51,13 @@ impl StreamStateMachine {
     /// group in stream-id order (each removal enqueues its cold-object
     /// prefixes for the GC worker, so every replica stamps the same cold-GC
     /// sequence numbers), then the bucket, and installs a permanent erasure
-    /// fence. The bucket's usage row stays, its counters retired and its
+    /// fence. Each stream ends `Purged` at `now_ms`, the purge request's
+    /// clock, and leaves an end record. The bucket's usage row stays, its
     /// gauges at zero, so an external accounting system can still observe
-    /// them (F15).
+    /// its counters (F15).
     /// Purging an absent bucket succeeds with zero removals so a crashed
     /// purge can be re-run to convergence.
-    pub(super) fn purge_bucket(&mut self, bucket_id: &str) -> StreamResponse {
+    pub(super) fn purge_bucket(&mut self, bucket_id: &str, now_ms: u64) -> StreamResponse {
         if let Err(message) = validate_bucket_id(bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
         }
@@ -63,7 +65,7 @@ impl StreamStateMachine {
         // Removal stamps cold-GC sequence numbers, so it follows the
         // stream-id order, never the order of this replica's hash map.
         for stream_id in self.registry.bucket_stream_ids(bucket_id) {
-            if self.remove_stream_state(&stream_id) {
+            if self.remove_stream_state(&stream_id, StreamEnd::Purged, now_ms) {
                 removed_streams = removed_streams.saturating_add(1);
             }
         }
@@ -91,7 +93,7 @@ impl StreamStateMachine {
             .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
-            self.remove_stream_state(&input.stream_id);
+            self.remove_stream_state(&input.stream_id, StreamEnd::Expired, input.now_ms);
         }
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
@@ -196,7 +198,7 @@ impl StreamStateMachine {
             .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
-            self.remove_stream_state(&input.stream_id);
+            self.remove_stream_state(&input.stream_id, StreamEnd::Expired, input.now_ms);
         }
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
@@ -327,7 +329,12 @@ impl StreamStateMachine {
             );
         };
         let expired = stream_is_expired(stream, now_ms);
-        self.remove_stream_state(stream_id);
+        let end = if expired {
+            StreamEnd::Expired
+        } else {
+            StreamEnd::Deleted
+        };
+        self.remove_stream_state(stream_id, end, now_ms);
         StreamResponse::Deleted { expired }
     }
 
@@ -347,7 +354,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(stream_id);
+            self.remove_stream_state(stream_id, StreamEnd::Expired, now_ms);
             return StreamResponse::Accessed {
                 changed: true,
                 expired: true,
@@ -378,7 +385,7 @@ impl StreamStateMachine {
             .stream_metadata(stream_id)
             .is_some_and(|stream| stream_is_expired(stream, now_ms))
         {
-            self.remove_stream_state(stream_id);
+            self.remove_stream_state(stream_id, StreamEnd::Expired, now_ms);
             return true;
         }
         false
@@ -386,8 +393,9 @@ impl StreamStateMachine {
 
     /// Applies [`StreamCommand::ExpireStreams`]: removes up to `limit`
     /// streams expired at `now_ms`, in the TTL index's (expiry, bucket,
-    /// stream) order. Every side effect of a removal (cold GC, usage, the
-    /// removal tally) happens here, as for any removal.
+    /// stream) order, each ending `Expired`. Every side effect of a removal
+    /// (cold GC, its end record, the removal tally) happens here, as for any
+    /// removal.
     pub(super) fn expire_streams(&mut self, now_ms: u64, limit: NonZeroU32) -> StreamResponse {
         let limit = u64::from(limit.get());
         let mut removed = 0u64;
@@ -395,14 +403,24 @@ impl StreamStateMachine {
             let Some(stream_id) = self.registry.pop_expired(now_ms) else {
                 break;
             };
-            if self.remove_stream_state(&stream_id) {
+            if self.remove_stream_state(&stream_id, StreamEnd::Expired, now_ms) {
                 removed = removed.saturating_add(1);
             }
         }
         StreamResponse::StreamsExpired { removed }
     }
 
-    pub(super) fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
+    /// Removes the stream `stream_id`, which ended as `end` at `now_ms`, the
+    /// removing entry's clock. Every removal goes through here: it counts
+    /// the removal (#669), queues the stream's cold objects for GC and
+    /// leaves the version's end record (F20). `false` when there is no such
+    /// stream.
+    pub(super) fn remove_stream_state(
+        &mut self,
+        stream_id: &BucketStreamId,
+        end: StreamEnd,
+        now_ms: u64,
+    ) -> bool {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
@@ -416,7 +434,7 @@ impl StreamStateMachine {
             .shared_object_paths()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        self.usage_on_removed(&slot);
+        self.usage_on_end(&slot, end, now_ms);
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).

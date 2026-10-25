@@ -107,6 +107,7 @@ use ursula_runtime::Proposal;
 use ursula_runtime::ProposedUpload;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::PublishSnapshotResponse;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -2223,7 +2224,7 @@ impl GroupEngine for RaftGroupEngine {
 
     fn purge_bucket<'a>(
         &'a mut self,
-        bucket_id: String,
+        request: PurgeBucketRequest,
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
@@ -2239,10 +2240,10 @@ impl GroupEngine for RaftGroupEngine {
                         &leadership,
                     ));
                 };
-                return forward_purge_bucket_to_leader(&route, self.placement, bucket_id).await;
+                return forward_purge_bucket_to_leader(&route, self.placement, request).await;
             }
             ursula_runtime::PurgeBucketResponse::try_from(
-                self.write(StreamCommand::PurgeBucket { bucket_id }).await?,
+                self.write(StreamCommand::from(request)).await?,
             )
         })
     }

@@ -2116,7 +2116,10 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
     assert!(b_chunks[0].s3_path.starts_with("erasure-b/_packs/"));
 
     let purge = runtime
-        .purge_bucket_all_groups(bucket_a)
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: bucket_a.to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("purge first bucket");
     assert_eq!(purge.removed_streams, 2);
@@ -2126,7 +2129,10 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
         .await
         .expect("reclaim first bucket");
     let proof = runtime
-        .purge_bucket_all_groups(bucket_a)
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: bucket_a.to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("prove first bucket absence");
     assert_eq!(proof.pending_cold_gc_entries, 0);
@@ -2407,7 +2413,10 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("flush cold");
 
     let purge = runtime
-        .purge_bucket_all_groups("offboard-tenant")
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: "offboard-tenant".to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("purge bucket");
     assert_eq!(purge.removed_streams, 1);
@@ -2418,7 +2427,10 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .await
         .expect("reclaim cold payload");
     let proof = runtime
-        .purge_bucket_all_groups("offboard-tenant")
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: "offboard-tenant".to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("prove purge");
     assert_eq!(proof.removed_streams, 0);

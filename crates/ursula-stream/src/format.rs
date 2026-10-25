@@ -135,7 +135,14 @@
 //!   sequence number, counters when its current history began and the
 //!   history its counters began in, counted at the bucket counter's call
 //!   sites by its rule. Bucket totals derive from each bucket's retired
-//!   usage and its live versions. The group keeps its genesis history id.
+//!   usage, its live versions and its end records. The group keeps its
+//!   genesis history id.
+//! - every removal leaves an end record with the version's final usage,
+//!   its end (`Deleted`, `Expired`, `Purged`), the removing entry's
+//!   `now_ms` and the history it ended in, under a new usage seq. A group
+//!   holds at most `MAX_END_RECORDS`: a removal past that first folds the
+//!   lowest-seq end record into its bucket's retired usage.
+//! - `PurgeBucket` carries the purge request's `now_ms`.
 //! - an import gives every restored version zero counters, counted since
 //!   the import's history, and retires the backup's bucket totals. A
 //!   restore refuses a backup with two usage rows of one bucket

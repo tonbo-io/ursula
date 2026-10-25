@@ -1,13 +1,15 @@
 //! Per-version usage (F20, F9) through the production entry points: the
 //! counting rule at the bucket counter's call sites, the seqs, the history
-//! baseline, and the bucket totals derived from retired usage and live
-//! versions.
+//! baseline, end records and their cap, and the bucket totals derived from
+//! retired usage, live versions and end records.
 
+use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 
 use bytes::Bytes;
 
 use super::BucketStreamId;
+use super::MAX_END_RECORDS;
 use super::ProducerRequest;
 use super::StreamCommand;
 use super::StreamResponse;
@@ -17,7 +19,9 @@ use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::model::ExternalPayloadRef;
 use crate::usage::CommittedUsage;
+use crate::usage::EndRecord;
 use crate::usage::LastWrite;
+use crate::usage::StreamEnd;
 use crate::usage::VersionCounters;
 use crate::usage::VersionUsage;
 
@@ -312,17 +316,21 @@ fn a_publish_and_a_retention_take_a_seq_and_count_nothing() {
     assert_eq!(row.retained_bytes, 2);
 }
 
-/// A removal retires the version's usage into its bucket's: the totals
+/// A removal leaves an end record with the version's final usage, how and
+/// when it ended and the history it ended in, under a new seq: the totals
 /// keep every committed counter, and the gauges leave with the stream. A
+/// purge ends its streams in stream-id order at its own clock, and the
 /// purged bucket keeps its row at zero gauges (F15).
 #[test]
-fn a_removal_retires_the_version_into_its_bucket() {
+fn a_removal_leaves_an_end_record_and_keeps_the_totals() {
     let mut machine = group(7);
     create(&mut machine, "a", b"abc", 1);
-    create(&mut machine, "b", b"defg", 1);
+    create(&mut machine, "c", b"defg", 1);
+    create(&mut machine, "b", b"", 1);
     append(&mut machine, "a", b"hi", 2);
     let before = committed_of(bucket_row(&machine));
-    assert_eq!(before, sum(&[(3, 1), (4, 1), (2, 1)]));
+    assert_eq!(before, sum(&[(3, 1), (4, 1), (0, 0), (2, 1)]));
+    let a = usage(&machine, "a");
 
     assert_eq!(
         machine.apply(StreamCommand::DeleteStream {
@@ -332,23 +340,215 @@ fn a_removal_retires_the_version_into_its_bucket() {
         StreamResponse::Deleted { expired: false }
     );
     assert_eq!(machine.version_usage(&sid("a")), None);
+    assert_eq!(machine.usage_seq(), 5);
+    assert_eq!(machine.end_records().collect::<Vec<_>>(), [&EndRecord {
+        seq: 5,
+        stream_id: sid("a"),
+        created_at_ms: 1,
+        counted_since: id(7),
+        ended_in: id(7),
+        end: StreamEnd::Deleted,
+        ended_at_ms: 3,
+        counters: a.counters,
+        history_baseline: VersionCounters::default(),
+        last_write: LastWrite::At(2),
+    }]);
     let row = bucket_row(&machine);
     assert_eq!(committed_of(row), before);
-    assert_eq!(row.stream_count, 1);
+    assert_eq!(row.stream_count, 2);
     assert_eq!(row.retained_bytes, 4);
 
     let purged = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: BUCKET.to_owned(),
+        now_ms: 40,
     });
     assert!(
-        matches!(purged, StreamResponse::BucketPurged { .. }),
+        matches!(purged, StreamResponse::BucketPurged {
+            removed_streams: 2,
+            ..
+        }),
         "{purged:?}"
     );
+    let ends = machine
+        .end_records()
+        .map(|record| {
+            (
+                record.seq,
+                record.stream_id.stream_id.as_str(),
+                record.end,
+                record.ended_at_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ends, [
+        (5, "a", StreamEnd::Deleted, 3),
+        (6, "b", StreamEnd::Purged, 40),
+        (7, "c", StreamEnd::Purged, 40),
+    ]);
     let row = bucket_row(&machine);
     assert_eq!(committed_of(row), before);
     assert_eq!(row.stream_count, 0);
     assert_eq!(row.retained_bytes, 0);
     assert_eq!(machine.state_gauges().bucket_usage_rows, 1);
+    assert_eq!(machine.usage_retired_through(), 0);
+    assert_eq!(machine.removed_state().end_records, 0);
+}
+
+fn create_expiring(machine: &mut StreamStateMachine, name: &str, expires_at_ms: u64, now_ms: u64) {
+    let response = machine.apply(StreamCommand::CreateStream {
+        stream_id: sid(name),
+        content_type: OCTET.to_owned(),
+        initial_payload: Bytes::from_static(b"xy"),
+        close_after: false,
+        stream_seq: None,
+        stream_ttl_seconds: None,
+        stream_expires_at_ms: Some(expires_at_ms),
+        now_ms,
+    });
+    assert!(
+        matches!(response, StreamResponse::Created { .. }),
+        "{response:?}"
+    );
+}
+
+/// Every removal of an expired stream ends it `Expired` at the removing
+/// entry's clock: the sweep, a delete, a touch, a write and a create over
+/// it. A create over an expired stream stamps the end before the new
+/// version.
+#[test]
+fn every_removal_of_an_expired_stream_ends_it_expired() {
+    let mut machine = group(7);
+    create_expiring(&mut machine, "swept", 9, 1);
+    for name in ["deleted", "touched", "written", "recreated"] {
+        create_expiring(&mut machine, name, 10, 1);
+    }
+    assert_eq!(
+        machine.apply(StreamCommand::ExpireStreams {
+            now_ms: 11,
+            limit: NonZeroU32::MIN,
+        }),
+        StreamResponse::StreamsExpired { removed: 1 }
+    );
+    assert_eq!(
+        machine.apply(StreamCommand::DeleteStream {
+            stream_id: sid("deleted"),
+            now_ms: 12,
+        }),
+        StreamResponse::Deleted { expired: true }
+    );
+    let touched = machine.apply(StreamCommand::TouchStreamAccess {
+        stream_id: sid("touched"),
+        now_ms: 13,
+        renew_ttl: false,
+    });
+    assert_eq!(touched, StreamResponse::Accessed {
+        changed: true,
+        expired: true,
+    });
+    let written = append_as(&mut machine, "written", OCTET, b"z", None, 14);
+    assert!(
+        matches!(written, StreamResponse::Error { .. }),
+        "{written:?}"
+    );
+    create(&mut machine, "recreated", b"new", 15);
+
+    let ends = machine
+        .end_records()
+        .map(|record| {
+            (
+                record.seq,
+                record.stream_id.stream_id.as_str(),
+                record.end,
+                record.ended_at_ms,
+                record.counters.committed,
+            )
+        })
+        .collect::<Vec<_>>();
+    let initial = CommittedUsage::of_write(2, 1);
+    assert_eq!(ends, [
+        (6, "swept", StreamEnd::Expired, 11, initial),
+        (7, "deleted", StreamEnd::Expired, 12, initial),
+        (8, "touched", StreamEnd::Expired, 13, initial),
+        (9, "written", StreamEnd::Expired, 14, initial),
+        (10, "recreated", StreamEnd::Expired, 15, initial),
+    ]);
+    assert_eq!(usage(&machine, "recreated").seq, 11);
+    let mut expected = sum(&[(2, 1); 5]);
+    expected.add(CommittedUsage::of_write(3, 1));
+    assert_eq!(committed_of(bucket_row(&machine)), expected);
+}
+
+/// An end record carries the version's counters at the start of the
+/// group's history when it ended: its recorded baseline when it was
+/// written in that history, else its final counters, since nothing counted
+/// after the event.
+#[test]
+fn an_end_record_carries_the_baseline_of_the_history_it_ended_in() {
+    let mut machine = group(7);
+    create(&mut machine, "quiet", b"abc", 1);
+    create(&mut machine, "written", b"de", 1);
+    let quiet = usage(&machine, "quiet").counters;
+    let at_event = usage(&machine, "written").counters;
+    new_history(&mut machine, 10, 9);
+    append(&mut machine, "written", b"fgh", 2);
+    for (name, now_ms) in [("quiet", 3), ("written", 4)] {
+        assert_eq!(
+            machine.apply(StreamCommand::DeleteStream {
+                stream_id: sid(name),
+                now_ms,
+            }),
+            StreamResponse::Deleted { expired: false }
+        );
+    }
+    let ends = machine.end_records().cloned().collect::<Vec<_>>();
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0].stream_id, sid("quiet"));
+    assert_eq!(ends[0].counted_since, id(7));
+    assert_eq!(ends[0].ended_in, id(9));
+    assert_eq!(ends[0].counters, quiet);
+    assert_eq!(ends[0].history_baseline, quiet);
+    assert_eq!(ends[1].stream_id, sid("written"));
+    assert_eq!(ends[1].ended_in, id(9));
+    assert_eq!(ends[1].history_baseline, at_event);
+    assert_eq!(ends[1].counters, VersionCounters {
+        committed: sum(&[(2, 1), (3, 1)]),
+        appends: 1,
+    });
+}
+
+/// A removal that finds the group holding `MAX_END_RECORDS` end records
+/// first folds the lowest-seq one into its bucket's retired usage, counted
+/// as an early fold: the group never holds more, and no total changes.
+#[test]
+fn a_removal_past_the_cap_folds_the_oldest_end_record_first() {
+    let mut machine = group(7);
+    let name = |index: usize| format!("s{index:06}");
+    for index in 0..=MAX_END_RECORDS {
+        create(&mut machine, &name(index), b"ab", 1);
+    }
+    let before = committed_of(bucket_row(&machine));
+    let purged = machine.apply(StreamCommand::PurgeBucket {
+        bucket_id: BUCKET.to_owned(),
+        now_ms: 2,
+    });
+    assert!(
+        matches!(purged, StreamResponse::BucketPurged { .. }),
+        "{purged:?}"
+    );
+    let created = u64::try_from(MAX_END_RECORDS + 1).expect("count fits u64");
+    assert_eq!(machine.end_records().len(), MAX_END_RECORDS);
+    // The first purged stream, `s000000`, ended at seq `created + 1` and
+    // was folded when the last one ended.
+    let first = machine.end_records().next().expect("an end record");
+    assert_eq!(first.stream_id, sid(&name(1)));
+    assert_eq!(first.seq, created + 2);
+    assert_eq!(machine.usage_retired_through(), created + 1);
+    assert_eq!(machine.usage_seq(), 2 * created);
+    let removed = machine.removed_state();
+    assert_eq!(removed.streams, created);
+    assert_eq!(removed.end_records, 1);
+    assert_eq!(removed.end_records_early, 1);
+    assert_eq!(committed_of(bucket_row(&machine)), before);
 }
 
 /// The genesis records the group's genesis id, and a later event keeps

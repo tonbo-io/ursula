@@ -792,6 +792,15 @@ pub struct DeferColdGcResponse {
     pub group_commit_index: u64,
 }
 
+/// A bucket purge of one group (tenant offboarding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeBucketRequest {
+    pub bucket_id: String,
+    /// The admin request's clock, stamped once and sent to every group of
+    /// one purge: the purged versions' `ended_at_ms` (F20).
+    pub now_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeBucketResponse {
     pub placement: ShardPlacement,

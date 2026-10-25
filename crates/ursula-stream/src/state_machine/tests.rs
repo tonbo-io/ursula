@@ -291,6 +291,7 @@ fn snapshot_bytes_leave_with_expired_and_purged_streams() {
     assert!(matches!(
         machine.apply(StreamCommand::PurgeBucket {
             bucket_id: "benchcmp".to_owned(),
+            now_ms: 2_000,
         }),
         StreamResponse::BucketPurged { .. }
     ));
@@ -4123,6 +4124,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     ));
     let response = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     });
     let StreamResponse::BucketPurged {
         bucket_id,
@@ -4182,6 +4184,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     // Idempotent re-run reports zero removals.
     let rerun = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     });
     assert!(matches!(rerun, StreamResponse::BucketPurged {
         removed_streams: 0,
@@ -4250,6 +4253,7 @@ fn purge_bucket_numbers_cold_gc_entries_alike_on_replicas_that_hash_differently(
 
     let purge = StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     };
     let purged = first.apply(purge.clone());
     assert_eq!(second.apply(purge), purged);
@@ -4985,6 +4989,7 @@ proptest! {
         if purge {
             let purged = machine.apply(StreamCommand::PurgeBucket {
                 bucket_id: "benchcmp".to_owned(),
+                now_ms: 2_000,
             });
             prop_assert!(matches!(purged, StreamResponse::BucketPurged { .. }), "{:?}", purged);
             for (_, bytes, leaves) in &held {

@@ -162,9 +162,9 @@ pub struct StreamStateMachine {
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
     shared_cold_object_refs: HashMap<String, u64>,
-    /// The usage ledger (F15, F20): the group's genesis, its usage seq and
-    /// each bucket's retired usage. Bucket totals derive from it and the
-    /// slots ([`Self::bucket_usage_report`]).
+    /// The usage ledger (F15, F20): the group's genesis, its usage seq, its
+    /// end records and each bucket's retired usage. Bucket totals derive
+    /// from it and the slots ([`Self::bucket_usage_report`]).
     usage: usage_ledger::UsageLedger,
     /// Derived flush-planner state (bounded-stream-state F10): the streams
     /// that hold hot bytes and the leader-local rotation cursor. Neither is
@@ -186,16 +186,23 @@ pub struct StreamStateMachine {
     removed: RemovedState,
 }
 
-/// Streams a group's state machine removed and the bytes they held in a
-/// group snapshot (#669): cumulative since the state machine was built or
-/// restored. A deletion, a bucket purge, a TTL expiry and a create over an
-/// expired stream all remove a stream through one path.
+/// Streams and end records a group's state machine removed and the bytes
+/// they held in a group snapshot (#669): cumulative since the state machine
+/// was built or restored. A deletion, a bucket purge, a TTL expiry and a
+/// create over an expired stream all remove a stream through one path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RemovedState {
     /// Streams removed.
     pub streams: u64,
-    /// What those streams added to a group snapshot: their hot bytes, any
-    /// inline snapshot body, and [`crate::COMMAND_LOG_OVERHEAD_BYTES`] each.
+    /// End records folded into their buckets' retired usage (F20).
+    pub end_records: u64,
+    /// Of those, end records folded early, because a removal found the
+    /// group holding [`MAX_END_RECORDS`].
+    pub end_records_early: u64,
+    /// What those streams and end records added to a group snapshot: a
+    /// stream's hot bytes, any inline snapshot body, and
+    /// [`crate::COMMAND_LOG_OVERHEAD_BYTES`] each, and an end record's
+    /// encoded size.
     pub bytes: u64,
 }
 
@@ -204,10 +211,19 @@ impl RemovedState {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             streams: self.streams.saturating_sub(earlier.streams),
+            end_records: self.end_records.saturating_sub(earlier.end_records),
+            end_records_early: self
+                .end_records_early
+                .saturating_sub(earlier.end_records_early),
             bytes: self.bytes.saturating_sub(earlier.bytes),
         }
     }
 }
+
+/// The most end records a group holds (F20, bounded-state I2). A removal
+/// that would hold more first folds the lowest-seq end record into its
+/// bucket's retired usage. Part of the apply semantics of format epoch 7.
+pub const MAX_END_RECORDS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 struct StreamSlot {
@@ -587,7 +603,9 @@ impl StreamStateMachine {
             StreamCommand::DeleteStream { stream_id, now_ms } => {
                 self.delete_stream(&stream_id, now_ms)
             }
-            StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
+            StreamCommand::PurgeBucket { bucket_id, now_ms } => {
+                self.purge_bucket(&bucket_id, now_ms)
+            }
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
             StreamCommand::DeferColdGc { seq, not_before_ms } => {
                 self.defer_cold_gc(seq, not_before_ms)

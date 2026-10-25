@@ -84,6 +84,7 @@ use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RouteWriteRequest;
@@ -927,11 +928,11 @@ impl GroupEngine for MadsimScopedGroupEngine {
 
     fn purge_bucket<'a>(
         &'a mut self,
-        bucket_id: String,
+        request: PurgeBucketRequest,
         placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.purge_bucket(bucket_id, placement).await
+            self.inner.purge_bucket(request, placement).await
         }))
     }
 

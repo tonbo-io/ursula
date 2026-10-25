@@ -344,6 +344,7 @@ impl Op {
             },
             Self::Purge { bucket } => StreamCommand::PurgeBucket {
                 bucket_id: BUCKETS[*bucket].to_owned(),
+                now_ms: now,
             },
             Self::Expire(max) => expire(now, *max),
             Self::Restore | Self::Advance(_) => return None,
@@ -721,6 +722,7 @@ fn a_stale_due_front_removes_nothing_and_clears() {
             _ => {
                 machine.apply(StreamCommand::PurgeBucket {
                     bucket_id: BUCKETS[0].to_owned(),
+                    now_ms: 1_500,
                 });
             }
         }

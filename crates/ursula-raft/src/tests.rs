@@ -4058,6 +4058,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
         9,
         RaftCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
             bucket_id: "removal-purged".to_owned(),
+            now_ms: 9,
         }),
     )])
     .await;

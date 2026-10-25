@@ -13,6 +13,7 @@ use super::StreamStateMachine;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
 use crate::json_records::is_json_record_content_type;
+use crate::usage::StreamEnd;
 
 /// Grace before the cold GC may delete pack slices that retention dropped
 /// (bounded-state F14i). It matches the default
@@ -122,7 +123,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(&stream_id);
+            self.remove_stream_state(&stream_id, StreamEnd::Expired, now_ms);
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -263,7 +264,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(&stream_id);
+            self.remove_stream_state(&stream_id, StreamEnd::Expired, now_ms);
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),

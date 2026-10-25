@@ -75,6 +75,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
@@ -1023,7 +1024,13 @@ pub(super) async fn run_deleted_data_inner(
             let (remover, ()) = if plan.removal == Removal::BucketPurge {
                 on_leader!(cluster, &context, |engine| async {
                     engine
-                        .purge_bucket(BUCKET.to_owned(), placement)
+                        .purge_bucket(
+                            PurgeBucketRequest {
+                                bucket_id: BUCKET.to_owned(),
+                                now_ms: clock.now_ms(),
+                            },
+                            placement,
+                        )
                         .await
                         .map(drop)
                 })

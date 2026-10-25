@@ -14,6 +14,7 @@ use crate::request::CreateStreamRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
+use crate::request::PurgeBucketRequest;
 use crate::request::StreamAppendCount;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +168,15 @@ impl From<DeleteStreamRequest> for StreamCommand {
             now_ms: request.now_ms,
         };
         if_incarnation(command, request.if_incarnation)
+    }
+}
+
+impl From<PurgeBucketRequest> for StreamCommand {
+    fn from(request: PurgeBucketRequest) -> Self {
+        Self::PurgeBucket {
+            bucket_id: request.bucket_id,
+            now_ms: request.now_ms,
+        }
     }
 }
 

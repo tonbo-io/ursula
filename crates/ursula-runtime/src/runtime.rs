@@ -96,6 +96,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketRequest;
 use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
@@ -967,20 +968,21 @@ impl ShardRuntime {
     }
 
     /// Purges one tenant bucket from every Raft group this node hosts:
-    /// streams, bucket, and usage entries. The report lists the groups it
-    /// hosts no replica of, which the caller purges through their leaders.
+    /// streams, bucket, and usage entries, every group with the request's
+    /// one `now_ms`. The report lists the groups it hosts no replica of,
+    /// which the caller purges through their leaders with the same request.
     /// Idempotent: a re-run over an already purged bucket reports zero
     /// removals. Cold objects are reclaimed by the enqueued GC entries;
     /// callers wanting synchronous reclamation run the cold GC pass
     /// afterwards.
     pub async fn purge_bucket_all_groups(
         &self,
-        bucket_id: &str,
+        request: &PurgeBucketRequest,
     ) -> Result<PurgeBucketReport, RuntimeError> {
         let mut report = PurgeBucketReport::default();
         for group_id in 0..self.shard_map.raft_group_count() {
             let group = RaftGroupId(group_id);
-            match hosted(self.purge_bucket(group, bucket_id.to_owned()).await)? {
+            match hosted(self.purge_bucket(group, request.clone()).await)? {
                 Some(response) => report.add(&response),
                 None => report.not_hosted.push(self.placement_for_group(group)?),
             }

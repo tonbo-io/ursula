@@ -264,6 +264,7 @@ pub fn stream_commands() -> Vec<StreamCommand> {
         },
         StreamCommand::PurgeBucket { .. } => StreamCommand::PurgeBucket {
             bucket_id: "tenant-c".to_owned(),
+            now_ms: 1_700_000_000_015,
         },
         StreamCommand::AckColdGc { .. } => StreamCommand::AckColdGc { up_to_seq: 21 },
         StreamCommand::DeferColdGc { .. } => StreamCommand::DeferColdGc {
@@ -850,7 +851,9 @@ fn vary_command_by(command: StreamCommand, mask: &mut Mask) -> StreamCommand {
         StreamCommand::DeleteStream { stream_id, now_ms } => {
             StreamCommand::DeleteStream { stream_id, now_ms }
         }
-        StreamCommand::PurgeBucket { bucket_id } => StreamCommand::PurgeBucket { bucket_id },
+        StreamCommand::PurgeBucket { bucket_id, now_ms } => {
+            StreamCommand::PurgeBucket { bucket_id, now_ms }
+        }
         StreamCommand::AckColdGc { up_to_seq } => StreamCommand::AckColdGc { up_to_seq },
         StreamCommand::DeferColdGc { seq, not_before_ms } => {
             StreamCommand::DeferColdGc { seq, not_before_ms }

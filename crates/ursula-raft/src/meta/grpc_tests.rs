@@ -173,6 +173,7 @@ async fn a_register_node_for_another_node_is_refused_for_good_on_both_seams() {
     });
     let stream = RaftCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
         bucket_id: "b".to_owned(),
+        now_ms: 1,
     });
     for (command, refusal) in [
         (history, UnproposableCommand::NewHistory),

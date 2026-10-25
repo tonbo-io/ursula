@@ -137,12 +137,16 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
     },
-    /// Administrator-triggered tenant offboarding: removes every stream in
-    /// the bucket and the bucket itself in this group. Monotonic
-    /// aggregate usage is retained for asynchronous accounting. Idempotent —
-    /// purging an absent bucket reports zero removals.
+    /// Administrator-triggered tenant offboarding: removes every stream the
+    /// bucket owns in this group, in stream-id order, each ending `Purged`
+    /// at `now_ms`, then the bucket, and installs its erasure fence.
+    /// Monotonic aggregate usage is retained for asynchronous accounting.
+    /// Idempotent: purging an absent bucket reports zero removals.
     PurgeBucket {
         bucket_id: String,
+        /// The admin request's clock, one value for every group of one
+        /// purge: the purged versions' `ended_at_ms`.
+        now_ms: u64,
     },
     /// Confirms the leader's background worker has physically reclaimed every
     /// queued cold-GC entry with `seq <= up_to_seq`; removes them from the
@@ -384,7 +388,7 @@ impl fmt::Display for StreamCommand {
             ),
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
             Self::DeleteStream { stream_id, .. } => write!(f, "delete_stream:{stream_id}"),
-            Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
+            Self::PurgeBucket { bucket_id, .. } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
             Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
             Self::ImportSnapshot {

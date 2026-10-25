@@ -92,6 +92,7 @@ fn purge_bucket_drops_append_counts() {
         .apply_committed_write(
             StreamCommand::PurgeBucket {
                 bucket_id: "purged".to_owned(),
+                now_ms: 2,
             },
             placement(),
         )

@@ -23,6 +23,7 @@ use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::Proposal;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::RuntimeError;
 
 use super::*;
@@ -110,6 +111,14 @@ async fn cluster_advertising(
     (engines, leader_index, stream_id, wal_roots)
 }
 
+/// A purge of `stream_id`'s bucket, stamped as the admin handler stamps it.
+fn purge_request(stream_id: &ursula_shard::BucketStreamId) -> PurgeBucketRequest {
+    PurgeBucketRequest {
+        bucket_id: stream_id.bucket_id.clone(),
+        now_ms: 1_000,
+    }
+}
+
 /// Waits until `engine` follows a known leader.
 async fn wait_for_leader(engine: &RaftGroupEngine) {
     engine
@@ -194,7 +203,7 @@ async fn forwards_to_a_silent_leader_fail_within_the_transport_bound() {
 
     let purge = tokio::time::timeout(
         SILENT_LEADER_BOUND,
-        follower.purge_bucket(stream_id.bucket_id.clone(), placement()),
+        follower.purge_bucket(purge_request(&stream_id), placement()),
     )
     .await
     .expect("a forwarded purge to a silent leader is bounded")
@@ -560,7 +569,7 @@ async fn a_forward_to_an_address_that_serves_another_node_is_leader_unknown() {
         "{read:?}"
     );
     let purge = follower
-        .purge_bucket(stream_id.bucket_id.clone(), placement())
+        .purge_bucket(purge_request(&stream_id), placement())
         .await
         .expect_err("another node serves nothing for the leader");
     assert_leader_unknown("forwarded purge", &purge, &url);
@@ -659,7 +668,7 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
         "{read:?}"
     );
     let purge = follower
-        .purge_bucket(stream_id.bucket_id.clone(), placement())
+        .purge_bucket(purge_request(&stream_id), placement())
         .await
         .expect_err("a leader of another cluster serves nothing");
     // Refused before the body: nothing was proposed there.

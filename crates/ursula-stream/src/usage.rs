@@ -2,12 +2,15 @@
 //! and its applied appends (F9), counted at the bucket counter's call sites
 //! by its rule.
 //!
-//! A group's bucket totals are not a counter of their own: they derive from
-//! each bucket's retired usage and its live versions on every read
-//! ([`crate::StreamStateMachine::bucket_usage_report`]), so they equal the
-//! per-version sums by construction.
+//! A removal leaves an [`EndRecord`] with the version's final usage. A
+//! group's bucket totals are not a counter of their own: they derive from
+//! each bucket's retired usage, its live versions and its end records on
+//! every read ([`crate::StreamStateMachine::bucket_usage_report`]), so they
+//! equal the per-version sums by construction.
 
 use std::num::NonZeroU64;
+
+use ursula_shard::BucketStreamId;
 
 use crate::model::BucketUsage;
 use crate::state_machine::COMMITTED_WRITE_UNIT_BYTES;
@@ -106,6 +109,41 @@ pub struct VersionUsage {
     /// import that restored it. Part of the version's key, so a restore
     /// gives every version a new key.
     pub counted_since: NonZeroU64,
+}
+
+/// How a version ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// A `DeleteStream` of a stream that had not expired at its `now_ms`.
+    Deleted,
+    /// Expired at the removing entry's `now_ms`: the expiry sweep, a
+    /// command that named it, a create over it, or a delete after its
+    /// expiry.
+    Expired,
+    /// Its bucket was purged.
+    Purged,
+}
+
+/// The final usage of a version that ended, held in its group until it is
+/// folded into its bucket's retired usage (F20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndRecord {
+    /// The seq of its end, unique in the group.
+    pub seq: u64,
+    pub stream_id: BucketStreamId,
+    pub created_at_ms: u64,
+    pub counted_since: NonZeroU64,
+    /// The group's history when it ended. Its `Stream-Incarnation` token is
+    /// `incarnation_token(created_at_ms, ended_in)`.
+    pub ended_in: NonZeroU64,
+    pub end: StreamEnd,
+    /// `now_ms` of the entry that removed it, the removing proposer's
+    /// clock.
+    pub ended_at_ms: u64,
+    pub counters: VersionCounters,
+    /// Its counters when `ended_in` began for it.
+    pub history_baseline: VersionCounters,
+    pub last_write: LastWrite,
 }
 
 #[cfg(test)]
