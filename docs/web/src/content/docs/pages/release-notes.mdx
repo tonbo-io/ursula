@@ -3,9 +3,11 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
-## Unreleased
+## 0.10.1
 
-These changes are planned for 0.10.1.
+0.10.1 is a patch of 0.10 and interoperates with 0.10.0: format epoch 6, backup format 5 and every storage, wire and protocol format are unchanged. 0.10.0 and 0.10.1 nodes run in one cluster during a rolling upgrade. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.10.0 is safe.
+
+This release was published without a DST Nightly run on its commit. The release owner waived it.
 
 ### Admin API
 
@@ -18,6 +20,10 @@ These changes are planned for 0.10.1.
 ### Rust library APIs
 
 - **Snapshot bytes in usage.** `StreamStateMachine::snapshot_bytes_by_bucket` and `InMemoryGroupEngine::snapshot_bytes_by_bucket` are new, `ursula_runtime::GroupBucketUsage` gains `snapshot_bytes`, and `ursula_proto::admin::BucketUsageReport` gains `snapshot_bytes: Option<u64>` (`None` is unknown, and `BucketUsageReport::add` keeps it known only when both sides are), so a struct literal of either needs the field.
+
+### Known issues
+
+The known issues of [0.10.0](#0100) are unchanged.
 
 ## 0.10.0
 
