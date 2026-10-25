@@ -347,6 +347,44 @@ fn head_resets_rewound_or_deleted_and_blocks_another_cluster() {
     );
 }
 
+// A bound session's HEAD (here the one a `404` asks for) refuses what an open refuses: another
+// release line blocks `protocol_mismatch`, and an answer without identity `no_server_identity`.
+// Neither resets: the session keeps its commits and resends every 30 s.
+#[test]
+fn head_blocks_another_release_line_and_an_answer_without_identity() {
+    for found in [2, crate::open::table::next_line()] {
+        let mut h = streaming(1);
+        h.answer(&RawAnswer::new(404));
+        let mut raw = RawAnswer::new(200);
+        ServerIdentity {
+            protocol: found,
+            cluster_id: cluster(),
+        }
+        .render(raw.emit());
+        StreamHead::new(token(), off(0), off(0), 1 << 20)
+            .unwrap()
+            .render(raw.emit());
+        let actions = h.answer(&raw);
+        assert_eq!(reset_of(&actions), None);
+        assert_eq!(
+            condition(&actions),
+            Some(Some(Condition::Blocked(BlockedReason::ProtocolMismatch {
+                found
+            })))
+        );
+        let (at, _) = timer_of(&actions).unwrap();
+        assert_eq!(at, h.now_ms + BLOCKED_RETRY_MS);
+    }
+    let mut h = streaming(1);
+    h.answer(&RawAnswer::new(404));
+    let actions = h.answer(&RawAnswer::new(404));
+    assert_eq!(reset_of(&actions), None);
+    assert_eq!(
+        condition(&actions),
+        Some(Some(Condition::Blocked(BlockedReason::NoServerIdentity)))
+    );
+}
+
 #[test]
 fn producer_expired_claims_exactly_own_plus_one_after_persisting_it() {
     let mut h = streaming(2);

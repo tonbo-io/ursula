@@ -222,9 +222,19 @@ pub(crate) enum BlockedReason {
     Unauthorized,
     PaymentRequired,
     Forbidden,
-    Redirected { location: Option<String> },
+    Redirected {
+        location: Option<String>,
+    },
     WrongCluster,
-    Rejected { status: u16 },
+    /// A HEAD answer without `Ursula-Protocol` and `Ursula-Cluster-Id`.
+    NoServerIdentity,
+    /// A HEAD answer of the release line `found`, not this extension's.
+    ProtocolMismatch {
+        found: u32,
+    },
+    Rejected {
+        status: u16,
+    },
 }
 
 /// The replication condition status reports (design: Status).

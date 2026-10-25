@@ -63,7 +63,10 @@ pub(crate) enum ErrorKind {
     BoundElsewhere,
     LocalSetup,
     StreamFormat,
-    ServerTooOld,
+    /// A HEAD answer without the server's identity (`Ursula-Protocol`, `Ursula-Cluster-Id`).
+    NoServerIdentity,
+    /// A server of another release line.
+    ProtocolMismatch,
     WrongCluster,
     StreamState,
     ClaimRaces,
@@ -94,7 +97,8 @@ impl ErrorKind {
             ErrorKind::BoundElsewhere => "bound_elsewhere",
             ErrorKind::LocalSetup => "local_setup",
             ErrorKind::StreamFormat => "stream_format",
-            ErrorKind::ServerTooOld => "server_too_old",
+            ErrorKind::NoServerIdentity => "no_server_identity",
+            ErrorKind::ProtocolMismatch => "protocol_mismatch",
             ErrorKind::WrongCluster => "wrong_cluster",
             ErrorKind::StreamState => "stream_state",
             ErrorKind::ClaimRaces => "claim_races",
@@ -129,7 +133,8 @@ impl ErrorKind {
             | ErrorKind::NotFound
             | ErrorKind::LocalSetup
             | ErrorKind::StreamFormat
-            | ErrorKind::ServerTooOld
+            | ErrorKind::NoServerIdentity
+            | ErrorKind::ProtocolMismatch
             | ErrorKind::WrongCluster
             | ErrorKind::StreamState
             | ErrorKind::Unauthorized
@@ -163,7 +168,8 @@ impl OpenError {
             OpenError::LocalSetup(_) => ErrorKind::LocalSetup,
             OpenError::Internal(_) | OpenError::Panicked => ErrorKind::Internal,
             OpenError::StreamFormat(_) => ErrorKind::StreamFormat,
-            OpenError::ServerTooOld { .. } => ErrorKind::ServerTooOld,
+            OpenError::NoServerIdentity => ErrorKind::NoServerIdentity,
+            OpenError::ProtocolMismatch { .. } => ErrorKind::ProtocolMismatch,
             OpenError::WrongCluster { .. } => ErrorKind::WrongCluster,
             OpenError::StreamState(_)
             | OpenError::Snapshot(_)
@@ -177,6 +183,8 @@ impl OpenError {
                 Unavailable::PaymentRequired => ErrorKind::PaymentRequired,
                 Unavailable::Forbidden => ErrorKind::Forbidden,
                 Unavailable::WrongCluster => ErrorKind::WrongCluster,
+                Unavailable::NoServerIdentity => ErrorKind::NoServerIdentity,
+                Unavailable::ProtocolMismatch { .. } => ErrorKind::ProtocolMismatch,
                 Unavailable::Retrying
                 | Unavailable::Redirected { .. }
                 | Unavailable::Rejected { .. }
@@ -211,9 +219,10 @@ impl ImportError {
             ImportError::InvalidUrl(_) => ErrorKind::InvalidUrl,
             ImportError::Source(_) => ErrorKind::InvalidArgument,
             ImportError::Io { .. } => ErrorKind::LocalSetup,
-            ImportError::ServerTooOld { .. } => ErrorKind::ServerTooOld,
+            ImportError::NoServerIdentity => ErrorKind::NoServerIdentity,
+            ImportError::ProtocolMismatch { .. } => ErrorKind::ProtocolMismatch,
             ImportError::ContentType { .. } | ImportError::Configuration => ErrorKind::StreamFormat,
-            ImportError::NotNew(_) | ImportError::Refused(_) => ErrorKind::StreamState,
+            ImportError::NotNew(_) => ErrorKind::StreamState,
             ImportError::WrongCluster { .. } => ErrorKind::WrongCluster,
             ImportError::Rejected { status, .. } => status_kind(*status),
             ImportError::Unavailable { .. } | ImportError::TimedOut { .. } => {
@@ -226,6 +235,8 @@ impl ImportError {
                     ErrorKind::StreamState
                 }
                 SnapshotFailure::WrongCluster { .. } => ErrorKind::WrongCluster,
+                SnapshotFailure::NoServerIdentity => ErrorKind::NoServerIdentity,
+                SnapshotFailure::ProtocolMismatch { .. } => ErrorKind::ProtocolMismatch,
                 SnapshotFailure::Status { status, .. } => status_kind(*status),
                 SnapshotFailure::Io { .. } | SnapshotFailure::Body(_) => ErrorKind::LocalSetup,
                 SnapshotFailure::Host(_) | SnapshotFailure::Driver(_) => ErrorKind::Internal,

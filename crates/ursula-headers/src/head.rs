@@ -13,9 +13,79 @@ use crate::snapshot::SnapshotRef;
 use crate::value::Incarnation;
 use crate::value::Offset;
 
-/// The contract version this crate implements (`Ursula-Protocol`). A server
-/// that sends none speaks version 1.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The release line this crate speaks, as `Ursula-Protocol` carries it:
+/// major × 1000 + minor of the package version (0.11 is `11`, 1.0 would be
+/// `1000`). It is computed at compile time from the package version, so it
+/// moves with the workspace version and nobody bumps it by hand. Patches of
+/// one line interoperate, lines do not.
+pub const PROTOCOL_LINE: u32 = protocol_line(
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    env!("CARGO_PKG_VERSION_MINOR"),
+);
+
+/// The release line of a package version's `major` and `minor` components:
+/// `major * 1000 + minor`. Evaluated in a const, so a component that is not
+/// a decimal, a minor of 1000 or more, or a line above `u32::MAX` fails the
+/// build.
+#[expect(
+    clippy::panic,
+    reason = "evaluated at compile time only: a malformed package version fails the build"
+)]
+const fn protocol_line(major: &str, minor: &str) -> u32 {
+    let minor = decimal(minor);
+    if minor >= 1000 {
+        panic!("a minor version of 1000 or more has no release line");
+    }
+    let Some(line) = decimal(major).checked_mul(1000) else {
+        panic!("the release line is above u32::MAX");
+    };
+    let Some(line) = line.checked_add(minor) else {
+        panic!("the release line is above u32::MAX");
+    };
+    line
+}
+
+/// A package version component as a number.
+#[expect(
+    clippy::panic,
+    reason = "evaluated at compile time only: a malformed package version fails the build"
+)]
+const fn decimal(text: &str) -> u32 {
+    let mut digits = text.as_bytes();
+    if digits.is_empty() {
+        panic!("an empty version component");
+    }
+    let mut value: u32 = 0;
+    while let [digit @ b'0'..=b'9', rest @ ..] = digits {
+        let Some(shifted) = value.checked_mul(10) else {
+            panic!("a version component above u32::MAX");
+        };
+        let Some(next) = shifted.checked_add(digit.wrapping_sub(b'0') as u32) else {
+            panic!("a version component above u32::MAX");
+        };
+        value = next;
+        digits = rest;
+    }
+    if !digits.is_empty() {
+        panic!("a version component that is not a decimal");
+    }
+    value
+}
+
+/// An `Ursula-Protocol` value shown as the releases that send it: `0.11`
+/// for `11`, `1.0` for `1000`, and `0.8 to 0.10` for `2`, the contract
+/// integer those releases sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseLine(pub u32);
+
+impl fmt::Display for ReleaseLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            2 => f.write_str("0.8 to 0.10"),
+            line => write!(f, "{}.{}", line / 1000, line % 1000),
+        }
+    }
+}
 
 /// The longest `Ursula-Cluster-Id`, in bytes.
 pub const CLUSTER_ID_MAX_BYTES: usize = 64;
@@ -70,8 +140,8 @@ impl fmt::Display for ClusterId {
 /// `Ursula-Protocol` and `Ursula-Cluster-Id`, on every HEAD answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerIdentity {
-    /// The contract version the server speaks. A client refuses one below
-    /// [`PROTOCOL_VERSION`].
+    /// The server's release line ([`PROTOCOL_LINE`]). A client of another
+    /// line refuses it.
     pub protocol: u32,
     pub cluster_id: ClusterId,
 }
@@ -80,13 +150,13 @@ impl ServerIdentity {
     /// The identity this crate's server sends.
     pub fn current(cluster_id: ClusterId) -> Self {
         Self {
-            protocol: PROTOCOL_VERSION,
+            protocol: PROTOCOL_LINE,
             cluster_id,
         }
     }
 
-    /// `Ok(None)` when neither header is present: a server of protocol 1,
-    /// or a layer that is not Ursula. One without the other is
+    /// `Ok(None)` when neither header is present: a server before 0.8, or
+    /// a layer that is not Ursula, such as a gateway's concealing `404`. One without the other is
     /// [`HeaderError::Missing`].
     pub fn parse<'a, I>(headers: I) -> Result<Option<Self>, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
@@ -369,7 +439,8 @@ impl StreamHead {
 mod tests {
     use super::ClusterId;
     use super::Inherited;
-    use super::PROTOCOL_VERSION;
+    use super::PROTOCOL_LINE;
+    use super::ReleaseLine;
     use super::ServerIdentity;
     use super::StreamHead;
     use crate::error::HeaderError;
@@ -421,13 +492,51 @@ mod tests {
             .render(|name, value| pairs.push((name, value.to_owned())));
         assert_eq!(
             pairs,
-            pairs_of(&[("ursula-protocol", "2"), ("ursula-cluster-id", "c")])
+            pairs_of(&[
+                ("ursula-protocol", &PROTOCOL_LINE.to_string()),
+                ("ursula-cluster-id", "c")
+            ])
         );
-        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    // `Ursula-Protocol` is the package's release line, major × 1000 + minor: 0.11 sends `11`,
+    // and a patch release sends what its line sends.
+    #[test]
+    fn the_protocol_is_the_release_line_of_the_package() {
+        let mut parts = env!("CARGO_PKG_VERSION").split('.');
+        let major: u32 = parts.next().unwrap().parse().unwrap();
+        let minor: u32 = parts.next().unwrap().parse().unwrap();
+        assert_eq!(PROTOCOL_LINE, major * 1000 + minor);
+        for (major, minor, line) in [
+            ("0", "8", 8),
+            ("0", "10", 10),
+            ("0", "11", 11),
+            ("0", "12", 12),
+            ("1", "0", 1000),
+            ("1", "999", 1999),
+            ("4294967", "295", u32::MAX),
+        ] {
+            assert_eq!(super::protocol_line(major, minor), line, "{major}.{minor}");
+        }
+    }
+
+    // A line reads as the releases that send it, and `2` as the three that sent the contract
+    // integer.
+    #[test]
+    fn a_release_line_shows_as_its_releases() {
+        for (line, shown) in [
+            (2, "0.8 to 0.10"),
+            (11, "0.11"),
+            (12, "0.12"),
+            (1000, "1.0"),
+            (1012, "1.12"),
+        ] {
+            assert_eq!(ReleaseLine(line).to_string(), shown);
+        }
     }
 
     #[test]
-    fn a_server_without_identity_is_protocol_one() {
+    fn a_server_without_identity_has_none() {
         assert_eq!(ServerIdentity::parse(iter(&Pairs::new())), Ok(None));
     }
 

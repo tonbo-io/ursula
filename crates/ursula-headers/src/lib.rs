@@ -1,4 +1,5 @@
-//! Typed HTTP headers of the Ursula protocol (version 2).
+//! Typed HTTP headers of the Ursula protocol, of the release line
+//! [`PROTOCOL_LINE`] (`Ursula-Protocol`).
 //!
 //! The server renders its headers with this crate and its clients (the
 //! gateway, `clients/sqlite-vfs`) parse them with it, so the two sides share
@@ -129,7 +130,8 @@ pub use error_body::ErrorCode;
 pub use head::CLUSTER_ID_MAX_BYTES;
 pub use head::ClusterId;
 pub use head::Inherited;
-pub use head::PROTOCOL_VERSION;
+pub use head::PROTOCOL_LINE;
+pub use head::ReleaseLine;
 pub use head::ServerIdentity;
 pub use head::StreamHead;
 pub use immutable::ChunkMark;

@@ -62,6 +62,7 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
+use ursula_headers::ReleaseLine;
 use ursula_headers::SnapshotRead;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
@@ -174,6 +175,10 @@ pub(crate) enum Unavailable {
     PaymentRequired,
     Forbidden,
     WrongCluster,
+    NoServerIdentity,
+    ProtocolMismatch {
+        found: u32,
+    },
     Redirected {
         location: Option<String>,
     },
@@ -192,6 +197,8 @@ impl Unavailable {
             Self::PaymentRequired => "payment_required",
             Self::Forbidden => "forbidden",
             Self::WrongCluster => "wrong_cluster",
+            Self::NoServerIdentity => "no_server_identity",
+            Self::ProtocolMismatch { .. } => "protocol_mismatch",
             Self::Retrying
             | Self::Redirected { .. }
             | Self::Rejected { .. }
@@ -207,6 +214,8 @@ impl Unavailable {
             BlockedReason::Forbidden => Self::Forbidden,
             BlockedReason::Redirected { location } => Self::Redirected { location },
             BlockedReason::WrongCluster => Self::WrongCluster,
+            BlockedReason::NoServerIdentity => Self::NoServerIdentity,
+            BlockedReason::ProtocolMismatch { found } => Self::ProtocolMismatch { found },
             BlockedReason::Rejected { status } => Self::Rejected { status },
         }
     }
@@ -288,8 +297,18 @@ pub(crate) enum OpenError {
     Panicked,
     #[error("stream_format: {0:?}")]
     StreamFormat(StreamFormat),
-    #[error("server_too_old: protocol {protocol:?}, this extension needs 2")]
-    ServerTooOld { protocol: Option<u32> },
+    #[error(
+        "no_server_identity: the stream's HEAD answer carries no Ursula-Protocol and \
+         Ursula-Cluster-Id: a server before 0.8, or a layer that answers HEAD itself"
+    )]
+    NoServerIdentity,
+    #[error(
+        "protocol_mismatch: the server runs release {}, this extension is {}: use the extension \
+         of the server's release",
+        ReleaseLine(*.found),
+        ReleaseLine(ursula_headers::PROTOCOL_LINE)
+    )]
+    ProtocolMismatch { found: u32 },
     #[error(
         "wrong_cluster: the generation is of cluster {local:?}, the stream answers as {stream}"
     )]
@@ -802,7 +821,7 @@ impl Build {
                     && let Err(refused) =
                         table::check_identity(identity.as_ref(), Some(&self.header.cluster_id))
                 {
-                    return BuildStep::Fail(refused.into());
+                    return BuildStep::Fail(table::Refused::from(refused).into());
                 }
                 let head = match &answer.typed {
                     Ok(Typed::Head {

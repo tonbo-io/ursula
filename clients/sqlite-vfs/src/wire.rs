@@ -426,7 +426,7 @@ pub(crate) enum Typed {
     Routing(RoutingAnswer),
     /// A `HEAD`: the server's identity on every answer (extensions: Server Metadata), and the
     /// stream's metadata on a `200`.
-    /// A server that sends no identity speaks protocol 1, whose metadata is not read.
+    /// A server that sends no identity (before 0.8) is refused, its metadata not read.
     Head {
         identity: Option<ServerIdentity>,
         stream: Option<StreamHead>,

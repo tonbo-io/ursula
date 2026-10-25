@@ -457,7 +457,7 @@ fn head_carries_the_identity_on_200_and_on_404() {
     else {
         panic!("{typed:?}");
     };
-    assert_eq!(identity.protocol, 2);
+    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_LINE);
     assert_eq!(identity.cluster_id.as_str(), "model-a");
 
     let token = world.create();
