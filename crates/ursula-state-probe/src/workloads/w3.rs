@@ -94,7 +94,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
         0
     });
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     let mut staged_at: HashMap<String, u64> = HashMap::new();
     let mut max_staged = 0_u64;
     let mut offloads = 0_u64;

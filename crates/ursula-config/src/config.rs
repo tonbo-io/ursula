@@ -306,6 +306,18 @@ impl RaftConfig {
             .clamp(Self::SWEEP_MIN_INTERVAL, Self::SWEEP_MAX_INTERVAL)
     }
 
+    /// How long an end record stays under `deleted_data_max_age` before
+    /// the group sweep folds it into its bucket's usage
+    /// (bounded-stream-state F20): half of it. The one source of the rule:
+    /// the node's tidy driver passes the bound, and each group's retirement
+    /// clock derives the retention from it, as the sweep derives its
+    /// interval ([`Self::sweep_interval`]).
+    pub fn end_record_retention(deleted_data_max_age: std::time::Duration) -> std::time::Duration {
+        deleted_data_max_age
+            .checked_div(2)
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+
     /// The group count the node runs: `group_count`, or, unset,
     /// `core_count * 16` of this host within
     /// [`ursula_proto::placement::MAX_GROUP_COUNT`], so a large host's
@@ -377,14 +389,10 @@ impl UrsulaConfig {
         )
     }
 
-    /// How long an end record stays before the group sweep folds it into
-    /// its bucket's usage (bounded-stream-state F20): half of
-    /// [`Self::effective_deleted_data_max_age`]. The one source of it: the
-    /// node's tidy driver passes it to every group's sweep.
+    /// [`RaftConfig::end_record_retention`] of
+    /// [`Self::effective_deleted_data_max_age`].
     pub fn end_record_retention(&self) -> Duration {
-        self.effective_deleted_data_max_age()
-            .checked_div(2)
-            .unwrap_or(Duration::ZERO)
+        RaftConfig::end_record_retention(self.effective_deleted_data_max_age())
     }
 }
 

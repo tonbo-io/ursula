@@ -37,7 +37,7 @@ fn build(
     starved_bytes: usize,
 ) -> Result<StreamStateMachine> {
     let mut rng = payload::Rng::new(31);
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     for i in 0..streams {
         let id = smx::sid("bkt1", &format!("h{i:06}"), &format!("log{i:06}"));

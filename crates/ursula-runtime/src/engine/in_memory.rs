@@ -152,9 +152,13 @@ pub struct InMemoryGroupEngine {
     /// install (#581 section 4.7).
     pub(crate) history: super::HistoryPublisher,
     /// When this replica's end records are due (F20): node-local, sampled
-    /// on every tidy pass, on every replica, and reset by a snapshot
+    /// on every tidy pass, on every replica, and seeded again by a snapshot
     /// install.
     pub(crate) retirement: crate::expiry_sweep::RetirementClock,
+    /// Where this replica counts the end records the entries it applies
+    /// fold (F20). Both engines apply through this one, so a node counts
+    /// the folds of every replica it hosts.
+    pub(crate) metrics: Option<GroupEngineMetrics>,
 }
 
 impl InMemoryGroupEngine {
@@ -162,6 +166,11 @@ impl InMemoryGroupEngine {
         let mut engine = Self::default();
         engine.set_cold_store(Some(cold_store));
         engine
+    }
+
+    /// Counts the folds of the entries this engine applies in `metrics`.
+    pub fn set_metrics(&mut self, metrics: Option<GroupEngineMetrics>) {
+        self.metrics = metrics;
     }
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
@@ -279,9 +288,21 @@ impl InMemoryGroupEngine {
             command,
             StreamCommand::NewHistory { .. } | StreamCommand::ImportSnapshot { .. }
         );
+        let removed_before = self.state_machine.removed_state();
         let response = self.apply_unpublished(command, index, placement, check);
         if history_event {
             self.history.publish(self.state_machine.history());
+        }
+        if let Some(metrics) = &self.metrics {
+            let removed = self.state_machine.removed_state().since(removed_before);
+            if removed.end_records > 0 {
+                metrics.record_end_records_folded(
+                    removed
+                        .end_records
+                        .saturating_sub(removed.end_records_early),
+                    removed.end_records_early,
+                );
+            }
         }
         response
     }
@@ -875,26 +896,30 @@ impl InMemoryGroupEngine {
 
     /// Samples the group's usage seq on this replica's retirement clock at
     /// `now`, and returns the usage seq through which its end records are
-    /// due, which the leader's sweep folds through (F20,
-    /// [`crate::expiry_sweep::RetirementClock`]). Every replica samples, so
-    /// a new leader retires on time. `now_ms`, the pass's wall clock less
-    /// `retain`, dates the seed after a start, an install or a history
-    /// change.
+    /// due under `deleted_data_max_age`, which the leader's sweep folds
+    /// through (F20, [`crate::expiry_sweep::RetirementClock`]). Every
+    /// replica samples, so a new leader retires on time. `now_ms` is the
+    /// pass's wall clock: it dates the end records this replica held at its
+    /// start, installed or held at a history change, which are due once
+    /// they ended at least the retention before it.
     pub fn sample_retirement(
         &mut self,
         now: crate::rt::time::Instant,
         now_ms: u64,
-        retain: std::time::Duration,
+        deleted_data_max_age: std::time::Duration,
     ) -> u64 {
         let sample = crate::expiry_sweep::RetirementSample {
             history: self.state_machine.history_id(),
             usage_seq: self.state_machine.usage_seq(),
         };
         let state_machine = &self.state_machine;
-        self.retirement.sample(now, sample, retain, || {
-            let retain_ms = u64::try_from(retain.as_millis()).unwrap_or(u64::MAX);
-            state_machine.end_records_ended_by(now_ms.saturating_sub(retain_ms))
-        })
+        self.retirement.sample(
+            now,
+            now_ms,
+            sample,
+            deleted_data_max_age,
+            |at_ms, through| state_machine.end_records_ended_by(at_ms, through),
+        )
     }
 
     pub fn head_stream_after_access(
@@ -1428,9 +1453,10 @@ impl InMemoryGroupEngine {
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
-        // The installed state is another lineage's as far as the clock
-        // knows: it seeds again from the end records' times.
-        self.retirement = crate::expiry_sweep::RetirementClock::default();
+        // The install brings end records this replica never sampled: the
+        // clock dates them by their removal times. A history change it
+        // brings seeds the clock again at its next sample.
+        self.retirement.installed();
         // The installed state may follow page rewrites (clips, compaction)
         // this replica never applied; cached pages could predate them.
         if let Some(cache) = self.cold_index_cache.as_ref() {
@@ -1637,7 +1663,7 @@ impl GroupEngine for InMemoryGroupEngine {
             let retire_through = self.sample_retirement(
                 crate::rt::time::Instant::now(),
                 request.now_ms,
-                request.end_record_retain,
+                request.deleted_data_max_age,
             );
             if request.max_expiry_sweeps > 0 && crate::expiry_sweep::enabled() {
                 let now_ms = crate::expiry_sweep::sweep_now_ms(request.now_ms);
@@ -2210,11 +2236,12 @@ impl GroupEngineFactory for InMemoryGroupEngineFactory {
     fn create<'a>(
         &'a self,
         placement: ShardPlacement,
-        _metrics: GroupEngineMetrics,
+        metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             let mut engine = InMemoryGroupEngine::default();
             engine.set_cold_store(self.cold_store.clone());
+            engine.set_metrics(Some(metrics));
             engine.start_genesis(placement, 0);
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)

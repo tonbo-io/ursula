@@ -42,7 +42,7 @@ fn limit(limit: u32) -> NonZeroU32 {
 }
 
 fn machine() -> StreamStateMachine {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     for bucket in BUCKETS {
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: bucket.to_owned(),
@@ -497,7 +497,7 @@ proptest! {
     /// entry per `limit` due streams and one more. With the front not due,
     /// no stream has expired.
     #[test]
-    fn expire_streams_removes_the_earliest_due_streams(
+    fn sweep_removes_the_earliest_due_streams(
         ops in vec(op_strategy(), 1..=80),
     ) {
         let mut machine = machine();
@@ -543,7 +543,7 @@ proptest! {
     /// from its snapshot gives the same answer and the same snapshot: a
     /// replica that restored and one that replayed agree.
     #[test]
-    fn expire_streams_agrees_across_restore(
+    fn sweep_agrees_across_restore(
         ops in vec(op_strategy(), 1..=60),
         max in 1_u32..=8,
     ) {
@@ -744,7 +744,7 @@ fn a_stale_due_front_removes_nothing_and_clears() {
 
 /// `Sweep` never renews a live stream's sliding TTL.
 #[test]
-fn expire_streams_never_renews_a_ttl() {
+fn sweep_never_renews_a_ttl() {
     let mut machine = machine();
     let named = stream(0, 0);
     machine.apply(create(named.clone(), Some(10), None, 1_000));

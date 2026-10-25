@@ -249,8 +249,33 @@ struct StreamSlot {
 }
 
 impl StreamStateMachine {
+    /// A group before its genesis: it applies nothing but the genesis
+    /// history event, and creates no stream before it.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A group whose genesis history event `history` applied as its first
+    /// entry, the state both engines start a group in (#581 section 4.3).
+    /// For callers that drive the machine without an engine: tests,
+    /// benchmarks and the state probe.
+    pub fn with_genesis(history: std::num::NonZeroU64) -> Self {
+        let mut machine = Self::new();
+        let started = machine.apply_entry(1, StreamCommand::NewHistory {
+            history,
+            now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: crate::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
+        });
+        debug_assert!(
+            matches!(started, StreamResponse::HistoryStarted { .. }),
+            "a genesis event always applies: {started:?}"
+        );
+        machine
     }
 
     /// What this state machine removed since it was built or restored
@@ -862,8 +887,6 @@ mod derived_boundaries_tests;
 #[cfg(test)]
 mod derived_cold_tests;
 #[cfg(test)]
-mod expire_streams_tests;
-#[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]
 mod history_tests;
@@ -871,6 +894,8 @@ mod history_tests;
 mod hygiene_tests;
 #[cfg(test)]
 mod producer_record_tests;
+#[cfg(test)]
+mod sweep_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

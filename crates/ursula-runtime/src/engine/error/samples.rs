@@ -668,6 +668,9 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
         StreamSnapshotError::DuplicateBucketUsage(_) => {
             StreamSnapshotError::DuplicateBucketUsage("bucket".to_owned())
         },
+        StreamSnapshotError::StreamWithoutHistory(_) => {
+            StreamSnapshotError::StreamWithoutHistory(stream())
+        },
         StreamSnapshotError::Usage(_) => StreamSnapshotError::Usage(usage_errors().swap_remove(0)),
     });
     let key = || "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap".to_owned();

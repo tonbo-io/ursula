@@ -928,11 +928,7 @@ impl Background {
                             max_streams: 0,
                             max_expiry_sweeps: expiry_sweep::MAX_COMMANDS_PER_GROUP,
                             expiry_sweep_budget: expiry_sweep::GROUP_BUDGET,
-                            // Half the bound, as `UrsulaConfig::end_record_retention`.
-                            end_record_retain: BOUND_DRIVERS
-                                .max_age
-                                .checked_div(2)
-                                .expect("non-zero divisor"),
+                            deleted_data_max_age: BOUND_DRIVERS.max_age,
                             now_ms,
                         },
                         group_placement(GROUP),

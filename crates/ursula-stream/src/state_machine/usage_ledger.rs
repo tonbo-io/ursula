@@ -36,11 +36,48 @@ use crate::usage::UsageSnapshotError;
 use crate::usage::VersionCounters;
 use crate::usage::VersionUsage;
 
-/// The history a version counts in when it is created or restored before
-/// its group's genesis. Only a state machine driven without an engine
-/// (tests, benchmarks, the state probe) applies a create then: both engines
-/// apply nothing but the genesis before it.
-const BEFORE_GENESIS: NonZeroU64 = NonZeroU64::MIN;
+/// The most end records a group holds: [`MAX_END_RECORDS`], or in a
+/// unit test the cap [`test_cap::with`] set, so a generated run reaches it
+/// with a few removals.
+fn end_record_cap() -> usize {
+    #[cfg(test)]
+    {
+        test_cap::get()
+    }
+    #[cfg(not(test))]
+    {
+        MAX_END_RECORDS
+    }
+}
+
+/// A smaller end-record cap for one unit test's thread.
+#[cfg(test)]
+pub(super) mod test_cap {
+    use std::cell::Cell;
+
+    use super::MAX_END_RECORDS;
+
+    thread_local! {
+        static CAP: Cell<usize> = const { Cell::new(MAX_END_RECORDS) };
+    }
+
+    pub(super) fn get() -> usize {
+        CAP.with(Cell::get)
+    }
+
+    /// Runs `run` with the group cap at `cap` on this thread.
+    pub(in crate::state_machine) fn with<R>(cap: usize, run: impl FnOnce() -> R) -> R {
+        /// Restores the cap however `run` ends.
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CAP.with(|current| current.set(self.0));
+            }
+        }
+        let _restore = Restore(CAP.with(|current| current.replace(cap)));
+        run()
+    }
+}
 
 /// What an end record adds to a group snapshot beside its stream id: its
 /// seq, times, histories, end and counters, rounded up.
@@ -200,23 +237,18 @@ impl UsageLedger {
 }
 
 impl StreamStateMachine {
-    /// The history new counters begin in: the group's current one.
-    pub(super) fn counting_history(&self) -> NonZeroU64 {
-        NonZeroU64::new(self.history_id()).unwrap_or(BEFORE_GENESIS)
-    }
-
-    /// The usage of a version a create makes, with `bytes` initial payload
-    /// bytes and `records` records: one counted write at `now_ms`, counted
-    /// since the group's history, stamped with the next seq. Its bucket gets
-    /// its retired row (F15).
+    /// The usage of a version a create makes in the group's history
+    /// `counted_since`, with `bytes` initial payload bytes and `records`
+    /// records: one counted write at `now_ms`, stamped with the next seq.
+    /// Its bucket gets its retired row (F15).
     pub(super) fn usage_on_create(
         &mut self,
+        counted_since: NonZeroU64,
         bucket_id: &str,
         bytes: u64,
         records: u64,
         now_ms: u64,
     ) -> VersionUsage {
-        let counted_since = self.counting_history();
         self.usage.insert_bucket(bucket_id);
         VersionUsage {
             seq: self.usage.stamp(),
@@ -271,13 +303,18 @@ impl StreamStateMachine {
     /// the next seq. A group that holds [`MAX_END_RECORDS`] first folds its
     /// lowest-seq end record, early.
     pub(super) fn usage_on_end(&mut self, slot: &StreamSlot, end: StreamEnd, now_ms: u64) {
-        if self.usage.ends.len() >= MAX_END_RECORDS
+        if self.usage.ends.len() >= end_record_cap()
             && let Some(folded) = self.usage.fold_first_end_record()
         {
             self.record_folded(&folded);
             self.removed.end_records_early = self.removed.end_records_early.saturating_add(1);
         }
-        let ended_in = self.counting_history();
+        // A version lives only after its group's genesis: a create before it
+        // is refused, and a restore refuses a stream without a history. The
+        // version's own history stands in for one the group cannot lack.
+        let ended_in = self
+            .history
+            .map_or(slot.usage.counted_since, |history| history.id);
         let history_baseline = slot.history_baseline_in(self.history_id());
         let seq = self.usage.stamp();
         self.usage.ends.insert(seq, EndRecord {
@@ -319,17 +356,20 @@ impl StreamStateMachine {
             .is_some_and(|(seq, _)| *seq <= retire_through)
     }
 
-    /// The highest seq through which every end record of the group ended
-    /// at or before `at_ms`, by its `ended_at_ms`: the seq of the last one
-    /// of the run from the lowest seq that did, or `retired_through` when
-    /// the lowest did not. It seeds a replica's retirement clock after a
-    /// start, an install or a history change, so an end record keeps its
-    /// age across them when the nodes' clocks agree. A scan from the lowest
-    /// seq that stops at the first end record dated after `at_ms`.
-    pub fn end_records_ended_by(&self, at_ms: u64) -> u64 {
+    /// The highest seq at or below `through` through which every end
+    /// record of the group ended at or before `at_ms`, by its
+    /// `ended_at_ms`: the seq of the last one of the run from the lowest
+    /// seq that did, or `retired_through` when the lowest did not. A
+    /// replica's retirement clock dates by it the end records it held at
+    /// its start, installed, or held at a history change, so an end record
+    /// keeps its age across them when the nodes' clocks agree. A scan from
+    /// the lowest seq that stops at `through` or at the first end record
+    /// dated after `at_ms`.
+    pub fn end_records_ended_by(&self, at_ms: u64, through: u64) -> u64 {
         self.usage
             .ends
-            .values()
+            .range(..=through)
+            .map(|(_, record)| record)
             .take_while(|record| record.ended_at_ms <= at_ms)
             .last()
             .map_or(self.usage.retired_through, |record| record.seq)

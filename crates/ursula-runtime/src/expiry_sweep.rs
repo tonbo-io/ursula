@@ -25,7 +25,9 @@
 //! deadline is not beaten by the sweep. `retire_through` comes from the
 //! group's [`RetirementClock`] on the leader: the usage seq it saw at least
 //! the end-record retention ago, by its monotonic clock, so no proposer's
-//! wall clock decides a fold. Per group and pass it proposes at most
+//! wall clock decides the fold of an end record the leader saw removed.
+//! Only the end records a replica held at its start or brought in with a
+//! snapshot install are dated by its wall clock. Per group and pass it proposes at most
 //! [`MAX_COMMANDS_PER_GROUP`] entries and, on an engine with a log, starts
 //! none after [`GROUP_BUDGET`]. It stops once the group is no longer due,
 //! which an entry that removed and folded fewer than its limit guarantees.
@@ -151,18 +153,21 @@ pub fn interrupted(group: RaftGroupId, err: &GroupEngineError, report: &mut Tidy
 /// retention old. Never replicated: the clock picks the watermark, and
 /// apply folds what the entry names.
 ///
-/// The clock seeds at its first sample, after its replica's state was
-/// restored (the engine's start, which builds a new clock, and a snapshot
-/// install, which resets it), and after a history change: seqs of an
-/// earlier lineage say nothing about the new one. The seed is
-/// [`ursula_stream::StreamStateMachine::end_records_ended_by`] of the
-/// pass's wall clock less the retention, so a restart or an install keeps
-/// each end record's age when the nodes' clocks agree. An end record dated
-/// ahead holds only the seed: the samples after it fold it within the
-/// retention.
+/// The clock seeds at its first sample after it was built (the engine's
+/// start) and after a history change, since seqs of an earlier lineage say
+/// nothing about the new one. A snapshot install of the same history keeps
+/// the samples and seeds again the end records it brought. The end records
+/// a replica held or installed before it sampled them, those at or below
+/// the seed's usage seq, are dated by the wall clock: every pass folds
+/// through those that ended at least the retention before the pass's wall
+/// clock ([`ursula_stream::StreamStateMachine::end_records_ended_by`]),
+/// until the seed's own sample is the retention old. So a restart or an
+/// install keeps each end record's age when the nodes' clocks agree. An end
+/// record dated ahead holds the ones after it only until that sample is
+/// due. End records removed after the seed are dated by the samples alone.
 #[derive(Debug, Clone, Default)]
 pub struct RetirementClock {
-    /// `None` until the first sample after the clock was built or reset.
+    /// `None` until the first sample after the clock was built.
     samples: Option<RetirementSamples>,
 }
 
@@ -171,8 +176,15 @@ pub struct RetirementClock {
 struct RetirementSamples {
     /// The history the samples belong to.
     history: u64,
-    /// End records at or below it are due already: the seed, or a sample
-    /// past the retention that was dropped.
+    /// The group's usage seq at the latest seed. The wall clock dates the
+    /// end records at or below it while `due_through` is below it.
+    seeded_through: u64,
+    /// The replica installed a snapshot since the last sample: the next
+    /// sample seeds again at its usage seq.
+    installed: bool,
+    /// End records at or below it are due already: those the wall clock
+    /// dated past the retention, or a sample past the retention that was
+    /// dropped.
     due_through: u64,
     /// `(when, usage_seq)`, oldest first, one per distinct `usage_seq`,
     /// trimmed to the newest sample at least the retention old and the ones
@@ -192,28 +204,53 @@ pub struct RetirementSample {
 }
 
 impl RetirementClock {
-    /// Records `sample` at `now`, `seed` giving the seed when the clock
-    /// seeds, and returns the usage seq through which end records are due:
-    /// the larger of the seed or a dropped sample and the seq of the newest
-    /// sample at least `retain` old. 0, which no seq is, when none is.
+    /// The replica installed a snapshot: its next sample seeds the end
+    /// records the install brought, which this replica never sampled. A
+    /// clock not yet seeded seeds at its first sample anyway.
+    pub fn installed(&mut self) {
+        if let Some(samples) = &mut self.samples {
+            samples.installed = true;
+        }
+    }
+
+    /// Records `sample` at `now`, the pass's monotonic clock, and returns
+    /// the usage seq through which end records are due under
+    /// `deleted_data_max_age`, whose [`RaftConfig::end_record_retention`]
+    /// they wait: the largest of what the wall clock dated, a dropped
+    /// sample and the seq of the newest sample at least the retention old.
+    /// 0, which no seq is, when none is. `wall_ms` is the pass's wall clock,
+    /// and `ended_by(at_ms, through)` the end records at or below `through`
+    /// that ended by `at_ms`
+    /// ([`ursula_stream::StreamStateMachine::end_records_ended_by`]), read
+    /// only while the seeded end records are not all due.
     pub fn sample(
         &mut self,
         now: Instant,
+        wall_ms: u64,
         sample: RetirementSample,
-        retain: Duration,
-        seed: impl FnOnce() -> u64,
+        deleted_data_max_age: Duration,
+        ended_by: impl FnOnce(u64, u64) -> u64,
     ) -> u64 {
+        let retain = RaftConfig::end_record_retention(deleted_data_max_age);
+        let spacing = interval(deleted_data_max_age)
+            .checked_div(2)
+            .unwrap_or(Duration::ZERO);
         let samples = match &mut self.samples {
-            Some(samples) if samples.history == sample.history => samples,
+            Some(samples) if samples.history == sample.history => {
+                if samples.installed {
+                    samples.installed = false;
+                    samples.seeded_through = samples.seeded_through.max(sample.usage_seq);
+                }
+                samples
+            }
             stale => stale.insert(RetirementSamples {
                 history: sample.history,
-                due_through: seed(),
+                seeded_through: sample.usage_seq,
+                installed: false,
+                due_through: 0,
                 samples: VecDeque::new(),
             }),
         };
-        let spacing = interval(retain.saturating_mul(2))
-            .checked_div(2)
-            .unwrap_or(Duration::ZERO);
         let record = samples.samples.back().is_none_or(|&(when, usage_seq)| {
             usage_seq != sample.usage_seq && now.saturating_duration_since(when) >= spacing
         });
@@ -231,12 +268,19 @@ impl RetirementClock {
                 samples.due_through = samples.due_through.max(usage_seq);
             }
         }
-        let aged = samples
-            .samples
-            .front()
-            .filter(|&&(when, _)| now.saturating_duration_since(when) >= retain)
-            .map_or(0, |&(_, usage_seq)| usage_seq);
-        samples.due_through.max(aged)
+        if let Some(&(when, usage_seq)) = samples.samples.front()
+            && now.saturating_duration_since(when) >= retain
+        {
+            samples.due_through = samples.due_through.max(usage_seq);
+        }
+        // Until the seed's sample is the retention old, the wall clock dates
+        // the end records the seed held.
+        if samples.due_through < samples.seeded_through {
+            let retain_ms = u64::try_from(retain.as_millis()).unwrap_or(u64::MAX);
+            let dated = ended_by(wall_ms.saturating_sub(retain_ms), samples.seeded_through);
+            samples.due_through = samples.due_through.max(dated.min(samples.seeded_through));
+        }
+        samples.due_through
     }
 }
 
@@ -327,9 +371,15 @@ mod tests {
         ));
     }
 
-    const RETAIN: Duration = Duration::from_secs(1_800);
-    /// The sweep interval of the bound `RETAIN` is half of.
+    /// The default bound, whose retention is 30 minutes and whose sweep
+    /// runs every minute.
+    const BOUND: Duration = Duration::from_secs(3_600);
+    /// The sweep interval of `BOUND`.
     const PASS: Duration = Duration::from_secs(60);
+    /// The wall clock of the first pass of each test, in ms.
+    const WALL: u64 = 1_000_000_000;
+    /// `BOUND`'s retention in ms.
+    const RETAIN_MS: u64 = 1_800_000;
 
     fn at(history: u64, usage_seq: u64) -> RetirementSample {
         RetirementSample { history, usage_seq }
@@ -342,8 +392,28 @@ mod tests {
             .expect("within the clock")
     }
 
-    fn unseeded() -> u64 {
-        panic!("the clock seeds only at its first sample or a history change")
+    /// `WALL` plus `secs` seconds.
+    fn wall_after(secs: u64) -> u64 {
+        WALL.saturating_add(secs.saturating_mul(1_000))
+    }
+
+    /// The end records a group holds, as `(seq, ended_at_ms)` in seq order:
+    /// what [`ursula_stream::StreamStateMachine::end_records_ended_by`]
+    /// answers over them, with nothing folded.
+    fn ended_by(records: &[(u64, u64)]) -> impl Fn(u64, u64) -> u64 + '_ {
+        move |at_ms, through| {
+            records
+                .iter()
+                .take_while(|&&(seq, ended_at_ms)| seq <= through && ended_at_ms <= at_ms)
+                .last()
+                .map_or(0, |&(seq, _)| seq)
+        }
+    }
+
+    /// The clock dates nothing by the wall clock: every end record it is
+    /// asked about was removed after its seed.
+    fn undated(_at_ms: u64, _through: u64) -> u64 {
+        panic!("the wall clock dates only the end records held at the seed")
     }
 
     fn held(clock: &RetirementClock) -> usize {
@@ -359,21 +429,160 @@ mod tests {
     fn a_sample_is_due_once_it_is_the_retention_old() {
         let start = Instant::now();
         let mut clock = RetirementClock::default();
-        assert_eq!(clock.sample(start, at(7, 10), RETAIN, || 4), 4);
+        // Seqs 1 to 4 ended long before, and the held end records above
+        // them later than the retention before the pass.
+        let records = [(4, 0), (9, wall_after(0))];
+        assert_eq!(
+            clock.sample(start, WALL, at(7, 10), BOUND, ended_by(&records)),
+            4
+        );
         // A pass a minute, three new seqs each, up to a minute short of the
-        // retention: only the seed is due.
+        // retention: only what the wall clock dated is due, until the
+        // record at 9 is the retention old by it.
         for pass in 1_u64..30 {
             let now = after(start, pass.saturating_mul(PASS.as_secs()));
             let seq = pass.saturating_mul(3).saturating_add(10);
-            assert_eq!(clock.sample(now, at(7, seq), RETAIN, unseeded), 4, "{pass}");
+            assert_eq!(
+                clock.sample(
+                    now,
+                    wall_after(pass.saturating_mul(60)),
+                    at(7, seq),
+                    BOUND,
+                    ended_by(&[(4, 0)])
+                ),
+                4,
+                "{pass}"
+            );
         }
         assert_eq!(
-            clock.sample(after(start, 1_800), at(7, 100), RETAIN, unseeded),
+            clock.sample(
+                after(start, 1_800),
+                wall_after(1_800),
+                at(7, 100),
+                BOUND,
+                undated
+            ),
             10
         );
         assert_eq!(
-            clock.sample(after(start, 1_860), at(7, 101), RETAIN, unseeded),
+            clock.sample(
+                after(start, 1_860),
+                wall_after(1_860),
+                at(7, 101),
+                BOUND,
+                undated
+            ),
             13
+        );
+    }
+
+    /// An end record the replica held when its clock seeded keeps its age:
+    /// one removed 29 minutes before the reset is due about a minute after
+    /// it, by the wall clock, not a whole retention later.
+    #[test]
+    fn an_end_record_held_at_the_seed_keeps_its_age() {
+        let start = Instant::now();
+        let mut clock = RetirementClock::default();
+        let removed_at = WALL.saturating_sub(1_740_000);
+        let records = [(9, removed_at)];
+        assert_eq!(
+            clock.sample(start, WALL, at(1, 9), BOUND, ended_by(&records)),
+            0
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 30),
+                wall_after(30),
+                at(1, 9),
+                BOUND,
+                ended_by(&records)
+            ),
+            0
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 60),
+                wall_after(60),
+                at(1, 9),
+                BOUND,
+                ended_by(&records)
+            ),
+            9
+        );
+        // Half a retention before the reset: due half a retention after it.
+        let mut clock = RetirementClock::default();
+        let records = [(3, WALL.saturating_sub(900_000))];
+        assert_eq!(
+            clock.sample(start, WALL, at(1, 3), BOUND, ended_by(&records)),
+            0
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 899),
+                wall_after(899),
+                at(1, 3),
+                BOUND,
+                ended_by(&records)
+            ),
+            0
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 900),
+                wall_after(900),
+                at(1, 3),
+                BOUND,
+                ended_by(&records)
+            ),
+            3
+        );
+    }
+
+    /// The wall clock dates only the end records held at the seed: one
+    /// removed after it waits for the samples, whatever the wall clock says.
+    /// An end record dated ahead holds the ones after it until the seed's
+    /// sample is the retention old.
+    #[test]
+    fn the_wall_clock_dates_only_what_the_seed_held() {
+        let start = Instant::now();
+        let mut clock = RetirementClock::default();
+        // 5 was removed on a node whose clock was a day ahead.
+        let records = [(5, wall_after(86_400)), (6, 0), (12, 0)];
+        assert_eq!(
+            clock.sample(start, WALL, at(1, 6), BOUND, ended_by(&records)),
+            0
+        );
+        // 12 ended after the seed: the scan never reaches it.
+        assert_eq!(
+            clock.sample(
+                after(start, 60),
+                wall_after(7_200),
+                at(1, 12),
+                BOUND,
+                ended_by(&records)
+            ),
+            0
+        );
+        // The seed's sample is the retention old: 5 and 6 are due, 12 is not.
+        assert_eq!(
+            clock.sample(
+                after(start, 1_800),
+                wall_after(9_000),
+                at(1, 12),
+                BOUND,
+                undated
+            ),
+            6
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 1_860),
+                wall_after(9_060),
+                at(1, 12),
+                BOUND,
+                undated
+            ),
+            12
         );
     }
 
@@ -384,19 +593,20 @@ mod tests {
     fn samples_keep_the_oldest_instant_of_a_seq_and_are_bounded() {
         let start = Instant::now();
         let mut clock = RetirementClock::default();
-        clock.sample(start, at(1, 5), RETAIN, || 0);
+        clock.sample(start, WALL, at(1, 5), BOUND, ended_by(&[]));
         // The same seq for the whole retention: its first instant counts.
         assert_eq!(
-            clock.sample(after(start, 1_800), at(1, 5), RETAIN, unseeded),
+            clock.sample(after(start, 1_800), WALL, at(1, 5), BOUND, ended_by(&[])),
             5
         );
         // A pass a second: only one sample per half interval is kept.
         for seq in 6_u64..=600 {
             clock.sample(
                 after(start, seq.saturating_add(1_800)),
+                WALL,
                 at(1, seq),
-                RETAIN,
-                unseeded,
+                BOUND,
+                undated,
             );
         }
         // Twice the retention over the interval, plus two.
@@ -410,11 +620,11 @@ mod tests {
     fn a_dropped_sample_keeps_its_seq_due() {
         let start = Instant::now();
         let mut clock = RetirementClock::default();
-        clock.sample(start, at(1, 3), RETAIN, || 0);
-        clock.sample(after(start, 60), at(1, 8), RETAIN, unseeded);
+        clock.sample(start, WALL, at(1, 3), BOUND, ended_by(&[]));
+        clock.sample(after(start, 60), WALL, at(1, 8), BOUND, ended_by(&[]));
         // Both samples are past the retention: only the newer one stays.
         assert_eq!(
-            clock.sample(after(start, 1_920), at(1, 9), RETAIN, unseeded),
+            clock.sample(after(start, 1_920), WALL, at(1, 9), BOUND, undated),
             8
         );
         assert_eq!(held(&clock), 2);
@@ -426,29 +636,111 @@ mod tests {
     fn a_history_change_seeds_the_clock_again() {
         let start = Instant::now();
         let mut clock = RetirementClock::default();
-        clock.sample(start, at(1, 50), RETAIN, || 0);
+        clock.sample(start, WALL, at(1, 50), BOUND, ended_by(&[]));
         assert_eq!(
-            clock.sample(after(start, 1_800), at(1, 60), RETAIN, unseeded),
+            clock.sample(after(start, 1_800), WALL, at(1, 60), BOUND, undated),
             50
         );
-        // The new history's seed, never the old samples.
+        // The new history's wall-clock dating, never the old samples.
+        let records = [(12, 0), (30, wall_after(1_860))];
         assert_eq!(
-            clock.sample(after(start, 1_860), at(2, 40), RETAIN, || 12),
+            clock.sample(
+                after(start, 1_860),
+                wall_after(1_860),
+                at(2, 40),
+                BOUND,
+                ended_by(&records)
+            ),
             12
         );
         assert_eq!(
-            clock.sample(after(start, 1_920), at(2, 45), RETAIN, unseeded),
+            clock.sample(
+                after(start, 1_920),
+                wall_after(1_920),
+                at(2, 45),
+                BOUND,
+                ended_by(&records)
+            ),
             12
         );
     }
 
-    /// A reset clock, as an install leaves it, seeds at its next sample.
+    /// An install of the same history keeps the samples, and its next
+    /// sample dates the end records it brought by the wall clock. A clock
+    /// built anew, as at a start, seeds at its first sample.
     #[test]
-    fn a_reset_clock_seeds_at_its_next_sample() {
+    fn an_install_keeps_the_samples_and_dates_what_it_brought() {
         let start = Instant::now();
         let mut clock = RetirementClock::default();
-        clock.sample(start, at(1, 50), RETAIN, || 0);
-        clock = RetirementClock::default();
-        assert_eq!(clock.sample(after(start, 60), at(1, 70), RETAIN, || 30), 30);
+        clock.sample(start, WALL, at(1, 50), BOUND, ended_by(&[]));
+        clock.sample(
+            after(start, 600),
+            wall_after(600),
+            at(1, 55),
+            BOUND,
+            ended_by(&[]),
+        );
+        clock.installed();
+        // The install brought seqs up to 90: 70 ended a retention before
+        // the pass, 80 later.
+        let records = [
+            (70, wall_after(700).saturating_sub(RETAIN_MS)),
+            (80, wall_after(700)),
+        ];
+        assert_eq!(
+            clock.sample(
+                after(start, 700),
+                wall_after(700),
+                at(1, 90),
+                BOUND,
+                ended_by(&records)
+            ),
+            70
+        );
+        // The sample from before the install still counts at its own age.
+        assert_eq!(
+            clock.sample(
+                after(start, 1_800),
+                wall_after(1_800),
+                at(1, 90),
+                BOUND,
+                ended_by(&records[..1])
+            ),
+            70
+        );
+        assert_eq!(
+            clock.sample(
+                after(start, 2_400),
+                wall_after(2_400),
+                at(1, 91),
+                BOUND,
+                ended_by(&records[..1])
+            ),
+            70
+        );
+        // 80 ended at the install's pass: a retention later it is due.
+        assert_eq!(
+            clock.sample(
+                after(start, 2_500),
+                wall_after(2_500),
+                at(1, 91),
+                BOUND,
+                ended_by(&records)
+            ),
+            90
+        );
+
+        let mut clock = RetirementClock::default();
+        clock.installed();
+        assert_eq!(
+            clock.sample(
+                after(start, 60),
+                WALL,
+                at(1, 70),
+                BOUND,
+                ended_by(&[(30, 0)])
+            ),
+            30
+        );
     }
 }

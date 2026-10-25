@@ -854,23 +854,22 @@ impl RuntimeMetricsInner {
     }
 
     /// Records one sweep pass over the node's groups (#669, F20): its
-    /// `Sweep` entries, the expired streams and the end records they
-    /// removed, and the groups it left due.
+    /// `Sweep` entries and the expired streams they removed, and the groups
+    /// it left due.
     pub(crate) fn record_ttl_expiry_sweep(&self, pass: &crate::request::TidyStreamsResponse) {
         self.ttl_expiry_sweeps.fetch_add_relaxed(pass.expiry_sweeps);
         self.ttl_expiry_swept_streams
             .fetch_add_relaxed(pass.expiry_swept_streams);
-        self.usage_end_records_retired
-            .fetch_add_relaxed(pass.end_records_retired);
         self.ttl_expiry_sweep_due_groups
             .store_relaxed(pass.expiry_due_groups);
     }
 
-    /// End records a replica folded early, at a removal that found its
-    /// group holding `MAX_END_RECORDS` (F20).
-    pub(crate) fn record_end_records_folded_early(&self, records: u64) {
-        self.usage_end_records_folded_early
-            .fetch_add_relaxed(records);
+    /// End records one entry a replica applied folded (F20): `swept` by the
+    /// group sweep, `early` at a removal that found its group holding
+    /// `MAX_END_RECORDS`.
+    pub(crate) fn record_end_records_folded(&self, swept: u64, early: u64) {
+        self.usage_end_records_retired.fetch_add_relaxed(swept);
+        self.usage_end_records_folded_early.fetch_add_relaxed(early);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {

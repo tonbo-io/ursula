@@ -1297,20 +1297,33 @@ impl RaftGroupEngine {
     /// on every replica from the applied state, so that a new leader
     /// retires on time: the usage seq through which the group's end records
     /// are due. 0, which folds nothing, when the applied state cannot be
-    /// read: the sweep then reports that error itself.
+    /// read: a leader's sweep then reports that error itself, and a
+    /// follower logs it at debug.
     async fn sample_retirement(&self, request: TidyStreamsRequest) -> u64 {
         let now = crate::rt::time::Instant::now();
-        self.with_applied_state(move |state_machine| {
-            Box::pin(async move {
-                state_machine.engine.sample_retirement(
-                    now,
-                    request.now_ms,
-                    request.end_record_retain,
-                )
+        let sampled = self
+            .with_applied_state(move |state_machine| {
+                Box::pin(async move {
+                    state_machine.engine.sample_retirement(
+                        now,
+                        request.now_ms,
+                        request.deleted_data_max_age,
+                    )
+                })
             })
-        })
-        .await
-        .unwrap_or_default()
+            .await;
+        match sampled {
+            Ok(retire_through) => retire_through,
+            Err(_reported_by_sweep) if self.leads() => 0,
+            Err(error) => {
+                tracing::debug!(
+                    raft_group_id = self.placement.raft_group_id.0,
+                    %error,
+                    "retirement clock: the applied state cannot be read"
+                );
+                0
+            }
+        }
     }
 
     /// The leader's group sweep of one tidy pass (#669, F20,

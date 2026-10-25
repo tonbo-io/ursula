@@ -2,13 +2,19 @@
 //! inline and external appends, producer repeats, closes, publishes,
 //! retentions, deletes, touches, expiry, a bucket purge, sweeps that fold
 //! at a moving watermark, history events, an import and group snapshot
-//! round trips drives one group. An oracle applies the counting rule to
-//! each command and its answer, and after every step the ledger must agree
-//! with it: each bucket's totals, each live version's counters, last write,
-//! `counted_since` and history baseline, and each new end record's final
-//! usage. The ledger invariants L1 to L8 hold, and a round trip through
+//! round trips drives one group. The oracle models the ledger on its own:
+//! the counting rule applied to each command and its answer, its own TTL
+//! clock (a stream expires when the run's clock jumps past its TTL), how
+//! each removal ends a version (`Deleted` unless it had expired, `Expired`,
+//! `Purged` at the purge's `now_ms`), the history each version counts and
+//! ends in, the usage seq each stamp takes, the sweep's fold and the
+//! end-record cap. After every step the whole ledger must equal the
+//! oracle's: each bucket's totals and retired usage, each live version's
+//! usage, every end record, the seq, the fold watermark and the genesis.
+//! The ledger invariants L1 to L8 hold, and a round trip through
 //! `usage_snapshot` and `restore_group` reproduces the ledger whatever the
-//! order of the streams.
+//! order of the streams. A second property runs at a cap of three end
+//! records, so removals fold at the cap.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -25,9 +31,14 @@ use super::ProducerRequest;
 use super::StreamCommand;
 use super::StreamResponse;
 use super::StreamStateMachine;
+use super::compare_stream_ids;
+use super::usage_ledger::test_cap;
 use crate::model::ExternalPayloadRef;
+use crate::usage::BucketRetired;
 use crate::usage::CommittedUsage;
+use crate::usage::EndRecord;
 use crate::usage::LastWrite;
+use crate::usage::StreamEnd;
 use crate::usage::VersionCounters;
 
 const OCTET: &str = "application/octet-stream";
@@ -36,6 +47,17 @@ const BUCKETS: [&str; 2] = ["usage-a", "usage-b"];
 const PURGED: &str = "usage-b";
 const STREAMS: usize = 6;
 const GENESIS: u64 = 0x0007;
+/// The TTL of a stream created with one, in ms.
+const TTL_MS: u64 = 1_000;
+/// How far an `Expire` step moves the clock: past every TTL. Every other
+/// step moves it 1 ms, so a run never reaches a TTL without it.
+const EXPIRE_JUMP_MS: u64 = 5_000;
+/// The streams a `Sweep` removes at most, and the end records it folds.
+const SWEEP_LIMIT: u32 = 4;
+/// [`SWEEP_LIMIT`] as a count.
+const SWEEP_LIMIT_COUNT: usize = 4;
+/// The end-record cap of the second property.
+const SMALL_CAP: usize = 3;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -113,7 +135,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         1 => stream.clone().prop_map(|stream| Op::Close { stream }),
         1 => stream.clone().prop_map(|stream| Op::Publish { stream }),
         1 => stream.clone().prop_map(|stream| Op::Retain { stream }),
-        1 => stream.clone().prop_map(|stream| Op::Delete { stream }),
+        2 => stream.clone().prop_map(|stream| Op::Delete { stream }),
         1 => stream.prop_map(|stream| Op::Touch { stream }),
         1 => Just(Op::Expire),
         2 => (0u64..=4).prop_map(|quarters| Op::Sweep { quarters }),
@@ -131,45 +153,208 @@ fn stream_id(stream: usize) -> BucketStreamId {
     )
 }
 
-/// One live version as the oracle counts it.
+/// `len` bytes of `byte`.
+fn filled(byte: u8, len: u64) -> Bytes {
+    Bytes::from(vec![
+        byte;
+        usize::try_from(len).expect("a generated length fits")
+    ])
+}
+
+fn non_zero(id: u64) -> NonZeroU64 {
+    NonZeroU64::new(id).expect("a history id is not zero")
+}
+
+/// One live version as the oracle models it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Version {
+    /// The incarnation apply chose (C7, not the ledger's).
     created_at_ms: u64,
+    seq: u64,
     counters: VersionCounters,
     last_write: LastWrite,
     counted_since: u64,
     /// The last producer seq that applied, not as a repeat.
     producer_seq: Option<u64>,
+    tail: u64,
+    retained: u64,
+    snapshot_offset: Option<u64>,
+    closed: bool,
+    /// Created with a TTL, renewed by its writes and touches.
+    ttl: bool,
+    last_touch_ms: u64,
+    /// The clock jumped past its TTL since its last renewal: the next
+    /// command that names it, or the sweep, removes it as expired.
+    expired: bool,
 }
 
-/// What the counting rule says the group committed.
-#[derive(Debug, Default)]
+/// What the ledger must hold, modelled apart from it.
+#[derive(Debug)]
 struct Oracle {
+    cap: usize,
+    genesis: u64,
+    history: u64,
+    usage_seq: u64,
+    retired_through: u64,
+    /// Every bucket's committed totals, by the counting rule.
     totals: BTreeMap<String, CommittedUsage>,
+    retired: BTreeMap<String, CommittedUsage>,
     live: HashMap<BucketStreamId, Version>,
+    ends: BTreeMap<u64, EndRecord>,
     /// The counters, at the group's latest history event, of each version
     /// live then. A version created or restored since has a zero baseline.
     at_event: HashMap<(BucketStreamId, u64), VersionCounters>,
 }
 
 impl Oracle {
-    fn count(&mut self, stream_id: &BucketStreamId, bytes: u64, now_ms: u64, append: bool) {
-        let records = u64::from(bytes > 0);
-        let write = CommittedUsage::of_write(bytes, records);
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            genesis: GENESIS,
+            history: GENESIS,
+            usage_seq: 0,
+            retired_through: 0,
+            totals: BTreeMap::new(),
+            retired: BTreeMap::new(),
+            live: HashMap::new(),
+            ends: BTreeMap::new(),
+            at_event: HashMap::new(),
+        }
+    }
+
+    fn stamp(&mut self) -> u64 {
+        self.usage_seq = self.usage_seq.saturating_add(1);
+        self.usage_seq
+    }
+
+    fn version(&self, id: &BucketStreamId) -> Option<&Version> {
+        self.live.get(id)
+    }
+
+    fn expired(&self, id: &BucketStreamId) -> bool {
+        self.version(id).is_some_and(|version| version.expired)
+    }
+
+    /// A create answered `Created`.
+    fn create(&mut self, id: &BucketStreamId, bytes: u64, ttl: bool, now_ms: u64, at: u64) {
+        let write = CommittedUsage::of_write(bytes, u64::from(bytes > 0));
         self.totals
-            .entry(stream_id.bucket_id.clone())
+            .entry(id.bucket_id.clone())
             .or_default()
             .add(write);
-        if append {
-            let version = self.live.get_mut(stream_id).expect("a live version");
-            version.counters.committed.add(write);
-            version.counters.appends = version.counters.appends.saturating_add(1);
-            version.last_write = LastWrite::At(now_ms);
+        self.retired.entry(id.bucket_id.clone()).or_default();
+        let seq = self.stamp();
+        self.live.insert(id.clone(), Version {
+            created_at_ms: at,
+            seq,
+            counters: VersionCounters {
+                committed: write,
+                appends: 0,
+            },
+            last_write: LastWrite::At(now_ms),
+            counted_since: self.history,
+            producer_seq: None,
+            tail: bytes,
+            retained: 0,
+            snapshot_offset: None,
+            closed: false,
+            ttl,
+            last_touch_ms: now_ms,
+            expired: false,
+        });
+    }
+
+    /// An append of `bytes` that applied, not as a repeat.
+    fn append(&mut self, id: &BucketStreamId, bytes: u64, now_ms: u64) {
+        let write = CommittedUsage::of_write(bytes, u64::from(bytes > 0));
+        self.totals
+            .entry(id.bucket_id.clone())
+            .or_default()
+            .add(write);
+        let seq = self.stamp();
+        let version = self.live.get_mut(id).expect("a live version");
+        version.counters.committed.add(write);
+        version.counters.appends = version.counters.appends.saturating_add(1);
+        version.last_write = LastWrite::At(now_ms);
+        version.seq = seq;
+        version.tail = version.tail.saturating_add(bytes);
+        version.last_touch_ms = version.last_touch_ms.max(now_ms);
+    }
+
+    /// A change of a version's retained or snapshot bytes: a new seq.
+    fn restamp(&mut self, id: &BucketStreamId) {
+        let seq = self.stamp();
+        self.live.get_mut(id).expect("a live version").seq = seq;
+    }
+
+    /// Folds the lowest-seq end record into its bucket's retired usage.
+    fn fold_first(&mut self) {
+        let (seq, record) = self.ends.pop_first().expect("an end record to fold");
+        self.retired
+            .entry(record.stream_id.bucket_id.clone())
+            .or_default()
+            .add(record.counters.committed);
+        self.retired_through = seq;
+    }
+
+    /// The version of `id` ends as `end` at `now_ms`, leaving its end
+    /// record, after the cap folds the oldest one.
+    fn end(&mut self, id: &BucketStreamId, end: StreamEnd, now_ms: u64) {
+        let version = self.live.remove(id).expect("a live version ends");
+        if self.ends.len() >= self.cap {
+            self.fold_first();
         }
+        let history_baseline = self
+            .at_event
+            .get(&(id.clone(), version.created_at_ms))
+            .copied()
+            .unwrap_or_default();
+        let seq = self.stamp();
+        self.ends.insert(seq, EndRecord {
+            seq,
+            stream_id: id.clone(),
+            created_at_ms: version.created_at_ms,
+            counted_since: non_zero(version.counted_since),
+            ended_in: non_zero(self.history),
+            end,
+            ended_at_ms: now_ms,
+            counters: version.counters,
+            history_baseline,
+            last_write: version.last_write,
+        });
+    }
+
+    /// The live versions of `ids` that expired, in the TTL index's order:
+    /// expiry, then bucket and stream.
+    fn expired_in_ttl_order(&self) -> Vec<BucketStreamId> {
+        let mut expired = self
+            .live
+            .iter()
+            .filter(|(_, version)| version.expired)
+            .map(|(id, version)| (version.last_touch_ms.saturating_add(TTL_MS), id.clone()))
+            .collect::<Vec<_>>();
+        expired.sort_by(|(left_at, left), (right_at, right)| {
+            left_at
+                .cmp(right_at)
+                .then_with(|| compare_stream_ids(left, right))
+        });
+        expired.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The bucket's live versions in stream-id order.
+    fn in_bucket(&self, bucket_id: &str) -> Vec<BucketStreamId> {
+        let mut ids = self
+            .live
+            .keys()
+            .filter(|id| id.bucket_id == bucket_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_by(compare_stream_ids);
+        ids
     }
 }
 
-/// The group under test and its clocks.
+/// The group under test, its oracle and its clocks.
 struct Run {
     machine: StreamStateMachine,
     oracle: Oracle,
@@ -188,10 +373,10 @@ fn appended_non_repeat(response: &StreamResponse) -> bool {
 }
 
 impl Run {
-    fn new() -> Self {
+    fn new(cap: usize) -> Self {
         let mut run = Self {
             machine: StreamStateMachine::new(),
-            oracle: Oracle::default(),
+            oracle: Oracle::new(cap),
             now_ms: 1_000,
             index: 0,
             next_history: GENESIS,
@@ -214,7 +399,7 @@ impl Run {
     }
 
     fn history_event(&mut self, previous: u64) -> StreamResponse {
-        let history = NonZeroU64::new(self.next_history).expect("non-zero");
+        let history = non_zero(self.next_history);
         self.next_history = self.next_history.saturating_add(1);
         let kept = self.index;
         self.apply(StreamCommand::NewHistory {
@@ -241,20 +426,37 @@ impl Run {
         }
     }
 
-    fn tail(&self, stream_id: &BucketStreamId) -> u64 {
-        self.machine
-            .head(stream_id)
-            .map_or(0, |metadata| metadata.tail_offset)
+    /// A command naming `id` found it expired: it removed the version as
+    /// `Expired` and answered as if it did not exist.
+    fn expired_on_access(
+        &mut self,
+        op: &Op,
+        id: &BucketStreamId,
+        response: &StreamResponse,
+    ) -> Result<(), TestCaseError> {
+        prop_assert!(
+            matches!(response, StreamResponse::Error {
+                code: crate::StreamErrorCode::StreamNotFound,
+                ..
+            }),
+            "{:?}: {:?}",
+            op,
+            response
+        );
+        self.oracle.end(id, StreamEnd::Expired, self.now_ms);
+        Ok(())
     }
 
-    /// Applies `op` and updates the oracle from each command and its
-    /// answer. Returns the versions the step ended.
-    fn step(&mut self, op: &Op) -> Vec<(BucketStreamId, Version)> {
+    /// Applies `op`, checks the answer against what the oracle expects and
+    /// updates the oracle.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "a version the oracle holds is live by the step's own checks; a miss is a bug \
+                  of the test, not a case"
+    )]
+    fn step(&mut self, op: &Op) -> Result<(), TestCaseError> {
         self.now_ms = self.now_ms.saturating_add(1);
         let now_ms = self.now_ms;
-        let before = self.machine.usage_seq();
-        let mut created = None;
-        let mut appended = None;
         match op {
             Op::Create {
                 stream,
@@ -263,9 +465,14 @@ impl Run {
                 ttl,
             } => {
                 let id = stream_id(*stream);
-                let stream_ttl_seconds = ttl.then_some(1);
+                let stream_ttl_seconds = ttl.then_some(TTL_MS / 1_000);
+                let bytes = if *external {
+                    len.saturating_add(1)
+                } else {
+                    *len
+                };
                 let command = if *external {
-                    let payload = self.external(&id, len.saturating_add(1));
+                    let payload = self.external(&id, bytes);
                     StreamCommand::CreateExternal {
                         stream_id: id.clone(),
                         content_type: OCTET.to_owned(),
@@ -281,7 +488,7 @@ impl Run {
                     StreamCommand::CreateStream {
                         stream_id: id.clone(),
                         content_type: OCTET.to_owned(),
-                        initial_payload: Bytes::from(vec![b'c'; usize::try_from(*len).unwrap()]),
+                        initial_payload: filled(b'c', *len),
                         close_after: false,
                         stream_seq: None,
                         stream_ttl_seconds,
@@ -289,13 +496,32 @@ impl Run {
                         now_ms,
                     }
                 };
-                let bytes = if *external {
-                    len.saturating_add(1)
-                } else {
-                    *len
-                };
-                if matches!(self.apply(command), StreamResponse::Created { .. }) {
-                    created = Some((id, bytes));
+                let expired = self.oracle.expired(&id);
+                let live = self.oracle.version(&id).is_some();
+                let response = self.apply(command);
+                if expired {
+                    // A create over an expired stream ends it, then creates.
+                    prop_assert!(
+                        matches!(response, StreamResponse::Created { .. }),
+                        "{:?}",
+                        response
+                    );
+                    self.oracle.end(&id, StreamEnd::Expired, now_ms);
+                } else if live {
+                    prop_assert!(
+                        !matches!(response, StreamResponse::Created { .. }),
+                        "{:?}",
+                        response
+                    );
+                }
+                if matches!(response, StreamResponse::Created { .. }) {
+                    let at = self
+                        .machine
+                        .stream_slot(&id)
+                        .expect("a created version")
+                        .metadata
+                        .created_at_ms;
+                    self.oracle.create(&id, bytes, *ttl, now_ms, at);
                 }
             }
             Op::Append {
@@ -324,7 +550,7 @@ impl Run {
                         StreamCommand::Append {
                             stream_id: id.clone(),
                             content_type: Some(OCTET.to_owned()),
-                            payload: Bytes::from(vec![b'a'; usize::try_from(*len).unwrap()]),
+                            payload: filled(b'a', *len),
                             close_after: false,
                             stream_seq: None,
                             producer: None,
@@ -333,8 +559,21 @@ impl Run {
                         *len,
                     )
                 };
-                if appended_non_repeat(&self.apply(command)) {
-                    appended = Some((id, bytes, None));
+                let expired = self.oracle.expired(&id);
+                let open = self
+                    .oracle
+                    .version(&id)
+                    .is_some_and(|version| !version.closed);
+                let response = self.apply(command);
+                if expired {
+                    self.expired_on_access(op, &id, &response)?;
+                } else if appended_non_repeat(&response) {
+                    prop_assert!(open, "{:?}: {:?}", op, response);
+                    self.oracle.append(&id, bytes, now_ms);
+                } else {
+                    // A refusal: a missing or closed stream, or an empty
+                    // inline append.
+                    prop_assert!(!open || bytes == 0, "{:?}: refused {:?}", op, response);
                 }
             }
             Op::ProducerAppend {
@@ -345,18 +584,18 @@ impl Run {
                 let id = stream_id(*stream);
                 let last = self
                     .oracle
-                    .live
-                    .get(&id)
+                    .version(&id)
                     .and_then(|version| version.producer_seq);
                 let producer_seq = match (last, repeat) {
                     (Some(last), true) => last,
                     (Some(last), false) => last.saturating_add(1),
                     (None, _) => 0,
                 };
+                let expired = self.oracle.expired(&id);
                 let response = self.apply(StreamCommand::Append {
                     stream_id: id.clone(),
                     content_type: Some(OCTET.to_owned()),
-                    payload: Bytes::from(vec![b'p'; usize::try_from(*len).unwrap()]),
+                    payload: filled(b'p', *len),
                     close_after: false,
                     stream_seq: None,
                     producer: Some(ProducerRequest {
@@ -367,78 +606,241 @@ impl Run {
                     }),
                     now_ms,
                 });
-                if appended_non_repeat(&response) {
-                    appended = Some((id, *len, Some(producer_seq)));
+                if expired {
+                    self.expired_on_access(op, &id, &response)?;
+                } else if appended_non_repeat(&response) {
+                    // Only a new seq to an open stream applies.
+                    prop_assert!(
+                        last.is_none_or(|last| producer_seq > last),
+                        "{:?}: {:?}",
+                        op,
+                        response
+                    );
+                    self.oracle.append(&id, *len, now_ms);
+                    self.oracle
+                        .live
+                        .get_mut(&id)
+                        .expect("a live version")
+                        .producer_seq = Some(producer_seq);
                 }
             }
             Op::Close { stream } => {
-                self.apply(StreamCommand::Close {
-                    stream_id: stream_id(*stream),
+                let id = stream_id(*stream);
+                let expired = self.oracle.expired(&id);
+                let response = self.apply(StreamCommand::Close {
+                    stream_id: id.clone(),
                     stream_seq: None,
                     producer: None,
                     now_ms,
                 });
+                if expired {
+                    self.expired_on_access(op, &id, &response)?;
+                } else if let Some(version) = self.oracle.live.get_mut(&id) {
+                    // A close-only write counts nothing and takes no seq. A
+                    // close of an open stream renews its TTL.
+                    prop_assert!(
+                        matches!(response, StreamResponse::Closed { .. }),
+                        "{:?}",
+                        response
+                    );
+                    if !version.closed {
+                        version.closed = true;
+                        version.last_touch_ms = version.last_touch_ms.max(now_ms);
+                    }
+                }
             }
             Op::Publish { stream } => {
                 let id = stream_id(*stream);
-                let snapshot_offset = self.tail(&id);
-                self.apply(StreamCommand::PublishSnapshot {
-                    stream_id: id,
+                let expired = self.oracle.expired(&id);
+                let version = self.oracle.version(&id).cloned();
+                let snapshot_offset = version.as_ref().map_or(0, |version| version.tail);
+                let response = self.apply(StreamCommand::PublishSnapshot {
+                    stream_id: id.clone(),
                     snapshot_offset,
                     content_type: OCTET.to_owned(),
                     payload: Bytes::from(format!("snapshot at {now_ms}")),
                     now_ms,
                     expected_incarnation: None,
                 });
+                if expired {
+                    self.expired_on_access(op, &id, &response)?;
+                } else if let Some(version) = version {
+                    // Every body differs, so a publish at the visible
+                    // snapshot's offset conflicts, and any other replaces
+                    // it: a new seq for the snapshot bytes.
+                    let replaces = version.snapshot_offset != Some(snapshot_offset);
+                    prop_assert_eq!(
+                        matches!(response, StreamResponse::SnapshotPublished { .. }),
+                        replaces,
+                        "{:?}",
+                        response
+                    );
+                    if replaces {
+                        self.oracle.restamp(&id);
+                        self.oracle
+                            .live
+                            .get_mut(&id)
+                            .expect("a live version")
+                            .snapshot_offset = Some(snapshot_offset);
+                    }
+                }
             }
             Op::Retain { stream } => {
                 let id = stream_id(*stream);
-                let retained_offset = self.tail(&id);
-                self.apply(StreamCommand::AdvanceRetention {
-                    stream_id: id,
+                let expired = self.oracle.expired(&id);
+                let version = self.oracle.version(&id).cloned();
+                let retained_offset = version.as_ref().map_or(0, |version| version.tail);
+                let response = self.apply(StreamCommand::AdvanceRetention {
+                    stream_id: id.clone(),
                     retained_offset,
                     now_ms,
                     expected_incarnation: None,
                 });
+                if expired {
+                    self.expired_on_access(op, &id, &response)?;
+                } else if let Some(version) = version {
+                    // Retention moves only forward, and never past the
+                    // visible snapshot. A move takes a new seq for the
+                    // retained bytes.
+                    if retained_offset <= version.retained {
+                        prop_assert_eq!(&response, &StreamResponse::RetentionAdvanced {
+                            retained_offset: version.retained,
+                        });
+                    } else if version
+                        .snapshot_offset
+                        .is_some_and(|snapshot| retained_offset <= snapshot)
+                    {
+                        prop_assert_eq!(&response, &StreamResponse::RetentionAdvanced {
+                            retained_offset,
+                        });
+                        self.oracle.restamp(&id);
+                        self.oracle
+                            .live
+                            .get_mut(&id)
+                            .expect("a live version")
+                            .retained = retained_offset;
+                    } else {
+                        prop_assert!(
+                            matches!(response, StreamResponse::Error { .. }),
+                            "{:?}",
+                            response
+                        );
+                    }
+                }
             }
             Op::Delete { stream } => {
-                self.apply(StreamCommand::DeleteStream {
-                    stream_id: stream_id(*stream),
+                let id = stream_id(*stream);
+                let expired = self.oracle.expired(&id);
+                let live = self.oracle.version(&id).is_some();
+                let response = self.apply(StreamCommand::DeleteStream {
+                    stream_id: id.clone(),
                     now_ms,
                 });
+                if live {
+                    prop_assert_eq!(&response, &StreamResponse::Deleted { expired });
+                    let end = if expired {
+                        StreamEnd::Expired
+                    } else {
+                        StreamEnd::Deleted
+                    };
+                    self.oracle.end(&id, end, now_ms);
+                } else {
+                    prop_assert!(
+                        matches!(response, StreamResponse::Error { .. }),
+                        "{:?}",
+                        response
+                    );
+                }
             }
             Op::Touch { stream } => {
-                self.apply(StreamCommand::TouchStreamAccess {
-                    stream_id: stream_id(*stream),
+                let id = stream_id(*stream);
+                let expired = self.oracle.expired(&id);
+                let response = self.apply(StreamCommand::TouchStreamAccess {
+                    stream_id: id.clone(),
                     now_ms,
                     renew_ttl: true,
                 });
+                if expired {
+                    prop_assert!(
+                        matches!(response, StreamResponse::Accessed { expired: true, .. }),
+                        "{:?}",
+                        response
+                    );
+                    self.oracle.end(&id, StreamEnd::Expired, now_ms);
+                } else if let Some(version) = self.oracle.live.get_mut(&id) {
+                    prop_assert!(
+                        matches!(response, StreamResponse::Accessed { expired: false, .. }),
+                        "{:?}",
+                        response
+                    );
+                    if version.ttl {
+                        version.last_touch_ms = version.last_touch_ms.max(now_ms);
+                    }
+                }
             }
-            Op::Expire => self.now_ms = self.now_ms.saturating_add(5_000),
+            Op::Expire => {
+                self.now_ms = self.now_ms.saturating_add(EXPIRE_JUMP_MS);
+                for version in self.oracle.live.values_mut() {
+                    version.expired |= version.ttl;
+                }
+            }
             Op::Sweep { quarters } => {
-                let retire_through = self.machine.usage_seq().saturating_mul(*quarters) / 4;
+                let retire_through = self.oracle.usage_seq.saturating_mul(*quarters) / 4;
+                let limit = SWEEP_LIMIT_COUNT;
+                // The entry folds only what the group held before it.
+                let through = retire_through.min(self.oracle.usage_seq);
+                let expired = self.oracle.expired_in_ttl_order();
+                let removed = expired.len().min(limit);
+                for id in expired.iter().take(limit) {
+                    self.oracle.end(id, StreamEnd::Expired, now_ms);
+                }
+                let mut retired = 0_usize;
+                while retired < limit
+                    && self
+                        .oracle
+                        .ends
+                        .first_key_value()
+                        .is_some_and(|(seq, _)| *seq <= through)
+                {
+                    self.oracle.fold_first();
+                    retired = retired.saturating_add(1);
+                }
                 let response = self.apply(StreamCommand::Sweep {
                     now_ms,
-                    limit: NonZeroU32::new(4).expect("non-zero"),
+                    limit: NonZeroU32::new(SWEEP_LIMIT).expect("non-zero"),
                     retire_through,
                 });
-                assert!(
-                    matches!(response, StreamResponse::Swept { .. }),
-                    "{response:?}"
-                );
+                prop_assert_eq!(&response, &StreamResponse::Swept {
+                    expired: u64::try_from(removed).unwrap_or(u64::MAX),
+                    retired: u64::try_from(retired).unwrap_or(u64::MAX),
+                });
             }
             Op::Purge => {
-                self.apply(StreamCommand::PurgeBucket {
+                let response = self.apply(StreamCommand::PurgeBucket {
                     bucket_id: PURGED.to_owned(),
                     now_ms,
                 });
+                prop_assert!(
+                    matches!(response, StreamResponse::BucketPurged { .. }),
+                    "{:?}",
+                    response
+                );
+                // Expired or not, each stream ends purged, in stream-id
+                // order.
+                for id in self.oracle.in_bucket(PURGED) {
+                    self.oracle.end(&id, StreamEnd::Purged, now_ms);
+                }
             }
             Op::NewHistory => {
-                let previous = self.machine.history_id();
-                assert!(matches!(
-                    self.history_event(previous),
-                    StreamResponse::HistoryStarted { .. }
-                ));
+                let previous = self.oracle.history;
+                let history = self.next_history;
+                let started = self.history_event(previous);
+                prop_assert!(
+                    matches!(started, StreamResponse::HistoryStarted { .. }),
+                    "{:?}",
+                    started
+                );
+                self.oracle.history = history;
                 self.oracle.at_event = self
                     .oracle
                     .live
@@ -446,10 +848,7 @@ impl Run {
                     .map(|(id, version)| ((id.clone(), version.created_at_ms), version.counters))
                     .collect();
             }
-            Op::Import => {
-                self.import();
-                return Vec::new();
-            }
+            Op::Import => self.import()?,
             Op::RoundTrip => {
                 self.machine = StreamStateMachine::restore_group(
                     self.machine.snapshot(),
@@ -458,68 +857,21 @@ impl Run {
                 .expect("a group snapshot restores");
             }
         }
-
-        // A version whose slot left, or holds another version, ended.
-        let mut ended = Vec::new();
-        let live = std::mem::take(&mut self.oracle.live);
-        for (id, version) in live {
-            let same = self
-                .machine
-                .stream_slot(&id)
-                .is_some_and(|slot| slot.metadata.created_at_ms == version.created_at_ms);
-            if same {
-                self.oracle.live.insert(id, version);
-            } else {
-                ended.push((id, version));
-            }
-        }
-        if let Some((id, bytes)) = created {
-            self.oracle.count(&id, bytes, now_ms, false);
-            let slot = self.machine.stream_slot(&id).expect("a created version");
-            self.oracle.live.insert(id, Version {
-                created_at_ms: slot.metadata.created_at_ms,
-                counters: VersionCounters {
-                    committed: CommittedUsage::of_write(bytes, u64::from(bytes > 0)),
-                    appends: 0,
-                },
-                last_write: LastWrite::At(now_ms),
-                counted_since: self.machine.history_id(),
-                producer_seq: None,
-            });
-        }
-        if let Some((id, bytes, producer_seq)) = appended {
-            self.oracle.count(&id, bytes, now_ms, true);
-            if producer_seq.is_some() {
-                self.oracle
-                    .live
-                    .get_mut(&id)
-                    .expect("a live version")
-                    .producer_seq = producer_seq;
-            }
-        }
-        // Every removal of the step stamped one end record above the seq
-        // before it.
-        let new_ends = self
-            .machine
-            .end_records()
-            .filter(|record| record.seq > before)
-            .count();
-        assert_eq!(new_ends, ended.len(), "{op:?}");
-        ended
+        Ok(())
     }
 
     /// The group's snapshot, imported as a backup into a fresh group: every
-    /// version restarts at zero counted since the import, and the totals
-    /// carry on as retired usage.
-    fn import(&mut self) {
+    /// version restarts at zero counted since the import, stamped in
+    /// stream-id order, and the totals carry on as retired usage.
+    fn import(&mut self) -> Result<(), TestCaseError> {
         let snapshot = self.machine.snapshot();
-        let mut target = StreamStateMachine::new();
-        let genesis = NonZeroU64::new(self.next_history).expect("non-zero");
-        let history = NonZeroU64::new(self.next_history.saturating_add(1)).expect("non-zero");
+        let genesis = self.next_history;
+        let history = self.next_history.saturating_add(1);
         self.next_history = self.next_history.saturating_add(2);
         self.index = self.index.saturating_add(1);
+        let mut target = StreamStateMachine::new();
         target.apply_entry(self.index, StreamCommand::NewHistory {
-            history: genesis,
+            history: non_zero(genesis),
             now_ms: self.now_ms,
             previous: 0,
             kept: 0,
@@ -531,51 +883,87 @@ impl Run {
         self.index = self.index.saturating_add(1);
         let imported = target.apply_entry(self.index, StreamCommand::ImportSnapshot {
             snapshot: Box::new(snapshot),
-            history,
-            backup_digest: [u8::try_from(self.index % 256).unwrap(); 32],
+            history: non_zero(history),
+            backup_digest: [self.index.to_le_bytes()[0]; 32],
             now_ms: self.now_ms,
         });
-        assert!(
+        prop_assert!(
             matches!(imported, StreamResponse::SnapshotImported { .. }),
-            "{imported:?}"
+            "{:?}",
+            imported
         );
-        assert_eq!(target.usage_genesis(), genesis.get());
         self.machine = target;
-        for version in self.oracle.live.values_mut() {
+
+        let oracle = &mut self.oracle;
+        oracle.genesis = genesis;
+        oracle.history = history;
+        oracle.retired = oracle.totals.clone();
+        oracle.ends.clear();
+        oracle.retired_through = 0;
+        oracle.usage_seq = 0;
+        oracle.at_event.clear();
+        let mut ids = oracle.live.keys().cloned().collect::<Vec<_>>();
+        ids.sort_by(compare_stream_ids);
+        for id in ids {
+            let seq = oracle.stamp();
+            let version = oracle.live.get_mut(&id).expect("a live version");
+            version.seq = seq;
             version.counters = VersionCounters::default();
             version.last_write = LastWrite::Imported;
-            version.counted_since = history.get();
+            version.counted_since = history;
         }
-        self.oracle.at_event.clear();
+        Ok(())
     }
 
-    /// The ledger agrees with the oracle, and L1 to L8 hold.
-    fn check(&self, ended: &[(BucketStreamId, Version)]) -> Result<(), TestCaseError> {
+    /// The ledger equals the oracle's, and L1 to L8 hold.
+    fn check(&self) -> Result<(), TestCaseError> {
         let machine = &self.machine;
+        let oracle = &self.oracle;
         let report = machine.bucket_usage_report();
         let totals = report
             .iter()
             .map(|row| (row.bucket_id.clone(), CommittedUsage::of_bucket(&row.usage)))
             .collect::<BTreeMap<_, _>>();
-        prop_assert_eq!(&totals, &self.oracle.totals);
+        prop_assert_eq!(&totals, &oracle.totals);
         // L4: every bucket with a row has its retired row.
         prop_assert_eq!(
             machine.state_gauges().bucket_usage_rows,
             u64::try_from(report.len()).unwrap_or(u64::MAX)
         );
 
+        let usage = machine.usage_snapshot();
+        prop_assert_eq!(usage.genesis, oracle.genesis);
+        prop_assert_eq!(machine.history_id(), oracle.history);
+        prop_assert_eq!(usage.usage_seq, oracle.usage_seq);
+        prop_assert_eq!(usage.retired_through, oracle.retired_through);
+        let retired = oracle
+            .retired
+            .iter()
+            .map(|(bucket_id, retired)| BucketRetired {
+                bucket_id: bucket_id.clone(),
+                retired: *retired,
+            })
+            .collect::<Vec<_>>();
+        prop_assert_eq!(&usage.retired, &retired);
+        // Every end record, whole: how and when it ended, in which history,
+        // its final usage and its seq.
+        let ends = oracle.ends.values().cloned().collect::<Vec<_>>();
+        prop_assert_eq!(&usage.ends, &ends);
+
         let usage_seq = machine.usage_seq();
         let retired_through = machine.usage_retired_through();
-        let group = machine.history_id();
         // L3.
         prop_assert!(retired_through <= usage_seq);
         let mut seqs = BTreeSet::new();
-        prop_assert_eq!(machine.registry.slots().count(), self.oracle.live.len());
-        for (id, version) in &self.oracle.live {
+        prop_assert_eq!(machine.registry.slots().count(), oracle.live.len());
+        for (id, version) in &oracle.live {
             let Some(slot) = machine.stream_slot(id) else {
                 return Err(TestCaseError::fail(format!("{id} is not live")));
             };
+            prop_assert_eq!(slot.metadata.created_at_ms, version.created_at_ms, "{}", id);
+            prop_assert_eq!(slot.metadata.tail_offset, version.tail, "{}", id);
             let usage = slot.usage;
+            prop_assert_eq!(usage.seq, version.seq, "{}", id);
             prop_assert_eq!(usage.counters, version.counters, "{}", id);
             prop_assert_eq!(usage.last_write, version.last_write, "{}", id);
             prop_assert_eq!(usage.counted_since.get(), version.counted_since, "{}", id);
@@ -585,9 +973,8 @@ impl Run {
             // The baseline of the group's history, which an export derives,
             // is the counters at the event, or zero for a version created
             // or restored since. L6: it never exceeds the counters.
-            let baseline = slot.history_baseline_in(group);
-            let at_event = self
-                .oracle
+            let baseline = slot.history_baseline_in(oracle.history);
+            let at_event = oracle
                 .at_event
                 .get(&(id.clone(), version.created_at_ms))
                 .copied()
@@ -600,32 +987,14 @@ impl Run {
             );
         }
         // L2 and L8.
-        prop_assert!(machine.end_records().len() <= MAX_END_RECORDS);
+        prop_assert!(machine.end_records().len() <= MAX_END_RECORDS.min(oracle.cap));
         for record in machine.end_records() {
             prop_assert!(record.seq > retired_through && record.seq <= usage_seq);
             prop_assert!(seqs.insert(record.seq));
         }
-        // L6: an end record carries the version's usage at its removal.
-        for (id, version) in ended {
-            let record = machine
-                .end_records()
-                .filter(|record| {
-                    record.stream_id == *id && record.created_at_ms == version.created_at_ms
-                })
-                .last();
-            // A sweep of the same step never folds its own removals.
-            let Some(record) = record else {
-                return Err(TestCaseError::fail(format!("{id} left no end record")));
-            };
-            prop_assert_eq!(record.counters, version.counters);
-            prop_assert_eq!(record.last_write, version.last_write);
-            prop_assert_eq!(record.counted_since.get(), version.counted_since);
-            prop_assert_eq!(record.ended_in.get(), group);
-        }
 
         // A round trip through the group snapshot reproduces the ledger,
         // and so does a twin whose snapshot lists its streams the other way.
-        let usage = machine.usage_snapshot();
         let restored = StreamStateMachine::restore_group(machine.snapshot(), usage.clone())
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
         prop_assert_eq!(&restored.usage_snapshot(), &usage);
@@ -641,6 +1010,20 @@ impl Run {
     }
 }
 
+/// Runs `ops` on a fresh group at an end-record cap of `cap`, checking the
+/// ledger after every step.
+fn run_against_the_oracle(cap: usize, ops: &[Op]) -> Result<(), TestCaseError> {
+    test_cap::with(cap, || {
+        let mut run = Run::new(cap);
+        run.check()?;
+        for op in ops {
+            run.step(op)?;
+            run.check()?;
+        }
+        Ok(())
+    })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
@@ -648,11 +1031,14 @@ proptest! {
     fn prop_the_ledger_counts_what_the_oracle_counts(
         ops in proptest::collection::vec(op_strategy(), 1..48),
     ) {
-        let mut run = Run::new();
-        run.check(&[])?;
-        for op in &ops {
-            let ended = run.step(op);
-            run.check(&ended)?;
-        }
+        run_against_the_oracle(MAX_END_RECORDS, &ops)?;
+    }
+
+    /// At a cap of three end records most runs fold at the cap.
+    #[test]
+    fn prop_the_ledger_folds_at_its_cap_as_the_oracle_does(
+        ops in proptest::collection::vec(op_strategy(), 1..64),
+    ) {
+        run_against_the_oracle(SMALL_CAP, &ops)?;
     }
 }

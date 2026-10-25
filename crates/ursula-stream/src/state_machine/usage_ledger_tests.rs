@@ -662,9 +662,10 @@ fn a_sweep_never_folds_its_own_removals() {
     assert_eq!(machine.state_gauges().bucket_usage_rows, 1);
 }
 
-/// A restarted replica's retirement clock seeds from the end records'
-/// removal times: the highest seq through which every end record ended at
-/// or before a time, the folded watermark when the lowest did not.
+/// A restarted replica's retirement clock dates the end records it held by
+/// their removal times: the highest seq at or below a bound through which
+/// every end record ended at or before a time, the folded watermark when
+/// the lowest did not.
 #[test]
 fn end_records_ended_by_a_time_stop_at_the_first_later_one() {
     let mut machine = group(7);
@@ -675,17 +676,21 @@ fn end_records_ended_by_a_time_stop_at_the_first_later_one() {
     for (name, now_ms) in [("a", 10), ("b", 20), ("c", 90), ("d", 30)] {
         delete(&mut machine, name, now_ms);
     }
-    assert_eq!(machine.end_records_ended_by(9), 0);
-    assert_eq!(machine.end_records_ended_by(10), 5);
-    assert_eq!(machine.end_records_ended_by(30), 6);
-    assert_eq!(machine.end_records_ended_by(89), 6);
-    assert_eq!(machine.end_records_ended_by(90), 8);
+    assert_eq!(machine.end_records_ended_by(9, u64::MAX), 0);
+    assert_eq!(machine.end_records_ended_by(10, u64::MAX), 5);
+    assert_eq!(machine.end_records_ended_by(30, u64::MAX), 6);
+    assert_eq!(machine.end_records_ended_by(89, u64::MAX), 6);
+    assert_eq!(machine.end_records_ended_by(90, u64::MAX), 8);
+    // The bound stops the scan: end records above it are not dated.
+    assert_eq!(machine.end_records_ended_by(90, 7), 7);
+    assert_eq!(machine.end_records_ended_by(90, 5), 5);
+    assert_eq!(machine.end_records_ended_by(90, 4), 0);
     assert_eq!(sweep(&mut machine, 16, 6), StreamResponse::Swept {
         expired: 0,
         retired: 2,
     });
-    assert_eq!(machine.end_records_ended_by(9), 6);
-    assert_eq!(machine.end_records_ended_by(90), 8);
+    assert_eq!(machine.end_records_ended_by(9, u64::MAX), 6);
+    assert_eq!(machine.end_records_ended_by(90, u64::MAX), 8);
 }
 
 /// The genesis records the group's genesis id, and a later event keeps

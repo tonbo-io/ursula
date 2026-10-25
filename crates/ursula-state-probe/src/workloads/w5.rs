@@ -97,7 +97,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     )?;
     let mut rng = payload::Rng::new(21);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let keep = smx::sid("bkt1", "keep", "log");
     smx::create_stream(&mut m, &keep, None, None, smx::T0)?;
@@ -169,7 +169,7 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         "appends_per_stream": args.appends_per_stream, "ttl_seconds": ttl}))?;
     let mut rng = payload::Rng::new(22);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let keep = smx::sid("bkt1", "keep", "log");
     smx::create_stream(&mut m, &keep, None, None, smx::T0)?;
@@ -263,7 +263,7 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         // Allocated before the heap baseline, so it does not count as state.
         let mut starts = smx::RecordStarts::new(if args.retain_every > 0 { 1_002 } else { 0 });
         let base = Baseline::now();
-        let mut m = StreamStateMachine::new();
+        let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         smx::create_bucket(&mut m, "bkt1")?;
         let id = smx::sid("bkt1", "h0001", "log");
         let (ttl_seconds, expires_at) = match variant {
@@ -359,7 +359,7 @@ fn purge(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     sink.row(&json!({"mode": "purge", "buckets": buckets}))?;
     let mut rng = payload::Rng::new(24);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     for b in 0..buckets {
         let bucket = format!("tenant-{b:08}");
         smx::create_bucket(&mut m, &bucket)?;

@@ -529,7 +529,8 @@ pub struct AdvanceRetentionResponse {
 /// One tidy pass over a group (bounded-state F0, F20). Every replica first
 /// samples its group's retirement clock
 /// ([`crate::expiry_sweep::RetirementClock`]), which gives the usage seq
-/// through which end records at least `end_record_retain` old are due. A
+/// through which end records past their retention under
+/// `deleted_data_max_age` are due. A
 /// leader then runs the group sweep: while the group's TTL front is due at
 /// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms` or an end record is
 /// due, it proposes `Sweep`, at most `max_expiry_sweeps` entries, and on an
@@ -545,10 +546,10 @@ pub struct TidyStreamsRequest {
     /// [`crate::expiry_sweep::RERUN_BUDGET`] for one that drains a capped
     /// group.
     pub expiry_sweep_budget: std::time::Duration,
-    /// How long an end record stays before the sweep folds it: the node's
-    /// `UrsulaConfig::end_record_retention`, half of
-    /// `raft.deleted_data_max_age`.
-    pub end_record_retain: std::time::Duration,
+    /// The node's `raft.deleted_data_max_age`
+    /// (`UrsulaConfig::effective_deleted_data_max_age`). An end record stays
+    /// for its `RaftConfig::end_record_retention` before the sweep folds it.
+    pub deleted_data_max_age: std::time::Duration,
     pub now_ms: u64,
 }
 

@@ -186,9 +186,7 @@ impl StreamStateMachine {
     /// since the backup's own history and stamped `1..=n` in
     /// `compare_stream_ids` order, with no end records (F20).
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        Self::restore_with(snapshot, RestoredUsage::Backup {
-            counted_since: None,
-        })
+        Self::restore_with(snapshot, RestoredUsage::Backup)
     }
 
     /// A group snapshot's state (F20): `snapshot` with its ledger `usage`
@@ -210,9 +208,7 @@ impl StreamStateMachine {
         snapshot: StreamSnapshot,
         counted_since: NonZeroU64,
     ) -> Result<Self, StreamSnapshotError> {
-        Self::restore_with(snapshot, RestoredUsage::Backup {
-            counted_since: Some(counted_since),
-        })
+        Self::restore_with(snapshot, RestoredUsage::Imported { counted_since })
     }
 
     /// The one restore behind [`Self::restore`] and [`Self::restore_group`].
@@ -224,10 +220,14 @@ impl StreamStateMachine {
         let totals = committed_by_bucket(&snapshot.bucket_usage)?;
         // A group snapshot's totals are checked against its parts once the
         // state is built. A backup's become its retired usage.
-        let (ledger, versions, counted_since, checked_totals) = match usage {
-            RestoredUsage::Backup { counted_since } => {
-                (UsageLedger::retiring(totals), None, counted_since, None)
-            }
+        let (ledger, versions, imported_since, checked_totals) = match usage {
+            RestoredUsage::Backup => (UsageLedger::retiring(totals), None, None, None),
+            RestoredUsage::Imported { counted_since } => (
+                UsageLedger::retiring(totals),
+                None,
+                Some(counted_since),
+                None,
+            ),
             RestoredUsage::Group(usage) => {
                 if usage.streams.len() != snapshot.streams.len() {
                     return Err(UsageSnapshotError::StreamCount {
@@ -252,7 +252,6 @@ impl StreamStateMachine {
             usage: ledger,
             ..Self::default()
         };
-        let counted_since = counted_since.unwrap_or_else(|| machine.counting_history());
         for bucket_id in &snapshot.buckets {
             if !machine.buckets.insert(bucket_id.clone()) {
                 return Err(StreamSnapshotError::DuplicateBucket(bucket_id.clone()));
@@ -289,6 +288,10 @@ impl StreamStateMachine {
         });
         for (entry, version) in entries {
             let stream_id = entry.metadata.stream_id.clone();
+            // Every version counts in a history (F20).
+            let Some(history) = machine.history.map(|history| history.id) else {
+                return Err(StreamSnapshotError::StreamWithoutHistory(stream_id));
+            };
             if !machine.buckets.contains(&stream_id.bucket_id) {
                 return Err(StreamSnapshotError::MissingBucket(stream_id));
             }
@@ -341,7 +344,7 @@ impl StreamStateMachine {
                 }
                 None => machine
                     .usage
-                    .restored_version(&stream_id.bucket_id, counted_since),
+                    .restored_version(&stream_id.bucket_id, imported_since.unwrap_or(history)),
             };
             let slot = StreamSlot {
                 metadata: entry.metadata,
@@ -392,9 +395,11 @@ impl StreamStateMachine {
 /// Where a restore takes each version's usage from.
 enum RestoredUsage {
     /// A backup's, which holds only bucket totals: they retire, and every
-    /// version counts from zero since `counted_since`, or since the
-    /// backup's own history when `None`.
-    Backup { counted_since: Option<NonZeroU64> },
+    /// version counts from zero since the backup's own history.
+    Backup,
+    /// A backup's that an import restores: as [`Self::Backup`], every
+    /// version counted since the import's history `counted_since`.
+    Imported { counted_since: NonZeroU64 },
     /// A group snapshot's ledger, checked against its totals.
     Group(UsageSnapshot),
 }

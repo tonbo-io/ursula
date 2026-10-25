@@ -151,8 +151,12 @@
 //! - an import gives every restored version zero counters, counted since
 //!   the import's history, and retires the backup's bucket totals. A
 //!   restore refuses a backup with two usage rows of one bucket
-//!   (`StreamSnapshotError::DuplicateBucketUsage`, in the group engine
-//!   error).
+//!   (`StreamSnapshotError::DuplicateBucketUsage`) and a snapshot that
+//!   holds a stream but no history event
+//!   (`StreamSnapshotError::StreamWithoutHistory`), both in the group
+//!   engine error. A create before the genesis is refused with
+//!   `HistoryPending`, as both engines already refused every command but
+//!   the genesis then.
 //! - `AppendResponse` without `stream_append_count`.
 //! - group snapshots carry the ledger: each stream frame its version's
 //!   usage (field 24), each end record a frame (`end_record`, frame 8,

@@ -1,6 +1,7 @@
 //! Bucket/stream lifecycle: create, close, delete, and TTL expiry.
 
 use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 
 use super::AppendStreamInput;
 use super::BucketStreamId;
@@ -79,7 +80,24 @@ impl StreamStateMachine {
         }
     }
 
+    /// The history a create's version counts in: the group's current one.
+    /// Before the genesis a group creates nothing, as both engines apply
+    /// nothing but the genesis first, so a version always has a history to
+    /// count in (F20).
+    fn counting_history(&self) -> Result<NonZeroU64, StreamResponse> {
+        self.history.map(|history| history.id).ok_or_else(|| {
+            StreamResponse::error(
+                StreamErrorCode::HistoryPending,
+                "the group's genesis has not applied; it creates no stream before it",
+            )
+        })
+    }
+
     pub(super) fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
+        let history = match self.counting_history() {
+            Ok(history) => history,
+            Err(response) => return response,
+        };
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
             return response;
         }
@@ -138,6 +156,7 @@ impl StreamStateMachine {
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
         let stream_id = input.stream_id.clone();
         let usage = self.usage_on_create(
+            history,
             &stream_id.bucket_id,
             initial_len,
             Self::appended_record_count(input.message_count, initial_len),
@@ -176,6 +195,10 @@ impl StreamStateMachine {
         &mut self,
         input: CreateExternalStreamInput,
     ) -> StreamResponse {
+        let history = match self.counting_history() {
+            Ok(history) => history,
+            Err(response) => return response,
+        };
         if let Err(response) = validate_external_payload_ref(&input.initial_payload) {
             return response;
         }
@@ -254,6 +277,7 @@ impl StreamStateMachine {
         cold.push_direct_external_segment(object.clone());
         let stream_id = input.stream_id.clone();
         let usage = self.usage_on_create(
+            history,
             &stream_id.bucket_id,
             initial_len,
             Self::appended_record_count(input.message_count, initial_len),

@@ -88,7 +88,7 @@ impl Group {
 
 fn new_group(index: usize, streams_per_group: usize) -> Result<Group> {
     let mut group = Group {
-        machine: StreamStateMachine::new(),
+        machine: StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN),
         gauge: GroupLogGauge::default(),
         streams: Vec::new(),
         commit_index: 0,

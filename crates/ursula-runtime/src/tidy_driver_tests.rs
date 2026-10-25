@@ -19,8 +19,9 @@ use crate::cold_store::DEFAULT_CONTENT_TYPE;
 /// F3: a producer idle this long expires at the next tidy.
 const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
-/// The end-record retention of the default `raft.deleted_data_max_age`.
-const END_RECORD_RETAIN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The default `raft.deleted_data_max_age`.
+const DELETED_DATA_MAX_AGE: std::time::Duration =
+    ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE;
 
 /// A tidy pass with the scheduled sweep's budget.
 fn tidy(max_streams: usize, max_expiry_sweeps: usize, now_ms: u64) -> TidyStreamsRequest {
@@ -28,7 +29,7 @@ fn tidy(max_streams: usize, max_expiry_sweeps: usize, now_ms: u64) -> TidyStream
         max_streams,
         max_expiry_sweeps,
         expiry_sweep_budget: crate::expiry_sweep::GROUP_BUDGET,
-        end_record_retain: END_RECORD_RETAIN,
+        deleted_data_max_age: DELETED_DATA_MAX_AGE,
         now_ms,
     }
 }
@@ -240,59 +241,84 @@ async fn bucket_committed(runtime: &ShardRuntime) -> Vec<(String, u64, u64)> {
 }
 
 /// F20: a deleted stream's end record stays until the sweep folds it into
-/// its bucket's usage, once its retention passed. The first pass of a group
-/// seeds its retirement clock from the end records' removal times, so a
-/// record removed at least the retention before the pass's clock folds in
-/// that pass, and one removed after it stays. The bucket's totals never
+/// its bucket's usage, once its retention passed. A group's first pass
+/// seeds its retirement clock, which dates the end records the group held
+/// then by their removal times: one removed half a retention before the
+/// seed folds half a retention later by the pass's wall clock, and one
+/// removed at least the retention before folds at once. An end record
+/// removed after the seed is due only once this replica's samples are the
+/// retention old, whatever the wall clock says. The bucket's totals never
 /// move.
 #[tokio::test]
 async fn the_sweep_folds_end_records_past_their_retention() {
+    // A retention of a minute.
+    let bound = std::time::Duration::from_secs(120);
     let runtime = spawn();
-    for index in 0..40 {
+    let delete = |index: usize, now_ms: u64| {
+        let runtime = &runtime;
+        async move {
+            runtime
+                .delete_stream(DeleteStreamRequest {
+                    stream_id: BucketStreamId::new("retire", format!("s-{index:02}")),
+                    now_ms,
+                    if_incarnation: None,
+                })
+                .await
+                .expect("delete");
+        }
+    };
+    for index in 0..50 {
         let stream_id = BucketStreamId::new("retire", format!("s-{index:02}"));
         let mut request = CreateStreamRequest::new(stream_id.clone(), DEFAULT_CONTENT_TYPE);
         request.now_ms = 1;
         runtime.create_stream(request).await.expect("create");
-        runtime
-            .delete_stream(DeleteStreamRequest {
-                stream_id,
-                // Half of them before the retention ends at `now`, half after.
-                now_ms: if index < 20 { 2 } else { 120_000 },
-                if_incarnation: None,
-            })
-            .await
-            .expect("delete");
+    }
+    // Twenty a whole retention before the first pass, twenty half a
+    // retention before it.
+    for index in 0..40 {
+        delete(index, if index < 20 { 2 } else { 30_002 }).await;
     }
     let before = bucket_committed(&runtime).await;
-    assert_eq!(before, vec![("retire".to_owned(), 40, 0)]);
+    assert_eq!(before, vec![("retire".to_owned(), 50, 10)]);
 
-    let retain = std::time::Duration::from_secs(60);
-    let now = 60_002;
-    let mut request = tidy(0, 16, now);
-    request.end_record_retain = retain;
-    let report = runtime
-        .tidy_streams_all_groups_once(request)
-        .await
-        .into_result()
-        .expect("a pass that retires");
+    let pass = |now_ms: u64| {
+        let runtime = &runtime;
+        async move {
+            let mut request = tidy(0, 16, now_ms);
+            request.deleted_data_max_age = bound;
+            runtime
+                .tidy_streams_all_groups_once(request)
+                .await
+                .into_result()
+                .expect("a sweep pass")
+        }
+    };
+    let report = pass(60_002).await;
     assert_eq!(report.end_records_retired, 20, "{report:?}");
     assert_eq!(report.expiry_swept_streams, 0, "{report:?}");
     assert_eq!(report.expiry_due_groups, 0, "{report:?}");
     assert_eq!(bucket_committed(&runtime).await, before);
 
-    // The rest are due only once this replica's samples are the retention
-    // old, whatever the pass's wall clock says: a pass right away folds none
-    // of them.
-    let mut request = tidy(0, 16, 1_000_000);
-    request.end_record_retain = retain;
-    let report = runtime
-        .tidy_streams_all_groups_once(request)
-        .await
-        .into_result()
-        .expect("a pass that retires nothing yet");
+    // Ten removed after the seed, dated long before the pass's clock.
+    for index in 40..50 {
+        delete(index, 0).await;
+    }
+    // Half a retention before the next pass's clock is not yet a whole one.
+    let report = pass(90_001).await;
     assert_eq!(report.end_records_retired, 0, "{report:?}");
     assert_eq!(report.expiry_sweeps, 0, "{report:?}");
-    assert_eq!(bucket_committed(&runtime).await, before);
-    // `/__ursula/metrics` counts the folds of the node's sweeps.
-    assert_eq!(runtime.metrics().snapshot().usage_end_records_retired, 20);
+    // Half a retention after the seed, the twenty held at the seed are
+    // due, and the ten removed after it are not.
+    let report = pass(90_002).await;
+    assert_eq!(report.end_records_retired, 20, "{report:?}");
+    let report = pass(10_000_000).await;
+    assert_eq!(report.end_records_retired, 0, "{report:?}");
+    assert_eq!(report.expiry_sweeps, 0, "{report:?}");
+    assert_eq!(bucket_committed(&runtime).await, vec![(
+        "retire".to_owned(),
+        50,
+        0
+    )]);
+    // `/__ursula/metrics` counts the folds this node's replicas applied.
+    assert_eq!(runtime.metrics().snapshot().usage_end_records_retired, 40);
 }

@@ -125,13 +125,8 @@ fn later(now: Instant, pause: Duration) -> Instant {
 
 /// Start the periodic tidy driver, which sweeps every
 /// [`expiry_sweep::interval`] of `deleted_data_max_age` and folds end
-/// records `end_record_retain` after their removal, the node's
-/// `UrsulaConfig::end_record_retention`.
-pub fn spawn_tidy_worker(
-    runtime: &ShardRuntime,
-    deleted_data_max_age: Duration,
-    end_record_retain: Duration,
-) {
+/// records its `RaftConfig::end_record_retention` after their removal.
+pub fn spawn_tidy_worker(runtime: &ShardRuntime, deleted_data_max_age: Duration) {
     let runtime = runtime.clone();
     let mut schedule = Schedule::new(expiry_sweep::interval(deleted_data_max_age), Instant::now());
     tokio::spawn(async move {
@@ -151,7 +146,7 @@ pub fn spawn_tidy_worker(
                         0
                     },
                     expiry_sweep_budget: tick.sweep.map_or(Duration::ZERO, Sweep::budget),
-                    end_record_retain,
+                    deleted_data_max_age,
                     now_ms: crate::runtime::unix_time_ms(),
                 })
                 .await;

@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn gauges_count_producers_ttl_and_shared_refs() {
-        let mut m = StreamStateMachine::new();
+        let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         m.apply(StreamCommand::CreateBucket {
             bucket_id: "bkt1".to_owned(),
         });

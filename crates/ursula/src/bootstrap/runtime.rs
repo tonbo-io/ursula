@@ -181,7 +181,6 @@ fn spawn_with_inputs(
     ursula_runtime::tidy_worker::spawn_tidy_worker(
         &spawned.runtime,
         config.effective_deleted_data_max_age(),
-        config.end_record_retention(),
     );
     if spawned.runtime.has_cold_store() {
         spawn_cold_flush_worker_if_configured(&spawned.runtime, &config.storage.cold);

@@ -16,7 +16,7 @@ fn stream(id: &str) -> BucketStreamId {
 }
 
 fn fresh_machine() -> StreamStateMachine {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: BUCKET.to_owned(),

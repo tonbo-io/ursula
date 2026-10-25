@@ -93,7 +93,7 @@ impl SnapshotScenario {
 }
 
 fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: "benchcmp".to_owned(),
@@ -160,7 +160,7 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
 }
 
 fn build_high_cardinality_machine() -> StreamStateMachine {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: "high-cardinality".to_owned(),

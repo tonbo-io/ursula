@@ -1011,7 +1011,8 @@ mod tests {
     /// exactly the live replica's producer state.
     #[test]
     fn producer_record_and_epoch_floor_round_trip() {
-        let mut machine = ursula_stream::StreamStateMachine::new();
+        let mut machine =
+            ursula_stream::StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });
@@ -1447,7 +1448,8 @@ mod tests {
 
         // A stream frame without its usage, and a header without a required
         // ledger field, are refused.
-        let mut machine = ursula_stream::StreamStateMachine::new();
+        let mut machine =
+            ursula_stream::StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });
@@ -1694,7 +1696,8 @@ mod tests {
     /// its object reference, never as inline bytes.
     #[test]
     fn cold_snapshot_reference_round_trips() {
-        let mut machine = ursula_stream::StreamStateMachine::new();
+        let mut machine =
+            ursula_stream::StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });

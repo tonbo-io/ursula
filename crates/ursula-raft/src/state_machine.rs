@@ -2227,9 +2227,13 @@ impl RaftGroupStateMachine {
             #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault: None,
             placement,
-            engine: match cold_store {
-                Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
-                None => InMemoryGroupEngine::default(),
+            engine: {
+                let mut engine = match cold_store {
+                    Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
+                    None => InMemoryGroupEngine::default(),
+                };
+                engine.set_metrics(metrics.clone());
+                engine
             },
             metrics,
             last_applied_log_id: None,
@@ -2642,11 +2646,6 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                             // and the log on the removal cadence.
                             if removed.streams > 0 || removed.end_records > 0 {
                                 self.log_gauge.record_removal(removed.bytes);
-                            }
-                            if removed.end_records_early > 0
-                                && let Some(metrics) = &self.metrics
-                            {
-                                metrics.record_end_records_folded_early(removed.end_records_early);
                             }
                             RaftGroupResponse::Write(result)
                         }
