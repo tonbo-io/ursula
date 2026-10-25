@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       dst_waiver:
-        description: Leave empty. Otherwise, why this release ships without a DST Nightly run on its commit
+        description: Leave empty. Otherwise, why this release waives the DST Nightly gate (printed in the public release notes)
         required: false
         default: ""
         type: string
@@ -392,7 +392,7 @@ jobs:
               if [ -s "$body" ]; then
                 printf '\n' >>"$body"
               fi
-              printf 'Released without a DST Nightly run on this commit: %s\n' "$DST_WAIVER" >>"$body"
+              printf 'The DST Nightly gate (deterministic simulation) was waived for this release: %s\n' "$DST_WAIVER" >>"$body"
             fi
             if [ -s "$body" ]; then
               notes=(--notes-file "$body")

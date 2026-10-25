@@ -384,7 +384,7 @@ The commit also needs a successful DST Nightly run and a successful Memory
 soak run with both the soak and the 600 s outage at their defaults, each
 dispatched on that branch (`gh workflow run memory-soak.yml --ref <branch>`).
 The dispatch may waive the DST Nightly gate, and only that gate, with a
-recorded reason (`-f dst_waiver=<reason>`).
+recorded reason (`-f dst_waiver="<reason>"`).
 
 GHCR holds only what tagged stable releases publish: the images, the charts,
 and nothing else. Image indexes carry no attestation manifests. Commit
