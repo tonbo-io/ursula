@@ -22,7 +22,8 @@ For a stream `s`, `H(s)` is its unflushed payload bytes and `P(s)` is the number
 state(s) ≤ C0 + H(s) + Prod(s)
 
 C0      ≤ 32 KiB + visible snapshot (inline body or a ~150 B reference, F16)
-          metadata, counters, ≤ 64 shared pack refs (F2),
+          metadata, counters, the version's usage (~96 B, F20),
+          ≤ 64 shared pack refs (F2),
           ≤ 16 staged external refs (F5), one node-local TTL heap entry (F8)
 H(s)    = unflushed payload bytes (also capped per group by admission)
 Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* headers)
@@ -30,9 +31,9 @@ Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* heade
 
 `Prod(s)` covers each producer's id and its fixed-size record (scalars, the newest write's receipt, up to two digests, the closed epoch and the floor marker), plus the stream's epoch floor (F3). The constant term is slack. No term grows with record count or with cold history.
 
-**I2. Per group.** The sum of I1 over the group's streams, plus three terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). Tenant tombstones are the one documented exception (F15).
+**I2. Per group.** The sum of I1 over the group's streams, plus four terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). End records hold the removals of the last half of `raft.deleted_data_max_age` plus two sweep intervals, at most 65,536 per group (F20). An end record adds at most about 250 B to a snapshot (the 122-byte id limit plus about 128 B of fields), so a full group holds about 16 MiB of them. Like the cold-GC queue it is bounded by Ursula's own driver, and also by a hard cap. Tenant tombstones are the one documented exception (F15).
 
-**I3. Snapshots.** A group snapshot encodes I2 in a binary envelope that does not amplify it (F12a). Cadence follows bytes (F12e): a group snapshots after max(F, 2 × its last snapshot) bytes of Raft log, so snapshot bytes written per appended log byte stay near one half and never grow with history.
+**I3. Snapshots.** A group snapshot encodes I2 in a binary envelope that does not amplify it (F12a): one small field per live stream holds its usage, and one frame per end record. Cadence follows bytes (F12e): a group snapshots after max(F, 2 × its last snapshot) bytes of Raft log, so snapshot bytes written per appended log byte stay near one half and never grow with history. A fold of end records counts as a removal (F20).
 
 **I4. Per node.** No structure keyed by something ever seen (streams, pages, lookups) grows without a cap. Caches are bounded by bytes or entries (F13). Per-request memory is at most the 8 MiB response cap or one record (at most 32 MiB), and no write copies group state (F9, F11). The TTL heap holds at most two entries per live TTL stream (F8). Hot payload across the node stays near `flush_pressure_hot_size` (128 MiB) while S3 is healthy (F10), and the per-group admission cap is the hard bound. Unpurged Raft log stays near the node log-byte budget and never passes twice the budget, where admission refuses client writes (F12e).
 
@@ -117,7 +118,7 @@ After removing elements, a vector or deque whose capacity exceeds 2 × len + 64 
 
 ### F9: engine bookkeeping
 
-The per-stream append count is one of the counters of the stream version's replicated usage (F20), which apply keeps in `StreamSlot`, so it dies with the stream on delete, TTL expiry or bucket purge. Single-node admission uses the O(1) `check_cold_write_admission` instead of cloning the engine to preview a write.
+The per-stream append count is one of the counters of the stream version's replicated usage (F20), which apply keeps in `StreamSlot` and a group snapshot carries in the stream's frame. It leaves the slot with the stream on delete, TTL expiry or bucket purge, into the stream's end record. Single-node admission uses the O(1) `check_cold_write_admission` instead of cloning the engine to preview a write.
 
 ### F10: flush planner
 
@@ -185,6 +186,10 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 
 **Structure** (`ursula-stream/src/state_machine/usage_ledger.rs`). Each stream slot holds its version's usage: the committed counters of the usage contract, its applied appends, the time of its newest counted write, its counters when its current history began, the history its counters began in and its sequence number in the group's usage sequence. Apply counts each write where the bucket counter counted it, by its rule, and the first write after a history event records the version's counters when that history began, as it records the stream's inherited tail (W5). A removal leaves an end record with the version's final usage, how and when it ended, the history it ended in and the stream id, under a new sequence number. Every removal goes through `remove_stream_state`, so a deletion, a bucket purge, a TTL expiry and a create over an expired stream all leave one. A purge ends its streams at the one time its admin request stamped for every group. The group holds its genesis history id, its latest sequence number, its end records, the watermark through which end records are folded, and per bucket the retired usage of every folded end record and of every version a backup import restored (F15). A group holds at most 65,536 end records: a removal past that first folds the lowest-numbered one into its bucket's retired usage, which counts as a removal for the snapshot driver (#669). A bucket's totals are its retired usage plus its live versions plus its end records, derived on every read, so they equal the per-version sums by construction. An import restores every version at zero counters, counted since the import's history, and retires the backup's bucket totals.
 
+**Bound.** An end record stays for half of `raft.deleted_data_max_age`, by the group leader's monotonic clock. The leader's background sweep (F0) then folds it into its bucket's retired usage: each `Sweep` entry removes expired streams and folds the end records through the usage sequence number the leader saw half the bound ago, under the sweep's one cap, budget and re-run. The folded set is a function of replicated state and the entry, so every replica agrees. A group holds at most 65,536 end records, and a removal past that folds the oldest first, so the bound holds whatever the removal rate and whether or not the sweep runs. Folds count as removals for the snapshot driver, so the ids they held leave the snapshot and the log on the removal cadence. No bound depends on a consumer.
+
+**Persistence** (`ursula-raft/src/snapshot_codec.rs`). A group snapshot carries each version's usage in its stream frame (field 24), each end record as a frame of its own (frame 8), and the genesis id, the latest sequence number, the watermark and the retired rows in its header (fields 13 to 16). Every install, a restart's included, restores through `StreamStateMachine::restore_group`, which requires every bucket's totals in the header to equal its retired usage plus its live versions plus its end records, counter by counter, and refuses a snapshot whose sequence numbers repeat, are zero or pass the group's, whose end records are not above the watermark, or that holds more than 65,536 of them. A replica that installs a snapshot therefore keeps every version's counters and every end record. A backup holds only the bucket totals (backup format 5), which an import retires.
+
 **Retirement** (`ursula-runtime/src/expiry_sweep.rs`). The group sweep (F0) folds an end record into its bucket's retired usage half of `raft.deleted_data_max_age` after its removal, by the monotonic clock of the node that leads the group, and the fold counts as a removal for the snapshot driver. Each replica's group engine keeps a retirement clock: samples of the group's latest sequence number taken in every tidy pass, at most one per half sweep interval. The leader's `Sweep` names as `retire_through` the larger of the clock's seed and the sequence number of its newest sample at least the retention old, so no proposer's wall clock decides a fold, and apply folds what the entry names. The clock seeds at its first sample, after a snapshot install and after a history change, from the removal times the end records carry: the highest sequence number through which every end record was removed the retention before the pass's wall clock. The retention is one value per node, `UrsulaConfig::end_record_retention`, which the tidy driver passes to every group. `raft.deleted_data_max_age` is refused below the floor within which an end record leaves: half of it, two sweep intervals, a quarter of it until the fold's snapshot, a drive interval and an install timeout (`ursula_config::end_record_residence_floor`).
 
 ## 5. Structure, bound and mechanism
@@ -201,7 +206,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Cold-GC queue | replicated | bounded while GC is healthy | F14b |
 | Retired usage rows, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
 | Per-stream usage | replicated | about 96 B per stream, in C0 | F20, F9 |
-| End records | replicated | at most 65,536 per group | F20 |
+| End records | replicated | removals of the last half of `raft.deleted_data_max_age` plus two sweep intervals, at most 65,536 per group | F20 |
 | Retirement clock | node | at most twice the retention over the sweep interval, plus two, samples per group | F20 |
 | Group snapshot | replicated | encodes the above, cadence by bytes | F12a to F12e |
 | Unpurged Raft log | node | near the log budget, hard limit 2 × budget on every Raft node | F12e, F17 |
@@ -242,7 +247,7 @@ Each defect class is pinned by tests that drive the production entry points.
 - **W2**: slow streams sharing packed flushes, including the reduced starvation reproduction (`w2_starve`) and the F2 driver (`w2_driver`).
 - **W3**: external-only streams with 1 or 5,000 records per append.
 - **W4**: producer headers with one producer, epoch bumps, or many producer ids.
-- **W5**: churn through deletes, TTL expiry, the TTL heap and bucket purge.
+- **W5**: churn through deletes, TTL expiry, the TTL heap and bucket purge. Before its after checkpoints a `Sweep` folds every end record the removals left, as the leader's sweep does once their retention passed. It reports the end records held before that fold and the snapshot bytes each adds, and checks that each adds at most 256 B (`f20_end_record_bytes_per_removal`) and that none is left after it (`f20_end_records_after_retire`).
 - **W6**: the other workloads with periodic retention.
 - **planner**: deterministic counters for one flush-planning pass over many hot streams, and the W2 starved-stream shape.
 - **cadence**: real state machines with round-robin appends under the production F12e policy, reporting snapshot bytes per appended log byte (target at most 0.6) and the largest node log against the budget. `cadence_w1` is one heavy stream on a 128-group node, `cadence_g128` is a uniform 128-group workload.
@@ -271,7 +276,7 @@ The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.r
 
 ### 7.4 Gauges
 
-`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers (total and per-stream maximum), producer bytes (total and per-stream maximum), streams with an epoch floor, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows and erased buckets. Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters, the `cold_orphan_*` counters and `producer_expired_answers`. No alerts ship with them.
+`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers (total and per-stream maximum), producer bytes (total and per-stream maximum), streams with an epoch floor, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows, erased buckets, and the end records (F20) with their snapshot bytes and earliest removal time. Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters, the `cold_orphan_*` counters, `producer_expired_answers`, and `usage_end_records_retired` and `usage_end_records_folded_early`, the end records the node's sweeps folded and the ones its replicas folded at the cap (F20). No alerts ship with them.
 
 ## 8. Design rationale
 
