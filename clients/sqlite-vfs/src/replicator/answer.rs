@@ -59,6 +59,8 @@ use ursula_headers::WriteOutcome;
 use super::BlockedReason;
 use super::ResetKind;
 use super::batch::Sealed;
+use crate::open::table::IdentityRefused;
+use crate::open::table::check_identity;
 use crate::wire::Answer;
 use crate::wire::Exchange;
 use crate::wire::Typed;
@@ -357,12 +359,19 @@ pub(crate) fn decide_head(exchange: &Exchange, check: HeadCheck<'_>) -> HeadDeci
         Exchange::Answered(answer) => answer,
     };
     match &answer.typed {
-        Ok(Typed::Head {
-            identity: Some(identity),
-            stream,
-        }) if matches!(answer.status, 200 | 404) => {
-            if &identity.cluster_id != check.cluster_id {
-                return HeadDecision::WrongCluster;
+        Ok(Typed::Head { identity, stream }) if matches!(answer.status, 200 | 404) => {
+            // A bound session's HEAD takes the open's identity check.
+            match check_identity(identity.as_ref(), Some(check.cluster_id.as_str())) {
+                Ok(_) => {}
+                Err(IdentityRefused::WrongCluster { .. }) => return HeadDecision::WrongCluster,
+                Err(IdentityRefused::NoServerIdentity) => {
+                    return HeadDecision::Common(Common::Blocked(BlockedReason::NoServerIdentity));
+                }
+                Err(IdentityRefused::ProtocolMismatch { found }) => {
+                    return HeadDecision::Common(Common::Blocked(
+                        BlockedReason::ProtocolMismatch { found },
+                    ));
+                }
             }
             match stream {
                 None => HeadDecision::Deleted,
@@ -382,12 +391,6 @@ pub(crate) fn decide_head(exchange: &Exchange, check: HeadCheck<'_>) -> HeadDeci
                     None => HeadDecision::Rewound,
                 },
             }
-        }
-        Ok(Typed::Head { identity: None, .. }) if matches!(answer.status, 200 | 404) => {
-            // A server without `Ursula-Protocol: 2`.
-            HeadDecision::Common(Common::Blocked(BlockedReason::Rejected {
-                status: answer.status,
-            }))
         }
         _ => HeadDecision::Common(decide_status(answer)),
     }

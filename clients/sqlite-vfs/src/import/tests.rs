@@ -24,6 +24,7 @@ use crate::model::ModelServer;
 use crate::model::faults::Fault;
 use crate::model::faults::Scripted;
 use crate::options::OptionsError;
+use crate::snapshotter::SnapshotFailure;
 use crate::testdir::TempDir;
 use crate::transport::Attempt;
 use crate::transport::Transport;
@@ -520,8 +521,8 @@ fn bytes_after_the_claim_fail_the_import() {
     }
 }
 
-// A gateway's concealing 404 without `Ursula-Protocol` is no missing stream: server_too_old, and
-// nothing is created.
+// A gateway's concealing 404 without `Ursula-Protocol` is no missing stream: no_server_identity,
+// and nothing is created.
 #[test]
 fn a_head_404_without_the_protocol_creates_nothing() {
     let dir = TempDir::new("import-concealed");
@@ -531,9 +532,121 @@ fn a_head_404_without_the_protocol_creates_nothing() {
     transport.answer =
         Some(|request| (request.method == Method::Head).then(|| RawAnswer::new(404)));
     let e = import(&transport, &path).unwrap_err();
+    assert!(matches!(e, ImportError::NoServerIdentity), "{e}");
+    assert_eq!(e.kind().as_str(), "no_server_identity");
+    assert!(server.lock().unwrap().frames(PATH).is_none());
+}
+
+/// A HEAD's `404` from a server of the release line `protocol`.
+fn missing_on_line(protocol: u32) -> RawAnswer {
+    let mut raw = RawAnswer::new(404);
+    ursula_headers::ServerIdentity {
+        protocol,
+        cluster_id: ClusterId::new("cluster-a").unwrap(),
+    }
+    .render(raw.emit());
+    raw
+}
+
+// A server of another release line (0.8 to 0.10 send 2, a newer one its line) is refused
+// protocol_mismatch
+// before anything is created.
+#[test]
+fn a_server_of_another_release_line_creates_nothing() {
+    type HeadAnswer = fn(&Request) -> Option<RawAnswer>;
+    let answers: [(u32, HeadAnswer); 2] = [
+        (2, |request| {
+            (request.method == Method::Head).then(|| missing_on_line(2))
+        }),
+        (crate::open::table::next_line(), |request| {
+            (request.method == Method::Head)
+                .then(|| missing_on_line(crate::open::table::next_line()))
+        }),
+    ];
+    for (found, answer) in answers {
+        let dir = TempDir::new("import-other-line");
+        let path = write_db(dir.path(), &image(2));
+        let server = server();
+        let mut transport = Hooked::new(&server, |_| false, |_| {});
+        transport.answer = Some(answer);
+        let e = import(&transport, &path).unwrap_err();
+        assert!(
+            matches!(e, ImportError::ProtocolMismatch { found: f } if f == found),
+            "{e}"
+        );
+        assert_eq!(e.kind().as_str(), "protocol_mismatch");
+        assert!(server.lock().unwrap().frames(PATH).is_none());
+    }
+}
+
+/// A transport to the model whose HEADs after the first, the import's own, are rewritten by
+/// `rewrite`: the stream's server changes once the import has created and claimed it.
+struct LaterHeads {
+    server: Arc<Mutex<ModelServer>>,
+    /// Whether the import's own HEAD went by.
+    seen_first: Mutex<bool>,
+    rewrite: fn(&mut RawAnswer),
+}
+
+impl Transport for LaterHeads {
+    fn send(&self, request: &Request, _attempt: Attempt) -> Exchange {
+        let mut raw = self.server.lock().unwrap().handle(PATH, request);
+        if request.method == Method::Head
+            && std::mem::replace(&mut *self.seen_first.lock().unwrap(), true)
+        {
+            (self.rewrite)(&mut raw);
+        }
+        Exchange::Answered(Box::new(raw.parse(request)))
+    }
+}
+
+/// An import whose HEADs after its first are rewritten by `rewrite`: its error, and whether the
+/// stream then holds a snapshot.
+fn import_with_later_heads(rewrite: fn(&mut RawAnswer)) -> (ImportError, bool) {
+    let dir = TempDir::new("import-publish-line");
+    let path = write_db(dir.path(), &image(2));
+    let server = server();
+    let transport = LaterHeads {
+        server: Arc::clone(&server),
+        seen_first: Mutex::new(false),
+        rewrite,
+    };
+    let e = import(&transport, &path).unwrap_err();
+    let snapshot = head(&server).snapshot().is_some();
+    (e, snapshot)
+}
+
+// The publish's HEAD takes the same identity check as the import's first: a server of another
+// release line fails the import protocol_mismatch, and an answer without identity
+// no_server_identity, with no snapshot published.
+#[test]
+fn a_publish_head_of_another_line_or_without_identity_fails_the_import() {
+    let (e, snapshot) = import_with_later_heads(|raw| {
+        raw.headers.retain(|(name, _)| *name != "ursula-protocol");
+        raw.header(
+            "ursula-protocol",
+            crate::open::table::next_line().to_string(),
+        );
+    });
     assert!(
-        matches!(e, ImportError::ServerTooOld { protocol: None }),
+        matches!(
+            e,
+            ImportError::Publish(SnapshotFailure::ProtocolMismatch { found })
+                if found == crate::open::table::next_line()
+        ),
         "{e}"
     );
-    assert!(server.lock().unwrap().frames(PATH).is_none());
+    assert_eq!(e.kind().as_str(), "protocol_mismatch");
+    assert!(!snapshot);
+
+    let (e, snapshot) = import_with_later_heads(|raw| {
+        raw.headers
+            .retain(|(name, _)| !matches!(*name, "ursula-protocol" | "ursula-cluster-id"));
+    });
+    assert!(
+        matches!(e, ImportError::Publish(SnapshotFailure::NoServerIdentity)),
+        "{e}"
+    );
+    assert_eq!(e.kind().as_str(), "no_server_identity");
+    assert!(!snapshot);
 }

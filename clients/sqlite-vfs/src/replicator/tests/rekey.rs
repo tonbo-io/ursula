@@ -34,10 +34,12 @@ use crate::codec::frame;
 use crate::ids::Activation;
 use crate::ids::Position;
 use crate::replicator::Action;
+use crate::replicator::BlockedReason;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
 use crate::replicator::Replicator;
 use crate::replicator::ResetKind;
+use crate::replicator::answer::Common;
 use crate::replicator::answer::HeadCheck;
 use crate::replicator::answer::HeadDecision;
 use crate::replicator::answer::decide_head;
@@ -250,6 +252,44 @@ fn decide_head_rows() {
         .unwrap()
         .render(elsewhere.emit());
     assert_eq!(decide(&elsewhere, None), HeadDecision::WrongCluster);
+    // The open's identity check: another release line (0.8 to 0.10 send 2, a newer one its line) blocks
+    // `protocol_mismatch` before the cluster is compared, and an answer without identity, a
+    // `200` or a `404`, blocks `no_server_identity`.
+    let next = crate::open::table::next_line();
+    for (found, cluster_id) in [
+        (2, cluster()),
+        (next, cluster()),
+        (next, ursula_headers::ClusterId::new("cluster-b").unwrap()),
+    ] {
+        for status in [200, 404] {
+            let mut raw = RawAnswer::new(status);
+            ServerIdentity {
+                protocol: found,
+                cluster_id: cluster_id.clone(),
+            }
+            .render(raw.emit());
+            if status == 200 {
+                StreamHead::new(token(), off(40), off(0), max)
+                    .unwrap()
+                    .render(raw.emit());
+            }
+            assert_eq!(
+                decide(&raw, None),
+                HeadDecision::Common(Common::Blocked(BlockedReason::ProtocolMismatch { found })),
+                "{found} {status}"
+            );
+        }
+    }
+    let mut anonymous = RawAnswer::new(200);
+    StreamHead::new(token(), off(40), off(0), max)
+        .unwrap()
+        .render(anonymous.emit());
+    for raw in [anonymous, RawAnswer::new(404)] {
+        assert_eq!(
+            decide(&raw, None),
+            HeadDecision::Common(Common::Blocked(BlockedReason::NoServerIdentity))
+        );
+    }
 }
 
 #[test]

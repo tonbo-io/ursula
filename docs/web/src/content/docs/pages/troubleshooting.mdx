@@ -536,6 +536,8 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `request_too_large` | A layer in front of the stream allows request bodies below 4 KiB | Raise the layer's limit |
 | `redirected` | The stream URL answers with a redirect, which the extension never follows | Point the URL at a gateway or at a single node |
 | `wrong_cluster` | The stream URL now reaches another deployment (another `Ursula-Cluster-Id`) | Fix the routing. Replication resumes by itself within 30 s |
+| `protocol_mismatch` | A `HEAD` the session sent to confirm an answer such as a `412` or a `404` answered as a server of another release line, such as a cluster moved to another minor | Run the extension of the server's release, or point the URL back at a server of the extension's line. Stop every SQLite session before you move a cluster to another release line, since a session checks the line only at such a `HEAD` |
+| `no_server_identity` | A `HEAD` answer carries no `Ursula-Protocol` and `Ursula-Cluster-Id`: a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream | Check the token, and send `HEAD` through to the server |
 | `rejected` | A status the extension does not expect, such as a layer that rewrites bodies | Look at the layers between the client and the gateway |
 
 A blocked condition is retried every 30 s, and commits continue until `commits.pending_bytes` reaches `maxPendingBytes`. A `synced()` with a `signal` rejects with the signal's reason and leaves the commits replicating.
@@ -566,7 +568,9 @@ The database was reset. Every statement throws an `UrsulaResetError` (`errcode` 
 
 | `kind` | Cause | What to do |
 | ------ | ----- | ---------- |
-| `server_too_old` | The stream's `HEAD` lacks `Ursula-Protocol: 2` or `Ursula-Cluster-Id`: a 0.7 server, or a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream, whose `404` carries neither header | Run a 0.8 server, check the token, and send `HEAD` through to the server |
+| `protocol_mismatch` | The server is of another release line than the extension: its `Ursula-Protocol` is not the extension's line (`11` for 0.11.x). A 0.8 to 0.10 server sends `2` | Run the extension of the server's release |
+| `no_server_identity` | The stream's `HEAD` answer lacks `Ursula-Protocol` and `Ursula-Cluster-Id`: a server before 0.8, or a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream, whose `404` carries neither header | Check the token, send `HEAD` through to the server, and run a server of the extension's release |
+| `server_too_old` | Reported by a 0.8 to 0.10 extension when the server is of another release line, newer ones included: those extensions accept only the `Ursula-Protocol: 2` that 0.8 to 0.10 servers send | Upgrade the extension with the server, and stop its sessions before the move |
 | `stream_format` | The stream holds 0.7 data, or another content type | Move the database with an import, see [Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07) |
 | `wrong_cluster` | The cache was built on another deployment than the one the URL reaches now | Fix the routing, or use another `dir` for the other deployment |
 | `not_found` | The stream is missing and the cache holds data | Open with `recreate: true`, or open another stream |

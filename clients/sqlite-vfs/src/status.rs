@@ -34,6 +34,8 @@ fn condition(c: &Condition) -> &'static str {
             BlockedReason::Forbidden => "forbidden",
             BlockedReason::Redirected { .. } => "redirected",
             BlockedReason::WrongCluster => "wrong_cluster",
+            BlockedReason::NoServerIdentity => "no_server_identity",
+            BlockedReason::ProtocolMismatch { .. } => "protocol_mismatch",
             BlockedReason::Rejected { .. } => "rejected",
         },
     }

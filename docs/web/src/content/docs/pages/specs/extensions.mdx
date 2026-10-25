@@ -648,7 +648,7 @@ There is no client opt-in or opt-out: the stream's content type decides the enco
 
 A server implementing this extension sends on every answer to a `HEAD`, `404`, redirects and `503` included:
 
-- `Ursula-Protocol: 2`, the version of the contract that Sections 2.4, 5, 10 and 11 define. A later breaking change to them raises it. A server that sends none speaks version 1. A client MAY refuse a server that sends a lower version or none.
+- `Ursula-Protocol: <line>`, the server's release line as one unsigned decimal: major × 1000 + minor of the server's version (`11` for 0.11.x, `1000` for 1.0.x). Patch releases of one line interoperate, and releases of different lines do not. A client that depends on Sections 2.4, 5, 10 and 11 SHOULD refuse a server that sends another line or none. Servers of 0.8 to 0.10 send `2`.
 - `Ursula-Cluster-Id: <id>`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, naming the deployment that serves the request. It does not change across restarts, upgrades, leader changes or history events, and an operator keeps it when a restore replaces a deployment. Two deployments that one client can reach MUST NOT share an id. A client that keeps state across requests SHOULD keep the id with it, and treat a different id as a different deployment, not as a new history of the same stream.
 
 These two headers are route-level, so a client tells a host alias routed to another deployment from a deleted stream. Intermediaries pass them through. They come on answers from a server: an answer an intermediary sends itself, such as a gateway's `401`, `403`, `429` or `503`, carries neither, and a client judges the protocol and the deployment only from answers that carry them.

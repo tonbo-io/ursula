@@ -497,7 +497,8 @@ enum Replicator {
 }
 enum ClaimKind { Takeover { round, rekeyed }, Continuation { own, resent } }
 enum Condition { Retrying, Blocked(BlockedReason) }
-enum BlockedReason { RequestTooLarge, Unauthorized, PaymentRequired, Forbidden, Redirected, WrongCluster, Rejected }
+enum BlockedReason { RequestTooLarge, Unauthorized, PaymentRequired, Forbidden, Redirected, WrongCluster,
+                     NoServerIdentity, ProtocolMismatch { found }, Rejected }
 enum ResetKind { Fenced, Stale, Rewound, Deleted, LocalDamage, StreamState, Internal }
 // events:  Logged, Answer, Tick, Boundary, Snapshotted, Sync, CaughtUp, Stop
 // actions: Send, PersistClaim, ReKey, PersistAck, Wake, Synced, Abandoned, Timer, Condition,
@@ -763,7 +764,8 @@ Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
 
 | local generation | HEAD | the open |
 | --- | --- | --- |
-| any | no `Ursula-Protocol: 2` (a gateway's concealing `404` included) | refuse `server_too_old` |
+| any | no `Ursula-Protocol` (a gateway's concealing `404` included) | refuse `no_server_identity` |
+| any | `Ursula-Protocol` of another release line | refuse `protocol_mismatch` |
 | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
 | none, replaced | `404` | create, take over |
 | trusted, holding no data | `404` | create, take over |
@@ -802,8 +804,8 @@ Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
 - A stream binds under one `dir` at a time in a process. An open under another `dir` waits for a
   binding nothing of the host holds to retire, and is refused `bound_elsewhere` otherwise.
 
-Tests: `open/table.rs` `a_server_without_protocol_2_is_too_old`,
-`a_404_without_protocol_2_is_too_old_not_missing`,
+Tests: `open/table.rs` `another_line_or_no_identity_is_refused_before_anything_else`,
+`a_404_without_identity_is_refused_not_missing`,
 `another_cluster_refuses_a_trusted_generation_before_anything_else`,
 `a_missing_stream_is_created_unless_a_trusted_generation_holds_data`,
 `another_content_type_and_a_closed_stream_are_refused`,
@@ -815,7 +817,8 @@ Tests: `open/table.rs` `a_server_without_protocol_2_is_too_old`,
 `another_token_that_does_not_inherit_salvages_or_trashes`,
 `an_unreachable_stream_opens_a_trusted_generation_with_a_claim_provisionally`,
 `an_unreachable_stream_waits_without_a_generation_a_claim_to_continue_or_with_a_replaced_one`.
-Driver: `driver/tests.rs` `a_server_without_protocol_2_is_refused`,
+Driver: `driver/tests.rs` `a_server_without_identity_is_refused`,
+`a_server_of_another_release_line_is_refused`,
 `a_head_404_without_the_protocol_is_no_missing_stream`,
 `a_stream_of_another_content_type_is_refused`, `a_stream_of_usq1_frames_is_refused`,
 `a_missing_stream_with_a_local_generation_holding_data_is_not_found`,
@@ -880,7 +883,8 @@ A `readOnly` open claims nothing and never fences the owner.
 
   | reader generation | HEAD | the open |
   | --- | --- | --- |
-  | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
+  | any | no `Ursula-Protocol` | refuse `no_server_identity` |
+  | any | `Ursula-Protocol` of another release line | refuse `protocol_mismatch` |
   | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
   | any | `404` | refuse `not_found` |
   | any | another content type | refuse `stream_format` |
@@ -1039,11 +1043,25 @@ generation was built.
   misrouted to another deployment fails its incarnation precondition and never applies there.
 - A misrouted host alias is refused, never salvaged and adopted. A fresh host has nothing to
   compare, so a misrouted alias there opens the other deployment's stream ([Limits](#limits)).
+- `Ursula-Protocol` carries the server's release line, major × 1000 + minor of its version
+  (`11` for 0.11.x), which `ursula-headers` derives from its package version at compile time, so
+  the server and the extension built from one tree speak one line. Every HEAD goes through one
+  check (`open/table.rs` `check_identity`): no identity refuses `no_server_identity`, another line
+  `protocol_mismatch`, then another cluster `wrong_cluster`. The open table, a build's HEADs, the
+  import, the snapshotter and the replicator's HEAD while bound share it. A bound database that
+  meets another line or no identity while confirming a `412` or `404` blocks with that condition
+  and retries every 30 s, as for another cluster. A bound database sends a `HEAD` only to confirm
+  such an answer, and its writes carry no identity, so a cluster moved to another line under it
+  is noticed at the next such `HEAD`. Every SQLite session therefore stops before the move. A gateway's concealing
+  `404` carries no identity, so it is never read as a deleted stream.
 
 Tests: `generation/tests.rs` `every_spelling_of_a_path_is_one_canonical_path`,
 `urls_that_name_no_stream_are_refused`, `open/table.rs`
-`another_cluster_refuses_a_trusted_generation_before_anything_else`, `driver/tests.rs`
-`a_misroute_blocks_and_then_resumes`, `a_build_whose_route_flips_to_another_deployment_is_refused`,
+`another_cluster_refuses_a_trusted_generation_before_anything_else`,
+`another_line_or_no_identity_is_refused_before_anything_else`, `replicator/tests/rekey.rs`
+`decide_head_rows`, `replicator/tests/machine.rs`
+`head_blocks_another_release_line_and_an_answer_without_identity`, `driver/tests.rs`
+`a_server_of_another_release_line_is_refused`, `a_misroute_blocks_and_then_resumes`, `a_build_whose_route_flips_to_another_deployment_is_refused`,
 the world's properties 16 and 17 with
 `negative_control_a_misroute_taken_for_a_deleted_stream_resets` and
 `negative_control_a_misroute_taken_for_a_history_writes_to_the_other_deployment`, and
@@ -1247,7 +1265,7 @@ mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
 | `UrsulaUnavailableError` | `open()` when its signal fires, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 Network failures never throw from statements or `synced()`. A refused write fails with
 `SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
@@ -1315,8 +1333,9 @@ file the first snapshot of a new stream, page for page:
    4096-byte pages, no `-wal` and no hot journal beside it (before and after the copy), a length of
    exactly the pages its header counts. Page 1 of the copy is marked WAL.
 2. A HEAD: the stream must be missing, or an empty stream of the VFS content type with no
-   snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). A `404`
-   without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream.
+   snapshot. Anything else refuses (`no_server_identity`, `protocol_mismatch`, `stream_format`,
+   `stream_state`). A `404` without `Ursula-Protocol` is `no_server_identity`, never a missing
+   stream.
 3. The create, then a claim of epoch 1 with the reserved import activation (`ursula-import-v1`),
    resent unchanged until a definite answer. Its receipt must start at offset 0. Its end is `W`,
    above 0, since builds skip a snapshot at offset 0, and the first open then claims above epoch 1.
@@ -1340,7 +1359,8 @@ Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
 `a_file_above_the_limit_without_parts_is_refused_naming_it`,
 `only_a_missing_or_empty_stream_is_imported_into`, `a_claim_that_is_not_first_publishes_nothing`,
 `a_claim_whose_answer_is_lost_is_resent_unchanged`, `bytes_after_the_claim_fail_the_import`,
-`a_head_404_without_the_protocol_creates_nothing`, `the_claim_carries_the_import_activation`,
+`a_head_404_without_the_protocol_creates_nothing`,
+`a_server_of_another_release_line_creates_nothing`, `the_claim_carries_the_import_activation`,
 `codec/stream.rs` `the_claim_of_an_import_stops_the_read`, `driver/tests.rs`
 `an_empty_owner_behind_an_import_builds_from_its_snapshot_and_claims_after`,
 `a_reader_built_before_an_import_reopens_from_its_snapshot`, and `test/import.e2e.ts` "imports a
@@ -1384,7 +1404,7 @@ on its own, its database left open", `test/workers.e2e.ts`.
 
 - `replication.condition` names the retrying or blocked condition of [Answers](#answers):
   `retrying`, `request_too_large`, `unauthorized`, `payment_required`, `forbidden`, `redirected`,
-  `wrong_cluster`, `rejected`.
+  `wrong_cluster`, `no_server_identity`, `protocol_mismatch`, `rejected`.
 - `ursula_stats(path)` drains per-commit measurements (bytes, pages, time in the log and the VFS),
   at most 8,192 of each kind between drains, and reports what it dropped.
 - Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.
@@ -1418,7 +1438,7 @@ against, and the e2e suites run against a real server in CI.
 | 7 | Size, routing, repeats and key conflicts are answered before the body, and a node never redirects after reading a body. Over HTTP/1.1 an early answer drains the body | Answers Before the Body, Routing Answers | [Answers](#answers), [Transport](#transport) |
 | 8 | Snapshots are keyed by `(offset, digest)`, `204` or `409` naming the latest. Parts are staged and committed by id, a commit checks its key before its parts, and retention is monotonic | Publish Snapshot | [Snapshots](#snapshots), [Import](#import) |
 | 9 | Snapshot reads honor one byte range | Read Snapshot | [Snapshots](#snapshots) |
-| 10 | HEAD carries the token, tail, snapshot, `Ursula-Protocol: 2`, `Ursula-Cluster-Id` (on every answer, `404` included), `Ursula-Max-Request-Bytes`, `Ursula-Max-Snapshot-Bytes` with a cold store, and after a history event `Stream-Previous-Incarnation` and `Stream-Inherited-Offset`, all in one integer offset space | Server Metadata, Snapshot Metadata on HEAD and Stream Incarnation | [Appends](#appends), [Open](#open), [History](#history), [Identity](#identity) |
+| 10 | HEAD carries the token, tail, snapshot, `Ursula-Protocol` (the server's release line), `Ursula-Cluster-Id` (on every answer, `404` included), `Ursula-Max-Request-Bytes`, `Ursula-Max-Snapshot-Bytes` with a cold store, and after a history event `Stream-Previous-Incarnation` and `Stream-Inherited-Offset`, all in one integer offset space | Server Metadata, Snapshot Metadata on HEAD and Stream Incarnation | [Appends](#appends), [Open](#open), [History](#history), [Identity](#identity) |
 | 11 | Every `413` carries the limit it applied, decided from `Content-Length` | Server Metadata | [Answers](#answers) |
 | 12 | The cluster id is stable across restarts, upgrades, leader changes and history events, and unique among the deployments a client reaches | Server Metadata | [Log](#log), [Identity](#identity) |
 | 13 | Leader-consistent reads with the incarnation precondition | Leader Consistency | [Reconcile](#reconcile), [Synced](#synced) |
@@ -1445,8 +1465,17 @@ their bytes. The APIs that may only grow within 0.8.x are the `options_json` key
 `ursula_open` result, status keys and values, event shapes, error kinds and actions, the result
 codes 7178, 266 and 778, and the SQL function names and arities.
 
-0.8 refuses 0.7 streams (`stream_format`) and 0.7 servers (`server_too_old`) and never reads 0.7
-caches, since the default directory and the names changed. 0.7 fails closed on 0.8 files.
+0.8 refuses 0.7 streams (`stream_format`) and 0.7 servers and never reads 0.7 caches, since the
+default directory and the names changed. 0.7 fails closed on 0.8 files.
+
+The extension opens only on its own release line: `Ursula-Protocol` carries the server's line,
+major × 1000 + minor (`11` for 0.11.x), and the extension refuses another line
+(`protocol_mismatch`) and an answer without it and `Ursula-Cluster-Id` (`no_server_identity`) at
+open, at import, at a snapshot's `HEAD` and at a bound database's `HEAD` ([Identity](#identity)).
+A bound database writes without a `HEAD` between, so every SQLite session stops before a cluster
+moves to another line.
+Patches of one line interoperate. The 0.8 to 0.10 extensions accept only `2`, so they refuse a
+0.11 server with their `server_too_old`.
 
 Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
 `the_part_frames_are_frozen`, `the_log_segment_is_frozen`,

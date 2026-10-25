@@ -143,7 +143,7 @@ struct World {
     queue: VecDeque<(usize, super::Io)>,
     now: u64,
     sent: Vec<Sent>,
-    /// HEADs are answered as a protocol 1 server would.
+    /// HEADs are answered without the server's identity, as a server before 0.8 would.
     legacy: bool,
     /// HEADs are answered `404` without `Ursula-Protocol`, as a gateway that conceals a stream.
     concealed: bool,
@@ -2506,6 +2506,56 @@ fn snapshots_publish_under_the_new_token_and_a_stale_token_is_transient() {
     ));
 }
 
+// A snapshot's HEAD takes the open's identity check: one of another release line fails
+// `protocol_mismatch`, and one without identity `no_server_identity`. Neither publishes or stops
+// snapshots (design: Identity).
+#[test]
+fn a_snapshot_head_of_another_line_or_without_identity_publishes_nothing() {
+    let (server, token) = published_world();
+    let body = body_file(tail_of(&server), 1);
+    let before = retention(&server);
+    let other_line = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, mut raw| {
+            if request.method == Method::Head {
+                raw.headers.retain(|(name, _)| *name != "ursula-protocol");
+                raw.header(
+                    "ursula-protocol",
+                    crate::open::table::next_line().to_string(),
+                );
+            }
+            raw
+        },
+    };
+    let e = publish_through(&other_line, token, 1 << 20, &body).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            crate::snapshotter::SnapshotFailure::ProtocolMismatch { found }
+                if found == crate::open::table::next_line()
+        ),
+        "{e}"
+    );
+    assert!(!e.stops());
+    let anonymous = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, mut raw| {
+            if request.method == Method::Head {
+                raw.headers
+                    .retain(|(name, _)| !matches!(*name, "ursula-protocol" | "ursula-cluster-id"));
+            }
+            raw
+        },
+    };
+    let e = publish_through(&anonymous, token, 1 << 20, &body).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::NoServerIdentity),
+        "{e}"
+    );
+    assert!(!e.stops());
+    assert_eq!(retention(&server), before);
+}
+
 #[test]
 fn a_404_confirmed_by_head_resets_deleted() {
     assert_eq!(reset_after(|s| s.delete(PATH).unwrap()), vec![
@@ -2588,21 +2638,66 @@ fn acks_are_written_at_most_once_a_second() {
 }
 
 #[test]
-fn a_server_without_protocol_2_is_refused() {
-    let dir = TempDir::new("driver-too-old");
+fn a_server_without_identity_is_refused() {
+    let dir = TempDir::new("driver-no-identity");
     let mut w = World::new();
     w.legacy = true;
     let c = w.core();
     let e = kind(w.open_result(c, spec(dir.path(), 1)));
+    assert!(matches!(*e, OpenError::NoServerIdentity), "{e}");
+    assert_eq!(e.error_kind().as_str(), "no_server_identity");
+}
+
+/// Rewrites every HEAD answer's `Ursula-Protocol` to `value`.
+fn protocol_of_heads(value: String) -> AnswerHook {
+    Box::new(move |request, answer| {
+        if request.method == Method::Head {
+            answer
+                .headers
+                .retain(|(name, _)| *name != "ursula-protocol");
+            answer.header("ursula-protocol", value.clone());
+        }
+    })
+}
+
+// A server of another release line (0.8 to 0.10 send 2, a newer one its line) is refused at once with
+// `protocol_mismatch`, creating nothing. A malformed value is no answer of Ursula's: the open
+// retries it as rejected until its signal fires.
+#[test]
+fn a_server_of_another_release_line_is_refused() {
+    for found in [2, crate::open::table::next_line()] {
+        let dir = TempDir::new("driver-other-line");
+        let mut w = World::new();
+        w.rewrite = Some(protocol_of_heads(found.to_string()));
+        let c = w.core();
+        let start = w.now;
+        let e = kind(w.open_result(c, spec(dir.path(), 1)));
+        assert!(
+            matches!(*e, OpenError::ProtocolMismatch { found: f } if f == found),
+            "{e}"
+        );
+        assert_eq!(e.error_kind().as_str(), "protocol_mismatch");
+        assert!(w.now - start < 1_000, "refused at once");
+        assert!(w.server.token(PATH).is_none(), "nothing created");
+    }
+    let dir = TempDir::new("driver-malformed-line");
+    let mut w = World::new();
+    w.rewrite = Some(protocol_of_heads("v2".to_owned()));
+    let c = w.core();
+    let e = kind(w.open_result(c, spec(dir.path(), 1)));
     assert!(
-        matches!(*e, OpenError::ServerTooOld { protocol: None }),
+        matches!(
+            *e,
+            OpenError::Unavailable(Unavailable::Rejected { status: 404 })
+        ),
         "{e}"
     );
+    assert!(w.server.token(PATH).is_none(), "nothing created");
 }
 
 // A gateway's concealing 404 carries no `Ursula-Protocol`: it is no missing stream. An open over
 // no generation creates nothing, and one with `recreate` over a generation holding data salvages
-// nothing: both are refused server_too_old.
+// nothing: both are refused no_server_identity.
 #[test]
 fn a_head_404_without_the_protocol_is_no_missing_stream() {
     let dir = TempDir::new("driver-concealed");
@@ -2610,10 +2705,7 @@ fn a_head_404_without_the_protocol_is_no_missing_stream() {
     w.concealed = true;
     let c = w.core();
     let e = kind(w.open_result(c, spec(dir.path(), 1)));
-    assert!(
-        matches!(*e, OpenError::ServerTooOld { protocol: None }),
-        "{e}"
-    );
+    assert!(matches!(*e, OpenError::NoServerIdentity), "{e}");
     assert!(w.server.token(PATH).is_none(), "nothing created");
 
     let dir = TempDir::new("driver-concealed-data");
@@ -2631,10 +2723,7 @@ fn a_head_404_without_the_protocol_is_no_missing_stream() {
         access: Access::Owner { recreate: true },
         ..spec(dir.path(), 2)
     }));
-    assert!(
-        matches!(*e, OpenError::ServerTooOld { protocol: None }),
-        "{e}"
-    );
+    assert!(matches!(*e, OpenError::NoServerIdentity), "{e}");
     assert!(generation.exists(), "the generation stays");
     assert!(!stream_root(dir.path()).join("salvage").exists());
 }

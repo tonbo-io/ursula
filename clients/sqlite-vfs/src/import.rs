@@ -9,9 +9,10 @@
 //!    and a length of exactly the pages its header counts. Page 1 of the copy is marked WAL (bytes
 //!    18 and 19), as a bound database's always is;
 //! 2. a HEAD: the stream is missing, or an empty stream of the VFS's content type with no
-//!    snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). An
-//!    answer without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream: a gateway's
-//!    concealing `404` creates nothing;
+//!    snapshot. Anything else refuses (`no_server_identity`, `protocol_mismatch`,
+//!    `stream_format`, `stream_state`). An answer without `Ursula-Protocol` and
+//!    `Ursula-Cluster-Id` is `no_server_identity`, never a missing stream: a gateway's concealing
+//!    `404` creates nothing;
 //! 3. the create, and the claim of epoch 1 under the create's token with the reserved activation
 //!    `IMPORT_ACTIVATION`. The claim is resent unchanged, keyed by the producer, until a definite
 //!    answer (I5). Its receipt must start at offset 0: no byte came before it. Its end is `W`,
@@ -54,6 +55,7 @@ use ursula_headers::Offset;
 use ursula_headers::ProducerId;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
+use ursula_headers::ReleaseLine;
 use ursula_headers::Seq;
 use ursula_headers::SnapshotDigest;
 use ursula_headers::SnapshotRef;
@@ -77,7 +79,7 @@ use crate::json::Value;
 use crate::json::parse_object;
 use crate::log;
 use crate::log::Level;
-use crate::open::table::Refused;
+use crate::open::table::IdentityRefused;
 use crate::open::table::check_identity;
 use crate::options::OptionsError;
 use crate::replicator::answer::ClaimDecision;
@@ -182,16 +184,26 @@ pub(crate) enum ImportError {
         #[source]
         source: std::io::Error,
     },
-    #[error("server_too_old: protocol {protocol:?}, this extension needs 2")]
-    ServerTooOld { protocol: Option<u32> },
+    #[error(
+        "no_server_identity: the stream's HEAD answer carries no Ursula-Protocol and \
+         Ursula-Cluster-Id: a server before 0.8, or a layer that answers HEAD itself"
+    )]
+    NoServerIdentity,
+    #[error(
+        "protocol_mismatch: the server runs release {}, this extension is {}: use the extension \
+         of the server's release",
+        ReleaseLine(*.found),
+        ReleaseLine(ursula_headers::PROTOCOL_LINE)
+    )]
+    ProtocolMismatch { found: u32 },
     #[error("stream_format: the stream's content type is {found:?}")]
     ContentType { found: Option<String> },
     #[error("stream_format: a stream at the path exists with another configuration")]
     Configuration,
     #[error("stream_state: {0}: import into a new stream")]
     NotNew(NotNew),
-    #[error("wrong_cluster: the stream answered as cluster {found}, then as {other}")]
-    WrongCluster { found: ClusterId, other: ClusterId },
+    #[error("wrong_cluster: the stream answers as cluster {found}, not {expected}")]
+    WrongCluster { expected: String, found: ClusterId },
     #[error("the stream answered {status} to the {what}")]
     Rejected { what: &'static str, status: u16 },
     #[error("unavailable: the {what} got no definite answer: {cause}")]
@@ -200,19 +212,17 @@ pub(crate) enum ImportError {
     TimedOut { timeout_ms: u64 },
     #[error("the snapshot: {0}")]
     Publish(#[source] SnapshotFailure),
-    #[error("stream_state: {0:?}")]
-    Refused(Refused),
 }
 
-impl From<Refused> for ImportError {
-    fn from(refused: Refused) -> Self {
+impl From<IdentityRefused> for ImportError {
+    fn from(refused: IdentityRefused) -> Self {
         match refused {
-            Refused::ServerTooOld { protocol } => Self::ServerTooOld { protocol },
-            Refused::ContentType { found } => Self::ContentType { found },
-            Refused::Closed => Self::NotNew(NotNew::Closed),
-            // The identity is checked against no cluster of ours, and a missing stream is not
-            // refused: neither comes back.
-            refused @ (Refused::WrongCluster { .. } | Refused::NotFound) => Self::Refused(refused),
+            IdentityRefused::NoServerIdentity => Self::NoServerIdentity,
+            IdentityRefused::ProtocolMismatch { found } => Self::ProtocolMismatch { found },
+            IdentityRefused::WrongCluster { local, stream } => Self::WrongCluster {
+                expected: local,
+                found: stream,
+            },
         }
     }
 }
@@ -545,12 +555,10 @@ fn send(
         })
 }
 
-/// The stream a HEAD names, checked: protocol 2 and the cluster `ours` once known, then missing
-/// (`None`, a `404`), or a stream of the VFS's content type, open and empty, with no snapshot.
-fn check_new(
-    answer: &Answer,
-    ours: Option<&ClusterId>,
-) -> Result<(ClusterId, Option<StreamHead>), ImportError> {
+/// The stream a HEAD names, checked: this extension's release line (the import's first HEAD, so
+/// no cluster of ours yet), then missing (`None`, a `404`), or a stream of the VFS's content type,
+/// open and empty, with no snapshot.
+fn check_new(answer: &Answer) -> Result<(ClusterId, Option<StreamHead>), ImportError> {
     let (identity, stream) = match &answer.typed {
         Ok(Typed::Head { identity, stream }) if matches!(answer.status, 200 | 404) => {
             (identity.as_ref(), stream.as_ref())
@@ -558,14 +566,6 @@ fn check_new(
         _ => return Err(rejected("HEAD", answer)),
     };
     let identity = check_identity(identity, None)?;
-    if let Some(ours) = ours
-        && *ours != identity.cluster_id
-    {
-        return Err(ImportError::WrongCluster {
-            found: ours.clone(),
-            other: identity.cluster_id.clone(),
-        });
-    }
     let cluster_id = identity.cluster_id.clone();
     let Some(stream) = stream else {
         return Ok((cluster_id, None));
@@ -701,7 +701,7 @@ fn steps(
         &Request::new(Method::Head, Target::Stream),
         deadline,
     )?;
-    let (cluster_id, _) = check_new(&head, None)?;
+    let (cluster_id, _) = check_new(&head)?;
     let incarnation = create(&probe, deadline)?;
     let w = claim(&probe, incarnation, deadline)?;
     let lineage = Lineage(random16().map_err(io("read", Path::new(crate::ids::URANDOM)))?);

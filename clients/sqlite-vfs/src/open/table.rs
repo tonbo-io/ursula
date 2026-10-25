@@ -4,7 +4,8 @@
 //!
 //! | local generation | HEAD | row |
 //! | --- | --- | --- |
-//! | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
+//! | any | no `Ursula-Protocol` | refuse `no_server_identity` |
+//! | any | `Ursula-Protocol` of another release line | refuse `protocol_mismatch` |
 //! | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
 //! | none, replaced | `404` | create |
 //! | trusted, holding no data | `404` | create |
@@ -56,7 +57,8 @@
 //!
 //! | reader generation | HEAD | row |
 //! | --- | --- | --- |
-//! | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
+//! | any | no `Ursula-Protocol` | refuse `no_server_identity` |
+//! | any | `Ursula-Protocol` of another release line | refuse `protocol_mismatch` |
 //! | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
 //! | any | `404` | refuse `not_found` |
 //! | any | another content type | refuse `stream_format` |
@@ -202,8 +204,11 @@ pub(crate) enum OpenRow<L, R> {
 /// Why the open refuses. Each keeps the local files and sends nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refused {
-    ServerTooOld {
-        protocol: Option<u32>,
+    /// The HEAD answer carries no `Ursula-Protocol` and `Ursula-Cluster-Id`.
+    NoServerIdentity,
+    /// The server speaks the release line `found`, not this extension's.
+    ProtocolMismatch {
+        found: u32,
     },
     WrongCluster {
         local: String,
@@ -220,7 +225,8 @@ pub(crate) enum Refused {
 impl From<Refused> for OpenError {
     fn from(refused: Refused) -> Self {
         match refused {
-            Refused::ServerTooOld { protocol } => Self::ServerTooOld { protocol },
+            Refused::NoServerIdentity => Self::NoServerIdentity,
+            Refused::ProtocolMismatch { found } => Self::ProtocolMismatch { found },
             Refused::WrongCluster { local, stream } => Self::WrongCluster { local, stream },
             Refused::NotFound => Self::NotFound,
             Refused::ContentType { found } => {
@@ -275,26 +281,58 @@ pub(crate) fn behind_snapshot(summary: &LocalSummary, head: &StreamHead) -> bool
         .is_some_and(|snapshot| snapshot.offset > summary.acked_offset)
 }
 
-/// The identity a HEAD named, checked (design: Identity): protocol 2, and the cluster id `ours`
-/// when a generation names one. The open table and a build's HEADs share it.
+/// Why a HEAD's identity is not one this extension takes ([`check_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityRefused {
+    /// No `Ursula-Protocol` and `Ursula-Cluster-Id`: a server before 0.8, or a layer that answers
+    /// the HEAD itself, such as a gateway's concealing `404`. A server upgrade would not help it.
+    NoServerIdentity,
+    /// `Ursula-Protocol` names the release line `found`, not [`ursula_headers::PROTOCOL_LINE`].
+    ProtocolMismatch { found: u32 },
+    /// Another `Ursula-Cluster-Id` than the generation's `local`.
+    WrongCluster { local: String, stream: ClusterId },
+}
+
+impl From<IdentityRefused> for Refused {
+    fn from(refused: IdentityRefused) -> Self {
+        match refused {
+            IdentityRefused::NoServerIdentity => Self::NoServerIdentity,
+            IdentityRefused::ProtocolMismatch { found } => Self::ProtocolMismatch { found },
+            IdentityRefused::WrongCluster { local, stream } => Self::WrongCluster { local, stream },
+        }
+    }
+}
+
+/// The identity a HEAD named, checked (design: Identity): present, of this extension's release
+/// line ([`ursula_headers::PROTOCOL_LINE`]), and of the cluster id `ours` when a generation names
+/// one. The one check of every HEAD: the open table, a build's HEADs, the import's, the
+/// snapshotter's and the replicator's while bound.
 pub(crate) fn check_identity<'a>(
     identity: Option<&'a ServerIdentity>,
     ours: Option<&str>,
-) -> Result<&'a ServerIdentity, Refused> {
-    let identity = match identity {
-        Some(identity) if identity.protocol == ursula_headers::PROTOCOL_VERSION => identity,
-        other => {
-            let protocol = other.map(|i| i.protocol);
-            return Err(Refused::ServerTooOld { protocol });
-        }
-    };
+) -> Result<&'a ServerIdentity, IdentityRefused> {
+    let identity = identity.ok_or(IdentityRefused::NoServerIdentity)?;
+    if identity.protocol != ursula_headers::PROTOCOL_LINE {
+        return Err(IdentityRefused::ProtocolMismatch {
+            found: identity.protocol,
+        });
+    }
     match ours {
-        Some(ours) if ours != identity.cluster_id.as_str() => Err(Refused::WrongCluster {
+        Some(ours) if ours != identity.cluster_id.as_str() => Err(IdentityRefused::WrongCluster {
             local: ours.to_owned(),
             stream: identity.cluster_id.clone(),
         }),
         Some(_) | None => Ok(identity),
     }
+}
+
+/// The release line after this extension's, which tests send as a newer server's: it moves with
+/// [`ursula_headers::PROTOCOL_LINE`].
+#[cfg(test)]
+pub(crate) fn next_line() -> u32 {
+    ursula_headers::PROTOCOL_LINE
+        .checked_add(1)
+        .expect("a release line below u32::MAX")
 }
 
 /// Whether an open takes a closed stream: an owner's cannot write to it, a reader's reads it.
@@ -591,43 +629,68 @@ mod tests {
         Superseded::Salvage { why, local: "gen" }
     }
 
+    /// The identity of cluster `name` on the release line `protocol`.
+    fn line(name: &str, protocol: u32) -> ServerIdentity {
+        ServerIdentity {
+            protocol,
+            cluster_id: cluster(name),
+        }
+    }
+
+    // A server of another release line (0.8 to 0.10 send 2, a newer one its line) is refused
+    // `protocol_mismatch`, and an answer without identity `no_server_identity`, whatever the local
+    // generation, before its cluster is compared, by the owner's rows and the reader's.
     #[test]
-    fn a_server_without_protocol_2_is_too_old() {
+    fn another_line_or_no_identity_is_refused_before_anything_else() {
         let head = stream(1, 0, None);
-        let seen = HeadSeen {
-            identity: None,
-            stream: Some(&head),
-            content_type: Some(CONTENT_TYPE),
-        };
-        let too_old = Refused::ServerTooOld { protocol: None };
-        for found in [local(1, 0), NONE, REPLACED] {
-            assert_eq!(
-                decide(found.clone(), ask(), seen),
-                refused(too_old.clone(), found)
-            );
+        let old = line("cluster-a", 2);
+        let next = super::next_line();
+        let newer = line("cluster-a", next);
+        let elsewhere = line("cluster-b", next);
+        for (identity, expected) in [
+            (None, Refused::NoServerIdentity),
+            (Some(&old), Refused::ProtocolMismatch { found: 2 }),
+            (Some(&newer), Refused::ProtocolMismatch { found: next }),
+            (Some(&elsewhere), Refused::ProtocolMismatch { found: next }),
+        ] {
+            let seen = HeadSeen {
+                identity,
+                stream: Some(&head),
+                content_type: Some(CONTENT_TYPE),
+            };
+            for found in [local(1, 0), NONE, REPLACED] {
+                assert_eq!(
+                    decide(found.clone(), ask(), seen),
+                    refused(expected.clone(), found.clone())
+                );
+                assert_eq!(
+                    decide_reader(found, seen),
+                    ReaderRow::Refuse(expected.clone())
+                );
+            }
         }
     }
 
     // A 404 without `Ursula-Protocol` (a gateway concealing a stream) is no missing stream: it
-    // refuses as too old whatever the local generation and `recreate`, never creates.
+    // refuses `no_server_identity` whatever the local generation and `recreate`, never creates.
     #[test]
-    fn a_404_without_protocol_2_is_too_old_not_missing() {
+    fn a_404_without_identity_is_refused_not_missing() {
         let seen = HeadSeen {
             identity: None,
             stream: None,
             content_type: None,
         };
-        let too_old = Refused::ServerTooOld { protocol: None };
+        let refusal = Refused::NoServerIdentity;
         for found in [local(1, 0), NONE, REPLACED] {
             for asked in [ask(), RECREATE] {
                 assert_eq!(
                     decide(found.clone(), asked, seen),
-                    refused(too_old.clone(), found.clone())
+                    refused(refusal.clone(), found.clone())
                 );
             }
             assert_eq!(
                 decide_reader(found, seen),
-                ReaderRow::Refuse(too_old.clone())
+                ReaderRow::Refuse(refusal.clone())
             );
         }
     }
@@ -901,7 +964,7 @@ mod tests {
         };
         assert_eq!(
             decide_reader(local(1, 0), no_identity),
-            ReaderRow::Refuse(Refused::ServerTooOld { protocol: None })
+            ReaderRow::Refuse(Refused::NoServerIdentity)
         );
         let b = identity("cluster-b");
         assert_eq!(

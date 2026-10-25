@@ -81,6 +81,7 @@ use ursula_headers::Offset;
 use ursula_headers::PartsCommit;
 use ursula_headers::PartsManifest;
 use ursula_headers::ProducerRequestHeaders;
+use ursula_headers::ReleaseLine;
 use ursula_headers::SizeLimit;
 use ursula_headers::SnapshotDigest;
 use ursula_headers::SnapshotPublishAnswer;
@@ -108,6 +109,8 @@ use crate::ids::CommitId;
 use crate::ids::Position;
 use crate::log;
 use crate::log::Level;
+use crate::open::table::IdentityRefused;
+use crate::open::table::check_identity;
 use crate::replicator::BoundaryReceipt;
 use crate::replicator::ResetKind;
 use crate::replicator::backoff::BACKOFF_CAP_MS;
@@ -509,6 +512,20 @@ pub(crate) enum SnapshotFailure {
     /// fix (design: Identity).
     #[error("wrong_cluster: the stream answers as cluster {found}, not {expected}")]
     WrongCluster { expected: String, found: ClusterId },
+    /// A HEAD answered without the server's identity (design: Identity): nothing is published.
+    #[error(
+        "no_server_identity: the stream's HEAD answer carries no Ursula-Protocol and \
+         Ursula-Cluster-Id"
+    )]
+    NoServerIdentity,
+    /// A HEAD answered as a server of another release line (design: Identity): nothing is
+    /// published.
+    #[error(
+        "protocol_mismatch: the server runs release {}, this extension is {}",
+        ReleaseLine(*.found),
+        ReleaseLine(ursula_headers::PROTOCOL_LINE)
+    )]
+    ProtocolMismatch { found: u32 },
     #[error("unavailable: the {what} got no definite answer: {cause}")]
     Outage {
         what: &'static str,
@@ -544,6 +561,19 @@ pub(crate) enum SizeBound {
     /// A `413` that named no limit.
     #[error("above a limit the stream did not name")]
     Unnamed,
+}
+
+impl From<IdentityRefused> for SnapshotFailure {
+    fn from(refused: IdentityRefused) -> Self {
+        match refused {
+            IdentityRefused::NoServerIdentity => Self::NoServerIdentity,
+            IdentityRefused::ProtocolMismatch { found } => Self::ProtocolMismatch { found },
+            IdentityRefused::WrongCluster { local, stream } => Self::WrongCluster {
+                expected: local,
+                found: stream,
+            },
+        }
+    }
 }
 
 impl SnapshotFailure {
@@ -957,16 +987,13 @@ impl Remote<'_> {
     /// The stream's HEAD, when it answers as the binding's cluster under the binding's token.
     pub(crate) fn head(&self) -> Result<StreamHead, SnapshotFailure> {
         let head = self.send("HEAD", &Request::new(Method::Head, Target::Stream))?;
+        if let Ok(Typed::Head { identity, .. }) = &head.typed
+            && matches!(head.status, 200 | 404)
+        {
+            // The open's identity check: a binding publishes only to its own line and cluster.
+            check_identity(identity.as_ref(), Some(self.cluster_id))?;
+        }
         match &head.typed {
-            Ok(Typed::Head {
-                identity: Some(identity),
-                ..
-            }) if identity.cluster_id.as_str() != self.cluster_id => {
-                Err(SnapshotFailure::WrongCluster {
-                    expected: self.cluster_id.to_owned(),
-                    found: identity.cluster_id.clone(),
-                })
-            }
             Ok(Typed::Head {
                 stream: Some(head), ..
             }) if head.incarnation() == self.incarnation => Ok(*head),

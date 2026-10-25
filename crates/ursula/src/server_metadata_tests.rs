@@ -18,7 +18,7 @@ use axum::response::Response;
 use tower::ServiceExt;
 use ursula_headers::ErrorCode;
 use ursula_headers::MAX_SNAPSHOT_BYTES;
-use ursula_headers::PROTOCOL_VERSION;
+use ursula_headers::PROTOCOL_LINE;
 use ursula_headers::ServerIdentity;
 use ursula_headers::SizeLimit;
 use ursula_headers::StreamHead;
@@ -127,7 +127,7 @@ async fn every_head_answer_carries_one_server_identity() {
         let identity = ServerIdentity::parse(pairs(&response))
             .expect("well-formed identity")
             .expect("an identity");
-        assert_eq!(identity.protocol, PROTOCOL_VERSION, "{uri}");
+        assert_eq!(identity.protocol, PROTOCOL_LINE, "{uri}");
         ids.push(identity.cluster_id);
     }
     assert!(ids.windows(2).all(|pair| pair[0] == pair[1]), "{ids:?}");

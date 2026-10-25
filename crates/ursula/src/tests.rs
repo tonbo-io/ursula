@@ -2660,7 +2660,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     )
     .expect("well-formed identity")
     .expect("the identity on a redirect");
-    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_VERSION);
+    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_LINE);
 
     for node in nodes {
         node.shutdown().await;
@@ -4159,7 +4159,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
     )
     .expect("well-formed identity")
     .expect("the identity on a follower's answer");
-    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_VERSION);
+    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_LINE);
 
     let forwarded_placement = nodes[0].runtime.locate(&forwarded_stream);
     for node in &nodes {

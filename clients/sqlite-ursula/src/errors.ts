@@ -47,7 +47,8 @@ export type SetupKind =
 	| "bound_elsewhere"
 	| "local_setup"
 	| "stream_format"
-	| "server_too_old"
+	| "no_server_identity"
+	| "protocol_mismatch"
 	| "wrong_cluster"
 	| "stream_state"
 	| "claim_races"
@@ -88,7 +89,8 @@ const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaEr
 	["not_found", "fix"],
 	["local_setup", "fix"],
 	["stream_format", "fix"],
-	["server_too_old", "fix"],
+	["no_server_identity", "fix"],
+	["protocol_mismatch", "fix"],
 	["not_bound", "fix"],
 	["bound_elsewhere", "fix"],
 ]);

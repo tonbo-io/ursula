@@ -12,6 +12,7 @@ description: Changes that affect clients and operators, newest first.
 - **Move your data with a backup, and keep the 0.10 `server.cluster_id` and `raft.group_count`.** Stop client writes and every SQLite session, back up 0.10 with `ursulactl backup-create` and `backup-verify` of 0.10, stop the 0.10 nodes, copy their cold objects into the 0.11 cold root, skipping `URSULA_FORMAT_EPOCH` and `snapshots/`, and run `ursulactl restore` of 0.11, which checks the copy first. Every restored stream answers with a new `Stream-Incarnation`, as after any restore.
 - **`helm upgrade` from 0.10 stops at the first pod.** The new pod finds the 0.10 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`.
 - **Keep the peer lists of 0.10 and 0.11 nodes apart.** A node that exchanges a Raft RPC with a node of the other release answers `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts.
+- **Upgrade the SQLite extension with the server.** `Ursula-Protocol` now carries the server's release line, `11`, where 0.8 to 0.10 sent `2`. The 0.11 extension refuses a server of another line with `protocol_mismatch` at open and at import, and an answer without `Ursula-Protocol` and `Ursula-Cluster-Id` with `no_server_identity`. Both replace `server_too_old`. The 0.8 to 0.10 extensions refuse a 0.11 server at once with `server_too_old`. A running session checks the line only at its next `HEAD`, and a running 0.10 session checks only the cluster id, so neither notices the move by itself. Stop every SQLite session before you move a cluster to another release line.
 
 See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 
@@ -25,9 +26,14 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 - **A request gets time for its size** ([#891](https://github.com/tonbo-io/ursula/issues/891)). The gateway waits for a node's answer for `--response-header-timeout` (`gateway.responseHeaderTimeoutSeconds`) plus the time the node may take to store or copy the request's bytes before it answers, at 8 MiB per second. A request counts its body, which a node with a cold store writes to object storage whole when it is large, and a snapshot parts commit counts its parts at the 32 MiB request limit each, up to the 1 GiB snapshot limit. A 32 MiB body waits 4 s longer, and a commit of 32 parts or more 128 s longer. A large append, create, snapshot or commit no longer answers `504` while the node still works on it, so the base timeout can stay just above the leader lease. An object store slower than 8 MiB per second still needs a higher timeout. A node that stops answering is still cut off at the end of the longer wait, and the probes eject it within 1.75 s as before.
 - **A gateway drain can cut a large commit's answer.** A commit waits up to the base plus 128 s, longer than the chart's 45 s `gateway.gracefulShutdownTimeoutSeconds`. A commit in flight when the drain ends loses its answer, and repeating it gets the answer from its key. Every other write waits at most the base plus 4 s.
 
+### Server metadata
+
+- **`Ursula-Protocol` is the server's release line.** It is one unsigned decimal, major × 1000 + minor of the server's version: `11` for every 0.11.x. Patches of one line interoperate, and lines do not. See [Server metadata](/docs/specs/extensions#10-server-metadata).
+
 ### SQLite VFS
 
 - **The VFS waits for an answer as the gateway does.** Its 15 s wait for an answer's head grows by the same 8 MiB per second allowance, for its body or for the parts a commit copies, counted as the gateway counts them. It waited 16 MiB per second for a commit's actual bytes, which gave up before a gateway in front of the node for a commit of more than five full parts.
+- **`protocol_mismatch` and `no_server_identity`** replace `server_too_old` as open and import kinds, both with action `fix`. A bound database whose `HEAD` meets another line or no identity blocks with the same name as `replication.condition` and retries every 30 s. It sends that `HEAD` to confirm an answer such as a `412` or a `404`, not on every write. A snapshot publish checks the `HEAD` the same way.
 
 ### Deleted data
 
@@ -37,6 +43,7 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 
 - **`ursula_headers::MAX_SNAPSHOT_BYTES`** is new: the 1 GiB snapshot limit a node with a cold store advertises in `Ursula-Max-Snapshot-Bytes`. `ursula_stream::MAX_COLD_SNAPSHOT_BYTES` and its `ursula_runtime` re-export are removed. Use `ursula_headers::MAX_SNAPSHOT_BYTES`.
 - **`ursula_headers::answer_allowance`, `STORE_FLOOR_BYTES_PER_SECOND` and `PartCount::copy_bytes`** are new: the time beyond a base wait a node's answer may take for the bytes it stores or copies first, which the gateway and the VFS both add.
+- **`ursula_headers::PROTOCOL_LINE`** replaces `PROTOCOL_VERSION`. `ServerIdentity::current` sends it, and `ReleaseLine` shows a line as its releases (`0.11`, or `0.8 to 0.10` for `2`).
 
 ## 0.10.1
 
