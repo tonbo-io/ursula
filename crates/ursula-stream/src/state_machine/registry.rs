@@ -29,6 +29,7 @@ use super::StreamMetadata;
 use super::StreamSlot;
 use super::TtlEntry;
 use super::TtlIndex;
+use super::compare_stream_ids;
 use super::stream_expiry_at_ms;
 use super::stream_is_expired;
 
@@ -74,12 +75,30 @@ impl StreamRegistry {
         self.keys.is_empty()
     }
 
-    /// Stream ids of every live slot, in arbitrary order.
-    pub(super) fn stream_ids(&self) -> impl Iterator<Item = &BucketStreamId> {
+    /// Stream ids of the bucket's live slots, in `compare_stream_ids` order.
+    /// The keys map iterates in the order of each replica's own hash seed, so
+    /// apply code that must act alike on every replica takes this order.
+    pub(super) fn bucket_stream_ids(&self, bucket_id: &str) -> Vec<BucketStreamId> {
+        let mut stream_ids = self
+            .keys
+            .keys()
+            .filter(|stream_id| stream_id.bucket_id == bucket_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        stream_ids.sort_unstable_by(compare_stream_ids);
+        stream_ids
+    }
+
+    /// Stream ids of every live slot, in the hash order of this replica's
+    /// keys map, which differs between replicas.
+    #[cfg(test)]
+    pub(super) fn stream_ids_in_hash_order(&self) -> impl Iterator<Item = &BucketStreamId> {
         self.keys.keys()
     }
 
-    /// Every live slot, in arbitrary order.
+    /// Every live slot, in an order that can differ between replicas (a
+    /// restored registry lays out its slots anew). Apply code that must act
+    /// alike on every replica sorts what it takes from here.
     pub(super) fn slots(&self) -> impl Iterator<Item = &StreamSlot> {
         self.slots.values().map(|slot| &**slot)
     }

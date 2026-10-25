@@ -29,6 +29,10 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 
 - **The VFS waits for an answer as the gateway does.** Its 15 s wait for an answer's head grows by the same 8 MiB per second allowance, for its body or for the parts a commit copies, counted as the gateway counts them. It waited 16 MiB per second for a commit's actual bytes, which gave up before a gateway in front of the node for a commit of more than five full parts.
 
+### Deleted data
+
+- **A bucket purge removes its streams in stream-id order.** The replicas of a group removed a purged bucket's streams in the order of their own in-memory hash map, and each removal numbers the cold-object cleanup entries it queues. Replicas could therefore give one number to different streams. The leader's acknowledgement of reclaimed objects then drained other entries on a follower, so after a leader change cold GC could skip some of a purged stream's objects. Those objects stayed in object storage until a purge request reported `cold_gc_complete=true`, whose erase of the `{bucket}/` prefix removes them, so a purge that reported `cold_gc_complete=true` left nothing behind. Every replica now removes the streams by bucket and stream id and numbers the entries alike, and cold GC reclaims every purged stream's objects after a leader change. 0.10.1 has the same issue and does not carry the fix: on 0.10, repeat a purge until it reports `cold_gc_complete=true` ([Tenant offboarding](/docs/operations#tenant-offboarding-bucket-purge)).
+
 ### Rust library APIs
 
 - **`ursula_headers::MAX_SNAPSHOT_BYTES`** is new: the 1 GiB snapshot limit a node with a cold store advertises in `Ursula-Max-Snapshot-Bytes`. `ursula_stream::MAX_COLD_SNAPSHOT_BYTES` and its `ursula_runtime` re-export are removed. Use `ursula_headers::MAX_SNAPSHOT_BYTES`.

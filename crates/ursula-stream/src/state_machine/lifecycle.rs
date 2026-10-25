@@ -47,24 +47,22 @@ impl StreamStateMachine {
     }
 
     /// Tenant offboarding: removes every stream the bucket owns in this
-    /// group (each removal enqueues its cold-object prefixes for the GC
-    /// worker), then the bucket, and installs a permanent erasure fence. The
-    /// aggregate usage ledger is retained with zero gauges until an external
-    /// accounting system has had a chance to observe its monotonic counters.
+    /// group in stream-id order (each removal enqueues its cold-object
+    /// prefixes for the GC worker, so every replica stamps the same cold-GC
+    /// sequence numbers), then the bucket, and installs a permanent erasure
+    /// fence. The aggregate usage ledger is retained with zero gauges until
+    /// an external accounting system has had a chance to observe its
+    /// monotonic counters.
     /// Purging an absent bucket succeeds with zero removals so a crashed
     /// purge can be re-run to convergence.
     pub(super) fn purge_bucket(&mut self, bucket_id: &str) -> StreamResponse {
         if let Err(message) = validate_bucket_id(bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
         }
-        let stream_ids = self
-            .registry
-            .stream_ids()
-            .filter(|stream_id| stream_id.bucket_id == bucket_id)
-            .cloned()
-            .collect::<Vec<_>>();
         let mut removed_streams = 0u64;
-        for stream_id in stream_ids {
+        // Removal stamps cold-GC sequence numbers, so it follows the
+        // stream-id order, never the order of this replica's hash map.
+        for stream_id in self.registry.bucket_stream_ids(bucket_id) {
             if self.remove_stream_state(&stream_id) {
                 removed_streams = removed_streams.saturating_add(1);
             }

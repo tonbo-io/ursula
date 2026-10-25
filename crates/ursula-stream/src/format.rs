@@ -127,6 +127,9 @@
 //!
 //! - every version number below reads 7, so 0.11 refuses the data and peers
 //!   of 0.10 as it refuses those of any other epoch.
+//! - a bucket purge removes its streams in stream-id order
+//!   (`compare_stream_ids`), so every replica numbers the purge's cold-GC
+//!   entries alike.
 //!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert
