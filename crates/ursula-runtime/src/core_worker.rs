@@ -1744,6 +1744,30 @@ impl CoreWorker {
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }
 
+    pub(crate) async fn ack_stream_usage(
+        group: &mut Box<dyn GroupEngine>,
+        history: u64,
+        through_seq: u64,
+        placement: ShardPlacement,
+    ) -> Result<crate::request::AckStreamUsageResponse, RuntimeError> {
+        group
+            .ack_stream_usage(history, through_seq, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn stream_usage(
+        group: &mut Box<dyn GroupEngine>,
+        after_seq: u64,
+        limit: usize,
+        placement: ShardPlacement,
+    ) -> Result<crate::engine::GroupStreamUsage, RuntimeError> {
+        group
+            .stream_usage(after_seq, limit, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
     pub(crate) async fn defer_cold_gc(
         group: &mut Box<dyn GroupEngine>,
         seq: u64,

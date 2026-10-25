@@ -226,6 +226,8 @@ pub enum ResponseKind {
     DeferColdGc,
     OffloadColdRefs,
     ExpireStreams,
+    /// Added in 0.10.2.
+    AckStreamUsage,
     /// A state-machine answer that no group write answers.
     BucketCreated,
     BucketAlreadyExists,
@@ -266,6 +268,7 @@ impl ResponseKind {
             StreamCommand::TidyStream { .. } => Self::TidyStream,
             StreamCommand::OffloadColdRefs { .. } => Self::OffloadColdRefs,
             StreamCommand::ExpireStreams { .. } => Self::ExpireStreams,
+            StreamCommand::AckStreamUsage { .. } => Self::AckStreamUsage,
             StreamCommand::IfIncarnation { command, .. } => Self::answering(command),
         }
     }
@@ -295,6 +298,7 @@ impl From<&StreamResponse> for ResponseKind {
             StreamResponse::StreamTidied { .. } => Self::TidyStream,
             StreamResponse::ColdRefsOffloaded { .. } => Self::OffloadColdRefs,
             StreamResponse::StreamsExpired { .. } => Self::ExpireStreams,
+            StreamResponse::StreamUsageAcked { .. } => Self::AckStreamUsage,
             StreamResponse::Error { .. } => Self::StreamError,
         }
     }
@@ -320,6 +324,11 @@ pub enum EngineOperation {
     PlanColdFlush,
     PlanGroupColdFlush,
     ColdHotBacklog,
+    /// Added in 0.10.2. A Raft engine also refuses it, before proposal,
+    /// while a replica of the group does not advertise the usage ledger.
+    AckStreamUsage,
+    /// Added in 0.10.2.
+    StreamUsage,
 }
 
 /// The cold-tier operation that failed ([`GroupInfraError::ColdStore`]).

@@ -163,6 +163,7 @@ pub fn uploaded_object(command: &StreamCommand) -> Option<&str> {
         | StreamCommand::DeleteStream { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
+        | StreamCommand::AckStreamUsage { .. }
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::NewHistory { .. }

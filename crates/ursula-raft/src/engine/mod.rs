@@ -1137,6 +1137,7 @@ impl RaftGroupEngine {
         crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft, self.fence(), self.contact())?;
         let expected_leader = crate::forward::proposal_leader(&command, fence)?;
+        crate::usage_gate::admit(&self.raft, self.peer_cluster.as_ref(), &command)?;
         let expected = crate::forward::answer_kind(&command);
         let (responder, complete) = ProgressResponder::<UrsulaRaftTypeConfig, _>::complete_only();
         let request = self.raft.write(command).responder(responder);
@@ -2247,6 +2248,68 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn ack_stream_usage<'a>(
+        &'a mut self,
+        history: u64,
+        through_seq: u64,
+        _placement: ShardPlacement,
+    ) -> ursula_runtime::GroupAckStreamUsageFuture<'a> {
+        Box::pin(async move {
+            let command = StreamCommand::AckStreamUsage {
+                history,
+                through_seq,
+            };
+            // A follower's replica forwards to the leader, whose proposal
+            // runs the usage gate (`crate::usage_gate`).
+            let answer = if self.leads() {
+                self.write(command).await?
+            } else {
+                let leader_id = self.read_barrier.owner().current_leader();
+                let route = self.leader_route().await;
+                let leadership = self.leadership();
+                let Some(route) = route else {
+                    return Err(leadership_refusal(
+                        LeadershipReason::Follower,
+                        Proposal::NotProposed,
+                        leader_id,
+                        &leadership,
+                    ));
+                };
+                crate::forward::forward_write_to_leader(
+                    &route,
+                    self.placement,
+                    command,
+                    "stream usage acknowledgement",
+                )
+                .await?
+            };
+            ursula_runtime::AckStreamUsageResponse::try_from(answer)
+        })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        after_seq: u64,
+        limit: usize,
+        _placement: ShardPlacement,
+    ) -> ursula_runtime::GroupStreamUsageFuture<'a> {
+        Box::pin(async move {
+            // Local applied state, follower or leader, like `bucket_usage`:
+            // the consumer keeps the most advanced replica of each group.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    Ok(ursula_runtime::GroupStreamUsage {
+                        applied_index: state_machine
+                            .last_applied_log_id
+                            .map_or(0, |log_id| log_id.index()),
+                        changes: state_machine.engine.stream_usage_changes(after_seq, limit),
+                    })
+                })
+            })
+            .await?
+        })
+    }
+
     fn ack_cold_gc<'a>(
         &'a mut self,
         up_to_seq: u64,
@@ -2448,6 +2511,7 @@ impl GroupEngine for RaftGroupEngine {
                 self.fence(),
                 self.contact(),
                 &self.history,
+                self.peer_cluster.as_ref(),
                 commands,
             )
             .await;

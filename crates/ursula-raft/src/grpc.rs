@@ -1441,6 +1441,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     let fence = raft.fence().clone();
                     let contact = raft.contact().clone();
                     let history = entry.core.history.clone();
+                    let peer_cluster = self.registry.peer_cluster().clone();
                     let commands = commands(&request)?;
                     let count = commands.len();
                     // A refusal of the whole batch answers each command with
@@ -1448,7 +1449,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     // pending history, an unknown outcome).
                     let results = raft
                         .call(move |raft| async move {
-                            write_commands_on_raft(raft, &fence, &contact, &history, commands).await
+                            write_commands_on_raft(
+                                raft,
+                                &fence,
+                                &contact,
+                                &history,
+                                Some(&peer_cluster),
+                                commands,
+                            )
+                            .await
                         })
                         .await
                         .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
@@ -3629,6 +3638,7 @@ mod reconnect_tests {
         assert_eq!(Stamp::of(status.metadata()), Stamp {
             node: Some(2),
             incarnation: Some(process(8)),
+            features: crate::usage_gate::Features::this_binary(),
         });
         let (frames, receiver) = mpsc::channel(1);
         frames

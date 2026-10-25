@@ -650,7 +650,7 @@ async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() 
     .expect("OpenRaft takes the request's vote");
 }
 
-fn placement() -> ShardPlacement {
+pub(crate) fn placement() -> ShardPlacement {
     ShardPlacement {
         core_id: CoreId(0),
         shard_id: ShardId(0),
@@ -658,7 +658,7 @@ fn placement() -> ShardPlacement {
     }
 }
 
-fn bsid(name: &str) -> ursula_shard::BucketStreamId {
+pub(crate) fn bsid(name: &str) -> ursula_shard::BucketStreamId {
     ursula_shard::BucketStreamId::new("benchcmp", name)
 }
 
@@ -727,7 +727,7 @@ fn hosted_config(core_count: usize, raft_group_count: usize) -> RuntimeConfig {
     config
 }
 
-async fn shutdown_all(engines: &[RaftGroupEngine]) {
+pub(crate) async fn shutdown_all(engines: &[RaftGroupEngine]) {
     for engine in engines {
         engine.shutdown().await.expect("shutdown raft group node");
     }
@@ -737,7 +737,7 @@ async fn shutdown_all(engines: &[RaftGroupEngine]) {
 /// leader. Returns the registry, the engines (index = node id - 1), the
 /// elected leader id and the WAL directories, which must outlive the engines.
 #[cfg(not(madsim))]
-async fn build_three_node_cluster(
+pub(crate) async fn build_three_node_cluster(
     cluster_name: &str,
     policy: Option<InProcessRaftNetworkPolicy>,
 ) -> (
@@ -764,7 +764,7 @@ async fn build_three_node_cluster_at(
     Vec<tempfile::TempDir>,
 ) {
     let (registry, engines, leader, roots, _gate) =
-        build_three_node_cluster_gating(cluster_name, policy, address, None).await;
+        build_three_node_cluster_gating(cluster_name, policy, address, None, false).await;
     (registry, engines, leader, roots)
 }
 
@@ -792,6 +792,7 @@ async fn build_three_node_cluster_with_a_gated_node(
         None,
         |node_id| format!("node-{node_id}"),
         Some(GATED_NODE),
+        false,
     )
     .await;
     (
@@ -803,12 +804,38 @@ async fn build_three_node_cluster_with_a_gated_node(
     )
 }
 
+/// [`build_three_node_cluster`] whose nodes each answer in-process RPCs
+/// through a registry that shares the engine's peer cluster, as one
+/// process's gRPC transport and engines do: what a node learns from its
+/// peers' answers (the usage gate) reaches its engines.
+#[cfg(not(madsim))]
+pub(crate) async fn build_three_node_cluster_sharing_peer_clusters(
+    cluster_name: &str,
+    policy: Option<InProcessRaftNetworkPolicy>,
+) -> (
+    InProcessRaftRegistry,
+    Vec<RaftGroupEngine>,
+    u64,
+    Vec<tempfile::TempDir>,
+) {
+    let (registry, engines, leader, roots, _gate) = build_three_node_cluster_gating(
+        cluster_name,
+        policy,
+        |node_id| format!("node-{node_id}"),
+        None,
+        true,
+    )
+    .await;
+    (registry, engines, leader, roots)
+}
+
 #[cfg(not(madsim))]
 async fn build_three_node_cluster_gating(
     cluster_name: &str,
     policy: Option<InProcessRaftNetworkPolicy>,
     address: impl Fn(u64) -> String,
     gated: Option<u64>,
+    share_peer_cluster: bool,
 ) -> (
     InProcessRaftRegistry,
     Vec<RaftGroupEngine>,
@@ -845,6 +872,13 @@ async fn build_three_node_cluster_gating(
             .await
             .expect("open the gate"),
         );
+        let peer_cluster = crate::peer_cluster::test_peer_cluster_with(node_id, peers());
+        let endpoint = RaftGroupHandleRegistry::default();
+        if share_peer_cluster {
+            endpoint
+                .peer_cluster()
+                .bind(crate::peer_cluster::test_identity(node_id), peers());
+        }
         let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             placement(),
             node_id,
@@ -852,10 +886,11 @@ async fn build_three_node_cluster_gating(
             network,
             log_store,
             RaftGroupEngineOptions {
-                peer_cluster: Some(crate::peer_cluster::test_peer_cluster_with(
-                    node_id,
-                    peers(),
-                )),
+                peer_cluster: Some(if share_peer_cluster {
+                    endpoint.peer_cluster().clone()
+                } else {
+                    peer_cluster
+                }),
                 ..RaftGroupEngineOptions::gated(node_gate.clone())
             },
         )
@@ -868,7 +903,12 @@ async fn build_three_node_cluster_gating(
                 .expect("bind the gate");
             gate = Some(node_gate);
         }
-        registry.register(node_id, &engine);
+        if share_peer_cluster {
+            endpoint.register_engine(&engine);
+            registry.register_process(node_id, &engine, &endpoint);
+        } else {
+            registry.register(node_id, &engine);
+        }
         engines.push(engine);
         wal_roots.push(wal_root);
     }
@@ -1966,6 +2006,7 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
         follower.fence(),
         follower.contact(),
         &follower.history,
+        None,
         vec![
             append_command(stream_id.clone(), b"a"),
             append_command(stream_id, b"b"),
@@ -2729,7 +2770,10 @@ async fn append_madsim_stream(
     (stream_id, appended.log_id.index())
 }
 
-async fn create_stream_via_raft(engine: &RaftGroupEngine, stream_id: ursula_shard::BucketStreamId) {
+pub(crate) async fn create_stream_via_raft(
+    engine: &RaftGroupEngine,
+    stream_id: ursula_shard::BucketStreamId,
+) {
     wait_history(engine).await;
     let created = engine
         .raft
@@ -3287,7 +3331,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
 }
 
 /// Waits until `engine`'s replica applied a history event.
-async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent {
+pub(crate) async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent {
     let started = crate::rt::time::Instant::now();
     loop {
         if let Some(event) = engine.history().applied() {
@@ -5410,6 +5454,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
             crate::state_machine::RecordSite::Detached(metadata_path.clone()),
         );
         let snapshot = ursula_runtime::GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement: placement(),
             group_commit_index: snapshot_log_id.index,
             stream_snapshot: Default::default(),
@@ -5791,6 +5836,7 @@ async fn queue_state_machine_work(
         index: installed_index,
     };
     let group = ursula_runtime::GroupSnapshot {
+        usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
         placement: placement(),
         group_commit_index: installed_index,
         stream_snapshot: Default::default(),

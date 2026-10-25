@@ -3063,6 +3063,7 @@ mod tests {
 
     fn group_snapshot_bytes() -> Vec<u8> {
         crate::snapshot_codec::group_snapshot_frames(Arc::new(GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement: ShardPlacement {
                 core_id: ursula_shard::CoreId(0),
                 shard_id: ursula_shard::ShardId(0),

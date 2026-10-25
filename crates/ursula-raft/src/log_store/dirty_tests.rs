@@ -971,6 +971,7 @@ async fn snapshot_record_after_a_journal_sync(publication: Publication) {
     match publication {
         Publication::Install => {
             let snapshot = ursula_runtime::GroupSnapshot {
+                usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
                 placement: placement(QUIET),
                 group_commit_index: 2,
                 stream_snapshot: Default::default(),

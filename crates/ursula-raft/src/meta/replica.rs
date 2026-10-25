@@ -449,8 +449,11 @@ impl ActiveMeta {
         self.core
             .owner()
             .call(move |raft| async move {
-                crate::forward::write_commands_on_raft(raft, &fence, &contact, &history, commands)
-                    .await
+                // Meta commands pass no usage gate.
+                crate::forward::write_commands_on_raft(
+                    raft, &fence, &contact, &history, None, commands,
+                )
+                .await
             })
             .await
             .map_err(crate::owner::owner_stopped)?

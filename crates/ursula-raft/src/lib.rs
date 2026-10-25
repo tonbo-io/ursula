@@ -86,6 +86,10 @@
 //!   recovery plan's orchestration, generic over the state machine.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
+//! - [`usage_gate`]: the rolling-upgrade gate of 0.10.2: the features a
+//!   binary advertises on its Raft answers (`ursula-features`), and the
+//!   leader's refusal before proposal of `AckStreamUsage` while a member of
+//!   the group does not decode it.
 //! - [`voter`]: the one voter predicate on this node: whether a data
 //!   replica counts as a voter, and the left mark ([`LeftMarks`]) its
 //!   group's barrier answers set and its appends clear.
@@ -148,6 +152,7 @@ mod state_machine;
 mod target;
 mod telemetry;
 mod types;
+pub mod usage_gate;
 mod voter;
 pub mod wal;
 
@@ -378,6 +383,8 @@ pub use voter::LeftMarks;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_ledger_tests;
 
 #[cfg(test)]
 mod cold_index_tests;

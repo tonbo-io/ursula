@@ -92,6 +92,7 @@ fn meta(index: u64) -> openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig> {
 
 fn group(index: u64) -> GroupSnapshot {
     GroupSnapshot {
+        usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
         placement: placement(),
         group_commit_index: index,
         stream_snapshot: Default::default(),

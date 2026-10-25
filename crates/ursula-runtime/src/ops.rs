@@ -364,6 +364,20 @@ macro_rules! runtime_operations {
                 handle { call ack_cold_gc(engine, up_to_seq, placement) }
                 client { group fn ack_cold_gc }
             }
+            op AckStreamUsage {
+                fields { history: u64, through_seq: u64 }
+                reply { response_tx: crate::request::AckStreamUsageResponse }
+                guard { none }
+                handle { call ack_stream_usage(engine, history, through_seq, placement) }
+                client { pub group fn ack_stream_usage }
+            }
+            op StreamUsage {
+                fields { after_seq: u64, limit: usize }
+                reply { response_tx: crate::engine::GroupStreamUsage }
+                guard { none }
+                handle { call stream_usage(engine, after_seq, limit, placement) }
+                client { pub group fn stream_usage }
+            }
             op DeferColdGc {
                 fields { seq: u64, not_before_ms: u64 }
                 reply { response_tx: DeferColdGcResponse }

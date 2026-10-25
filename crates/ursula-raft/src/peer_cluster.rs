@@ -407,6 +407,10 @@ struct PeerClusterState {
     /// node sends Raft traffic to, so the map stays as small as the
     /// memberships it serves.
     misdelivered: Mutex<BTreeMap<u64, Misdeliveries>>,
+    /// The features each peer's latest accepted answer advertised (the
+    /// usage gate), at most [`crate::incarnation::INCARNATION_BOOK_CAP`]
+    /// peers: keys are the nodes this node sends Raft traffic to.
+    features: Mutex<BTreeMap<u64, crate::usage_gate::Features>>,
 }
 
 /// The misdelivery refusals of one dialed node: how many since start, and
@@ -590,12 +594,45 @@ impl PeerCluster {
         })
     }
 
-    /// This node's stamp on its answers: its node id and incarnation.
+    /// This node's stamp on its answers: its node id and incarnation, and
+    /// its binary's features.
     pub(crate) fn stamp(&self) -> Stamp {
         let identity = self.identity();
         Stamp {
             node: identity.as_ref().map(PeerIdentity::node_id),
             incarnation: identity.as_ref().and_then(PeerIdentity::incarnation),
+            features: crate::usage_gate::Features::this_binary(),
+        }
+    }
+
+    /// The features `node`'s latest accepted answer advertised: none for a
+    /// peer of 0.10.1 or earlier, or one this node has not heard since it
+    /// started (the usage gate).
+    pub(crate) fn peer_features(&self, node: u64) -> crate::usage_gate::Features {
+        self.0
+            .features
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Records the features of an accepted answer that `target` stamped as
+    /// itself.
+    pub(crate) fn note_features(&self, target: u64, stamp: Stamp) {
+        if stamp.node != Some(target) {
+            return;
+        }
+        let mut features = self
+            .0
+            .features
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if features.contains_key(&target)
+            || features.len() < crate::incarnation::INCARNATION_BOOK_CAP
+        {
+            features.insert(target, stamp.features);
         }
     }
 
@@ -626,6 +663,14 @@ impl PeerCluster {
     /// fence. Every discarded answer is counted, one that reached this node
     /// fenced included.
     pub(crate) fn accept_responder(&self, target: u64, stamp: Stamp) -> Result<(), Discarded> {
+        let accepted = self.judge_responder(target, stamp);
+        if accepted.is_ok() {
+            self.note_features(target, stamp);
+        }
+        accepted
+    }
+
+    fn judge_responder(&self, target: u64, stamp: Stamp) -> Result<(), Discarded> {
         let bound = self.0.bound.load();
         let Some(bound) = bound.as_deref() else {
             return Ok(());

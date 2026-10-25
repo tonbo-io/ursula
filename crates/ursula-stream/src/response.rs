@@ -127,6 +127,12 @@ pub enum StreamResponse {
         removed: u64,
         remaining: u64,
     },
+    /// Result of [`StreamCommand::AckStreamUsage`].
+    ///
+    /// [`StreamCommand::AckStreamUsage`]: crate::StreamCommand::AckStreamUsage
+    StreamUsageAcked {
+        ack: crate::usage::UsageAck,
+    },
     Error {
         code: StreamErrorCode,
         message: String,

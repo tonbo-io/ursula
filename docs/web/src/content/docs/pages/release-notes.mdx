@@ -3,6 +3,20 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## Unreleased
+
+These changes are planned for 0.10.2. 0.10.2 is a patch of 0.10 and an in-place rolling upgrade from 0.10.0 and 0.10.1: format epoch 6 and backup format 5 are unchanged, and a node of 0.10.2 writes every Raft entry and group snapshot byte for byte as 0.10.1 does until a consumer starts a group's usage ledger. Upgrade every node before anything acknowledges the per-stream usage export. Once a group's ledger started, rolling that group back to 0.10.1 is not supported.
+
+### Admin API
+
+- **Per-stream usage export.** `POST /__ursula/usage/streams` lists the usage of each stream version that changed after a cursor, per group, with its incarnation, content type, created time, last write, committed counters, retained and snapshot bytes, and how it ended, if it did. `POST /__ursula/usage/streams/ack` acknowledges a group's ended streams through a sequence number and folds them into the bucket totals. The first acknowledgement starts the group's ledger. Both are served on the admin listener only. `/__ursula/usage` keeps its shape and values: a bucket's totals are its retired usage plus its live and ended streams. See [Per-stream usage](/docs/operations#per-stream-usage).
+- **Usage gate.** A group's leader proposes an acknowledgement only while every member advertised the ledger on its Raft answers, in the new `ursula-features` answer metadata, so a group with a 0.10.1 member refuses it before proposal.
+- **Gauges.** `group_state_gauges` gains `ended_stream_usage` and `usage_ack_lag` (bounded-state F20).
+
+### Rust library APIs
+
+- **Usage ledger.** `ursula_stream` gains the ledger types (`StreamUsage`, `EndedStreamUsage`, `UsageLedgerSnapshot`, `UsageAck` and the export's `StreamUsageChanges`), `StreamCommand::AckStreamUsage` and `StreamResponse::StreamUsageAcked`. `ursula_runtime::GroupSnapshot` gains `usage_ledger`, `GroupWriteResponse`, `ResponseKind` and `EngineOperation` gain variants, and `GroupEngine` gains `ack_stream_usage` and `stream_usage`, both unsupported by default. `ursula_proto::admin` gains the request and answer types of both routes. A struct literal of `GroupSnapshot` needs the field, and an exhaustive match of those enums needs the variants.
+
 ## 0.10.1
 
 0.10.1 is a patch of 0.10 and interoperates with 0.10.0: format epoch 6, backup format 5 and every storage, wire and protocol format are unchanged, and the usage report only gains an optional field. 0.10.0 and 0.10.1 nodes run in one cluster during a rolling upgrade, and 0.10.0 and 0.10.1 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.10.0 is safe.

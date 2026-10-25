@@ -36,6 +36,7 @@ pub fn group_snapshot(
         group_commit_index,
         stream_snapshot,
         stream_append_counts,
+        usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
     }
 }
 
@@ -237,7 +238,10 @@ pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
                 bump(&mut st.cold_gc_frames, 1);
                 bump(&mut st.cold_gc_bytes, len);
             }
+            // The probes never start a usage ledger.
             proto::snapshot_frame_v1::Frame::FormatEpoch(_)
+            | proto::snapshot_frame_v1::Frame::StreamUsage(_)
+            | proto::snapshot_frame_v1::Frame::EndedStreamUsage(_)
             | proto::snapshot_frame_v1::Frame::Footer(_) => {}
         }
     }

@@ -316,6 +316,7 @@ async fn an_upload_command_without_a_fence_is_refused() {
         engine.fence(),
         engine.contact(),
         &engine.history,
+        None,
         vec![RaftCommand::Stream(command)],
     )
     .await

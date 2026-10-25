@@ -67,6 +67,8 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let mut streams = Vec::new();
     let mut stream_append_counts = Vec::new();
     let mut pending_cold_gc = Vec::new();
+    let mut stream_usage = Vec::new();
+    let mut ended_stream_usage = Vec::new();
     let mut footer_seen = false;
 
     // E5: the format-epoch frame comes first and is checked before any other
@@ -118,6 +120,12 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
             proto::snapshot_frame_v1::Frame::ColdGc(value) => {
                 pending_cold_gc.push(cold_gc_from_proto(value)?);
             }
+            proto::snapshot_frame_v1::Frame::StreamUsage(value) => {
+                stream_usage.push(stream_usage_from_proto(value)?);
+            }
+            proto::snapshot_frame_v1::Frame::EndedStreamUsage(value) => {
+                ended_stream_usage.push(ended_stream_usage_from_proto(value)?);
+            }
             proto::snapshot_frame_v1::Frame::Footer(_) => {
                 footer_seen = true;
             }
@@ -145,7 +153,38 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         )));
     }
 
-    Ok(GroupSnapshot {
+    let usage_ledger = match header.usage_ledger {
+        None if stream_usage.is_empty() && ended_stream_usage.is_empty() => {
+            ursula_stream::UsageLedgerSnapshot::NotStarted
+        }
+        None => {
+            return Err(SnapshotStoreError::Deserialize(
+                "snapshot holds stream usage frames without a usage ledger".to_owned(),
+            ));
+        }
+        Some(ledger) => {
+            ursula_stream::UsageLedgerSnapshot::Started(ursula_stream::StartedUsageLedger {
+                usage_seq: ledger.usage_seq,
+                acked_through: ledger.acked_through,
+                retired: ledger
+                    .retired
+                    .into_iter()
+                    .map(|retired| ursula_stream::BucketCommittedUsage {
+                        bucket_id: retired.bucket_id,
+                        usage: ursula_stream::CommittedUsage {
+                            committed_append_bytes: retired.committed_append_bytes,
+                            committed_records: retired.committed_records,
+                            committed_write_units: retired.committed_write_units,
+                        },
+                    })
+                    .collect(),
+                streams: stream_usage,
+                ended: ended_stream_usage,
+            })
+        }
+    };
+
+    let snapshot = GroupSnapshot {
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
@@ -164,6 +203,105 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
             history: header.history.map(history_from_proto).transpose()?,
         },
         stream_append_counts,
+        usage_ledger,
+    };
+    // A started ledger fits its stream snapshot before anything installs
+    // it: one entry per stream, and bucket totals equal to their parts.
+    if let ursula_stream::UsageLedgerSnapshot::Started(ledger) = &snapshot.usage_ledger {
+        let stream_snapshot = &snapshot.stream_snapshot;
+        ledger
+            .check(
+                stream_snapshot
+                    .streams
+                    .iter()
+                    .map(|stream| &stream.metadata.stream_id),
+                &stream_snapshot.bucket_usage,
+            )
+            .map_err(|mismatch| {
+                SnapshotStoreError::Deserialize(format!("snapshot usage ledger: {mismatch}"))
+            })?;
+    }
+    Ok(snapshot)
+}
+
+fn counters_to_proto(usage: ursula_stream::StreamUsage) -> proto::StreamUsageCountersV1 {
+    proto::StreamUsageCountersV1 {
+        committed_write_units: usage.committed_write_units,
+        committed_append_bytes: usage.committed_append_bytes,
+        committed_records: usage.committed_records,
+        last_write_at_ms: usage.last_write_at_ms,
+        usage_seq: usage.usage_seq,
+    }
+}
+
+fn counters_from_proto(usage: proto::StreamUsageCountersV1) -> ursula_stream::StreamUsage {
+    ursula_stream::StreamUsage {
+        committed_write_units: usage.committed_write_units,
+        committed_append_bytes: usage.committed_append_bytes,
+        committed_records: usage.committed_records,
+        last_write_at_ms: usage.last_write_at_ms,
+        usage_seq: usage.usage_seq,
+    }
+}
+
+fn stream_usage_to_proto(entry: ursula_stream::StreamUsageEntry) -> proto::StreamUsageV1 {
+    proto::StreamUsageV1 {
+        stream_id: Some(entry.stream_id.into()),
+        usage: Some(counters_to_proto(entry.usage)),
+    }
+}
+
+fn stream_usage_from_proto(
+    value: proto::StreamUsageV1,
+) -> Result<ursula_stream::StreamUsageEntry, SnapshotStoreError> {
+    Ok(ursula_stream::StreamUsageEntry {
+        stream_id: required(value.stream_id, "snapshot stream usage stream id")?.into(),
+        usage: counters_from_proto(required(value.usage, "snapshot stream usage counters")?),
+    })
+}
+
+fn ended_stream_usage_to_proto(
+    ended: ursula_stream::EndedStreamUsage,
+) -> proto::EndedStreamUsageV1 {
+    let end = match ended.end {
+        ursula_stream::StreamEnd::Deleted => proto::StreamEndV1::StreamEndDeleted,
+        ursula_stream::StreamEnd::Expired => proto::StreamEndV1::StreamEndExpired,
+        ursula_stream::StreamEnd::Purged => proto::StreamEndV1::StreamEndPurged,
+    };
+    proto::EndedStreamUsageV1 {
+        stream_id: Some(ended.stream_id.into()),
+        created_at_ms: ended.created_at_ms,
+        incarnation: ended.incarnation,
+        content_type: ended.content_type,
+        usage: Some(counters_to_proto(ended.usage)),
+        end: end.into(),
+    }
+}
+
+fn ended_stream_usage_from_proto(
+    value: proto::EndedStreamUsageV1,
+) -> Result<ursula_stream::EndedStreamUsage, SnapshotStoreError> {
+    let end = match proto::StreamEndV1::try_from(value.end) {
+        Ok(proto::StreamEndV1::StreamEndDeleted) => ursula_stream::StreamEnd::Deleted,
+        Ok(proto::StreamEndV1::StreamEndExpired) => ursula_stream::StreamEnd::Expired,
+        Ok(proto::StreamEndV1::StreamEndPurged) => ursula_stream::StreamEnd::Purged,
+        Err(_unknown) => {
+            return Err(SnapshotStoreError::Deserialize(format!(
+                "snapshot ended stream usage has unknown end {}",
+                value.end
+            )));
+        }
+    };
+    Ok(ursula_stream::EndedStreamUsage {
+        stream_id: required(value.stream_id, "snapshot ended stream usage stream id")?.into(),
+        created_at_ms: value.created_at_ms,
+        incarnation: value.incarnation,
+        content_type: value.content_type,
+        usage: counters_from_proto(required(
+            value.usage,
+            "snapshot ended stream usage counters",
+        )?),
+        end,
     })
 }
 
@@ -202,6 +340,8 @@ struct GroupSnapshotFrameIter {
     next_stream: usize,
     next_append_count: usize,
     next_cold_gc: usize,
+    next_stream_usage: usize,
+    next_ended_stream_usage: usize,
     footer: bool,
 }
 
@@ -214,6 +354,8 @@ impl GroupSnapshotFrameIter {
             next_stream: 0,
             next_append_count: 0,
             next_cold_gc: 0,
+            next_stream_usage: 0,
+            next_ended_stream_usage: 0,
             footer: true,
         }
     }
@@ -235,6 +377,23 @@ impl GroupSnapshotFrameIter {
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: stream_snapshot.last_created_at_ms,
             history: stream_snapshot.history.map(history_to_proto),
+            usage_ledger: match &snapshot.usage_ledger {
+                ursula_stream::UsageLedgerSnapshot::NotStarted => None,
+                ursula_stream::UsageLedgerSnapshot::Started(ledger) => Some(proto::UsageLedgerV1 {
+                    usage_seq: ledger.usage_seq,
+                    acked_through: ledger.acked_through,
+                    retired: ledger
+                        .retired
+                        .iter()
+                        .map(|retired| proto::BucketCommittedUsageV1 {
+                            bucket_id: retired.bucket_id.clone(),
+                            committed_append_bytes: retired.usage.committed_append_bytes,
+                            committed_records: retired.usage.committed_records,
+                            committed_write_units: retired.usage.committed_write_units,
+                        })
+                        .collect(),
+                }),
+            },
         }
     }
 }
@@ -310,6 +469,18 @@ impl Iterator for GroupSnapshotFrameIter {
         {
             self.next_cold_gc = self.next_cold_gc.saturating_add(1);
             proto::snapshot_frame_v1::Frame::ColdGc(cold_gc_to_proto(cold_gc.clone()))
+        } else if let Some(entry) =
+            started_ledger(snapshot).and_then(|ledger| ledger.streams.get(self.next_stream_usage))
+        {
+            self.next_stream_usage = self.next_stream_usage.saturating_add(1);
+            proto::snapshot_frame_v1::Frame::StreamUsage(stream_usage_to_proto(entry.clone()))
+        } else if let Some(ended) = started_ledger(snapshot)
+            .and_then(|ledger| ledger.ended.get(self.next_ended_stream_usage))
+        {
+            self.next_ended_stream_usage = self.next_ended_stream_usage.saturating_add(1);
+            proto::snapshot_frame_v1::Frame::EndedStreamUsage(ended_stream_usage_to_proto(
+                ended.clone(),
+            ))
         } else if self.footer {
             self.footer = false;
             proto::snapshot_frame_v1::Frame::Footer(proto::SnapshotFooterV1 {})
@@ -318,6 +489,15 @@ impl Iterator for GroupSnapshotFrameIter {
         };
 
         Some(encode_frame(proto::SnapshotFrameV1 { frame: Some(frame) }))
+    }
+}
+
+/// The group's ledger when it started; a ledger that has not started
+/// writes no frame, so the snapshot is one Ursula 0.10.1 reads.
+fn started_ledger(snapshot: &GroupSnapshot) -> Option<&ursula_stream::StartedUsageLedger> {
+    match &snapshot.usage_ledger {
+        ursula_stream::UsageLedgerSnapshot::NotStarted => None,
+        ursula_stream::UsageLedgerSnapshot::Started(ledger) => Some(ledger),
     }
 }
 
@@ -723,6 +903,7 @@ mod tests {
     #[test]
     fn empty_group_snapshot_round_trips() {
         let snapshot = GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement: ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -912,6 +1093,7 @@ mod tests {
             "{error}"
         );
         let snapshot = GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement: ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -1046,6 +1228,7 @@ mod tests {
         assert_eq!(entry.producer_states[0].history, 11);
 
         let snapshot = GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement: ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -1100,6 +1283,7 @@ mod tests {
 
     fn header_v1() -> proto::SnapshotHeaderV1 {
         proto::SnapshotHeaderV1 {
+            usage_ledger: None,
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -1179,6 +1363,7 @@ mod tests {
         let header = encode_frame(proto::SnapshotFrameV1 {
             frame: Some(proto::snapshot_frame_v1::Frame::Header(
                 proto::SnapshotHeaderV1 {
+                    usage_ledger: None,
                     placement: Some(placement_to_proto(ShardPlacement {
                         core_id: CoreId(0),
                         shard_id: ShardId(0),
@@ -1215,6 +1400,7 @@ mod tests {
 
     fn write_unit_snapshot(committed_write_unit_bytes: Option<u64>) -> Vec<u8> {
         let header = proto::SnapshotHeaderV1 {
+            usage_ledger: None,
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),

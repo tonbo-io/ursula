@@ -55,6 +55,12 @@ pub struct GroupStateGauges {
     pub bucket_usage_rows: u64,
     /// Tenant-erasure fences (F15, by design O(buckets ever purged)).
     pub erased_buckets: u64,
+    /// Ended streams whose final usage awaits a consumer's acknowledgement
+    /// (F20, grows while no consumer acknowledges).
+    pub ended_stream_usage: u64,
+    /// Usage sequence numbers above the last acknowledged one (F20); 0
+    /// while the ledger has not started.
+    pub usage_ack_lag: u64,
 }
 
 fn as_u64(value: usize) -> u64 {
@@ -79,7 +85,15 @@ impl StreamStateMachine {
             ttl_heap_entries: as_u64(self.registry.ttl_heap_len()),
             hot_payload_bytes: self.hot_payload_bytes,
             pending_cold_gc: as_u64(self.cold_gc.len()),
-            bucket_usage_rows: as_u64(self.bucket_usage.len()),
+            bucket_usage_rows: as_u64(self.bucket_usage_rows()),
+            ended_stream_usage: as_u64(self.ended_stream_usage_len()),
+            usage_ack_lag: match self.usage_ledger_progress() {
+                crate::usage::UsageLedgerProgress::NotStarted => 0,
+                crate::usage::UsageLedgerProgress::Started {
+                    usage_seq,
+                    acked_through,
+                } => usage_seq.saturating_sub(acked_through),
+            },
             erased_buckets: as_u64(self.erased_buckets.len()),
             ..GroupStateGauges::default()
         };

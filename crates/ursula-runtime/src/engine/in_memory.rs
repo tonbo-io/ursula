@@ -575,6 +575,16 @@ impl InMemoryGroupEngine {
                     hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
                 }))
             }
+            StreamResponse::StreamUsageAcked { ack } => {
+                self.advance_commit_index();
+                Ok(GroupWriteResponse::AckStreamUsage(
+                    crate::request::AckStreamUsageResponse {
+                        placement,
+                        ack,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
+            }
             StreamResponse::ColdGcAcked { removed } => {
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
@@ -842,6 +852,15 @@ impl InMemoryGroupEngine {
     /// Per-bucket bytes of the latest visible snapshot bodies in this
     /// group's state machine. Public so the Raft engine can serve usage
     /// reads from its applied state machine.
+    /// The usage ledger's changes after `after_seq` (U-C).
+    pub fn stream_usage_changes(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> ursula_stream::StreamUsageChanges {
+        self.state_machine.stream_usage_changes(after_seq, limit)
+    }
+
     pub fn snapshot_bytes_by_bucket(&self) -> BTreeMap<String, u64> {
         self.state_machine.snapshot_bytes_by_bucket()
     }
@@ -1145,6 +1164,7 @@ impl InMemoryGroupEngine {
             group_commit_index: self.commit_index,
             stream_snapshot,
             stream_append_counts,
+            usage_ledger: self.state_machine.usage_ledger_snapshot(),
         }
     }
 
@@ -1406,8 +1426,14 @@ impl InMemoryGroupEngine {
             group_commit_index,
             stream_snapshot,
             stream_append_counts,
+            usage_ledger,
         } = snapshot;
-        self.install_snapshot_parts(group_commit_index, stream_snapshot, stream_append_counts)
+        self.install_snapshot_parts(
+            group_commit_index,
+            stream_snapshot,
+            stream_append_counts,
+            usage_ledger,
+        )
     }
 
     pub(crate) fn install_snapshot_parts(
@@ -1415,9 +1441,13 @@ impl InMemoryGroupEngine {
         group_commit_index: u64,
         stream_snapshot: StreamSnapshot,
         stream_append_counts: Vec<StreamAppendCount>,
+        usage_ledger: ursula_stream::UsageLedgerSnapshot,
     ) -> Result<(), GroupEngineError> {
         let mut state_machine = StreamStateMachine::restore(stream_snapshot)
             .map_err(|err| GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(err)))?;
+        // The snapshot codec checked a started ledger against the stream
+        // snapshot it came with.
+        state_machine.restore_usage_ledger(usage_ledger);
         // A count for a stream the snapshot does not hold has nothing to
         // attach to and is dropped (F9: counts die with their slot).
         for count in stream_append_counts {
@@ -1860,6 +1890,37 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn ack_stream_usage<'a>(
+        &'a mut self,
+        history: u64,
+        through_seq: u64,
+        placement: ShardPlacement,
+    ) -> super::GroupAckStreamUsageFuture<'a> {
+        Box::pin(async move {
+            crate::request::AckStreamUsageResponse::try_from(self.apply_committed_write(
+                StreamCommand::AckStreamUsage {
+                    history,
+                    through_seq,
+                },
+                placement,
+            )?)
+        })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        after_seq: u64,
+        limit: usize,
+        _placement: ShardPlacement,
+    ) -> super::GroupStreamUsageFuture<'a> {
+        Box::pin(async move {
+            Ok(super::GroupStreamUsage {
+                applied_index: self.commit_index,
+                changes: self.state_machine.stream_usage_changes(after_seq, limit),
+            })
+        })
+    }
+
     fn defer_cold_gc<'a>(
         &'a mut self,
         seq: u64,
@@ -2257,6 +2318,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         StreamCommand::CreateBucket { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
+        | StreamCommand::AckStreamUsage { .. }
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::NewHistory { .. }

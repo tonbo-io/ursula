@@ -47,9 +47,11 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
 use ursula_stream::StreamStatus;
 use ursula_stream::StreamVisibleSnapshot;
+use ursula_stream::UsageAck;
 use ursula_stream::WriteReceipt;
 
 use crate::AckColdGcResponse;
+use crate::AckStreamUsageResponse;
 use crate::AdvanceRetentionResponse;
 use crate::AppendResponse;
 use crate::CloseStreamResponse;
@@ -287,6 +289,10 @@ pub fn stream_commands() -> Vec<StreamCommand> {
             stream_id: stream(),
             now_ms: 1_700_000_000_012,
         },
+        StreamCommand::AckStreamUsage { .. } => StreamCommand::AckStreamUsage {
+            history: history().get(),
+            through_seq: 22,
+        },
         StreamCommand::ExpireStreams { .. } => StreamCommand::ExpireStreams {
             now_ms: 1_700_000_000_013,
             limit: NonZeroU32::new(64).expect("non-zero"),
@@ -454,7 +460,39 @@ pub fn group_write_responses() -> Vec<GroupWriteResponse> {
                 group_commit_index: 57,
             })
         },
+        GroupWriteResponse::AckStreamUsage(_) => {
+            GroupWriteResponse::AckStreamUsage(AckStreamUsageResponse {
+                placement: placement(),
+                ack: UsageAck::Acknowledged {
+                    acked_through: 23,
+                    folded: 24,
+                },
+                group_commit_index: 58,
+            })
+        },
     });
+    responses.extend(
+        every!(UsageAck {
+            UsageAck::Started { .. } => UsageAck::Started { usage_seq: 25 },
+            UsageAck::Acknowledged { .. } => UsageAck::Acknowledged {
+                acked_through: 23,
+                folded: 24,
+            },
+            UsageAck::OtherHistory { .. } => UsageAck::OtherHistory {
+                history: history().get(),
+            },
+        })
+        .into_iter()
+        // The sample above carries this acknowledgement.
+        .filter(|ack| !matches!(ack, UsageAck::Acknowledged { .. }))
+        .map(|ack| {
+            GroupWriteResponse::AckStreamUsage(AckStreamUsageResponse {
+                placement: placement(),
+                ack,
+                group_commit_index: 58,
+            })
+        }),
+    );
     responses.extend(
         every!(ProducerDelivery {
             ProducerDelivery::Applied(_) => ProducerDelivery::Applied(receipt()),
@@ -853,6 +891,13 @@ fn vary_command_by(command: StreamCommand, mask: &mut Mask) -> StreamCommand {
         }
         StreamCommand::PurgeBucket { bucket_id } => StreamCommand::PurgeBucket { bucket_id },
         StreamCommand::AckColdGc { up_to_seq } => StreamCommand::AckColdGc { up_to_seq },
+        StreamCommand::AckStreamUsage {
+            history,
+            through_seq,
+        } => StreamCommand::AckStreamUsage {
+            history,
+            through_seq,
+        },
         StreamCommand::DeferColdGc { seq, not_before_ms } => {
             StreamCommand::DeferColdGc { seq, not_before_ms }
         }
@@ -1105,6 +1150,15 @@ pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteRespo
         }) => GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
             placement,
             removed,
+            group_commit_index,
+        }),
+        GroupWriteResponse::AckStreamUsage(AckStreamUsageResponse {
+            placement,
+            ack,
+            group_commit_index,
+        }) => GroupWriteResponse::AckStreamUsage(AckStreamUsageResponse {
+            placement,
+            ack,
             group_commit_index,
         }),
     }

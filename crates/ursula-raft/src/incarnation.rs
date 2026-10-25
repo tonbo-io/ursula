@@ -162,11 +162,14 @@ impl IncarnationBook {
 }
 
 /// The responder's identity on an answer or refusal: its node id and its
-/// incarnation, `ursula-node-id` and `ursula-incarnation` in gRPC metadata.
+/// incarnation, `ursula-node-id` and `ursula-incarnation` in gRPC metadata,
+/// and the features of its binary, `ursula-features`, which the usage gate
+/// reads ([`crate::usage_gate`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stamp {
     pub node: Option<u64>,
     pub incarnation: Option<ProcessIncarnation>,
+    pub features: crate::usage_gate::Features,
 }
 
 impl Stamp {
@@ -176,6 +179,7 @@ impl Stamp {
         Self {
             node: text(NODE_ID_METADATA).and_then(|text| text.parse().ok()),
             incarnation: text(INCARNATION_METADATA).and_then(|text| text.parse().ok()),
+            features: crate::usage_gate::Features::of(metadata),
         }
     }
 
@@ -187,6 +191,7 @@ impl Stamp {
         if let Some(incarnation) = self.incarnation {
             metadata.insert(INCARNATION_METADATA, incarnation_value(incarnation));
         }
+        self.features.write(metadata);
     }
 }
 
@@ -634,6 +639,7 @@ mod tests {
         Stamp {
             node: Some(node),
             incarnation,
+            features: crate::usage_gate::Features::default(),
         }
     }
 

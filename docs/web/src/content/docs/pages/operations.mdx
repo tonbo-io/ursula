@@ -527,6 +527,75 @@ Counters are monotonic and survive snapshots, stream deletion, and bucket purge.
 
 `staged_snapshot_parts` reports the staged snapshot parts that no commit has used yet, separately from the replicated fields: for each Raft group the answering node leads, the group, the node's term and the bytes of staged parts per bucket. A new term's totals start at the node's first part, commit or discard in the group, or when its Raft metrics show it leads, whichever comes first. The node then lists the group's part directories in the background and reports `counting_finished: false` until that listing ends. From then on it follows every part it stages, every commit, discard and delete, and every part the orphan sweep reclaims. The bytes are exact except for parts that were still uploading to the previous leader when the term began, parts a failed delete may have removed, and a part the sweep deletes while the seed listing runs, each until its stream is listed again. A collector polls every voter. For each group it keeps the report with the highest term, so a deposed leader that has not yet seen the new term is not counted twice. It treats the total as partial when a kept group has not finished counting, or when no report names one of the `raft_group_count` groups, for example a group without a leader. `ursula_proto::admin::UsageReport::staged_part_bytes` applies these rules. `node_id` is the answering node's id. Ursula bounds staged parts per stream only. A bound per bucket, or a charge for staged parts, is the operator's policy.
 
+### Per-stream usage
+
+The admin listener also exports usage per stream version, for a meter that bills each stream rather than each bucket. It is served on the admin listener only.
+
+**The ledger.** Each Raft group keeps a usage ledger. Each stream version counts what it committed (`committed_write_units`, `committed_append_bytes`, `committed_records`) and when it last wrote. A deleted, expired or purged stream leaves its final counters in the ledger until a consumer acknowledges them. Each change to a stream's counters or sizes takes the group's next usage sequence number. A bucket's totals in `/__ursula/usage` are the bucket's retired usage plus its live streams plus its ended streams not yet acknowledged, so they always equal the per-stream sums, and the report keeps its shape and values.
+
+**Starting it.** A group keeps nothing per stream until a consumer's first acknowledgement starts its ledger. Until then everything a group committed is retired into its buckets, as 0.10.1 counts it, and a group lists no stream. The first acknowledgement gives every live stream a sequence number, so a poll from cursor 0 then lists every live stream with zero counters: what it wrote before the start stays in its bucket's retired usage.
+
+**Polling.** `POST /__ursula/usage/streams` takes a cursor per group and a `limit` of 1 to 10,000 entries per group. A group without a cursor starts from 0.
+
+```json
+{ "version": 1, "cursors": [{ "raft_group_id": 0, "after_seq": 41 }], "limit": 1000 }
+```
+
+The answer lists, for each group the node hosts a replica of, the latest state of each stream version that changed after the cursor, once each, in sequence order:
+
+```json
+{
+  "version": 1,
+  "node_id": 1,
+  "write_unit_bytes": 10240,
+  "raft_group_count": 1,
+  "groups": [
+    {
+      "raft_group_id": 0,
+      "applied_index": 57,
+      "history": 1147797409030816545,
+      "ledger": { "state": "started", "usage_seq": 43, "acked_through": 40 },
+      "after_seq": 41,
+      "through": 43,
+      "complete": true,
+      "streams": [
+        {
+          "seq": 43,
+          "bucket_id": "tenant-a",
+          "stream_id": "notes",
+          "incarnation": 5124095576030430,
+          "created_at_ms": 1700000000100,
+          "content_type": "application/octet-stream",
+          "last_write_at_ms": 1700000000200,
+          "committed_write_units": 2,
+          "committed_append_bytes": 10250,
+          "committed_records": 2,
+          "retained_bytes": 0,
+          "snapshot_bytes": 0,
+          "ended": "deleted"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`through` is the next cursor: every change in `(after_seq, through]` is listed. `complete` is `false` when `limit` cut the list. `ended` is `deleted`, `expired`, `purged`, or absent for a live stream. An ended stream reports zero sizes. A stream created and deleted between two polls is listed once, as ended. Like `/__ursula/usage`, a node answers from its local applied state, so a collector polls every voter and keeps, per group, the answer with the highest `applied_index`. Replicas at the same `applied_index` answer the same entries and sequence numbers.
+
+Sequence numbers belong to one history of the group. After a history event, an accepted loss or an import, the group's `history` changes, and a consumer restarts its cursor from 0. An import starts a group's ledger over: its ledger is not started until the next acknowledgement, with the imported bucket totals retired. A backup carries no per-stream usage.
+
+**Acknowledging.** `POST /__ursula/usage/streams/ack`, a mutation like every other admin `POST`, takes the `x-ursula-process-incarnation` the caller observed:
+
+```json
+{ "version": 1, "groups": [{ "raft_group_id": 0, "history": 1147797409030816545, "through_seq": 43 }] }
+```
+
+It folds every ended stream through `through_seq` into its bucket's retired usage, so the bucket totals do not move. Nothing is folded without an acknowledgement, so acknowledge only after the consumer persisted what it read. Each group answers with an `outcome`: `started` (this acknowledgement started the ledger), `acknowledged` with `acked_through` and `folded`, `other_history` (the group's history changed: nothing happened, read again from 0), `not_hosted` (send it to a node whose poll listed the group), or `failed` with an `error`. An acknowledgement is idempotent: a repeat, or one at or below `acked_through`, folds nothing. The node proposes it through the group's leader.
+
+**Rolling upgrade.** A 0.10.1 node decodes neither the acknowledgement nor a started ledger in a group snapshot. A group's leader therefore refuses an acknowledgement, before it proposes anything, while any member of the group has not advertised the ledger on its latest Raft answer (`failed`, `Unsupported { operation: AckStreamUsage }`). Upgrade every node first; until then the ledger does not start, and every group stays byte for byte as 0.10.1 writes it. Once a group's ledger started, every replica of it must run 0.10.2 or later: rolling such a group back is not supported.
+
+**Bounds.** A stream's usage is five counters. Ended streams stay until they are acknowledged, so they grow with deletions while no consumer acknowledges. `group_state_gauges` in `/__ursula/metrics` reports `ended_stream_usage` and `usage_ack_lag` per group.
+
 ## Tenant offboarding (bucket purge)
 
 `DELETE /__ursula/purge/{bucket}` erases one tenant's complete bucket domain: every stream in every Raft group, the bucket, cold chunks and indexes, external payloads, and any uncommitted object-store staging orphan below `{bucket}/`. The replicated purge also installs a permanent bucket-erasure fence in every group. It retains only the bucket's aggregate usage counters, because deleting a counter before an asynchronous meter observes it would erase committed billable work. Purge is served only on the admin listener (`server.admin_listen`, loopback `127.0.0.1:4438` by default); the client listener answers `404`. On Kubernetes the chart keeps the admin listener on pod loopback, so reach it through `kubectl port-forward pod/<voter-pod> 4438:4438` or `kubectl exec`; any one node accepts the request for the whole cluster. It purges the groups it hosts itself and sends each other group's purge to that group's leader.

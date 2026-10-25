@@ -782,6 +782,14 @@ pub struct AckColdGcResponse {
     pub group_commit_index: u64,
 }
 
+/// Result of a replicated `AckStreamUsage` (U-B, F20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckStreamUsageResponse {
+    pub placement: ShardPlacement,
+    pub ack: ursula_stream::UsageAck,
+    pub group_commit_index: u64,
+}
+
 /// Result of a replicated `DeferColdGc` (bounded-state F14b).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferColdGcResponse {

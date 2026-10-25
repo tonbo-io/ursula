@@ -22,12 +22,15 @@ use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
 use super::WriteKind;
+use super::compare_stream_ids;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
 use super::validate_external_payload_ref;
 use super::validate_message_count;
 use super::validate_stream_id;
+use crate::usage::StreamEnd;
+use crate::usage::StreamUsage;
 
 impl StreamStateMachine {
     pub(super) fn create_bucket(&mut self, bucket_id: String) -> StreamResponse {
@@ -57,15 +60,19 @@ impl StreamStateMachine {
         if let Err(message) = validate_bucket_id(bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
         }
-        let stream_ids = self
+        // In stream order, not the registry's: every replica removes them,
+        // and gives their ends sequence numbers (U-B) and their objects
+        // cold-GC entries, in the same order.
+        let mut stream_ids = self
             .registry
             .stream_ids()
             .filter(|stream_id| stream_id.bucket_id == bucket_id)
             .cloned()
             .collect::<Vec<_>>();
+        stream_ids.sort_by(compare_stream_ids);
         let mut removed_streams = 0u64;
         for stream_id in stream_ids {
-            if self.remove_stream_state(&stream_id) {
+            if self.remove_stream_state(&stream_id, StreamEnd::Purged) {
                 removed_streams = removed_streams.saturating_add(1);
             }
         }
@@ -93,7 +100,7 @@ impl StreamStateMachine {
             .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
-            self.remove_stream_state(&input.stream_id);
+            self.remove_stream_state(&input.stream_id, StreamEnd::Expired);
         }
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
@@ -148,6 +155,7 @@ impl StreamStateMachine {
             history: self.history_id(),
             inherited: None,
             append_count: 0,
+            usage: StreamUsage::default(),
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
@@ -159,10 +167,11 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        self.usage_on_stream_created(
-            &stream_id.bucket_id,
+        self.usage_on_write(
+            &stream_id,
             initial_len,
             Self::appended_record_count(input.message_count, initial_len),
+            input.now_ms,
         );
         StreamResponse::Created {
             stream_id: input.stream_id,
@@ -197,7 +206,7 @@ impl StreamStateMachine {
             .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
-            self.remove_stream_state(&input.stream_id);
+            self.remove_stream_state(&input.stream_id, StreamEnd::Expired);
         }
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
@@ -263,6 +272,7 @@ impl StreamStateMachine {
             history: self.history_id(),
             inherited: None,
             append_count: 0,
+            usage: StreamUsage::default(),
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
@@ -274,10 +284,11 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        self.usage_on_stream_created(
-            &stream_id.bucket_id,
+        self.usage_on_write(
+            &stream_id,
             initial_len,
             Self::appended_record_count(input.message_count, initial_len),
+            input.now_ms,
         );
         StreamResponse::Created {
             stream_id: input.stream_id,
@@ -327,7 +338,12 @@ impl StreamStateMachine {
             );
         };
         let expired = stream_is_expired(stream, now_ms);
-        self.remove_stream_state(stream_id);
+        let end = if expired {
+            StreamEnd::Expired
+        } else {
+            StreamEnd::Deleted
+        };
+        self.remove_stream_state(stream_id, end);
         StreamResponse::Deleted { expired }
     }
 
@@ -347,7 +363,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(stream_id);
+            self.remove_stream_state(stream_id, StreamEnd::Expired);
             return StreamResponse::Accessed {
                 changed: true,
                 expired: true,
@@ -378,7 +394,7 @@ impl StreamStateMachine {
             .stream_metadata(stream_id)
             .is_some_and(|stream| stream_is_expired(stream, now_ms))
         {
-            self.remove_stream_state(stream_id);
+            self.remove_stream_state(stream_id, StreamEnd::Expired);
             return true;
         }
         false
@@ -395,18 +411,26 @@ impl StreamStateMachine {
             let Some(stream_id) = self.registry.pop_expired(now_ms) else {
                 break;
             };
-            if self.remove_stream_state(&stream_id) {
+            if self.remove_stream_state(&stream_id, StreamEnd::Expired) {
                 removed = removed.saturating_add(1);
             }
         }
         StreamResponse::StreamsExpired { removed }
     }
 
-    pub(super) fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
+    /// Removes a stream, which ended as `end`: the one path of every
+    /// removal, so each one queues its cold objects, moves its final usage
+    /// to the ledger's ended streams (U-B) and counts in the removal tally.
+    pub(super) fn remove_stream_state(
+        &mut self,
+        stream_id: &BucketStreamId,
+        end: StreamEnd,
+    ) -> bool {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
         self.record_removed(&slot);
+        self.usage_on_end(&slot, end);
         self.flush_planner.unmark_hot(stream_id);
         self.remove_hot_payload_bytes(
             u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"),
@@ -416,12 +440,6 @@ impl StreamStateMachine {
             .shared_object_paths()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        self.usage_on_stream_removed(
-            &stream_id.bucket_id,
-            slot.metadata
-                .tail_offset
-                .saturating_sub(slot.retained_offset),
-        );
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).

@@ -122,7 +122,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(&stream_id);
+            self.remove_stream_state(&stream_id, crate::usage::StreamEnd::Expired);
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -230,6 +230,7 @@ impl StreamStateMachine {
                 digest: digest.clone(),
                 object,
             });
+        self.usage_on_size_change(&stream_id);
         // A superseded cold body stays readable for the grace, so a read
         // planned before this publish still finds it (F16, as F14i).
         if let Some(superseded) = superseded.and_then(|snapshot| snapshot.object) {
@@ -262,7 +263,7 @@ impl StreamStateMachine {
             );
         };
         if stream_is_expired(stream, now_ms) {
-            self.remove_stream_state(&stream_id);
+            self.remove_stream_state(&stream_id, crate::usage::StreamEnd::Expired);
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -307,10 +308,9 @@ impl StreamStateMachine {
             .expect("stream existence checked before retention mutation");
         let previous_retained_offset = slot.retained_offset;
         slot.retained_offset = retained_offset;
-        self.usage_on_retention(
-            &stream_id.bucket_id,
-            retained_offset.saturating_sub(previous_retained_offset),
-        );
+        if retained_offset != previous_retained_offset {
+            self.usage_on_size_change(&stream_id);
+        }
         // F14i: dropped pack slices stay readable for the compaction grace,
         // so a read planned before this retention still finds its bytes. The
         // not-before time derives from the command's `now_ms`, so every

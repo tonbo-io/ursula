@@ -52,8 +52,6 @@ use crate::json_records::message_count_valid;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
-use crate::model::BucketUsage;
-use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
 use crate::model::ClosedEpoch;
 use crate::model::ColdChunkRef;
@@ -131,6 +129,7 @@ mod producers;
 mod query;
 mod registry;
 mod ttl;
+mod usage_ledger;
 
 /// Size of the self-described derived write unit exported by Ursula.
 ///
@@ -160,10 +159,11 @@ pub struct StreamStateMachine {
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
     shared_cold_object_refs: HashMap<String, u64>,
-    /// Per-bucket committed usage for this group; see [`BucketUsage`] for the
-    /// monotonic-versus-gauge split. Mutated only by the accounting helpers
-    /// below so every counter change stays deterministic and auditable.
-    bucket_usage: HashMap<String, BucketUsage>,
+    /// The usage ledger (U-A, U-B, F20): retired usage per bucket and, once
+    /// a consumer started it, ended streams awaiting acknowledgement. Bucket
+    /// totals are derived from it and the slots
+    /// ([`Self::bucket_usage_report`]).
+    usage: usage_ledger::UsageLedger,
     /// Derived flush-planner state (bounded-stream-state F10): the streams
     /// that hold hot bytes and the leader-local rotation cursor. Neither is
     /// replicated nor part of snapshots; restore rebuilds the index.
@@ -229,6 +229,8 @@ struct StreamSlot {
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
     append_count: u64,
+    /// The stream's usage (U-A), all zero until the group's ledger starts.
+    usage: crate::usage::StreamUsage,
 }
 
 impl StreamStateMachine {
@@ -343,49 +345,6 @@ impl StreamStateMachine {
         }
     }
 
-    fn usage_mut(&mut self, bucket_id: &str) -> &mut BucketUsage {
-        self.bucket_usage.entry(bucket_id.to_owned()).or_default()
-    }
-
-    /// One accepted (non-deduplicated) append: monotonic counters grow and
-    /// the retained gauge grows by the same bytes.
-    fn usage_on_append(&mut self, bucket_id: &str, payload_bytes: u64, records: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(payload_bytes);
-        usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units = usage
-            .committed_write_units
-            .saturating_add(payload_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
-        usage.retained_bytes = usage.retained_bytes.saturating_add(payload_bytes);
-    }
-
-    /// A newly created stream, including any initial payload it was created
-    /// with.
-    fn usage_on_stream_created(&mut self, bucket_id: &str, initial_bytes: u64, records: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.stream_count = usage.stream_count.saturating_add(1);
-        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(initial_bytes);
-        usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units = usage
-            .committed_write_units
-            .saturating_add(initial_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
-        usage.retained_bytes = usage.retained_bytes.saturating_add(initial_bytes);
-    }
-
-    /// Destructive retention reclaimed `reclaimed_bytes` of logical prefix.
-    fn usage_on_retention(&mut self, bucket_id: &str, reclaimed_bytes: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.retained_bytes = usage.retained_bytes.saturating_sub(reclaimed_bytes);
-    }
-
-    /// A stream left the registry (delete or TTL expiry); its remaining
-    /// retained bytes leave the gauge with it.
-    fn usage_on_stream_removed(&mut self, bucket_id: &str, retained_bytes: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.stream_count = usage.stream_count.saturating_sub(1);
-        usage.retained_bytes = usage.retained_bytes.saturating_sub(retained_bytes);
-    }
-
     /// Largest `created_at_ms` assigned by this group (C7).
     pub fn last_created_at_ms(&self) -> u64 {
         self.last_created_at_ms
@@ -422,21 +381,6 @@ impl StreamStateMachine {
         self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
     }
 
-    /// Current per-bucket usage for this group, sorted for deterministic
-    /// output.
-    pub fn bucket_usage_report(&self) -> Vec<BucketUsageSnapshot> {
-        let mut report = self
-            .bucket_usage
-            .iter()
-            .map(|(bucket_id, usage)| BucketUsageSnapshot {
-                bucket_id: bucket_id.clone(),
-                usage: *usage,
-            })
-            .collect::<Vec<_>>();
-        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
-        report
-    }
-
     /// Per bucket, the summed body length of each live stream's latest
     /// visible snapshot, as uploaded: the inline payload's length, or
     /// `payload_len` of the cold object that holds the body. A bucket
@@ -449,13 +393,9 @@ impl StreamStateMachine {
     pub fn snapshot_bytes_by_bucket(&self) -> BTreeMap<String, u64> {
         let mut bytes = BTreeMap::<String, u64>::new();
         for slot in self.registry.slots() {
-            let Some(snapshot) = slot.visible_snapshot.as_ref() else {
+            let Some(body_len) = usage_ledger::visible_snapshot_bytes(slot) else {
                 continue;
             };
-            let body_len = snapshot.object.as_ref().map_or_else(
-                || u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX),
-                |object| object.payload_len,
-            );
             let bucket_id = &slot.metadata.stream_id.bucket_id;
             match bytes.get_mut(bucket_id.as_str()) {
                 Some(total) => *total = total.saturating_add(body_len),
@@ -646,6 +586,10 @@ impl StreamStateMachine {
             }
             StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
+            StreamCommand::AckStreamUsage {
+                history,
+                through_seq,
+            } => self.ack_stream_usage(history, through_seq),
             StreamCommand::DeferColdGc { seq, not_before_ms } => {
                 self.defer_cold_gc(seq, not_before_ms)
             }
@@ -908,3 +852,5 @@ mod hygiene_tests;
 mod producer_record_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_ledger_tests;

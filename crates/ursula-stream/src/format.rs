@@ -151,6 +151,17 @@
 //!   install: new object-storage prefixes and empty data directories. If a
 //!   future release needs an apply-time change under a rolling upgrade, it adds
 //!   a narrowly scoped gate at that point.
+//! - 0.10.2 is such a release within epoch 6, behind one gate, the usage
+//!   gate (`ursula_raft`'s `usage_gate`). It adds the replicated command
+//!   `AckStreamUsage`, its answer and the engine errors that name it, and
+//!   the group snapshot frames and header field of a started usage ledger,
+//!   all as additions: every earlier encoding keeps its bytes, and a group
+//!   whose ledger has not started writes entries and snapshots byte for
+//!   byte as 0.10.1 does. A leader proposes `AckStreamUsage` only while
+//!   every member of the group advertised the ledger on its latest Raft
+//!   answer (`ursula-features`); the first one starts the group's ledger.
+//!   From then on every replica of the group must run 0.10.2 or later. The
+//!   backup format is unchanged: a backup carries no per-stream usage.
 //! - A change to what a backup holds also sets [`BACKUP_FORMAT_VERSION`] to
 //!   the new epoch, and the release notes say that backups of the earlier
 //!   format no longer restore.

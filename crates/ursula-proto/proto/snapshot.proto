@@ -14,6 +14,11 @@ message SnapshotFrameV1 {
     // Always the first frame, checked before any other frame is decoded.
     // Snapshots from Ursula 0.5.x and earlier (format epoch 1) have none.
     FormatEpochV1 format_epoch = 6;
+    // The per-stream usage ledger (0.10.2, bounded-state F20). Written only
+    // once the group's ledger started, which needs every replica to run
+    // 0.10.2 or later: an earlier reader refuses a frame it does not know.
+    StreamUsageV1 stream_usage = 7;
+    EndedStreamUsageV1 ended_stream_usage = 8;
   }
 }
 
@@ -51,6 +56,54 @@ message SnapshotHeaderV1 {
   // The group's latest history event (#581 section 4.2). Absent before the
   // group's genesis applied.
   HistoryEventV1 history = 12;
+  // The group's per-stream usage ledger (0.10.2, bounded-state F20).
+  // Absent while it has not started, as in every snapshot of 0.10.1: the
+  // committed counters of `bucket_usage` are then all retired. Present, the
+  // snapshot holds one `stream_usage` frame per stream and one
+  // `ended_stream_usage` frame per ended stream not yet acknowledged, and
+  // `bucket_usage` is the sum of the retired, live and ended parts.
+  UsageLedgerV1 usage_ledger = 13;
+}
+
+message UsageLedgerV1 {
+  uint64 usage_seq = 1;
+  uint64 acked_through = 2;
+  repeated BucketCommittedUsageV1 retired = 3;
+}
+
+message BucketCommittedUsageV1 {
+  string bucket_id = 1;
+  uint64 committed_append_bytes = 2;
+  uint64 committed_records = 3;
+  uint64 committed_write_units = 4;
+}
+
+message StreamUsageCountersV1 {
+  uint64 committed_write_units = 1;
+  uint64 committed_append_bytes = 2;
+  uint64 committed_records = 3;
+  uint64 last_write_at_ms = 4;
+  uint64 usage_seq = 5;
+}
+
+message StreamUsageV1 {
+  BucketStreamIdV1 stream_id = 1;
+  StreamUsageCountersV1 usage = 2;
+}
+
+enum StreamEndV1 {
+  STREAM_END_DELETED = 0;
+  STREAM_END_EXPIRED = 1;
+  STREAM_END_PURGED = 2;
+}
+
+message EndedStreamUsageV1 {
+  BucketStreamIdV1 stream_id = 1;
+  uint64 created_at_ms = 2;
+  uint64 incarnation = 3;
+  string content_type = 4;
+  StreamUsageCountersV1 usage = 5;
+  StreamEndV1 end = 6;
 }
 
 // A history event: the group's genesis, an import or an accepted loss.

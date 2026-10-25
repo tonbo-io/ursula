@@ -482,6 +482,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             DeferColdGc,
             OffloadColdRefs,
             ExpireStreams,
+            AckStreamUsage,
             BucketCreated,
             BucketAlreadyExists,
             StreamError,
@@ -515,6 +516,8 @@ fn infra_errors() -> Vec<GroupInfraError> {
             PlanColdFlush,
             PlanGroupColdFlush,
             ColdHotBacklog,
+            AckStreamUsage,
+            StreamUsage,
         })
         .into_iter()
         .map(|operation| GroupInfraError::Unsupported { operation }),

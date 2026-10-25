@@ -20,6 +20,8 @@
 //!   the commit that assembles and publishes them.
 //! - [`staged_parts`]: the bound on a stream's staged, unused snapshot
 //!   parts, counted by the leader.
+//! - [`stream_usage`]: the per-stream usage export and its acknowledgement
+//!   on the admin port (`/__ursula/usage/streams`).
 //! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
 //!   every HEAD answer, and the request limit on a `413` that names none.
 //! - [`placement_status`]: `GET /__ursula/placement`, this node's placement
@@ -49,6 +51,7 @@ mod render;
 mod response_metadata;
 mod snapshot_parts;
 mod staged_parts;
+mod stream_usage;
 mod wal_disk;
 
 use std::collections::HashMap;
@@ -1263,6 +1266,7 @@ pub fn router(runtime: ShardRuntime) -> Router {
     let state = HttpState::new(runtime);
     cluster_router_from_state(state.clone())
         .merge(admin_ops_router(state.clone()))
+        .merge(admin_reads_router(state.clone()))
         .merge(client_router_with_admission(
             state,
             IngressAdmission::default(),
@@ -1286,6 +1290,7 @@ pub fn router_with_raft_cluster(
 pub fn router_with_http_state(state: HttpState) -> Router {
     cluster_router_from_state(state.clone())
         .merge(admin_ops_router(state.clone()))
+        .merge(admin_reads_router(state.clone()))
         .merge(client_router_with_admission(
             state,
             IngressAdmission::default(),
@@ -1298,21 +1303,34 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 /// `server.admin_listen` (loopback by default) — nodes expose no
 /// cluster-mutation endpoints on the client or cluster planes.
 pub fn admin_router(state: HttpState) -> Router {
-    admin_ops_router(state.clone()).merge(
-        Router::new()
-            .route("/__ursula/metrics", get(metrics))
-            .route(
-                placement_status::PLACEMENT_PATH,
-                get(placement_status::admin_placement_status),
-            )
-            .route(
-                placement_status::GROUP_ROUTE,
-                get(placement_status::admin_group_status),
-            )
-            .route(READINESS_PATH, get(readiness))
-            .route("/__ursula/usage", get(bucket_usage))
-            .with_state(state),
-    )
+    admin_ops_router(state.clone())
+        .merge(admin_reads_router(state.clone()))
+        .merge(
+            Router::new()
+                .route("/__ursula/metrics", get(metrics))
+                .route(
+                    placement_status::PLACEMENT_PATH,
+                    get(placement_status::admin_placement_status),
+                )
+                .route(
+                    placement_status::GROUP_ROUTE,
+                    get(placement_status::admin_group_status),
+                )
+                .route(READINESS_PATH, get(readiness))
+                .route("/__ursula/usage", get(bucket_usage))
+                .with_state(state),
+        )
+}
+
+/// The admin plane's reads that no other plane serves, so they take no
+/// process-incarnation precondition: the per-stream usage export (U-C),
+/// a read with a JSON body of cursors.
+fn admin_reads_router(state: HttpState) -> Router {
+    Router::new()
+        .route("/__ursula/usage/streams", post(stream_usage::stream_usage))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(ResponseMetadataLayer::admin())
+        .with_state(state)
 }
 
 /// The mutating admin routes without the read-only aliases. The single-router
@@ -1327,6 +1345,12 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/purge/{bucket}",
             axum::routing::delete(purge_bucket),
+        )
+        // Admin port only, a mutation like any other here: the per-stream
+        // usage acknowledgement (U-B).
+        .route(
+            "/__ursula/usage/streams/ack",
+            post(stream_usage::ack_stream_usage),
         )
         .route("/__ursula/backup/info", get(backup_info))
         .route(
@@ -5818,6 +5842,8 @@ mod server_metadata_tests;
 mod snapshot_parts_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
+#[cfg(test)]
+mod stream_usage_tests;
 #[cfg(test)]
 mod upload_fence_tests;
 #[cfg(test)]

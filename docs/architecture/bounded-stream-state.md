@@ -8,7 +8,7 @@ A stream may live forever, receive many tiny records and never advance retention
 
 The principle: nothing a replica holds grows with the number of records, appends, flushes or producers a stream has ever seen. Per stream, replicated state is a small constant plus the unflushed hot window plus bounded producer state. Per node, nothing is keyed by what was ever seen. Retention is never required. It remains a storage-cost tool for applications that want it.
 
-Each mechanism below has a stable label (F0 to F19, D1 to D6, W1 to W6, I1 to I5). Code comments cite these labels, so they do not change when the text around them does.
+Each mechanism below has a stable label (F0 to F20, D1 to D6, W1 to W6, I1 to I5). Code comments cite these labels, so they do not change when the text around them does.
 
 Rationale in one paragraph: long-lived streams of tiny records (agent trajectories, chat and session logs, workflow event logs, telemetry) are the product's history, and their owners do not want to trim. The state machine is in memory on every replica by design and local storage is disposable, so nothing can be paged out. Any per-record or per-flush term in replicated state turns into replica memory, snapshot size, snapshot install time and Raft log amplification that grow with the stream's age.
 
@@ -30,13 +30,13 @@ Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* heade
 
 `Prod(s)` covers each producer's id and its fixed-size record (scalars, the newest write's receipt, up to two digests, the closed epoch and the floor marker), plus the stream's epoch floor (F3). The constant term is slack. No term grows with record count or with cold history.
 
-**I2. Per group.** The sum of I1 over the group's streams, plus three terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). Tenant tombstones are the one documented exception (F15).
+**I2. Per group.** The sum of I1 over the group's streams, plus three terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). Tenant tombstones (F15) and the final usage of ended streams awaiting a consumer's acknowledgement (F20) are the documented exceptions.
 
 **I3. Snapshots.** A group snapshot encodes I2 in a binary envelope that does not amplify it (F12a). Cadence follows bytes (F12e): a group snapshots after max(F, 2 × its last snapshot) bytes of Raft log, so snapshot bytes written per appended log byte stay near one half and never grow with history.
 
 **I4. Per node.** No structure keyed by something ever seen (streams, pages, lookups) grows without a cap. Caches are bounded by bytes or entries (F13). Per-request memory is at most the 8 MiB response cap or one record (at most 32 MiB), and no write copies group state (F9, F11). The TTL heap holds at most two entries per live TTL stream (F8). Hot payload across the node stays near `flush_pressure_hot_size` (128 MiB) while S3 is healthy (F10), and the per-group admission cap is the hard bound. Unpurged Raft log stays near the node log-byte budget and never passes twice the budget, where admission refuses client writes (F12e).
 
-**I5. Independence.** No bound depends on `AdvanceRetention`, a visible snapshot, TTL, a client, or an external consumer. The constants 64 (F2) and 16 (F5) for state-held references depend only on Ursula's own leader-side drivers. A stalled driver shows in the gauges (§7.4, Gauges), and nothing else grows while it is stalled.
+**I5. Independence.** No bound depends on `AdvanceRetention`, a visible snapshot, TTL, a client, or an external consumer, with one exception: once a consumer starts a group's usage ledger, the ended streams it has not acknowledged stay (F20). The constants 64 (F2) and 16 (F5) for state-held references depend only on Ursula's own leader-side drivers. A stalled driver shows in the gauges (§7.4, Gauges), and nothing else grows while it is stalled.
 
 ## 3. Definitions
 
@@ -161,7 +161,7 @@ The cold-index page cache is bounded by pages and by approximate bytes (`DEFAULT
 
 ### F15: tenant tombstones (known exception)
 
-`bucket_usage` keeps one row per bucket ever written in each group, and `erased_buckets` keeps one fence per bucket ever purged in every group. Both grow with tenant churn, not with records, and both are deliberate. They are the one exception to I2. The `bucket_usage_rows` and `erased_buckets` gauges expose them.
+The usage ledger's retired usage keeps one row per bucket ever written in each group, and `erased_buckets` keeps one fence per bucket ever purged in every group. Both grow with tenant churn, not with records, and both are deliberate exceptions to I2. The `bucket_usage_rows` and `erased_buckets` gauges expose them.
 
 ### F16: visible snapshots in the cold tier
 
@@ -181,6 +181,18 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 - **Clip on proven writes.** A page write for a range whose bytes state proves (a flush of hot bytes, an F2 replacement, an F5 offload) removes or clips every other entry overlapping the range in the same read-modify-write.
 - **Repair cursor** (`spawn_cold_index_repair_worker`). Every 60 s each led group repairs the pages of up to 16 streams after its cursor. Per page it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, start at or beyond the tail, or whose objects predate the stream's incarnation. The cursor also drives F14d and F14f. Two overlapping page-only external entries with different starts written before F5 cannot be told apart and remain a documented hazard.
 
+### F20: per-stream usage and ended streams (known exception)
+
+**Structure** (`ursula-stream/src/state_machine/usage_ledger.rs`, U-A to U-C). Each stream slot holds a `StreamUsage` of five `u64`s: committed write units, append bytes and records, the time of its last write, and its usage sequence number. The group holds its `usage_seq`, the highest acknowledged one, its retired usage per bucket (F15) and its ended streams, one entry each of about 200 B plus the stream id and content type. Bucket totals are derived as retired plus live plus ended, so nothing is counted twice and nothing is lost when usage moves between them.
+
+**Start.** Nothing per stream is kept until a consumer's first `AckStreamUsage` starts the ledger in the group. Until then a write counts into its bucket's retired usage, state and snapshots are those of 0.10.1, and a deletion leaves no entry. A cluster whose usage nobody exports holds no F20 state.
+
+**Bound.** A live stream's usage is a constant in C0. An ended stream's entry stays until a consumer acknowledges its sequence number, which folds it into retired usage: nothing is folded without an acknowledgement, so a billable final count is never dropped before the meter persisted it. The ended entries are therefore bounded by the deletions, expiries and purges since the consumer's last acknowledgement, not by anything Ursula drives. This is the exception to I5. A consumer that acknowledges every poll keeps them near one poll interval of deletions.
+
+**Node-local index.** Each replica derives a map from usage sequence number to live stream, about 40 B per live stream once the ledger started, never replicated or persisted and rebuilt on restore, so an export costs the changes it lists rather than the group's streams.
+
+**Gauges.** `ended_stream_usage` counts the ended entries and `usage_ack_lag` the sequence numbers above the last acknowledgement, per group in `group_state_gauges`. Both are 0 while the ledger has not started.
+
 ## 5. Structure, bound and mechanism
 
 | Structure | Scope | Bound | Mechanism |
@@ -193,7 +205,9 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Producer map and epoch floor | replicated | ≤ 4,096 producers, one receipt each | F0, F3 |
 | Cold coverage | replicated | derived, no field | F18 |
 | Cold-GC queue | replicated | bounded while GC is healthy | F14b |
-| `bucket_usage`, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
+| Retired usage rows, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
+| Per-stream usage | replicated | 40 B per stream, in C0 | F20 |
+| Ended stream usage | replicated | one entry per stream ended since the consumer's last acknowledgement; none before the ledger starts | F20 (exception) |
 | Group snapshot | replicated | encodes the above, cadence by bytes | F12a to F12e |
 | Unpurged Raft log | node | near the log budget, hard limit 2 × budget on every Raft node | F12e, F17 |
 | TTL heap | node | ≤ 2 entries per live TTL stream | F8 |
@@ -203,6 +217,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Registry slots and keys map | node | O(live streams) | F7 |
 | Per-stream append count | node | dies with the stream | F9 |
 | Flush planner index and cursor | node | O(hot streams) | F10 |
+| Usage sequence index | node | one entry per live stream once the ledger started | F20 |
 | Page cache and readers map | node | pages and 32 MiB, max(4 × blocks, minimum) | F13 |
 | Compaction debt | node | ≤ 65,536 pages | F14d |
 | Read and bootstrap responses | request | ≤ 8 MiB, or one record ≤ 32 MiB | F11 |
@@ -263,7 +278,7 @@ The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.r
 
 ### 7.4 Gauges
 
-`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers (total and per-stream maximum), producer bytes (total and per-stream maximum), streams with an epoch floor, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows and erased buckets. Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters, the `cold_orphan_*` counters and `producer_expired_answers`. No alerts ship with them.
+`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers (total and per-stream maximum), producer bytes (total and per-stream maximum), streams with an epoch floor, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows, erased buckets, ended stream usage entries and the usage acknowledgement lag (F20). Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters, the `cold_orphan_*` counters and `producer_expired_answers`. No alerts ship with them.
 
 ## 8. Design rationale
 

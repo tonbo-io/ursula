@@ -207,10 +207,11 @@ impl StreamStateMachine {
                 slot.hot_buffer.push(offset, next_offset, payload);
                 self.add_hot_payload_bytes(payload_len);
                 self.sync_hot_index(&stream_id);
-                self.usage_on_append(
-                    &stream_id.bucket_id,
+                self.usage_on_write(
+                    &stream_id,
                     payload_len,
                     Self::appended_record_count(message_count, payload_len),
+                    now_ms,
                 );
                 StreamResponse::Appended {
                     offset,
@@ -367,10 +368,11 @@ impl StreamStateMachine {
         slot.cold.push_direct_external_segment(object.clone());
         self.sync_hot_index(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
-        self.usage_on_append(
-            &stream_id.bucket_id,
+        self.usage_on_write(
+            &stream_id,
             appended_bytes,
             Self::appended_record_count(message_count, appended_bytes),
+            now_ms,
         );
         StreamResponse::Appended {
             offset,

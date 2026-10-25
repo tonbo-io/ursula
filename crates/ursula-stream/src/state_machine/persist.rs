@@ -256,6 +256,7 @@ impl StreamStateMachine {
                 history: entry.history,
                 inherited: entry.inherited,
                 append_count: 0,
+                usage: crate::usage::StreamUsage::default(),
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
@@ -279,28 +280,12 @@ impl StreamStateMachine {
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
         machine.normalize_last_created_at_ms();
 
-        // Usage restore: gauges are recomputed from the restored slots so a
-        // snapshot can never carry gauge drift forward; only the monotonic
-        // counters are taken from the snapshot.
-        let mut recomputed: HashMap<String, super::BucketUsage> = HashMap::new();
-        for slot in machine.registry.slots() {
-            let usage = recomputed
-                .entry(slot.metadata.stream_id.bucket_id.clone())
-                .or_default();
-            usage.stream_count = usage.stream_count.saturating_add(1);
-            usage.retained_bytes = usage.retained_bytes.saturating_add(
-                slot.metadata
-                    .tail_offset
-                    .saturating_sub(slot.retained_offset),
-            );
-        }
-        for persisted in snapshot.bucket_usage {
-            let usage = recomputed.entry(persisted.bucket_id).or_default();
-            usage.committed_append_bytes = persisted.usage.committed_append_bytes;
-            usage.committed_records = persisted.usage.committed_records;
-            usage.committed_write_units = persisted.usage.committed_write_units;
-        }
-        machine.bucket_usage = recomputed;
+        // Usage restore: the snapshot's bucket totals are all retired and
+        // the ledger has not started, as in a snapshot of Ursula 0.10.1. A
+        // group snapshot's started ledger replaces this
+        // ([`Self::restore_usage_ledger`]). The gauges are derived from the
+        // restored slots.
+        machine.usage = super::usage_ledger::UsageLedger::retiring(&snapshot.bucket_usage);
 
         Ok(machine)
     }

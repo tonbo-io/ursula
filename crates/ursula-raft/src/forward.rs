@@ -217,21 +217,41 @@ pub(crate) async fn forward_group_read_to_leader(
 }
 
 /// Forward the cluster-wide administrative bucket purge to the known
-/// Raft-group leader. Ordinary client writes intentionally do not use this
-/// path: their admission checks must run on the serving leader before
-/// replication. PurgeBucket has no per-stream admission step, and constraining
-/// this helper to that exact command keeps the exception narrow.
+/// Raft-group leader.
 pub(crate) async fn forward_purge_bucket_to_leader(
     route: &LeaderRoute,
     placement: ShardPlacement,
     bucket_id: String,
 ) -> Result<PurgeBucketResponse, GroupEngineError> {
+    PurgeBucketResponse::try_from(
+        forward_write_to_leader(
+            route,
+            placement,
+            ursula_stream::StreamCommand::PurgeBucket { bucket_id },
+            "bucket purge answer",
+        )
+        .await?,
+    )
+}
+
+/// Proposes `command` through the leader `route` names, as one forwarded
+/// `GroupWrite`, and decodes the leader's answer to it (`what` names it in
+/// a decode failure). The leader's proposal checks apply to it there.
+///
+/// Only the administrative commands without a per-stream admission step use
+/// it: the bucket purge and the stream usage acknowledgement. Ordinary
+/// client writes do not, since their admission checks must run on the
+/// serving leader before replication.
+pub(crate) async fn forward_write_to_leader(
+    route: &LeaderRoute,
+    placement: ShardPlacement,
+    command: ursula_stream::StreamCommand,
+    what: &'static str,
+) -> Result<GroupWriteResponse, GroupEngineError> {
     let mut request = raft_internal_proto::GroupWriteRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
-        command_payloads: vec![encode_wire(&RaftCommand::Stream(
-            ursula_stream::StreamCommand::PurgeBucket { bucket_id },
-        ))],
+        command_payloads: vec![encode_wire(&RaftCommand::Stream(command))],
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
     };
@@ -247,13 +267,7 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     .await
     .map_err(ForwardError::into_engine_error)?;
     let result = single_write_answer(response.results)?;
-    let response: GroupWriteResponse = forwarded_answer(
-        ForwardedRpc::GroupWrite,
-        result.ok,
-        &result.payload,
-        "bucket purge answer",
-    )?;
-    PurgeBucketResponse::try_from(response)
+    forwarded_answer(ForwardedRpc::GroupWrite, result.ok, &result.payload, what)
 }
 
 impl crate::RaftGroupHandleRegistry {
@@ -1011,12 +1025,14 @@ pub(crate) fn proposal_leader(
 /// carried, as one batch. A command of the meta plane refuses the batch
 /// before anything of it is proposed. `history` is the group's history on
 /// this replica: a leader whose history is pending admits none of them
-/// (#581 section 4.5).
+/// (#581 section 4.5). `peer_cluster` is this node's, which the usage gate
+/// reads ([`crate::usage_gate::admit`]).
 pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachine>(
     raft: Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
     contact: &crate::LeaderContact,
     history: &crate::history::GroupHistory,
+    peer_cluster: Option<&crate::PeerCluster>,
     commands: Vec<RaftCommand>,
 ) -> Result<Vec<Result<SM::Answer, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
@@ -1042,9 +1058,11 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
             .collect());
     }
     // A batch carries no fence, so an upload command in it refuses the
-    // batch before anything of it is proposed.
+    // batch before anything of it is proposed. A command of the usage gate
+    // refuses it while a member cannot decode the command.
     for command in &commands {
         proposal_leader(command, ProposalFence::Unfenced)?;
+        crate::usage_gate::admit(&raft, peer_cluster, command)?;
     }
     // The submission fails only when RaftCore is gone and hands the batch
     // back unsent: nothing of it was proposed, as for a single write.

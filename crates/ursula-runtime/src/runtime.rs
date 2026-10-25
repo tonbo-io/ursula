@@ -1022,6 +1022,40 @@ impl ShardRuntime {
         Ok(groups)
     }
 
+    /// The per-stream usage changes of every Raft group this node hosts,
+    /// by group in ascending order: each after its cursor in `cursors`
+    /// (0 for a group not named), at most `limit` each (U-C). Read from
+    /// local applied state, leader or follower, like
+    /// [`Self::bucket_usage_all_groups`]; a group this node hosts no
+    /// replica of is left out.
+    pub async fn stream_usage_all_groups(
+        &self,
+        cursors: &std::collections::BTreeMap<u32, u64>,
+        limit: usize,
+    ) -> Result<Vec<(RaftGroupId, crate::engine::GroupStreamUsage)>, RuntimeError> {
+        let mut groups = Vec::new();
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let group = RaftGroupId(group_id);
+            let after_seq = cursors.get(&group_id).copied().unwrap_or(0);
+            if let Some(usage) = hosted(self.stream_usage(group, after_seq, limit).await)? {
+                groups.push((group, usage));
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Acknowledges `group`'s usage ledger through `through_seq` under its
+    /// history `history`, through its leader (U-B). `None` when this node
+    /// hosts no replica of the group.
+    pub async fn ack_stream_usage_if_hosted(
+        &self,
+        group: RaftGroupId,
+        history: u64,
+        through_seq: u64,
+    ) -> Result<Option<crate::request::AckStreamUsageResponse>, RuntimeError> {
+        hosted(self.ack_stream_usage(group, history, through_seq).await)
+    }
+
     /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
     /// Gauges) of every Raft group as held by this node's applied replica state.
     /// Groups are asked concurrently; per-group results, so a group this

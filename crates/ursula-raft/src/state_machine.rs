@@ -3493,6 +3493,7 @@ mod tests {
     #[cfg(not(madsim))]
     fn test_group_snapshot(placement: ShardPlacement, commit_index: u64) -> GroupSnapshot {
         GroupSnapshot {
+            usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
             placement,
             group_commit_index: commit_index,
             stream_snapshot: Default::default(),

@@ -229,6 +229,22 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         refs: Vec<ObjectPayloadRef>,
     },
+    /// Acknowledges the group's per-stream usage ledger through
+    /// `through_seq` (U-B, bounded-state F20): every ended stream whose end
+    /// has a sequence number at or below it is folded into its bucket's
+    /// retired usage. Nothing is folded without it. The first one starts
+    /// the ledger. `history` is the group's history the consumer read the
+    /// sequence numbers in; under another history it changes nothing.
+    /// Idempotent under replay.
+    ///
+    /// Added in 0.10.2 within format epoch 6: an earlier node does not
+    /// decode it, so a leader proposes it only while every replica of the
+    /// group advertises the stream usage ledger (`ursula_raft`'s
+    /// `usage_gate`).
+    AckStreamUsage {
+        history: u64,
+        through_seq: u64,
+    },
     /// The `Stream-Incarnation` request precondition (D12): `command` (a
     /// create, append, close, delete, snapshot publish or retention move)
     /// applies only if its stream's token in the group's current history is
@@ -386,6 +402,13 @@ impl fmt::Display for StreamCommand {
             Self::DeleteStream { stream_id, .. } => write!(f, "delete_stream:{stream_id}"),
             Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
+            Self::AckStreamUsage {
+                history,
+                through_seq,
+            } => write!(
+                f,
+                "ack_stream_usage:history={history:#x}:through_seq={through_seq}"
+            ),
             Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
             Self::ImportSnapshot {
                 snapshot, history, ..

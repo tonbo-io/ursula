@@ -112,6 +112,16 @@ pub type GroupColdHotBacklogFuture<'a> =
 pub type GroupBucketUsageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupBucketUsage, GroupEngineError>> + Send + 'a>>;
 
+/// One group's per-stream usage changes after a cursor (U-C), as its
+/// replica on this node applied them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupStreamUsage {
+    /// The index of the last entry the replica applied, read with the
+    /// changes: of two replicas' answers, the higher index is the newer.
+    pub applied_index: u64,
+    pub changes: ursula_stream::StreamUsageChanges,
+}
+
 /// One group's per-bucket committed usage, as its replica on this node
 /// applied it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -212,6 +222,15 @@ pub type GroupDeleteStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeleteStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupAckStreamUsageFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::AckStreamUsageResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupStreamUsageFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GroupStreamUsage, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeferColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeferColdGcResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPurgeBucketFuture<'a> =
@@ -276,6 +295,8 @@ pub enum GroupWriteResponse {
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
     /// An `ExpireStreams` entry of the leader's expiry sweep applied.
     ExpireStreams(crate::request::ExpireStreamsResponse),
+    /// An `AckStreamUsage` applied (0.10.2, behind the usage gate).
+    AckStreamUsage(crate::request::AckStreamUsageResponse),
 }
 
 /// `GroupWriteResponse::kind` and one `TryFrom<GroupWriteResponse>` per
@@ -329,6 +350,7 @@ group_write_responses! {
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
     ExpireStreams(crate::request::ExpireStreamsResponse),
+    AckStreamUsage(crate::request::AckStreamUsageResponse),
 }
 
 /// The error of a [`GroupEngine`] operation the engine leaves
@@ -584,6 +606,31 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async { Err(unsupported(EngineOperation::AckColdGc)) })
+    }
+
+    /// Replicated `AckStreamUsage` (U-B, F20): starts the group's usage
+    /// ledger, or folds its ended streams through `through_seq`, under the
+    /// group's history `history`. Proposed through the group's leader.
+    /// Default unsupported.
+    fn ack_stream_usage<'a>(
+        &'a mut self,
+        _history: u64,
+        _through_seq: u64,
+        _placement: ShardPlacement,
+    ) -> GroupAckStreamUsageFuture<'a> {
+        Box::pin(async { Err(unsupported(EngineOperation::AckStreamUsage)) })
+    }
+
+    /// The group's per-stream usage changes after `after_seq`, at most
+    /// `limit` (U-C). Served from local replica state, leader or follower,
+    /// like [`Self::bucket_usage`]. Default unsupported.
+    fn stream_usage<'a>(
+        &'a mut self,
+        _after_seq: u64,
+        _limit: usize,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        Box::pin(async { Err(unsupported(EngineOperation::StreamUsage)) })
     }
 
     /// Replicated `DeferColdGc` (bounded-state F14b): moves

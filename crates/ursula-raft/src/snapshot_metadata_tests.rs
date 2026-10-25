@@ -55,6 +55,7 @@ fn machine(path: &Path) -> RaftGroupStateMachine {
 
 async fn install(machine: &mut RaftGroupStateMachine, index: u64) -> std::io::Result<()> {
     let snapshot = GroupSnapshot {
+        usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
         placement: machine.placement,
         group_commit_index: index,
         stream_snapshot: Default::default(),

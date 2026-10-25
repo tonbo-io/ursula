@@ -1958,6 +1958,7 @@ async fn a_later_generation_survives_snapshots_reclaim_and_restart() {
     }
     healthy.save_committed(Some(log_id(400))).await.unwrap();
     let snapshot = ursula_runtime::GroupSnapshot {
+        usage_ledger: ursula_stream::UsageLedgerSnapshot::NotStarted,
         placement: placement(HEALTHY),
         group_commit_index: 400,
         stream_snapshot: Default::default(),

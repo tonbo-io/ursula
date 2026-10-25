@@ -59,6 +59,14 @@ impl StreamRegistry {
         self.slots.get_mut(key).map(|slot| &mut **slot)
     }
 
+    pub(super) fn slot_by_key(&self, key: StreamKey) -> Option<&StreamSlot> {
+        self.slots.get(key).map(|slot| &**slot)
+    }
+
+    pub(super) fn slot_by_key_mut(&mut self, key: StreamKey) -> Option<&mut StreamSlot> {
+        self.slots.get_mut(key).map(|slot| &mut **slot)
+    }
+
     pub(super) fn metadata(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
         self.slot(stream_id).map(|slot| &slot.metadata)
     }
@@ -276,6 +284,7 @@ mod tests {
             history: 0,
             inherited: None,
             append_count: 0,
+            usage: crate::usage::StreamUsage::default(),
         }
     }
 

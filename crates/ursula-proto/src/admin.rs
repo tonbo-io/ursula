@@ -1940,6 +1940,169 @@ impl UsageReport {
     }
 }
 
+/// The most stream entries one group answers with in a
+/// [`StreamUsageReport`].
+pub const MAX_STREAM_USAGE_CHANGES: u32 = 10_000;
+
+/// Body of `POST /__ursula/usage/streams` (admin port): the caller's cursor
+/// in each group's per-stream usage ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageRequest {
+    pub version: SchemaVersion<1>,
+    /// The last usage sequence number the caller holds, per group. A group
+    /// not named starts from 0, which lists every live stream and every
+    /// ended stream not yet acknowledged.
+    pub cursors: Vec<StreamUsageCursor>,
+    /// The most stream entries each group answers with, 1 to
+    /// [`MAX_STREAM_USAGE_CHANGES`].
+    pub limit: u32,
+}
+
+/// One group's cursor in a [`StreamUsageRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageCursor {
+    pub raft_group_id: u32,
+    pub after_seq: u64,
+}
+
+/// Answer of `POST /__ursula/usage/streams`: the per-stream usage changes
+/// of each group the answering node hosts a replica of, from that
+/// replica's applied state. A collector keeps, per group, the answer with
+/// the highest `applied_index`, as for [`UsageReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageReport {
+    pub version: SchemaVersion<1>,
+    /// The answering node's id, when it has one.
+    pub node_id: Option<u64>,
+    /// The unit of `committed_write_units`, in bytes.
+    pub write_unit_bytes: u64,
+    /// How many Raft groups the cluster has, numbered from 0.
+    pub raft_group_count: u32,
+    /// One entry per group the node hosts, in group order.
+    pub groups: Vec<GroupStreamUsageReport>,
+}
+
+/// One group's changes in a [`StreamUsageReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStreamUsageReport {
+    pub raft_group_id: u32,
+    /// The index of the last entry the replica applied.
+    pub applied_index: u64,
+    /// The group's history id, 0 before its genesis. Sequence numbers
+    /// belong to one history: after a history event (an accepted loss or
+    /// an import) the caller restarts its cursor from 0.
+    pub history: u64,
+    pub ledger: StreamUsageLedgerState,
+    /// The cursor this answer starts after.
+    pub after_seq: u64,
+    /// Every change in `(after_seq, through]` is listed, each stream
+    /// version once at its latest sequence number. The next cursor.
+    pub through: u64,
+    /// Nothing after `through`: the ledger's sequence number is `through`.
+    pub complete: bool,
+    pub streams: Vec<StreamUsageEntryReport>,
+}
+
+/// Whether a group's ledger started. It starts with the first
+/// acknowledgement (`POST /__ursula/usage/streams/ack`); until then the
+/// group keeps only bucket totals and lists no stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StreamUsageLedgerState {
+    NotStarted,
+    Started { usage_seq: u64, acked_through: u64 },
+}
+
+/// How a stream version ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamUsageEnd {
+    Deleted,
+    Expired,
+    Purged,
+}
+
+/// The latest state of one stream version in a [`GroupStreamUsageReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageEntryReport {
+    /// The group's usage sequence number of this state.
+    pub seq: u64,
+    pub bucket_id: String,
+    pub stream_id: String,
+    /// The stream version's `Stream-Incarnation` token: in the group's
+    /// current history while it lives, at its end once it ended.
+    pub incarnation: u64,
+    pub created_at_ms: u64,
+    pub content_type: String,
+    /// `now_ms` of its newest committed write since the ledger started; 0
+    /// for none.
+    pub last_write_at_ms: u64,
+    /// Committed since the ledger started, monotonic per stream version.
+    pub committed_write_units: u64,
+    pub committed_append_bytes: u64,
+    pub committed_records: u64,
+    /// 0 once it ended.
+    pub retained_bytes: u64,
+    /// Body length of its latest visible snapshot; 0 once it ended.
+    pub snapshot_bytes: u64,
+    /// `None` while it lives.
+    pub ended: Option<StreamUsageEnd>,
+}
+
+/// Body of `POST /__ursula/usage/streams/ack` (admin port), a mutation that
+/// takes [`PROCESS_INCARNATION_HEADER`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageAckRequest {
+    pub version: SchemaVersion<1>,
+    pub groups: Vec<StreamUsageAck>,
+}
+
+/// One group's acknowledgement: every ended stream through `through_seq`
+/// is folded into its bucket's retired usage. `history` is the group's
+/// history the sequence numbers were read in. The first acknowledgement of
+/// a group starts its ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageAck {
+    pub raft_group_id: u32,
+    pub history: u64,
+    pub through_seq: u64,
+}
+
+/// Answer of `POST /__ursula/usage/streams/ack`, one outcome per group in
+/// request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageAckReport {
+    pub version: SchemaVersion<1>,
+    pub groups: Vec<GroupStreamUsageAck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStreamUsageAck {
+    pub raft_group_id: u32,
+    pub outcome: StreamUsageAckOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StreamUsageAckOutcome {
+    /// This acknowledgement started the group's ledger.
+    Started { usage_seq: u64 },
+    /// Every ended stream through `acked_through` is folded; `folded` by
+    /// this acknowledgement.
+    Acknowledged { acked_through: u64, folded: u64 },
+    /// The group's history is `history`, not the one named: nothing
+    /// changed. Read the group again from cursor 0.
+    OtherHistory { history: u64 },
+    /// This node hosts no replica of the group: acknowledge through a node
+    /// whose report named it.
+    NotHosted,
+    /// Not applied, or not known to have applied; `error` says why. An
+    /// acknowledgement is idempotent, so sending it again is safe. While a
+    /// member of the group runs a release without the ledger, the group
+    /// refuses every acknowledgement before proposing it (the usage gate).
+    Failed { error: String },
+}
+
 #[cfg(test)]
 mod usage_tests {
     use std::collections::BTreeMap;

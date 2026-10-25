@@ -22,6 +22,9 @@ pub struct GroupSnapshot {
     pub group_commit_index: u64,
     pub stream_snapshot: StreamSnapshot,
     pub stream_append_counts: Vec<StreamAppendCount>,
+    /// The group's per-stream usage ledger (F20), beside the stream
+    /// snapshot that a backup holds alone.
+    pub usage_ledger: ursula_stream::UsageLedgerSnapshot,
 }
 
 impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
