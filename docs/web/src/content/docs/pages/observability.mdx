@@ -194,7 +194,8 @@ they stay at 0 in the in-memory mode, which runs no Raft. Alert when `raft_delet
 Each group's leader removes expired streams in the background (see
 [Deleted data](/docs/operations#deleted-data)). `ttl_expiry_sweeps` counts the
 `Sweep` entries the node's leaders committed, each of which removes up to 256
-expired streams and folds up to 256 due end records, and
+expired streams and folds up to 256 due end records, those that only fold end
+records included, and
 `ttl_expiry_swept_streams` the expired streams they removed.
 `ttl_expiry_sweep_due_groups` reports the groups the latest pass left with
 expired streams or due end records. A group the pass stopped at its 16 entries or its
@@ -210,9 +211,11 @@ All three work in the in-memory mode too.
 A deleted, expired or purged stream leaves an end record with its id and final
 usage, which the sweep folds into its bucket's usage half of
 `raft.deleted_data_max_age` after the removal.
-`usage_end_records_retired` counts the end records the node's sweeps folded,
-and `usage_end_records_folded_early` the end records the node's replicas folded
-at once because their group already held 65,536. A rising
+`usage_end_records_retired` counts the end records the `Sweep` entries folded,
+and `usage_end_records_folded_early` the end records folded at once because
+their group already held 65,536. Both count on every replica as it applies the
+entry, so a node counts the folds of every group it hosts, led or followed,
+and a single node, in-memory mode included, counts each fold once. A rising
 `usage_end_records_folded_early` means a group removes streams faster than
 65,536 per half of `raft.deleted_data_max_age`. The totals in
 `/__ursula/usage` stay exact either way. `group_state_gauges` reports per
