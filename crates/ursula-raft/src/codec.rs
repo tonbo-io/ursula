@@ -786,8 +786,9 @@ mod tests {
     /// the decoder a restore reads it with (`decode_backup_snapshot`) turns
     /// the fixture's bytes back into the same snapshot. The fixture moves
     /// only when the backup format does, never with a format epoch, so a
-    /// backup that a release of an earlier epoch wrote in this backup format
-    /// restores on this binary. A change to the fixture is a change to the
+    /// group object of this backup format that a release of an earlier epoch
+    /// wrote decodes, through the restore's decoder, to the same snapshot. It
+    /// pins neither the backup manifest nor the cold key layout. A change to the fixture is a change to the
     /// backup format: it sets `BACKUP_FORMAT_VERSION` to the format epoch,
     /// and the new format gets a fixture of its own.
     #[test]

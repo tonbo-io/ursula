@@ -447,7 +447,13 @@ stops before a second voter is replaced, because the first new pod finds the
 Backups keep format 5, so move the data with `ursulactl backup-create` of 0.10,
 a copy of the 0.10 cold objects into the new prefix and `ursulactl restore` of
 0.11. See the operations guide's "Upgrading to 0.11". A 0.9 release moves the
-same way, once its values drop what "Upgrading to 0.10" lists as removed.
+same way. Its values file first drops the values 0.10 removed
+(`server.updateStrategy`, `server.podManagementPolicy`,
+`server.probes.readiness.enabled`, `server.onDeleteMigration`,
+`server.startupOwnership`, `server.gracefulRollout`, `raft.initMembership`,
+`raft.initMembershipPerGroup`), which fail validation, and its
+`<StatefulSet>-rollout-state` and `<StatefulSet>-maintenance` ConfigMaps are
+deleted with its other resources.
 
 The StatefulSet updates by `RollingUpdate` and never changes Raft membership.
 Each replaced voter hands off its leaderships on `SIGTERM`, and the controller

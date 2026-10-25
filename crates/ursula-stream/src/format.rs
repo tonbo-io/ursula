@@ -123,10 +123,10 @@
 //!   names, because one serde form serves both their admin JSON and their
 //!   MessagePack. Neither is converted to the other.
 //!
-//! Epoch 7 is the format of Ursula 0.11. It keeps the encodings and
-//! apply-time rules of epoch 6, and every version number below reads 7, so
-//! 0.11 refuses the data and peers of 0.10 as it refuses those of any other
-//! epoch.
+//! Epoch 7 is the format of Ursula 0.11:
+//!
+//! - every version number below reads 7, so 0.11 refuses the data and peers
+//!   of 0.10 as it refuses those of any other epoch.
 //!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert

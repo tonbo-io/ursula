@@ -222,7 +222,7 @@ The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This
 
 ### `raft WAL directory … is format epoch N`
 
-The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 7 only. Format epoch 6 is Ursula 0.10, whose data moves to this release by backup and restore ([Upgrading to 0.11](/docs/operations#upgrading-to-011)). Format epoch 5 is Ursula 0.9 and format epoch 4 is Ursula 0.8. Run the release that wrote it, or start on an empty directory.
+The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 7 only. Format epoch 6 is Ursula 0.10 and format epoch 5 is Ursula 0.9, whose data moves to this release by backup and restore ([Upgrading to 0.11](/docs/operations#upgrading-to-011)). Format epoch 4 is Ursula 0.8. Run the release that wrote it, or start on an empty directory.
 
 ### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
 
@@ -230,7 +230,7 @@ The cold root (or, with cold storage off, the S3 snapshot namespace) holds objec
 
 ### `object storage s3://… is format epoch N`
 
-The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.10 cluster (format epoch 6) moves to this release by backup and restore, with its cold objects copied into the new prefix without the marker ([Upgrading to 0.11](/docs/operations#upgrading-to-011)).
+The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. The data of a 0.10 or a 0.9 cluster (format epoch 6 or 5) moves to this release by backup and restore, with its cold objects copied into the new prefix without the marker ([Upgrading to 0.11](/docs/operations#upgrading-to-011)).
 
 ### `journal … uses Ursula WAL version N`
 
@@ -331,7 +331,7 @@ by the OS lock, not the file's existence.
 
 ### `backup manifest format_version N` or `target cluster speaks backup format N`
 
-The backup or the cluster uses another backup format. This release reads and writes backup format 5, the format of Ursula 0.9 and 0.10, so a 0.9 backup restores into it. A backup of another format, such as a 0.8 backup (format 4), cannot be restored, and a cluster that reports another backup format cannot be backed up or restored into.
+The backup or the cluster uses another backup format. This release reads and writes backup format 5, written by Ursula 0.9, 0.10 and 0.11, so a 0.10 or a 0.9 backup restores into it. A backup of another format, such as a 0.8 backup (format 4), cannot be restored, and a cluster that reports another backup format cannot be backed up or restored into.
 
 ### `… cold objects this backup references are missing from the target cluster's cold store`
 
