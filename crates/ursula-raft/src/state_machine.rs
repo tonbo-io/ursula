@@ -1685,6 +1685,9 @@ fn object_refusal(
         | SnapshotStoreError::ProducerDigestLength { .. }
         | SnapshotStoreError::HistoryIdZero
         | SnapshotStoreError::BackupDigestLength { .. }
+        | SnapshotStoreError::UsageFieldZero { .. }
+        | SnapshotStoreError::StreamEndUnknown { .. }
+        | SnapshotStoreError::UsageMismatch(_)
         | SnapshotStoreError::UnsupportedVersion { .. } => {
             GroupSnapshotError::PointerUnreadable { raft_group_id }
         }
@@ -3499,7 +3502,7 @@ mod tests {
             placement,
             group_commit_index: commit_index,
             stream_snapshot: Default::default(),
-            stream_append_counts: Vec::new(),
+            usage: Default::default(),
         }
     }
 

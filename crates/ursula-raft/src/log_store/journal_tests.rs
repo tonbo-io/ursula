@@ -1961,7 +1961,7 @@ async fn a_later_generation_survives_snapshots_reclaim_and_restart() {
         placement: placement(HEALTHY),
         group_commit_index: 400,
         stream_snapshot: Default::default(),
-        stream_append_counts: Vec::new(),
+        usage: Default::default(),
     };
     let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
         .collect::<Result<Vec<_>, _>>()

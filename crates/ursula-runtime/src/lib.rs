@@ -301,7 +301,6 @@ pub use request::ReadStreamRequest;
 pub use request::ReadStreamResponse;
 pub use request::RouteWriteRequest;
 pub use request::RoutedWrite;
-pub use request::StreamAppendCount;
 pub use request::SweepResponse;
 pub use request::TidyStreamResponse;
 pub use request::TidyStreamsPass;

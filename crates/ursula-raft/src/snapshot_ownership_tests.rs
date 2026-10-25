@@ -95,7 +95,7 @@ fn group(index: u64) -> GroupSnapshot {
         placement: placement(),
         group_commit_index: index,
         stream_snapshot: Default::default(),
-        stream_append_counts: Vec::new(),
+        usage: Default::default(),
     }
 }
 

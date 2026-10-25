@@ -4010,8 +4010,8 @@ async fn openraft_state_machine_applies_group_write_commands() {
 
     let snapshot = sm.group_snapshot().await.expect("snapshot");
     assert_eq!(snapshot.group_commit_index, 3);
-    assert_eq!(snapshot.stream_append_counts.len(), 1);
-    assert_eq!(snapshot.stream_append_counts[0].append_count, 1);
+    assert_eq!(snapshot.usage.streams.len(), 1);
+    assert_eq!(snapshot.usage.streams[0].counters.appends, 1);
 }
 
 /// #669: an applied entry that removes streams records what they held in a
@@ -4125,10 +4125,18 @@ async fn openraft_snapshot_round_trips_group_state() {
         }
         other => panic!("unexpected append response: {other:?}"),
     }
-    // The installed version kept its applied append, and counted this one.
-    let installed = target.group_snapshot().await.expect("snapshot");
-    assert_eq!(installed.stream_append_counts.len(), 1);
-    assert_eq!(installed.stream_append_counts[0].append_count, 2);
+    // The installed version kept its usage, and counted this append on top
+    // of it, under the next seq (F20).
+    let source_usage = source.group_snapshot().await.expect("snapshot").usage;
+    let installed = target.group_snapshot().await.expect("snapshot").usage;
+    assert_eq!(installed.genesis, source_usage.genesis);
+    assert_eq!(installed.streams.len(), 1);
+    assert_eq!(installed.streams[0].counters.appends, 2);
+    assert_eq!(installed.streams[0].seq, source_usage.usage_seq + 1);
+    assert_eq!(
+        installed.streams[0].counted_since,
+        source_usage.streams[0].counted_since
+    );
 }
 
 /// A forwarded read carries `leader_only` (field 6) to the leader over gRPC,
@@ -5524,7 +5532,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
             placement: placement(),
             group_commit_index: snapshot_log_id.index,
             stream_snapshot: Default::default(),
-            stream_append_counts: Vec::new(),
+            usage: Default::default(),
         };
         let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
             .collect::<Result<Vec<_>, _>>()
@@ -5905,7 +5913,7 @@ async fn queue_state_machine_work(
         placement: placement(),
         group_commit_index: installed_index,
         stream_snapshot: Default::default(),
-        stream_append_counts: Vec::new(),
+        usage: Default::default(),
     };
     let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(group))
         .collect::<Result<Vec<_>, _>>()

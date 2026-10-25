@@ -143,26 +143,6 @@ impl StreamStateMachine {
             .is_some_and(|metadata| !super::stream_is_expired(metadata, now_ms))
     }
 
-    /// Sets the applied appends of the live stream's version (F9), which a
-    /// group snapshot carries beside its stream snapshot. Returns `false`
-    /// when the stream does not exist.
-    pub fn set_stream_append_count(&mut self, stream_id: &BucketStreamId, count: u64) -> bool {
-        let Some(slot) = self.stream_slot_mut(stream_id) else {
-            return false;
-        };
-        slot.usage.counters.appends = count;
-        true
-    }
-
-    /// Non-zero applied appends of live streams' versions (F9), in
-    /// arbitrary order.
-    pub fn stream_append_counts(&self) -> impl Iterator<Item = (&BucketStreamId, u64)> {
-        self.registry
-            .slots()
-            .filter(|slot| slot.usage.counters.appends > 0)
-            .map(|slot| (&slot.metadata.stream_id, slot.usage.counters.appends))
-    }
-
     /// Hot payload bytes across the group: what admission and the flush
     /// planner count (F6c).
     pub fn total_hot_payload_bytes(&self) -> u64 {

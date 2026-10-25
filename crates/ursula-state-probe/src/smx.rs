@@ -5,7 +5,6 @@
 use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;
-use ursula_runtime::StreamAppendCount;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushCandidate;
@@ -361,14 +360,4 @@ pub fn ack_all_cold_gc(m: &mut StreamStateMachine) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-pub fn append_counts(ids: &[BucketStreamId], counts: &[u64]) -> Vec<StreamAppendCount> {
-    ids.iter()
-        .zip(counts)
-        .map(|(id, count)| StreamAppendCount {
-            stream_id: id.clone(),
-            append_count: *count,
-        })
-        .collect()
 }

@@ -86,14 +86,17 @@ async fn append_bytes(runtime: &ShardRuntime, stream: &BucketStreamId, payload: 
 /// The applied appends of the stream's version (F9), as its group's
 /// snapshot carries them.
 async fn applied_appends(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64 {
-    runtime
+    let snapshot = runtime
         .snapshot_group(runtime.locate(stream).raft_group_id)
         .await
-        .expect("snapshot group")
-        .stream_append_counts
+        .expect("snapshot group");
+    snapshot
+        .stream_snapshot
+        .streams
         .iter()
-        .find(|count| &count.stream_id == stream)
-        .map_or(0, |count| count.append_count)
+        .zip(&snapshot.usage.streams)
+        .find(|(entry, _)| &entry.metadata.stream_id == stream)
+        .map_or(0, |(_, usage)| usage.counters.appends)
 }
 
 fn memory_cold_store() -> ColdStore {
@@ -1484,7 +1487,7 @@ async fn snapshot_group_rejects_out_of_range_group_before_routing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn install_group_snapshot_restores_group_state_and_append_counts() {
+async fn install_group_snapshot_restores_group_state_and_usage() {
     let source = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "install-snapshot");
     let placement = source.locate(&stream);
@@ -1499,16 +1502,24 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     // The genesis history event, the create and two appends.
     assert_eq!(snapshot.group_commit_index, 4);
     let snapshot_commit_index = snapshot.group_commit_index;
-    assert_eq!(snapshot.stream_append_counts, vec![StreamAppendCount {
-        stream_id: stream.clone(),
-        append_count: 2,
-    }]);
+    let usage = snapshot.usage.clone();
+    assert_eq!(usage.streams.len(), 1);
+    assert_eq!(usage.streams[0].counters.appends, 2);
 
     let target = runtime(2, 8);
     target
         .install_group_snapshot(snapshot)
         .await
         .expect("install snapshot");
+    // The installed replica holds the source's ledger exactly (F20).
+    assert_eq!(
+        target
+            .snapshot_group(placement.raft_group_id)
+            .await
+            .expect("snapshot installed group")
+            .usage,
+        usage
+    );
 
     let read = target
         .read_stream(read_req(stream.clone(), 0, 16))
@@ -1529,12 +1540,10 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
-    // Regression: a deleted stream must not leave a stale entry in the runtime
-    // append-count map. Such an entry would make the snapshot fail every
-    // follower's install with "append count references missing snapshot stream",
-    // so a lagging node could never catch up and leadership transfer (which
-    // catches the target up via a snapshot) could never complete.
+async fn snapshot_after_stream_delete_installs_with_its_end_record() {
+    // A deleted stream's usage leaves with its slot into an end record, so
+    // no usage of a stream the snapshot does not hold can fail an install
+    // (F9, F20), and the installed replica keeps the end record.
     let source = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "churn-delete");
     let placement = source.locate(&stream);
@@ -1553,21 +1562,39 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
         .snapshot_group(placement.raft_group_id)
         .await
         .expect("snapshot group");
-    assert!(
-        snapshot
-            .stream_append_counts
-            .iter()
-            .all(|count| count.stream_id != stream),
-        "snapshot must not carry an append count for the deleted stream: {:?}",
-        snapshot.stream_append_counts
-    );
+    assert!(snapshot.usage.streams.is_empty(), "{:?}", snapshot.usage);
+    let ends = snapshot
+        .usage
+        .ends
+        .iter()
+        .map(|record| {
+            (
+                record.stream_id.clone(),
+                record.end,
+                record.counters.appends,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ends, [(
+        stream.clone(),
+        ursula_stream::StreamEnd::Deleted,
+        1
+    )]);
+    let usage = snapshot.usage.clone();
 
-    // Previously this failed the restore consistency check.
     let target = runtime(2, 8);
     target
         .install_group_snapshot(snapshot)
         .await
         .expect("install snapshot after delete");
+    assert_eq!(
+        target
+            .snapshot_group(placement.raft_group_id)
+            .await
+            .expect("snapshot installed group")
+            .usage,
+        usage
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1591,7 +1618,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             history: None,
             format_version: ursula_stream::BACKUP_FORMAT_VERSION,
         },
-        stream_append_counts: Vec::new(),
+        usage: ursula_stream::UsageSnapshot::default(),
     };
 
     let err = runtime
@@ -4285,7 +4312,7 @@ impl GroupEngine for BlockingReadEngine {
                     history: None,
                     format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
-                stream_append_counts: Vec::new(),
+                usage: ursula_stream::UsageSnapshot::default(),
             })
         })
     }
@@ -4501,7 +4528,7 @@ impl GroupEngine for RecordingEngine {
                     history: None,
                     format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
-                stream_append_counts: Vec::new(),
+                usage: ursula_stream::UsageSnapshot::default(),
             })
         })
     }

@@ -10,6 +10,8 @@
 
 use std::num::NonZeroU64;
 
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 use crate::model::BucketUsage;
@@ -144,6 +146,86 @@ pub struct EndRecord {
     /// Its counters when `ended_in` began for it.
     pub history_baseline: VersionCounters,
     pub last_write: LastWrite,
+}
+
+/// A bucket's retired usage: of every version whose end record was folded,
+/// and of every version a backup import restored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketRetired {
+    pub bucket_id: String,
+    pub retired: CommittedUsage,
+}
+
+/// What a group snapshot holds of the ledger beside its
+/// [`StreamSnapshot`](crate::StreamSnapshot). A backup holds none of it
+/// (backup format 5), so a restore from a backup starts per-version usage
+/// at zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    /// The group's genesis history id, 0 before its genesis.
+    pub genesis: u64,
+    /// The latest seq the group assigned.
+    pub usage_seq: u64,
+    /// Every end record at or below it is folded.
+    pub retired_through: u64,
+    /// One row per bucket the group ever wrote, by bucket id (F15).
+    pub retired: Vec<BucketRetired>,
+    /// One per stream of the stream snapshot, in its order.
+    pub streams: Vec<VersionUsage>,
+    /// Every unretired end record, by ascending seq.
+    pub ends: Vec<EndRecord>,
+}
+
+/// Why a group snapshot's usage does not fit its stream snapshot. An
+/// install refuses it as corruption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum UsageSnapshotError {
+    #[error("{usages} stream usages for {streams} streams")]
+    StreamCount { streams: u64, usages: u64 },
+    #[error("usage seq {seq} is zero, repeated, out of order, or above the group's {usage_seq}")]
+    InvalidSeq { seq: u64, usage_seq: u64 },
+    #[error("end record {seq} is at or below retired_through {retired_through}")]
+    RetiredEndRecord { seq: u64, retired_through: u64 },
+    #[error("retired_through {retired_through} is above usage seq {usage_seq}")]
+    RetiredThroughAhead {
+        retired_through: u64,
+        usage_seq: u64,
+    },
+    #[error("{count} end records, above the most a group holds, {max}")]
+    TooManyEndRecords { count: u64, max: u64 },
+    #[error("bucket '{bucket_id}' has two retired rows")]
+    DuplicateRetired { bucket_id: String },
+    #[error(
+        "bucket '{bucket_id}': its total {counter:?} is not its retired usage plus its versions and end records"
+    )]
+    TotalsDisagree {
+        bucket_id: String,
+        counter: UsageCounter,
+    },
+}
+
+/// One counter of [`CommittedUsage`], as a refusal names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsageCounter {
+    AppendBytes,
+    Records,
+    WriteUnits,
+}
+
+impl CommittedUsage {
+    /// The first counter in which `self` and `other` differ, `None` when
+    /// they are equal.
+    pub fn first_difference(self, other: Self) -> Option<UsageCounter> {
+        if self.committed_append_bytes != other.committed_append_bytes {
+            Some(UsageCounter::AppendBytes)
+        } else if self.committed_records != other.committed_records {
+            Some(UsageCounter::Records)
+        } else if self.committed_write_units != other.committed_write_units {
+            Some(UsageCounter::WriteUnits)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

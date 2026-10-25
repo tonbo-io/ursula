@@ -875,3 +875,7 @@ mod producer_record_tests;
 mod tests;
 #[cfg(test)]
 mod usage_ledger_tests;
+#[cfg(test)]
+mod usage_oracle_tests;
+#[cfg(test)]
+mod usage_snapshot_tests;

@@ -1110,12 +1110,6 @@ impl AppendResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamAppendCount {
-    pub stream_id: BucketStreamId,
-    pub append_count: u64,
-}
-
 #[cfg(test)]
 mod immutable_read_tests {
     use super::ReadEnd;

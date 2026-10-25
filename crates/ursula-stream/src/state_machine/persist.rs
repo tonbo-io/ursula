@@ -23,6 +23,9 @@ use super::StreamSnapshotError;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
 use super::usage_ledger::UsageLedger;
+use super::usage_ledger::committed_by_bucket;
+use crate::usage::UsageSnapshot;
+use crate::usage::UsageSnapshotError;
 
 impl StreamStateMachine {
     pub fn snapshot(&self) -> StreamSnapshot {
@@ -133,7 +136,7 @@ impl StreamStateMachine {
         // Every restored version counts from zero in the new history, so it
         // takes a new key: a backup holds its bucket totals, which retire,
         // and no per-version usage (F20).
-        match Self::restore_counted_since(snapshot, Some(history)) {
+        match Self::restore_counted_since(snapshot, history) {
             Ok(mut restored) => {
                 // C7: the counter never goes backwards, so a later create
                 // never reuses an incarnation this group already assigned.
@@ -177,26 +180,76 @@ impl StreamStateMachine {
     }
 
     /// A backup's state (`ImportSnapshot`, `ursulactl backup-verify`, the
-    /// cold check, and group snapshot installs): every bucket total
-    /// retired, and every version at zero counters and history baseline
-    /// with [`LastWrite::Imported`](crate::usage::LastWrite::Imported),
-    /// counted since the backup's own history and stamped `1..=n` in
-    /// `compare_stream_ids` order (F20).
+    /// cold check): every bucket total retired, and every version at zero
+    /// counters and history baseline with
+    /// [`LastWrite::Imported`](crate::usage::LastWrite::Imported), counted
+    /// since the backup's own history and stamped `1..=n` in
+    /// `compare_stream_ids` order, with no end records (F20).
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        Self::restore_counted_since(snapshot, None)
+        Self::restore_with(snapshot, RestoredUsage::Backup {
+            counted_since: None,
+        })
     }
 
-    /// [`Self::restore`], every version counted since `counted_since`, or
-    /// the backup's own history when `None`.
+    /// A group snapshot's state (F20): `snapshot` with its ledger `usage`
+    /// attached, one version usage per stream in the snapshot's order, and
+    /// checked exactly against the snapshot's bucket totals. Every install
+    /// and every restart restores through it, so a replica keeps each
+    /// version's counters, its seqs, its end records and the group's
+    /// genesis.
+    pub fn restore_group(
+        snapshot: StreamSnapshot,
+        usage: UsageSnapshot,
+    ) -> Result<Self, StreamSnapshotError> {
+        Self::restore_with(snapshot, RestoredUsage::Group(usage))
+    }
+
+    /// [`Self::restore`], every version counted since `counted_since`: the
+    /// history of the import that restores the backup.
     fn restore_counted_since(
         snapshot: StreamSnapshot,
-        counted_since: Option<NonZeroU64>,
+        counted_since: NonZeroU64,
+    ) -> Result<Self, StreamSnapshotError> {
+        Self::restore_with(snapshot, RestoredUsage::Backup {
+            counted_since: Some(counted_since),
+        })
+    }
+
+    /// The one restore behind [`Self::restore`] and [`Self::restore_group`].
+    fn restore_with(
+        snapshot: StreamSnapshot,
+        usage: RestoredUsage,
     ) -> Result<Self, StreamSnapshotError> {
         StreamSnapshot::check_format(Some(snapshot.format_version))?;
+        let totals = committed_by_bucket(&snapshot.bucket_usage)?;
+        // A group snapshot's totals are checked against its parts once the
+        // state is built. A backup's become its retired usage.
+        let (ledger, versions, counted_since, checked_totals) = match usage {
+            RestoredUsage::Backup { counted_since } => {
+                (UsageLedger::retiring(totals), None, counted_since, None)
+            }
+            RestoredUsage::Group(usage) => {
+                if usage.streams.len() != snapshot.streams.len() {
+                    return Err(UsageSnapshotError::StreamCount {
+                        streams: u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX),
+                        usages: u64::try_from(usage.streams.len()).unwrap_or(u64::MAX),
+                    }
+                    .into());
+                }
+                let ledger = UsageLedger::of_group(
+                    usage.genesis,
+                    usage.usage_seq,
+                    usage.retired_through,
+                    usage.retired,
+                    usage.ends,
+                )?;
+                (ledger, Some(usage.streams), None, Some(totals))
+            }
+        };
         let mut machine = Self {
             last_created_at_ms: snapshot.last_created_at_ms,
             history: snapshot.history,
-            usage: UsageLedger::retiring(snapshot.bucket_usage)?,
+            usage: ledger,
             ..Self::default()
         };
         let counted_since = counted_since.unwrap_or_else(|| machine.counting_history());
@@ -216,12 +269,25 @@ impl StreamStateMachine {
             }
         }
 
-        // Seqs follow the stream-id order, whatever the order of the entries.
-        let mut entries = snapshot.streams;
-        entries.sort_by(|left, right| {
+        // A backup's seqs follow the stream-id order, whatever the order of
+        // the entries. A group snapshot's usages pair with their entries
+        // first.
+        let mut entries = match versions {
+            Some(versions) => snapshot
+                .streams
+                .into_iter()
+                .zip(versions.into_iter().map(Some))
+                .collect::<Vec<_>>(),
+            None => snapshot
+                .streams
+                .into_iter()
+                .map(|entry| (entry, None))
+                .collect(),
+        };
+        entries.sort_by(|(left, _), (right, _)| {
             compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
         });
-        for entry in entries {
+        for (entry, version) in entries {
             let stream_id = entry.metadata.stream_id.clone();
             if !machine.buckets.contains(&stream_id.bucket_id) {
                 return Err(StreamSnapshotError::MissingBucket(stream_id));
@@ -268,9 +334,15 @@ impl StreamStateMachine {
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
             let hot_buffer = HotBuffer::from_snapshot(entry.payload, &entry.hot_segments);
-            let usage = machine
-                .usage
-                .restored_version(&stream_id.bucket_id, counted_since);
+            let usage = match version {
+                Some(usage) => {
+                    machine.usage.insert_bucket(&stream_id.bucket_id);
+                    usage
+                }
+                None => machine
+                    .usage
+                    .restored_version(&stream_id.bucket_id, counted_since),
+            };
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 hot_buffer,
@@ -308,10 +380,23 @@ impl StreamStateMachine {
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
         machine.normalize_last_created_at_ms();
+        if let Some(totals) = checked_totals {
+            machine.check_restored_usage(&totals)?;
+        }
         // The gauges of the bucket totals derive from the restored slots, so
         // a snapshot never carries gauge drift forward.
         Ok(machine)
     }
+}
+
+/// Where a restore takes each version's usage from.
+enum RestoredUsage {
+    /// A backup's, which holds only bucket totals: they retire, and every
+    /// version counts from zero since `counted_since`, or since the
+    /// backup's own history when `None`.
+    Backup { counted_since: Option<NonZeroU64> },
+    /// A group snapshot's ledger, checked against its totals.
+    Group(UsageSnapshot),
 }
 
 fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSnapshot> {

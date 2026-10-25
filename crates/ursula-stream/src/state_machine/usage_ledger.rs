@@ -14,6 +14,7 @@
 //! derives on every read equal the per-version sums at every entry.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use ursula_shard::BucketStreamId;
@@ -21,13 +22,17 @@ use ursula_shard::BucketStreamId;
 use super::MAX_END_RECORDS;
 use super::StreamSlot;
 use super::StreamStateMachine;
+use super::compare_stream_ids;
 use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::snapshot::StreamSnapshotError;
+use crate::usage::BucketRetired;
 use crate::usage::CommittedUsage;
 use crate::usage::EndRecord;
 use crate::usage::LastWrite;
 use crate::usage::StreamEnd;
+use crate::usage::UsageSnapshot;
+use crate::usage::UsageSnapshotError;
 use crate::usage::VersionCounters;
 use crate::usage::VersionUsage;
 
@@ -68,25 +73,79 @@ impl UsageLedger {
         self.usage_seq
     }
 
-    /// The ledger of a backup's state: every bucket total of `bucket_usage`
-    /// retired, refusing a second row of one bucket.
-    pub(super) fn retiring(
-        bucket_usage: Vec<BucketUsageSnapshot>,
-    ) -> Result<Self, StreamSnapshotError> {
-        let mut retired = BTreeMap::new();
-        for row in bucket_usage {
-            let usage = CommittedUsage::of_bucket(&row.usage);
-            if retired.insert(row.bucket_id.clone(), usage).is_some() {
-                return Err(StreamSnapshotError::DuplicateBucketUsage(row.bucket_id));
-            }
-        }
-        Ok(Self {
+    /// The ledger of a backup's state: every bucket total retired.
+    pub(super) fn retiring(totals: BTreeMap<String, CommittedUsage>) -> Self {
+        Self {
             genesis: 0,
-            retired,
+            retired: totals,
             usage_seq: 0,
             retired_through: 0,
             ends: BTreeMap::new(),
-        })
+        }
+    }
+
+    /// The ledger of a group snapshot's usage, but its live versions, which
+    /// the restore attaches to their slots: its genesis, seq and watermark,
+    /// its retired rows, refusing a second row of one bucket, and its end
+    /// records, refusing more than [`MAX_END_RECORDS`] and any not above
+    /// the watermark, not ascending or above the seq. Every end record's
+    /// bucket has its retired row (F15).
+    pub(super) fn of_group(
+        genesis: u64,
+        usage_seq: u64,
+        retired_through: u64,
+        retired: Vec<BucketRetired>,
+        ends: Vec<EndRecord>,
+    ) -> Result<Self, UsageSnapshotError> {
+        if retired_through > usage_seq {
+            return Err(UsageSnapshotError::RetiredThroughAhead {
+                retired_through,
+                usage_seq,
+            });
+        }
+        let mut ledger = Self {
+            genesis,
+            retired: BTreeMap::new(),
+            usage_seq,
+            retired_through,
+            ends: BTreeMap::new(),
+        };
+        for row in retired {
+            if ledger
+                .retired
+                .insert(row.bucket_id.clone(), row.retired)
+                .is_some()
+            {
+                return Err(UsageSnapshotError::DuplicateRetired {
+                    bucket_id: row.bucket_id,
+                });
+            }
+        }
+        if ends.len() > MAX_END_RECORDS {
+            return Err(UsageSnapshotError::TooManyEndRecords {
+                count: u64::try_from(ends.len()).unwrap_or(u64::MAX),
+                max: u64::try_from(MAX_END_RECORDS).unwrap_or(u64::MAX),
+            });
+        }
+        let mut previous = retired_through;
+        for record in ends {
+            if record.seq <= retired_through {
+                return Err(UsageSnapshotError::RetiredEndRecord {
+                    seq: record.seq,
+                    retired_through,
+                });
+            }
+            if record.seq <= previous || record.seq > usage_seq {
+                return Err(UsageSnapshotError::InvalidSeq {
+                    seq: record.seq,
+                    usage_seq,
+                });
+            }
+            previous = record.seq;
+            ledger.insert_bucket(&record.stream_id.bucket_id);
+            ledger.ends.insert(record.seq, record);
+        }
+        Ok(ledger)
     }
 
     /// The usage of a version a backup restored: zero counters and
@@ -108,7 +167,7 @@ impl UsageLedger {
     }
 
     /// Inserts the bucket's retired row at zero if it has none (F15).
-    fn insert_bucket(&mut self, bucket_id: &str) {
+    pub(super) fn insert_bucket(&mut self, bucket_id: &str) {
         if !self.retired.contains_key(bucket_id) {
             self.retired
                 .insert(bucket_id.to_owned(), CommittedUsage::default());
@@ -356,11 +415,92 @@ impl StreamStateMachine {
     pub(super) fn bucket_usage_rows(&self) -> usize {
         self.usage.retired.len()
     }
+
+    /// The usage half of a group snapshot, from the same state as
+    /// [`Self::snapshot`]: one version usage per stream, in the stream
+    /// snapshot's order.
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        let mut slots = self.registry.slots().collect::<Vec<_>>();
+        slots.sort_by(|left, right| {
+            compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
+        });
+        UsageSnapshot {
+            genesis: self.usage.genesis,
+            usage_seq: self.usage.usage_seq,
+            retired_through: self.usage.retired_through,
+            retired: self
+                .usage
+                .retired
+                .iter()
+                .map(|(bucket_id, retired)| BucketRetired {
+                    bucket_id: bucket_id.clone(),
+                    retired: *retired,
+                })
+                .collect(),
+            streams: slots.into_iter().map(|slot| slot.usage).collect(),
+            ends: self.usage.ends.values().cloned().collect(),
+        }
+    }
+
+    /// The checks of a restored group snapshot that need its whole state
+    /// (F20): every live version's seq is in `[1, usage_seq]`, and no two
+    /// live versions or end records share one. Then every bucket of
+    /// `totals`, of the retired rows, of a live version or of an end record
+    /// has a total, a missing one read as zero, equal to its retired usage
+    /// plus its live versions plus its end records, counter by counter.
+    pub(super) fn check_restored_usage(
+        &self,
+        totals: &BTreeMap<String, CommittedUsage>,
+    ) -> Result<(), UsageSnapshotError> {
+        let usage_seq = self.usage.usage_seq;
+        let mut seqs = self.usage.ends.keys().copied().collect::<BTreeSet<_>>();
+        for slot in self.registry.slots() {
+            let seq = slot.usage.seq;
+            if seq == 0 || seq > usage_seq || !seqs.insert(seq) {
+                return Err(UsageSnapshotError::InvalidSeq { seq, usage_seq });
+            }
+        }
+        let parts = self
+            .bucket_usage_report()
+            .into_iter()
+            .map(|row| (row.bucket_id, CommittedUsage::of_bucket(&row.usage)))
+            .collect::<BTreeMap<_, _>>();
+        for bucket_id in totals.keys().chain(parts.keys()) {
+            let total = totals.get(bucket_id).copied().unwrap_or_default();
+            let sum = parts.get(bucket_id).copied().unwrap_or_default();
+            if let Some(counter) = total.first_difference(sum) {
+                return Err(UsageSnapshotError::TotalsDisagree {
+                    bucket_id: bucket_id.clone(),
+                    counter,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Each bucket's committed counters in `rows`, a group's or a backup's
+/// bucket totals, refusing a second row of one bucket.
+pub(super) fn committed_by_bucket(
+    rows: &[BucketUsageSnapshot],
+) -> Result<BTreeMap<String, CommittedUsage>, StreamSnapshotError> {
+    let mut totals = BTreeMap::new();
+    for row in rows {
+        if totals
+            .insert(row.bucket_id.clone(), CommittedUsage::of_bucket(&row.usage))
+            .is_some()
+        {
+            return Err(StreamSnapshotError::DuplicateBucketUsage(
+                row.bucket_id.clone(),
+            ));
+        }
+    }
+    Ok(totals)
 }
 
 /// What `record` adds to a group snapshot: its ids and
 /// [`END_RECORD_FIXED_BYTES`].
-fn end_record_bytes(record: &EndRecord) -> u64 {
+pub(super) fn end_record_bytes(record: &EndRecord) -> u64 {
     let ids = record
         .stream_id
         .bucket_id

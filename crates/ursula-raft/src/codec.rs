@@ -819,7 +819,8 @@ mod tests {
     /// Raft entry and a forwarded `GroupWrite` carry, every write answer of
     /// a data group, every answer of the placement kernel a forwarded meta
     /// write gets, and the forwarded read answers, keyed by their `Debug`
-    /// form. A data entry's key and bytes are those of format epoch 5.
+    /// form. A data entry's key is `Stream(..)` and its bytes start with
+    /// `81 a6 "Stream"`, the envelope [`RaftCommand`] writes.
     fn commands_and_responses() -> std::collections::BTreeMap<String, Vec<u8>> {
         use ursula_runtime::wire_samples;
 

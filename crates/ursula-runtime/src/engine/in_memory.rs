@@ -122,7 +122,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::RouteWriteRequest;
-use crate::request::StreamAppendCount;
 use crate::request::SweepResponse;
 use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
@@ -218,9 +217,8 @@ impl InMemoryGroupEngine {
 
     /// Applies one canonical [`StreamCommand`] of an engine without a log
     /// to the deterministic state machine and lifts its [`StreamResponse`]
-    /// into the group-level response, maintaining the group commit index
-    /// and per-stream append counts. The entry's index is the next commit
-    /// index.
+    /// into the group-level response, maintaining the group commit index.
+    /// The entry's index is the next commit index.
     pub fn apply_stream_command(
         &mut self,
         command: StreamCommand,
@@ -1165,39 +1163,18 @@ impl InMemoryGroupEngine {
     }
 
     pub(crate) fn build_snapshot(&self, placement: ShardPlacement) -> GroupSnapshot {
-        let stream_snapshot = self.state_machine.snapshot();
-        let stream_append_counts = self.stream_append_counts_snapshot();
         GroupSnapshot {
             placement,
             group_commit_index: self.commit_index,
-            stream_snapshot,
-            stream_append_counts,
+            stream_snapshot: self.state_machine.snapshot(),
+            usage: self.state_machine.usage_snapshot(),
         }
-    }
-
-    pub(crate) fn stream_append_counts_snapshot(&self) -> Vec<StreamAppendCount> {
-        // Counts live in the stream slots, so only live streams carry one.
-        let mut counts = self
-            .state_machine
-            .stream_append_counts()
-            .map(|(stream_id, append_count)| StreamAppendCount {
-                stream_id: stream_id.clone(),
-                append_count,
-            })
-            .collect::<Vec<_>>();
-        counts.sort_by(|left, right| compare_stream_ids(&left.stream_id, &right.stream_id));
-        counts
     }
 
     /// Cold-index generation of the live stream `stream_id` (F14g), which
     /// pre-proposal cold-index page writes use.
     pub fn cold_index_generation(&self, stream_id: &BucketStreamId) -> Option<u64> {
         self.state_machine.cold_index_generation(stream_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tracked_append_count_entries(&self) -> usize {
-        self.state_machine.stream_append_counts().count()
     }
 
     pub fn stream_tail_offset(&self, stream_id: &BucketStreamId) -> Option<u64> {
@@ -1432,24 +1409,22 @@ impl InMemoryGroupEngine {
             placement: _,
             group_commit_index,
             stream_snapshot,
-            stream_append_counts,
+            usage,
         } = snapshot;
-        self.install_snapshot_parts(group_commit_index, stream_snapshot, stream_append_counts)
+        self.install_snapshot_parts(group_commit_index, stream_snapshot, usage)
     }
 
+    /// The one install path of both engines, a start's restore included:
+    /// the group snapshot's state with its usage ledger, checked exactly
+    /// against its bucket totals (F20).
     pub(crate) fn install_snapshot_parts(
         &mut self,
         group_commit_index: u64,
         stream_snapshot: StreamSnapshot,
-        stream_append_counts: Vec<StreamAppendCount>,
+        usage: ursula_stream::UsageSnapshot,
     ) -> Result<(), GroupEngineError> {
-        let mut state_machine = StreamStateMachine::restore(stream_snapshot)
+        let state_machine = StreamStateMachine::restore_group(stream_snapshot, usage)
             .map_err(|err| GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(err)))?;
-        // A count for a stream the snapshot does not hold has nothing to
-        // attach to and is dropped (F9: counts die with their slot).
-        for count in stream_append_counts {
-            state_machine.set_stream_append_count(&count.stream_id, count.append_count);
-        }
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
@@ -2247,14 +2222,6 @@ impl GroupEngineFactory for InMemoryGroupEngineFactory {
     }
 }
 
-pub(crate) fn compare_stream_ids(
-    left: &BucketStreamId,
-    right: &BucketStreamId,
-) -> std::cmp::Ordering {
-    left.bucket_id
-        .cmp(&right.bucket_id)
-        .then_with(|| left.stream_id.cmp(&right.stream_id))
-}
 pub(crate) fn ensure_bucket_exists(
     state_machine: &mut StreamStateMachine,
     stream_id: &BucketStreamId,

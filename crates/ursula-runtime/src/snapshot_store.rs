@@ -880,6 +880,17 @@ pub enum SnapshotStoreError {
     /// The digest of the backup a group was restored from is not 32 bytes.
     #[error("snapshot history event's backup digest is {len} bytes, not 32")]
     BackupDigestLength { len: usize },
+    /// A usage seq or history id of the ledger is 0, which no group
+    /// assigns (F20).
+    #[error("snapshot usage {field} is 0")]
+    UsageFieldZero { field: &'static str },
+    /// An end record names no end, or one this build does not know (F20).
+    #[error("snapshot end record {seq} has end {value}")]
+    StreamEndUnknown { seq: u64, value: i32 },
+    /// The group snapshot to encode holds another number of version usages
+    /// than streams.
+    #[error("snapshot usage does not fit its streams")]
+    UsageMismatch(#[source] ursula_stream::UsageSnapshotError),
     /// A group snapshot whose leading frame names another format epoch than
     /// [`ursula_stream::FORMAT_EPOCH`], or that has no such frame
     /// (`found: None`, Ursula 0.5.x and earlier).

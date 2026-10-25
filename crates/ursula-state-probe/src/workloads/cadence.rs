@@ -152,7 +152,7 @@ fn maybe_flush(group: &mut Group, flush_bytes: usize) -> Result<()> {
 }
 
 fn snapshot_bytes(group: &Group) -> Result<u64> {
-    let snapshot = codec::group_snapshot(group.machine.snapshot(), Vec::new(), group.commit_index);
+    let snapshot = codec::group_snapshot(&group.machine, group.commit_index);
     Ok(codec::encode_bytes(snapshot)?.len() as u64)
 }
 

@@ -97,11 +97,9 @@ fn purge_bucket_drops_append_counts() {
             placement(),
         )
         .expect("purge bucket");
-    assert_eq!(engine.tracked_append_count_entries(), 0);
-    assert!(
-        engine
-            .build_snapshot(placement())
-            .stream_append_counts
-            .is_empty()
-    );
+    // Every count left with its slot, into the stream's end record (F20).
+    let usage = engine.build_snapshot(placement()).usage;
+    assert!(usage.streams.is_empty());
+    assert_eq!(usage.ends.len(), 8);
+    assert!(usage.ends.iter().all(|record| record.counters.appends == 1));
 }

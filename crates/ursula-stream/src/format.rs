@@ -154,6 +154,16 @@
 //!   (`StreamSnapshotError::DuplicateBucketUsage`, in the group engine
 //!   error).
 //! - `AppendResponse` without `stream_append_count`.
+//! - group snapshots carry the ledger: each stream frame its version's
+//!   usage (field 24), each end record a frame (`end_record`, frame 8,
+//!   after the cold-GC frames), and the header the group's `usage_seq`,
+//!   `retired_through`, retired rows and genesis history id (fields 13 to
+//!   16), the scalars required. Frame field 3, the per-stream append
+//!   counts, is reserved. An install restores through `restore_group`,
+//!   which requires each bucket's totals (header field 5) to equal its
+//!   retired usage plus its live versions plus its end records, and
+//!   refuses what does not fit with `StreamSnapshotError::Usage`
+//!   (`UsageSnapshotError`, `UsageCounter`), in the group engine error.
 //!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert

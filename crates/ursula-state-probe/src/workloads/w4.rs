@@ -192,12 +192,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                     "us_per_retry": round3(started.elapsed().as_secs_f64() * 1e6 / f64::from(reps))}));
             }
         }
-        let measured = measure_sm(
-            &m,
-            &base,
-            smx::append_counts(std::slice::from_ref(&id), &[n]),
-            args.zstd,
-        )?;
+        let measured = measure_sm(&m, &base, args.zstd)?;
         formula::per_stream_checks(&mut outcome, &measured, 0);
         let heap = u64::try_from(measured.heap.bytes.max(0))?;
         sink.row(&json!({

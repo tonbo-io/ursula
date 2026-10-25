@@ -58,7 +58,7 @@ async fn install(machine: &mut RaftGroupStateMachine, index: u64) -> std::io::Re
         placement: machine.placement,
         group_commit_index: index,
         stream_snapshot: Default::default(),
-        stream_append_counts: Vec::new(),
+        usage: Default::default(),
     };
     let bytes = group_snapshot_frames(Arc::new(snapshot))
         .collect::<Result<Vec<_>, _>>()

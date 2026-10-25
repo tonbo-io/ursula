@@ -14,7 +14,6 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
-use ursula_runtime::StreamAppendCount;
 use ursula_stream::GroupStateGauges;
 use ursula_stream::StreamStateMachine;
 
@@ -116,20 +115,15 @@ impl Measured {
 
 /// Heap (actual, tight via clone, slack), big-allocation census, the bounded
 /// state gauges, and the real codec's snapshot size and breakdown.
-pub fn measure_sm(
-    m: &StreamStateMachine,
-    base: &Baseline,
-    counts: Vec<StreamAppendCount>,
-    zstd: bool,
-) -> Result<Measured> {
+pub fn measure_sm(m: &StreamStateMachine, base: &Baseline, zstd: bool) -> Result<Measured> {
     let heap = alloc::heap().saturating_sub(base.heap);
     let big = alloc::big_allocs_diff(&base.big, &alloc::big_allocs());
     let tight = alloc::tight_size(m);
     let gauges = m.state_gauges();
     let started = Instant::now();
-    let stream_snapshot = m.snapshot();
+    let snapshot = codec::group_snapshot(m, 0);
     let snapshot_clone_ms = started.elapsed().as_secs_f64() * 1e3;
-    let snap = codec::measure(codec::group_snapshot(stream_snapshot, counts, 0), zstd)?;
+    let snap = codec::measure(snapshot, zstd)?;
     Ok(Measured {
         heap,
         tight,

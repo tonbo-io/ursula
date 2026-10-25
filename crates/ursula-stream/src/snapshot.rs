@@ -194,6 +194,9 @@ pub enum StreamSnapshotError {
     ColdGcWithoutGeneration { seq: u64 },
     #[error("snapshot holds two usage rows of bucket '{0}'")]
     DuplicateBucketUsage(String),
+    /// A group snapshot's usage does not fit its stream snapshot (F20).
+    #[error(transparent)]
+    Usage(#[from] crate::usage::UsageSnapshotError),
 }
 
 fn snapshot_backup_format_message(found: &Option<u32>) -> String {

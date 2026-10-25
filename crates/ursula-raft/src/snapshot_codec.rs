@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use bytes::Buf;
@@ -8,26 +9,34 @@ use ursula_proto as proto;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::SnapshotBytesIterator;
 use ursula_runtime::SnapshotStoreError;
-use ursula_runtime::StreamAppendCount;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::BucketRetired;
 use ursula_stream::ClosedEpoch;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
+use ursula_stream::CommittedUsage;
+use ursula_stream::EndRecord;
 use ursula_stream::HistoryEvent;
 use ursula_stream::HotPayloadSegment;
 use ursula_stream::InheritedHistory;
+use ursula_stream::LastWrite;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::Opened;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
+use ursula_stream::StreamEnd;
 use ursula_stream::StreamMetadata;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
 use ursula_stream::StreamStatus;
 use ursula_stream::StreamVisibleSnapshot;
+use ursula_stream::UsageSnapshot;
+use ursula_stream::UsageSnapshotError;
+use ursula_stream::VersionCounters;
+use ursula_stream::VersionUsage;
 use ursula_stream::WriteDigest;
 use ursula_stream::WriteReceipt;
 
@@ -65,7 +74,8 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let mut cursor = Cursor::new(bytes);
     let mut header = None;
     let mut streams = Vec::new();
-    let mut stream_append_counts = Vec::new();
+    let mut stream_usages = Vec::new();
+    let mut ends = Vec::new();
     let mut pending_cold_gc = Vec::new();
     let mut footer_seen = false;
 
@@ -110,10 +120,12 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
                 }
             }
             proto::snapshot_frame_v1::Frame::Stream(value) => {
-                streams.push(stream_from_proto(*value)?);
+                let (entry, usage) = stream_from_proto(*value)?;
+                streams.push(entry);
+                stream_usages.push(usage);
             }
-            proto::snapshot_frame_v1::Frame::AppendCount(value) => {
-                stream_append_counts.push(append_count_from_proto(value)?);
+            proto::snapshot_frame_v1::Frame::EndRecord(value) => {
+                ends.push(end_record_from_proto(*value)?);
             }
             proto::snapshot_frame_v1::Frame::ColdGc(value) => {
                 pending_cold_gc.push(cold_gc_from_proto(value)?);
@@ -145,6 +157,20 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         )));
     }
 
+    // Header fields 13, 14 and 16 stay `optional` on the wire; every writer
+    // sets them, so an absent value is corruption (F20).
+    let usage = UsageSnapshot {
+        genesis: required(header.genesis, "snapshot header genesis")?,
+        usage_seq: required(header.usage_seq, "snapshot header usage_seq")?,
+        retired_through: required(header.retired_through, "snapshot header retired_through")?,
+        retired: header
+            .retired
+            .into_iter()
+            .map(retired_from_proto)
+            .collect::<Result<Vec<_>, _>>()?,
+        streams: stream_usages,
+        ends,
+    };
     Ok(GroupSnapshot {
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
@@ -163,7 +189,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
             last_created_at_ms: header.last_created_at_ms,
             history: header.history.map(history_from_proto).transpose()?,
         },
-        stream_append_counts,
+        usage,
     })
 }
 
@@ -200,8 +226,8 @@ struct GroupSnapshotFrameIter {
     format_epoch: bool,
     header: bool,
     next_stream: usize,
-    next_append_count: usize,
     next_cold_gc: usize,
+    next_end_record: usize,
     footer: bool,
 }
 
@@ -212,8 +238,8 @@ impl GroupSnapshotFrameIter {
             format_epoch: true,
             header: true,
             next_stream: 0,
-            next_append_count: 0,
             next_cold_gc: 0,
+            next_end_record: 0,
             footer: true,
         }
     }
@@ -235,6 +261,15 @@ impl GroupSnapshotFrameIter {
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: stream_snapshot.last_created_at_ms,
             history: stream_snapshot.history.map(history_to_proto),
+            usage_seq: Some(snapshot.usage.usage_seq),
+            retired_through: Some(snapshot.usage.retired_through),
+            retired: snapshot
+                .usage
+                .retired
+                .iter()
+                .map(retired_to_proto)
+                .collect(),
+            genesis: Some(snapshot.usage.genesis),
         }
     }
 }
@@ -290,19 +325,28 @@ impl Iterator for GroupSnapshotFrameIter {
             })
         } else if self.header {
             self.header = false;
+            // Each stream frame carries its version's usage, so the two
+            // lists pair one to one.
+            let streams = snapshot.stream_snapshot.streams.len();
+            let usages = snapshot.usage.streams.len();
+            if streams != usages {
+                return Some(Err(SnapshotStoreError::UsageMismatch(
+                    UsageSnapshotError::StreamCount {
+                        streams: u64::try_from(streams).unwrap_or(u64::MAX),
+                        usages: u64::try_from(usages).unwrap_or(u64::MAX),
+                    },
+                )));
+            }
             proto::snapshot_frame_v1::Frame::Header(Self::header_frame(snapshot))
-        } else if let Some(stream) = snapshot.stream_snapshot.streams.get(self.next_stream) {
+        } else if let (Some(stream), Some(usage)) = (
+            snapshot.stream_snapshot.streams.get(self.next_stream),
+            snapshot.usage.streams.get(self.next_stream),
+        ) {
             self.next_stream = self.next_stream.saturating_add(1);
-            match stream_to_proto(stream.clone()) {
+            match stream_to_proto(stream.clone(), *usage) {
                 Ok(stream) => proto::snapshot_frame_v1::Frame::Stream(Box::new(stream)),
                 Err(err) => return Some(Err(err)),
             }
-        } else if let Some(append_count) = snapshot.stream_append_counts.get(self.next_append_count)
-        {
-            self.next_append_count = self.next_append_count.saturating_add(1);
-            proto::snapshot_frame_v1::Frame::AppendCount(append_count_to_proto(
-                append_count.clone(),
-            ))
         } else if let Some(cold_gc) = snapshot
             .stream_snapshot
             .pending_cold_gc
@@ -310,6 +354,9 @@ impl Iterator for GroupSnapshotFrameIter {
         {
             self.next_cold_gc = self.next_cold_gc.saturating_add(1);
             proto::snapshot_frame_v1::Frame::ColdGc(cold_gc_to_proto(cold_gc.clone()))
+        } else if let Some(record) = snapshot.usage.ends.get(self.next_end_record) {
+            self.next_end_record = self.next_end_record.saturating_add(1);
+            proto::snapshot_frame_v1::Frame::EndRecord(Box::new(end_record_to_proto(record)))
         } else if self.footer {
             self.footer = false;
             proto::snapshot_frame_v1::Frame::Footer(proto::SnapshotFooterV1 {})
@@ -331,6 +378,7 @@ fn encode_frame(frame: proto::SnapshotFrameV1) -> Result<Bytes, SnapshotStoreErr
 
 fn stream_to_proto(
     entry: StreamSnapshotEntry,
+    usage: VersionUsage,
 ) -> Result<proto::StreamSnapshotEntryV1, SnapshotStoreError> {
     Ok(proto::StreamSnapshotEntryV1 {
         metadata: Some(metadata_to_proto(entry.metadata)),
@@ -361,16 +409,19 @@ fn stream_to_proto(
             history: inherited.history,
             offset: inherited.offset,
         }),
+        usage: Some(usage_to_proto(usage)),
     })
 }
 
 /// Entry field 16 `retained_offset` stays `optional` on the wire; every
 /// writer sets it, so an absent value is corruption. (Dropping `optional`
-/// would make writers omit a zero.)
+/// would make writers omit a zero.) So is an entry without its version's
+/// usage, field 24 (F20).
 fn stream_from_proto(
     entry: proto::StreamSnapshotEntryV1,
-) -> Result<StreamSnapshotEntry, SnapshotStoreError> {
-    Ok(StreamSnapshotEntry {
+) -> Result<(StreamSnapshotEntry, VersionUsage), SnapshotStoreError> {
+    let usage = usage_from_proto(required(entry.usage, "snapshot stream usage")?)?;
+    let entry = StreamSnapshotEntry {
         metadata: metadata_from_proto(required(entry.metadata, "snapshot stream metadata")?)?,
         hot_start_offset: entry.hot_start_offset,
         payload: entry.payload.to_vec(),
@@ -399,6 +450,147 @@ fn stream_from_proto(
             history: inherited.history,
             offset: inherited.offset,
         }),
+    };
+    Ok((entry, usage))
+}
+
+fn counters_to_proto(counters: VersionCounters) -> proto::VersionCountersV1 {
+    proto::VersionCountersV1 {
+        committed_append_bytes: counters.committed.committed_append_bytes,
+        committed_records: counters.committed.committed_records,
+        committed_write_units: counters.committed.committed_write_units,
+        appends: counters.appends,
+    }
+}
+
+fn counters_from_proto(counters: proto::VersionCountersV1) -> VersionCounters {
+    VersionCounters {
+        committed: CommittedUsage {
+            committed_append_bytes: counters.committed_append_bytes,
+            committed_records: counters.committed_records,
+            committed_write_units: counters.committed_write_units,
+        },
+        appends: counters.appends,
+    }
+}
+
+/// A version restored from a backup that counted no write since has no
+/// last write time.
+fn last_write_to_proto(last_write: LastWrite) -> Option<u64> {
+    match last_write {
+        LastWrite::At(now_ms) => Some(now_ms),
+        LastWrite::Imported => None,
+    }
+}
+
+fn last_write_from_proto(last_write_at_ms: Option<u64>) -> LastWrite {
+    last_write_at_ms.map_or(LastWrite::Imported, LastWrite::At)
+}
+
+/// A seq or history id of the ledger is never 0.
+fn non_zero(value: u64, field: &'static str) -> Result<NonZeroU64, SnapshotStoreError> {
+    NonZeroU64::new(value).ok_or(SnapshotStoreError::UsageFieldZero { field })
+}
+
+fn usage_to_proto(usage: VersionUsage) -> proto::StreamUsageV1 {
+    proto::StreamUsageV1 {
+        seq: usage.seq,
+        counters: Some(counters_to_proto(usage.counters)),
+        history_baseline: Some(counters_to_proto(usage.history_baseline)),
+        last_write_at_ms: last_write_to_proto(usage.last_write),
+        counted_since: usage.counted_since.get(),
+    }
+}
+
+fn usage_from_proto(usage: proto::StreamUsageV1) -> Result<VersionUsage, SnapshotStoreError> {
+    Ok(VersionUsage {
+        seq: non_zero(usage.seq, "stream usage seq")?.get(),
+        counters: counters_from_proto(required(usage.counters, "snapshot stream usage counters")?),
+        history_baseline: counters_from_proto(required(
+            usage.history_baseline,
+            "snapshot stream usage history_baseline",
+        )?),
+        last_write: last_write_from_proto(usage.last_write_at_ms),
+        counted_since: non_zero(usage.counted_since, "stream usage counted_since")?,
+    })
+}
+
+fn retired_to_proto(row: &BucketRetired) -> proto::BucketRetiredV1 {
+    proto::BucketRetiredV1 {
+        bucket_id: row.bucket_id.clone(),
+        retired: Some(proto::CommittedUsageV1 {
+            committed_append_bytes: row.retired.committed_append_bytes,
+            committed_records: row.retired.committed_records,
+            committed_write_units: row.retired.committed_write_units,
+        }),
+    }
+}
+
+fn retired_from_proto(row: proto::BucketRetiredV1) -> Result<BucketRetired, SnapshotStoreError> {
+    let retired = required(row.retired, "snapshot header retired usage")?;
+    Ok(BucketRetired {
+        bucket_id: row.bucket_id,
+        retired: CommittedUsage {
+            committed_append_bytes: retired.committed_append_bytes,
+            committed_records: retired.committed_records,
+            committed_write_units: retired.committed_write_units,
+        },
+    })
+}
+
+fn end_to_proto(end: StreamEnd) -> proto::StreamEndV1 {
+    match end {
+        StreamEnd::Deleted => proto::StreamEndV1::StreamEndDeleted,
+        StreamEnd::Expired => proto::StreamEndV1::StreamEndExpired,
+        StreamEnd::Purged => proto::StreamEndV1::StreamEndPurged,
+    }
+}
+
+/// `STREAM_END_UNSPECIFIED` and an end this build does not know are
+/// refused.
+fn end_from_proto(seq: u64, value: i32) -> Result<StreamEnd, SnapshotStoreError> {
+    match proto::StreamEndV1::try_from(value) {
+        Ok(proto::StreamEndV1::StreamEndDeleted) => Ok(StreamEnd::Deleted),
+        Ok(proto::StreamEndV1::StreamEndExpired) => Ok(StreamEnd::Expired),
+        Ok(proto::StreamEndV1::StreamEndPurged) => Ok(StreamEnd::Purged),
+        Ok(proto::StreamEndV1::StreamEndUnspecified) => {
+            Err(SnapshotStoreError::StreamEndUnknown { seq, value })
+        }
+        Err(_unknown) => Err(SnapshotStoreError::StreamEndUnknown { seq, value }),
+    }
+}
+
+fn end_record_to_proto(record: &EndRecord) -> proto::EndRecordV1 {
+    proto::EndRecordV1 {
+        seq: record.seq,
+        stream_id: Some(record.stream_id.clone().into()),
+        created_at_ms: record.created_at_ms,
+        counted_since: record.counted_since.get(),
+        ended_in: record.ended_in.get(),
+        end: end_to_proto(record.end) as i32,
+        ended_at_ms: record.ended_at_ms,
+        counters: Some(counters_to_proto(record.counters)),
+        history_baseline: Some(counters_to_proto(record.history_baseline)),
+        last_write_at_ms: last_write_to_proto(record.last_write),
+    }
+}
+
+fn end_record_from_proto(record: proto::EndRecordV1) -> Result<EndRecord, SnapshotStoreError> {
+    let seq = non_zero(record.seq, "end record seq")?.get();
+    Ok(EndRecord {
+        seq,
+        stream_id: required(record.stream_id, "snapshot end record stream id")?.into(),
+        created_at_ms: record.created_at_ms,
+        counted_since: non_zero(record.counted_since, "end record counted_since")?,
+        ended_in: non_zero(record.ended_in, "end record ended_in")?,
+        end: end_from_proto(seq, record.end)?,
+        ended_at_ms: record.ended_at_ms,
+        counters: counters_from_proto(required(record.counters, "snapshot end record counters")?),
+        history_baseline: counters_from_proto(required(
+            record.history_baseline,
+            "snapshot end record history_baseline",
+        )?),
+        last_write: last_write_from_proto(record.last_write_at_ms),
     })
 }
 
@@ -598,22 +790,6 @@ fn producer_from_proto(
     })
 }
 
-fn append_count_to_proto(count: StreamAppendCount) -> proto::StreamAppendCountV1 {
-    proto::StreamAppendCountV1 {
-        stream_id: Some(count.stream_id.into()),
-        append_count: count.append_count,
-    }
-}
-
-fn append_count_from_proto(
-    count: proto::StreamAppendCountV1,
-) -> Result<StreamAppendCount, SnapshotStoreError> {
-    Ok(StreamAppendCount {
-        stream_id: required(count.stream_id, "snapshot append count stream id")?.into(),
-        append_count: count.append_count,
-    })
-}
-
 fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
     proto::ColdGcEntryV1 {
         seq: entry.seq,
@@ -766,13 +942,25 @@ mod tests {
                 last_created_at_ms: 1_234,
                 history: None,
             },
-            stream_append_counts: vec![StreamAppendCount {
-                stream_id: BucketStreamId {
+            usage: UsageSnapshot {
+                genesis: 0x0abc,
+                usage_seq: 41,
+                retired_through: 37,
+                retired: vec![BucketRetired {
                     bucket_id: "bucket".to_owned(),
-                    stream_id: "stream".to_owned(),
-                },
-                append_count: 3,
-            }],
+                    retired: CommittedUsage {
+                        committed_append_bytes: 70,
+                        committed_records: 5,
+                        committed_write_units: 2,
+                    },
+                }],
+                streams: Vec::new(),
+                ends: vec![sample_end_record(39), EndRecord {
+                    end: StreamEnd::Purged,
+                    last_write: LastWrite::Imported,
+                    ..sample_end_record(40)
+                }],
+            },
         };
         let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
             .collect::<Result<Vec<_>, _>>()
@@ -784,6 +972,37 @@ mod tests {
         let decoded = decode_group_snapshot(&bytes).expect("decode frames");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    /// An end record with every field set, distinct values in fields of
+    /// one type.
+    fn sample_end_record(seq: u64) -> EndRecord {
+        EndRecord {
+            seq,
+            stream_id: BucketStreamId::new("bucket", "ended"),
+            created_at_ms: 1_101,
+            counted_since: NonZeroU64::new(0x0abc).expect("non-zero"),
+            ended_in: NonZeroU64::new(0x0abd).expect("non-zero"),
+            end: StreamEnd::Deleted,
+            ended_at_ms: 1_202,
+            counters: VersionCounters {
+                committed: CommittedUsage {
+                    committed_append_bytes: 15,
+                    committed_records: 1,
+                    committed_write_units: 1,
+                },
+                appends: 3,
+            },
+            history_baseline: VersionCounters {
+                committed: CommittedUsage {
+                    committed_append_bytes: 12,
+                    committed_records: 4,
+                    committed_write_units: 6,
+                },
+                appends: 2,
+            },
+            last_write: LastWrite::At(1_150),
+        }
     }
 
     /// The producer record (#581 section 2.3) survives the group snapshot
@@ -864,6 +1083,8 @@ mod tests {
             "{reclaim:?}"
         );
         let stream_snapshot = machine.snapshot();
+        let usage = machine.usage_snapshot();
+        let version = usage.streams[0];
         let entry = &stream_snapshot.streams[0];
         assert_eq!(entry.retired_epoch_watermark, Some(3));
         let producers = &entry.producer_states;
@@ -879,7 +1100,7 @@ mod tests {
         );
         // A digest is 32 bytes on the wire.
         let mut proto_entry =
-            stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+            stream_to_proto(stream_snapshot.streams[0].clone(), version).expect("encode entry");
         proto_entry.producer_states[0].claim_digest = Some(Bytes::from_static(b"short"));
         let error = stream_from_proto(proto_entry).expect_err("a short digest");
         assert!(
@@ -891,7 +1112,8 @@ mod tests {
             "{error}"
         );
         // Field 9 stays optional on the wire; an absent value is refused.
-        let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        let mut entry =
+            stream_to_proto(stream_snapshot.streams[0].clone(), version).expect("encode entry");
         entry.producer_states[0].last_seen_ms = None;
         let error = stream_from_proto(entry).expect_err("absent last_seen_ms");
         assert!(
@@ -902,7 +1124,8 @@ mod tests {
             "{error}"
         );
         // So does entry field 16.
-        let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        let mut entry =
+            stream_to_proto(stream_snapshot.streams[0].clone(), version).expect("encode entry");
         entry.retained_offset = None;
         let error = stream_from_proto(entry).expect_err("absent retained_offset");
         assert!(
@@ -919,7 +1142,7 @@ mod tests {
             },
             group_commit_index: 7,
             stream_snapshot,
-            stream_append_counts: Vec::new(),
+            usage,
         };
         let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
             .collect::<Result<Vec<_>, _>>()
@@ -929,9 +1152,13 @@ mod tests {
             .collect::<Vec<_>>();
         let decoded = decode_group_snapshot(&bytes).expect("decode frames");
         assert_eq!(decoded, snapshot);
-        let restored = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot)
-            .expect("restore decoded snapshot");
+        let restored = ursula_stream::StreamStateMachine::restore_group(
+            decoded.stream_snapshot,
+            decoded.usage,
+        )
+        .expect("restore decoded snapshot");
         assert_eq!(restored.snapshot(), machine.snapshot());
+        assert_eq!(restored.usage_snapshot(), machine.usage_snapshot());
         assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
@@ -1053,7 +1280,7 @@ mod tests {
             },
             group_commit_index: 4,
             stream_snapshot,
-            stream_append_counts: Vec::new(),
+            usage: restored.usage_snapshot(),
         };
         let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
             .collect::<Result<Vec<_>, _>>()
@@ -1063,8 +1290,13 @@ mod tests {
             .collect::<Vec<_>>();
         let decoded = decode_group_snapshot(&bytes).expect("decode frames");
         assert_eq!(decoded, snapshot);
-        let installed = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot)
-            .expect("restore decoded snapshot");
+        let installed = ursula_stream::StreamStateMachine::restore_group(
+            decoded.stream_snapshot,
+            decoded.usage,
+        )
+        .expect("restore decoded snapshot");
+        assert_eq!(installed.usage_snapshot(), restored.usage_snapshot());
+        assert_eq!(installed.usage_genesis(), 12);
         assert_eq!(
             installed.stream_incarnation(&stream_id),
             restored.stream_incarnation(&stream_id)
@@ -1087,6 +1319,215 @@ mod tests {
             history_from_proto(header.history.expect("a history")),
             Err(SnapshotStoreError::BackupDigestLength { len: 5 })
         ));
+    }
+
+    /// The ledger rides in the group snapshot (F20): each stream frame's
+    /// usage (field 24), end-record frames (frame 8) after the cold-GC
+    /// frames, and header fields 13 to 16. A frame without a required part,
+    /// a zero seq or history id, an end record without an end and a header
+    /// without fields 13, 14 or 16 are refused, and so is a snapshot to
+    /// encode whose usages do not pair with its streams.
+    #[test]
+    fn usage_frames_round_trip_and_refuse_what_is_missing() {
+        let usage = VersionUsage {
+            seq: 9,
+            counters: sample_end_record(1).counters,
+            history_baseline: sample_end_record(1).history_baseline,
+            last_write: LastWrite::At(77),
+            counted_since: NonZeroU64::new(5).expect("non-zero"),
+        };
+        let encoded = usage_to_proto(usage);
+        assert_eq!(usage_from_proto(encoded).expect("decodes"), usage);
+        let imported = VersionUsage {
+            last_write: LastWrite::Imported,
+            ..usage
+        };
+        assert_eq!(usage_to_proto(imported).last_write_at_ms, None);
+        assert_eq!(
+            usage_from_proto(usage_to_proto(imported)).expect("decodes"),
+            imported
+        );
+        for (broken, expected) in [
+            (
+                proto::StreamUsageV1 { seq: 0, ..encoded },
+                "stream usage seq",
+            ),
+            (
+                proto::StreamUsageV1 {
+                    counted_since: 0,
+                    ..encoded
+                },
+                "stream usage counted_since",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    usage_from_proto(broken),
+                    Err(SnapshotStoreError::UsageFieldZero { field }) if field == expected
+                ),
+                "{expected}"
+            );
+        }
+        for broken in [
+            proto::StreamUsageV1 {
+                counters: None,
+                ..encoded
+            },
+            proto::StreamUsageV1 {
+                history_baseline: None,
+                ..encoded
+            },
+        ] {
+            assert!(matches!(
+                usage_from_proto(broken),
+                Err(SnapshotStoreError::MissingField { .. })
+            ));
+        }
+
+        let record = sample_end_record(12);
+        let encoded = end_record_to_proto(&record);
+        assert_eq!(
+            end_record_from_proto(encoded.clone()).expect("decodes"),
+            record
+        );
+        for broken in [
+            proto::EndRecordV1 {
+                seq: 0,
+                ..encoded.clone()
+            },
+            proto::EndRecordV1 {
+                counted_since: 0,
+                ..encoded.clone()
+            },
+            proto::EndRecordV1 {
+                ended_in: 0,
+                ..encoded.clone()
+            },
+        ] {
+            assert!(matches!(
+                end_record_from_proto(broken),
+                Err(SnapshotStoreError::UsageFieldZero { .. })
+            ));
+        }
+        for end in [proto::StreamEndV1::StreamEndUnspecified as i32, 9] {
+            assert!(matches!(
+                end_record_from_proto(proto::EndRecordV1 {
+                    end,
+                    ..encoded.clone()
+                }),
+                Err(SnapshotStoreError::StreamEndUnknown { seq: 12, value }) if value == end
+            ));
+        }
+        for broken in [
+            proto::EndRecordV1 {
+                stream_id: None,
+                ..encoded.clone()
+            },
+            proto::EndRecordV1 {
+                counters: None,
+                ..encoded.clone()
+            },
+            proto::EndRecordV1 {
+                history_baseline: None,
+                ..encoded
+            },
+        ] {
+            assert!(matches!(
+                end_record_from_proto(broken),
+                Err(SnapshotStoreError::MissingField { .. })
+            ));
+        }
+        assert!(matches!(
+            retired_from_proto(proto::BucketRetiredV1 {
+                bucket_id: "bucket".to_owned(),
+                retired: None,
+            }),
+            Err(SnapshotStoreError::MissingField { .. })
+        ));
+
+        // A stream frame without its usage, and a header without a required
+        // ledger field, are refused.
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        machine.apply(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        machine.apply(ursula_stream::StreamCommand::CreateStream {
+            stream_id: BucketStreamId::new("bucket", "s"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::from_static(b"ab"),
+            close_after: false,
+            stream_seq: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            now_ms: 1,
+        });
+        let entry = machine.snapshot().streams.remove(0);
+        let version = machine.usage_snapshot().streams[0];
+        let mut stream = stream_to_proto(entry, version).expect("encode entry");
+        stream.usage = None;
+        assert!(matches!(
+            stream_from_proto(stream),
+            Err(SnapshotStoreError::MissingField {
+                field: "snapshot stream usage"
+            })
+        ));
+        for header in [
+            proto::SnapshotHeaderV1 {
+                usage_seq: None,
+                ..header_v1()
+            },
+            proto::SnapshotHeaderV1 {
+                retired_through: None,
+                ..header_v1()
+            },
+            proto::SnapshotHeaderV1 {
+                genesis: None,
+                ..header_v1()
+            },
+        ] {
+            let bytes = [
+                epoch_frame(ursula_stream::FORMAT_EPOCH),
+                encode_frame(proto::SnapshotFrameV1 {
+                    frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
+                })
+                .expect("encode header"),
+                footer_frame(),
+            ]
+            .concat();
+            assert!(matches!(
+                decode_group_snapshot(&bytes),
+                Err(SnapshotStoreError::MissingField { .. })
+            ));
+        }
+
+        // A group snapshot whose usages do not pair with its streams does
+        // not encode.
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            group_commit_index: 2,
+            stream_snapshot: machine.snapshot(),
+            usage: UsageSnapshot {
+                streams: Vec::new(),
+                ..machine.usage_snapshot()
+            },
+        };
+        let error = group_snapshot_frames(Arc::new(snapshot))
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("a usage per stream");
+        assert!(
+            matches!(
+                error,
+                SnapshotStoreError::UsageMismatch(UsageSnapshotError::StreamCount {
+                    streams: 1,
+                    usages: 0,
+                })
+            ),
+            "{error}"
+        );
     }
 
     fn epoch_frame(epoch: u32) -> Bytes {
@@ -1113,6 +1554,10 @@ mod tests {
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: 0,
             history: None,
+            usage_seq: Some(0),
+            retired_through: Some(0),
+            retired: Vec::new(),
+            genesis: Some(0),
         }
     }
 
@@ -1192,6 +1637,10 @@ mod tests {
                     committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
                     last_created_at_ms: 0,
                     history: None,
+                    usage_seq: Some(0),
+                    retired_through: Some(0),
+                    retired: Vec::new(),
+                    genesis: Some(0),
                 },
             )),
         })
@@ -1228,6 +1677,7 @@ mod tests {
             committed_write_unit_bytes,
             last_created_at_ms: 0,
             history: None,
+            ..header_v1()
         };
         [
             epoch_frame(ursula_stream::FORMAT_EPOCH),
@@ -1274,15 +1724,14 @@ mod tests {
             expected_incarnation: None,
         });
         let entry = machine.snapshot().streams.remove(0);
-        let encoded = stream_to_proto(entry.clone()).expect("encode entry");
+        let version = machine.usage_snapshot().streams[0];
+        let encoded = stream_to_proto(entry.clone(), version).expect("encode entry");
         let visible = encoded.visible_snapshot.as_ref().expect("visible snapshot");
         assert!(visible.payload.is_empty());
         assert_eq!(visible.object.as_ref(), Some(&object));
         assert_eq!(
-            stream_from_proto(encoded)
-                .expect("decode entry")
-                .visible_snapshot,
-            entry.visible_snapshot
+            stream_from_proto(encoded).expect("decode entry"),
+            (entry, version)
         );
     }
 }
