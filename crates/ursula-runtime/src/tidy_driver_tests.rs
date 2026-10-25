@@ -293,4 +293,6 @@ async fn the_sweep_folds_end_records_past_their_retention() {
     assert_eq!(report.end_records_retired, 0, "{report:?}");
     assert_eq!(report.expiry_sweeps, 0, "{report:?}");
     assert_eq!(bucket_committed(&runtime).await, before);
+    // `/__ursula/metrics` counts the folds of the node's sweeps.
+    assert_eq!(runtime.metrics().snapshot().usage_end_records_retired, 20);
 }

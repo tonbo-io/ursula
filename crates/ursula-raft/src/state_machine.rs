@@ -2643,6 +2643,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                             if removed.streams > 0 || removed.end_records > 0 {
                                 self.log_gauge.record_removal(removed.bytes);
                             }
+                            if removed.end_records_early > 0
+                                && let Some(metrics) = &self.metrics
+                            {
+                                metrics.record_end_records_folded_early(removed.end_records_early);
+                            }
                             RaftGroupResponse::Write(result)
                         }
                         Err(payload) => {

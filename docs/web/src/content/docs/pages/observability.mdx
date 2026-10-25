@@ -207,6 +207,19 @@ apply stopped. A sweep an error stopped runs again only at the usual
 interval.
 All three work in the in-memory mode too.
 
+A deleted, expired or purged stream leaves an end record with its id and final
+usage, which the sweep folds into its bucket's usage half of
+`raft.deleted_data_max_age` after the removal.
+`usage_end_records_retired` counts the end records the node's sweeps folded,
+and `usage_end_records_folded_early` the end records the node's replicas folded
+at once because their group already held 65,536. A rising
+`usage_end_records_folded_early` means a group removes streams faster than
+65,536 per half of `raft.deleted_data_max_age`. The totals in
+`/__ursula/usage` stay exact either way. `group_state_gauges` reports per
+group the end records it holds (`end_records`), what they add to its snapshot
+(`end_record_bytes`) and the earliest removal time among them
+(`oldest_end_record_at_ms`, 0 for none).
+
 With an S3 snapshot store, `snapshot_gc_deleted_objects` counts the snapshot
 objects the node's snapshot GC deleted from its own directory.
 `snapshot_gc_failed_passes` counts the GC passes that failed, for example

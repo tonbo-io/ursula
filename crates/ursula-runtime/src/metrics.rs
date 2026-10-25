@@ -472,6 +472,11 @@ runtime_metrics! {
     counter ttl_expiry_sweeps;
     counter ttl_expiry_swept_streams;
     counter ttl_expiry_sweep_due_groups;
+    // Usage end records (F20): the end records the node's leaders' sweeps
+    // folded into their buckets' usage, and the ones the node's replicas
+    // folded early, at a removal that found the group holding 65,536.
+    counter usage_end_records_retired;
+    counter usage_end_records_folded_early;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -848,12 +853,24 @@ impl RuntimeMetricsInner {
             .fetch_add_relaxed(sample.failed);
     }
 
-    /// Records one expiry sweep pass over the node's groups (#669).
-    pub(crate) fn record_ttl_expiry_sweep(&self, sweeps: u64, swept_streams: u64, due_groups: u64) {
-        self.ttl_expiry_sweeps.fetch_add_relaxed(sweeps);
+    /// Records one sweep pass over the node's groups (#669, F20): its
+    /// `Sweep` entries, the expired streams and the end records they
+    /// removed, and the groups it left due.
+    pub(crate) fn record_ttl_expiry_sweep(&self, pass: &crate::request::TidyStreamsResponse) {
+        self.ttl_expiry_sweeps.fetch_add_relaxed(pass.expiry_sweeps);
         self.ttl_expiry_swept_streams
-            .fetch_add_relaxed(swept_streams);
-        self.ttl_expiry_sweep_due_groups.store_relaxed(due_groups);
+            .fetch_add_relaxed(pass.expiry_swept_streams);
+        self.usage_end_records_retired
+            .fetch_add_relaxed(pass.end_records_retired);
+        self.ttl_expiry_sweep_due_groups
+            .store_relaxed(pass.expiry_due_groups);
+    }
+
+    /// End records a replica folded early, at a removal that found its
+    /// group holding `MAX_END_RECORDS` (F20).
+    pub(crate) fn record_end_records_folded_early(&self, records: u64) {
+        self.usage_end_records_folded_early
+            .fetch_add_relaxed(records);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -1142,7 +1159,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 182] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 184] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1314,6 +1331,8 @@ mod metric_manifest_tests {
         "ttl_expiry_sweeps",
         "ttl_expiry_swept_streams",
         "ttl_expiry_sweep_due_groups",
+        "usage_end_records_retired",
+        "usage_end_records_folded_early",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",

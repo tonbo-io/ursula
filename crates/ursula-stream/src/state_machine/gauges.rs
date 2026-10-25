@@ -55,6 +55,14 @@ pub struct GroupStateGauges {
     pub bucket_usage_rows: u64,
     /// Tenant-erasure fences (F15, by design O(buckets ever purged)).
     pub erased_buckets: u64,
+    /// Unretired end records (F20, at most `MAX_END_RECORDS`).
+    pub end_records: u64,
+    /// What those end records add to a group snapshot: their ids and a
+    /// fixed 128 B each.
+    pub end_record_bytes: u64,
+    /// The earliest `ended_at_ms` of those end records, 0 when the group
+    /// holds none.
+    pub oldest_end_record_at_ms: u64,
 }
 
 fn as_u64(value: usize) -> u64 {
@@ -83,6 +91,17 @@ impl StreamStateMachine {
             erased_buckets: as_u64(self.erased_buckets.len()),
             ..GroupStateGauges::default()
         };
+        let mut oldest_end = None::<u64>;
+        for record in self.end_records() {
+            gauges.end_records = gauges.end_records.saturating_add(1);
+            gauges.end_record_bytes = gauges
+                .end_record_bytes
+                .saturating_add(super::usage_ledger::end_record_bytes(record));
+            oldest_end = Some(
+                oldest_end.map_or(record.ended_at_ms, |oldest| oldest.min(record.ended_at_ms)),
+            );
+        }
+        gauges.oldest_end_record_at_ms = oldest_end.unwrap_or(0);
         for slot in self.registry.slots() {
             gauges.streams = gauges.streams.saturating_add(1);
             if stream_expiry_at_ms(&slot.metadata).is_some() {

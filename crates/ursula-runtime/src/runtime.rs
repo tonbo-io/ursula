@@ -1104,11 +1104,7 @@ impl ShardRuntime {
             }
         }
         if request.max_expiry_sweeps > 0 {
-            self.metrics.record_ttl_expiry_sweep(
-                total.expiry_sweeps,
-                total.expiry_swept_streams,
-                total.expiry_due_groups,
-            );
+            self.metrics.record_ttl_expiry_sweep(&total);
         }
         TidyStreamsPass {
             report: total,

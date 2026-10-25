@@ -879,6 +879,13 @@ impl GroupEngineMetrics {
             .record_wal_storage(placement.core_id, placement.raft_group_id, sample);
     }
 
+    /// Records end records the group's replica folded early, at a removal
+    /// that found the group holding `ursula_stream::MAX_END_RECORDS`
+    /// (F20).
+    pub fn record_end_records_folded_early(&self, records: u64) {
+        self.inner.record_end_records_folded_early(records);
+    }
+
     /// Records what a core journal's writer did besides writing batches.
     pub fn record_wal_journal(&self, core_id: CoreId, sample: WalJournalSample) {
         self.inner.record_wal_journal(core_id, sample);
