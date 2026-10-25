@@ -192,6 +192,8 @@ pub enum StreamSnapshotError {
     UnattributedColdGc { seq: u64 },
     #[error("snapshot cold GC entry {seq} targets a stream without a cold generation")]
     ColdGcWithoutGeneration { seq: u64 },
+    #[error("snapshot holds two usage rows of bucket '{0}'")]
+    DuplicateBucketUsage(String),
 }
 
 fn snapshot_backup_format_message(found: &Option<u32>) -> String {

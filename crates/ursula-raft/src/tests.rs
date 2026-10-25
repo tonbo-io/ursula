@@ -1385,7 +1385,6 @@ async fn single_node_openraft_group_applies_client_writes() {
     {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
-            assert_eq!(response.stream_append_count, 1);
         }
         other => panic!("unexpected append response: {other:?}"),
     }
@@ -4122,10 +4121,13 @@ async fn openraft_snapshot_round_trips_group_state() {
     match appended {
         GroupWriteResponse::Append(response) => {
             assert_eq!(response.start_offset, 7);
-            assert_eq!(response.stream_append_count, 2);
         }
         other => panic!("unexpected append response: {other:?}"),
     }
+    // The installed version kept its applied append, and counted this one.
+    let installed = target.group_snapshot().await.expect("snapshot");
+    assert_eq!(installed.stream_append_counts.len(), 1);
+    assert_eq!(installed.stream_append_counts[0].append_count, 2);
 }
 
 /// A forwarded read carries `leader_only` (field 6) to the leader over gRPC,

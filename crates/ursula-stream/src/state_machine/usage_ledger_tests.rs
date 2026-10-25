@@ -1,0 +1,465 @@
+//! Per-version usage (F20, F9) through the production entry points: the
+//! counting rule at the bucket counter's call sites, the seqs, the history
+//! baseline, and the bucket totals derived from retired usage and live
+//! versions.
+
+use std::num::NonZeroU64;
+
+use bytes::Bytes;
+
+use super::BucketStreamId;
+use super::ProducerRequest;
+use super::StreamCommand;
+use super::StreamResponse;
+use super::StreamSnapshotError;
+use super::StreamStateMachine;
+use crate::model::BucketUsage;
+use crate::model::BucketUsageSnapshot;
+use crate::model::ExternalPayloadRef;
+use crate::usage::CommittedUsage;
+use crate::usage::LastWrite;
+use crate::usage::VersionCounters;
+use crate::usage::VersionUsage;
+
+const OCTET: &str = "application/octet-stream";
+const BUCKET: &str = "usage";
+
+fn id(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).expect("non-zero history id")
+}
+
+fn sid(name: &str) -> BucketStreamId {
+    BucketStreamId::new(BUCKET, name)
+}
+
+fn new_history(machine: &mut StreamStateMachine, index: u64, history: u64) {
+    let previous = machine.history_id();
+    assert!(matches!(
+        machine.apply_entry(index, StreamCommand::NewHistory {
+            history: id(history),
+            now_ms: 0,
+            previous,
+            kept: index.saturating_sub(1),
+            leader: crate::HistoryLeader {
+                term: 1,
+                node_id: 1,
+            },
+        }),
+        StreamResponse::HistoryStarted { .. }
+    ));
+}
+
+/// A group whose genesis, history `genesis`, applied, with one bucket.
+fn group(genesis: u64) -> StreamStateMachine {
+    let mut machine = StreamStateMachine::new();
+    new_history(&mut machine, 1, genesis);
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: BUCKET.to_owned(),
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    machine
+}
+
+fn create(machine: &mut StreamStateMachine, name: &str, body: &[u8], now_ms: u64) {
+    let response = machine.apply(StreamCommand::CreateStream {
+        stream_id: sid(name),
+        content_type: OCTET.to_owned(),
+        initial_payload: Bytes::copy_from_slice(body),
+        close_after: false,
+        stream_seq: None,
+        stream_ttl_seconds: None,
+        stream_expires_at_ms: None,
+        now_ms,
+    });
+    assert!(
+        matches!(response, StreamResponse::Created { .. }),
+        "{response:?}"
+    );
+}
+
+fn append_as(
+    machine: &mut StreamStateMachine,
+    name: &str,
+    content_type: &str,
+    body: &[u8],
+    producer_seq: Option<u64>,
+    now_ms: u64,
+) -> StreamResponse {
+    machine.apply(StreamCommand::Append {
+        stream_id: sid(name),
+        content_type: Some(content_type.to_owned()),
+        payload: Bytes::copy_from_slice(body),
+        close_after: false,
+        stream_seq: None,
+        producer: producer_seq.map(|seq| ProducerRequest {
+            producer_id: "writer".to_owned(),
+            producer_epoch: 0,
+            producer_seq: seq,
+            ..Default::default()
+        }),
+        now_ms,
+    })
+}
+
+fn append(machine: &mut StreamStateMachine, name: &str, body: &[u8], now_ms: u64) {
+    let response = append_as(machine, name, OCTET, body, None, now_ms);
+    assert!(
+        matches!(response, StreamResponse::Appended { .. }),
+        "{response:?}"
+    );
+}
+
+fn usage(machine: &StreamStateMachine, name: &str) -> VersionUsage {
+    machine.version_usage(&sid(name)).expect("a live version")
+}
+
+fn bucket_row(machine: &StreamStateMachine) -> BucketUsage {
+    let report = machine.bucket_usage_report();
+    assert_eq!(report.len(), 1, "{report:?}");
+    report[0].usage
+}
+
+fn committed_of(row: BucketUsage) -> CommittedUsage {
+    CommittedUsage::of_bucket(&row)
+}
+
+fn sum(writes: &[(u64, u64)]) -> CommittedUsage {
+    let mut total = CommittedUsage::default();
+    for (bytes, records) in writes {
+        total.add(CommittedUsage::of_write(*bytes, *records));
+    }
+    total
+}
+
+/// A create counts one write, its initial payload; every applied append
+/// counts one more and one append, takes a new seq and records its time.
+/// The bucket's totals are the version's counters.
+#[test]
+fn a_create_and_its_appends_count_by_the_bucket_counters_rule() {
+    let mut machine = group(7);
+    let initial = vec![b'x'; 10_241];
+    create(&mut machine, "s", &initial, 5);
+    assert_eq!(usage(&machine, "s"), VersionUsage {
+        seq: 1,
+        counters: VersionCounters {
+            committed: CommittedUsage {
+                committed_append_bytes: 10_241,
+                committed_records: 1,
+                committed_write_units: 2,
+            },
+            appends: 0,
+        },
+        history_baseline: VersionCounters::default(),
+        last_write: LastWrite::At(5),
+        counted_since: id(7),
+    });
+
+    append(&mut machine, "s", b"abc", 6);
+    let after = usage(&machine, "s");
+    assert_eq!(after.seq, 2);
+    assert_eq!(after.counters, VersionCounters {
+        committed: sum(&[(10_241, 1), (3, 1)]),
+        appends: 1,
+    });
+    assert_eq!(after.last_write, LastWrite::At(6));
+    assert_eq!(after.history_baseline, VersionCounters::default());
+    assert_eq!(machine.usage_seq(), 2);
+
+    let row = bucket_row(&machine);
+    assert_eq!(committed_of(row), after.counters.committed);
+    assert_eq!(row.retained_bytes, 10_244);
+    assert_eq!(row.stream_count, 1);
+}
+
+/// A producer repeat, a refused write and a close-only write count
+/// nothing and take no seq.
+#[test]
+fn a_repeat_a_refusal_and_a_close_count_nothing() {
+    let mut machine = group(7);
+    create(&mut machine, "s", b"", 1);
+    let first = append_as(&mut machine, "s", OCTET, b"ab", Some(0), 2);
+    assert!(
+        matches!(first, StreamResponse::Appended { .. }),
+        "{first:?}"
+    );
+    let counted = usage(&machine, "s");
+    assert_eq!(counted.counters.appends, 1);
+
+    let repeat = append_as(&mut machine, "s", OCTET, b"ab", Some(0), 3);
+    assert!(
+        matches!(
+            &repeat,
+            StreamResponse::Appended {
+                producer: Some(ack),
+                ..
+            } if ack.is_repeat()
+        ),
+        "{repeat:?}"
+    );
+    assert_eq!(usage(&machine, "s"), counted);
+
+    let refused = append_as(&mut machine, "s", "text/plain", b"cd", None, 4);
+    assert!(
+        matches!(refused, StreamResponse::Error { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(usage(&machine, "s"), counted);
+
+    let closed = machine.apply(StreamCommand::Close {
+        stream_id: sid("s"),
+        stream_seq: None,
+        producer: None,
+        now_ms: 5,
+    });
+    assert!(
+        matches!(closed, StreamResponse::Closed { .. }),
+        "{closed:?}"
+    );
+    assert_eq!(usage(&machine, "s"), counted);
+    assert_eq!(committed_of(bucket_row(&machine)), sum(&[(0, 0), (2, 1)]));
+}
+
+/// An external append counts the bytes it staged, as the bucket counter
+/// did.
+#[test]
+fn an_external_append_counts_its_staged_bytes() {
+    let mut machine = group(7);
+    create(&mut machine, "s", b"", 1);
+    let response = machine.apply(StreamCommand::AppendExternal {
+        stream_id: sid("s"),
+        content_type: Some(OCTET.to_owned()),
+        payload: ExternalPayloadRef {
+            s3_path: "usage/external/a.bin".to_owned(),
+            payload_len: 20_000,
+            object_size: 20_000,
+        },
+        message_count: 0,
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 2,
+    });
+    assert!(
+        matches!(response, StreamResponse::Appended { .. }),
+        "{response:?}"
+    );
+    let usage = usage(&machine, "s");
+    assert_eq!(usage.counters, VersionCounters {
+        committed: sum(&[(0, 0), (20_000, 1)]),
+        appends: 1,
+    });
+    assert_eq!(usage.last_write, LastWrite::At(2));
+    assert_eq!(bucket_row(&machine).retained_bytes, 20_000);
+}
+
+/// A publish that replaces the visible snapshot and a retention that moves
+/// the retained offset change what the version holds, not what it
+/// committed: each takes a new seq and counts nothing. Their repeats change
+/// nothing.
+#[test]
+fn a_publish_and_a_retention_take_a_seq_and_count_nothing() {
+    let mut machine = group(7);
+    create(&mut machine, "s", b"abcdef", 1);
+    let created = usage(&machine, "s");
+    let publish = || StreamCommand::PublishSnapshot {
+        stream_id: sid("s"),
+        snapshot_offset: 4,
+        content_type: OCTET.to_owned(),
+        payload: Bytes::from_static(b"snap"),
+        now_ms: 2,
+        expected_incarnation: None,
+    };
+    let published = machine.apply(publish());
+    assert!(
+        matches!(published, StreamResponse::SnapshotPublished { .. }),
+        "{published:?}"
+    );
+    let after_publish = usage(&machine, "s");
+    assert_eq!(after_publish.seq, created.seq + 1);
+    assert_eq!(after_publish.counters, created.counters);
+    assert_eq!(after_publish.last_write, created.last_write);
+
+    let repeated = machine.apply(publish());
+    assert!(
+        matches!(repeated, StreamResponse::SnapshotPublished { .. }),
+        "{repeated:?}"
+    );
+    assert_eq!(usage(&machine, "s"), after_publish);
+
+    let retention = || StreamCommand::AdvanceRetention {
+        stream_id: sid("s"),
+        retained_offset: 4,
+        now_ms: 3,
+        expected_incarnation: None,
+    };
+    assert_eq!(
+        machine.apply(retention()),
+        StreamResponse::RetentionAdvanced { retained_offset: 4 }
+    );
+    let after_retention = usage(&machine, "s");
+    assert_eq!(after_retention.seq, after_publish.seq + 1);
+    assert_eq!(after_retention.counters, created.counters);
+    assert_eq!(
+        machine.apply(retention()),
+        StreamResponse::RetentionAdvanced { retained_offset: 4 }
+    );
+    assert_eq!(usage(&machine, "s"), after_retention);
+
+    let row = bucket_row(&machine);
+    assert_eq!(committed_of(row), created.counters.committed);
+    assert_eq!(row.retained_bytes, 2);
+}
+
+/// A removal retires the version's usage into its bucket's: the totals
+/// keep every committed counter, and the gauges leave with the stream. A
+/// purged bucket keeps its row at zero gauges (F15).
+#[test]
+fn a_removal_retires_the_version_into_its_bucket() {
+    let mut machine = group(7);
+    create(&mut machine, "a", b"abc", 1);
+    create(&mut machine, "b", b"defg", 1);
+    append(&mut machine, "a", b"hi", 2);
+    let before = committed_of(bucket_row(&machine));
+    assert_eq!(before, sum(&[(3, 1), (4, 1), (2, 1)]));
+
+    assert_eq!(
+        machine.apply(StreamCommand::DeleteStream {
+            stream_id: sid("a"),
+            now_ms: 3,
+        }),
+        StreamResponse::Deleted { expired: false }
+    );
+    assert_eq!(machine.version_usage(&sid("a")), None);
+    let row = bucket_row(&machine);
+    assert_eq!(committed_of(row), before);
+    assert_eq!(row.stream_count, 1);
+    assert_eq!(row.retained_bytes, 4);
+
+    let purged = machine.apply(StreamCommand::PurgeBucket {
+        bucket_id: BUCKET.to_owned(),
+    });
+    assert!(
+        matches!(purged, StreamResponse::BucketPurged { .. }),
+        "{purged:?}"
+    );
+    let row = bucket_row(&machine);
+    assert_eq!(committed_of(row), before);
+    assert_eq!(row.stream_count, 0);
+    assert_eq!(row.retained_bytes, 0);
+    assert_eq!(machine.state_gauges().bucket_usage_rows, 1);
+}
+
+/// The genesis records the group's genesis id, and a later event keeps
+/// it. A version's first write after an event records its counters as its
+/// history baseline before the write counts (W5). A version created after
+/// the event counts since it, from a zero baseline.
+#[test]
+fn the_first_write_after_a_history_event_records_the_baseline() {
+    let mut machine = group(7);
+    assert_eq!(machine.usage_genesis(), 7);
+    create(&mut machine, "s", b"abc", 1);
+    append(&mut machine, "s", b"de", 2);
+    let at_event = usage(&machine, "s").counters;
+
+    new_history(&mut machine, 10, 9);
+    assert_eq!(machine.usage_genesis(), 7);
+    let seq_at_event = machine.usage_seq();
+    assert_eq!(
+        usage(&machine, "s").history_baseline,
+        VersionCounters::default()
+    );
+
+    append(&mut machine, "s", b"fgh", 3);
+    let written = usage(&machine, "s");
+    assert_eq!(written.history_baseline, at_event);
+    assert_eq!(written.counters, VersionCounters {
+        committed: sum(&[(3, 1), (2, 1), (3, 1)]),
+        appends: 2,
+    });
+    assert_eq!(written.counted_since, id(7));
+    assert_eq!(written.seq, seq_at_event + 1);
+
+    append(&mut machine, "s", b"i", 4);
+    assert_eq!(usage(&machine, "s").history_baseline, at_event);
+
+    create(&mut machine, "t", b"j", 5);
+    let created = usage(&machine, "t");
+    assert_eq!(created.counted_since, id(9));
+    assert_eq!(created.history_baseline, VersionCounters::default());
+}
+
+/// An import retires the backup's bucket totals and restores every
+/// version at zero, counted since the import's history so that each takes
+/// a new key, stamped in stream-id order. The group keeps its genesis.
+#[test]
+fn an_import_retires_the_totals_and_gives_every_version_a_new_key() {
+    let mut source = group(7);
+    create(&mut source, "b", b"bb", 1);
+    create(&mut source, "a", b"aaa", 1);
+    create(&mut source, "c", b"c", 1);
+    append(&mut source, "a", b"more", 2);
+    assert_eq!(
+        source.apply(StreamCommand::DeleteStream {
+            stream_id: sid("c"),
+            now_ms: 3,
+        }),
+        StreamResponse::Deleted { expired: false }
+    );
+
+    let mut target = StreamStateMachine::new();
+    new_history(&mut target, 1, 11);
+    let imported = target.apply_entry(2, StreamCommand::ImportSnapshot {
+        snapshot: Box::new(source.snapshot()),
+        history: id(13),
+        backup_digest: [3; 32],
+        now_ms: 4,
+    });
+    assert!(
+        matches!(imported, StreamResponse::SnapshotImported { .. }),
+        "{imported:?}"
+    );
+    assert_eq!(target.bucket_usage_report(), source.bucket_usage_report());
+    assert_eq!(target.usage_genesis(), 11);
+    assert_eq!(target.usage_seq(), 2);
+    for (name, seq) in [("a", 1), ("b", 2)] {
+        assert_eq!(usage(&target, name), VersionUsage {
+            seq,
+            counters: VersionCounters::default(),
+            history_baseline: VersionCounters::default(),
+            last_write: LastWrite::Imported,
+            counted_since: id(13),
+        });
+    }
+
+    append(&mut target, "a", b"x", 5);
+    let written = usage(&target, "a");
+    assert_eq!(written.counters, VersionCounters {
+        committed: CommittedUsage::of_write(1, 1),
+        appends: 1,
+    });
+    assert_eq!(written.history_baseline, VersionCounters::default());
+    assert_eq!(written.last_write, LastWrite::At(5));
+    let mut expected = committed_of(bucket_row(&source));
+    expected.add(CommittedUsage::of_write(1, 1));
+    assert_eq!(committed_of(bucket_row(&target)), expected);
+}
+
+/// A backup that names one bucket's usage twice is refused, where 0.10
+/// kept the last row.
+#[test]
+fn a_restore_refuses_two_usage_rows_of_one_bucket() {
+    let mut machine = group(7);
+    create(&mut machine, "s", b"abc", 1);
+    let mut snapshot = machine.snapshot();
+    let row = snapshot.bucket_usage[0].clone();
+    snapshot.bucket_usage.push(BucketUsageSnapshot {
+        bucket_id: row.bucket_id,
+        usage: BucketUsage::default(),
+    });
+    assert_eq!(
+        StreamStateMachine::restore(snapshot).err(),
+        Some(StreamSnapshotError::DuplicateBucketUsage(BUCKET.to_owned()))
+    );
+}

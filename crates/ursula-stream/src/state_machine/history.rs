@@ -69,6 +69,9 @@ impl StreamStateMachine {
                 ),
             );
         }
+        if previous == 0 {
+            self.usage.record_genesis(history);
+        }
         self.history = Some(HistoryEvent {
             id: history,
             event_index: index,
@@ -129,14 +132,17 @@ impl StreamStateMachine {
 }
 
 impl StreamSlot {
-    /// The first write after a history event: no byte changed since the
-    /// event, so the tail now is the tail at the event.
+    /// The first write after a history event: no byte changed and nothing
+    /// counted since the event, so the tail and the usage counters now are
+    /// those at the event. The counters become the version's history
+    /// baseline before the write counts (F20).
     pub(super) fn inherit_history(&mut self, group: u64) {
         if !written_since_event(self.history, group) {
             self.inherited = Some(InheritedHistory {
                 history: self.history,
                 offset: self.metadata.tail_offset,
             });
+            self.usage.history_baseline = self.usage.counters;
             self.history = group;
         }
     }

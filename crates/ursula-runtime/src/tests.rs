@@ -83,6 +83,19 @@ async fn append_bytes(runtime: &ShardRuntime, stream: &BucketStreamId, payload: 
         .expect("append");
 }
 
+/// The applied appends of the stream's version (F9), as its group's
+/// snapshot carries them.
+async fn applied_appends(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64 {
+    runtime
+        .snapshot_group(runtime.locate(stream).raft_group_id)
+        .await
+        .expect("snapshot group")
+        .stream_append_counts
+        .iter()
+        .find(|count| &count.stream_id == stream)
+        .map_or(0, |count| count.append_count)
+}
+
 fn memory_cold_store() -> ColdStore {
     ColdStore::memory().expect("memory cold store")
 }
@@ -366,7 +379,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             start_offset: 0,
             next_offset: 3,
-            stream_append_count: 1,
             group_commit_index: 3,
             closed: false,
             producer: None,
@@ -1283,8 +1295,8 @@ async fn repeated_appends_to_one_stream_are_ordered() {
             .expect("append");
         assert_eq!(response.start_offset, index * 7);
         assert_eq!(response.next_offset, (index + 1) * 7);
-        assert_eq!(response.stream_append_count, index + 1);
     }
+    assert_eq!(applied_appends(&runtime, &stream).await, 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1367,7 +1379,6 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let first = runtime.append(first).await.expect("first append");
     assert_eq!(first.start_offset, 0);
     assert_eq!(first.next_offset, 1);
-    assert_eq!(first.stream_append_count, 1);
     assert!(!first.deduplicated());
 
     let mut duplicate = AppendRequest::from_bytes(stream.clone(), b"ignored".to_vec());
@@ -1375,7 +1386,6 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let duplicate = runtime.append(duplicate).await.expect("duplicate append");
     assert_eq!(duplicate.start_offset, 0);
     assert_eq!(duplicate.next_offset, 1);
-    assert_eq!(duplicate.stream_append_count, 1);
     assert!(duplicate.deduplicated());
 
     let mut next = AppendRequest::from_bytes(stream.clone(), b"b".to_vec());
@@ -1383,11 +1393,10 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let next = runtime.append(next).await.expect("next append");
     assert_eq!(next.start_offset, 1);
     assert_eq!(next.next_offset, 2);
-    assert_eq!(next.stream_append_count, 2);
     assert!(!next.deduplicated());
 
     let read = runtime
-        .read_stream(read_req(stream, 0, 16))
+        .read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"ab");
@@ -1396,6 +1405,8 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert_eq!(metrics.accepted_appends, 2);
     assert_eq!(metrics.applied_mutations, 3);
     assert_eq!(metrics.routed_requests, 5);
+    // The repeat counted no append.
+    assert_eq!(applied_appends(&runtime, &stream).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1508,13 +1519,13 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     assert_eq!(read.next_offset, 4);
 
     let appended = target
-        .append(AppendRequest::from_bytes(stream, b"ef".to_vec()))
+        .append(AppendRequest::from_bytes(stream.clone(), b"ef".to_vec()))
         .await
         .expect("append after restore");
     assert_eq!(appended.start_offset, 4);
     assert_eq!(appended.next_offset, 6);
-    assert_eq!(appended.stream_append_count, 3);
     assert_eq!(appended.group_commit_index, snapshot_commit_index + 1);
+    assert_eq!(applied_appends(&target, &stream).await, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4436,7 +4447,6 @@ impl GroupEngine for RecordingEngine {
                 placement,
                 start_offset,
                 next_offset,
-                stream_append_count: self.commit_index,
                 group_commit_index: self.commit_index,
                 closed: request.close_after,
                 producer: None,

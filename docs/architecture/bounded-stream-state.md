@@ -8,7 +8,7 @@ A stream may live forever, receive many tiny records and never advance retention
 
 The principle: nothing a replica holds grows with the number of records, appends, flushes or producers a stream has ever seen. Per stream, replicated state is a small constant plus the unflushed hot window plus bounded producer state. Per node, nothing is keyed by what was ever seen. Retention is never required. It remains a storage-cost tool for applications that want it.
 
-Each mechanism below has a stable label (F0 to F19, D1 to D6, W1 to W6, I1 to I5). Code comments cite these labels, so they do not change when the text around them does.
+Each mechanism below has a stable label (F0 to F20, D1 to D6, W1 to W6, I1 to I5). Code comments cite these labels, so they do not change when the text around them does.
 
 Rationale in one paragraph: long-lived streams of tiny records (agent trajectories, chat and session logs, workflow event logs, telemetry) are the product's history, and their owners do not want to trim. The state machine is in memory on every replica by design and local storage is disposable, so nothing can be paged out. Any per-record or per-flush term in replicated state turns into replica memory, snapshot size, snapshot install time and Raft log amplification that grow with the stream's age.
 
@@ -117,7 +117,7 @@ After removing elements, a vector or deque whose capacity exceeds 2 × len + 64 
 
 ### F9: engine bookkeeping
 
-The per-stream append count lives in `StreamSlot`, so it dies with the stream on delete, TTL expiry or bucket purge. Single-node admission uses the O(1) `check_cold_write_admission` instead of cloning the engine to preview a write.
+The per-stream append count is one of the counters of the stream version's replicated usage (F20), which apply keeps in `StreamSlot`, so it dies with the stream on delete, TTL expiry or bucket purge. Single-node admission uses the O(1) `check_cold_write_admission` instead of cloning the engine to preview a write.
 
 ### F10: flush planner
 
@@ -161,7 +161,7 @@ The cold-index page cache is bounded by pages and by approximate bytes (`DEFAULT
 
 ### F15: tenant tombstones (known exception)
 
-`bucket_usage` keeps one row per bucket ever written in each group, and `erased_buckets` keeps one fence per bucket ever purged in every group. Both grow with tenant churn, not with records, and both are deliberate. They are the one exception to I2. The `bucket_usage_rows` and `erased_buckets` gauges expose them.
+The usage ledger keeps one retired usage row per bucket ever written in each group (F20), and `erased_buckets` keeps one fence per bucket ever purged in every group. Both grow with tenant churn, not with records, and both are deliberate. They are the one exception to I2. The `bucket_usage_rows` and `erased_buckets` gauges expose them.
 
 ### F16: visible snapshots in the cold tier
 
@@ -181,6 +181,10 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 - **Clip on proven writes.** A page write for a range whose bytes state proves (a flush of hot bytes, an F2 replacement, an F5 offload) removes or clips every other entry overlapping the range in the same read-modify-write.
 - **Repair cursor** (`spawn_cold_index_repair_worker`). Every 60 s each led group repairs the pages of up to 16 streams after its cursor. Per page it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, start at or beyond the tail, or whose objects predate the stream's incarnation. The cursor also drives F14d and F14f. Two overlapping page-only external entries with different starts written before F5 cannot be told apart and remain a documented hazard.
 
+### F20: per-stream usage
+
+**Structure** (`ursula-stream/src/state_machine/usage_ledger.rs`). Each stream slot holds its version's usage: the committed counters of the usage contract, its applied appends, the time of its newest counted write, its counters when its current history began, the history its counters began in and its sequence number in the group's usage sequence. Apply counts each write where the bucket counter counted it, by its rule, and the first write after a history event records the version's counters when that history began, as it records the stream's inherited tail (W5). The group holds its genesis history id, its latest sequence number and, per bucket, the retired usage of every removed version and of every version a backup import restored (F15). A bucket's totals are its retired usage plus its live versions, derived on every read, so they equal the per-version sums by construction. An import restores every version at zero counters, counted since the import's history, and retires the backup's bucket totals.
+
 ## 5. Structure, bound and mechanism
 
 | Structure | Scope | Bound | Mechanism |
@@ -193,7 +197,8 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Producer map and epoch floor | replicated | ≤ 4,096 producers, one receipt each | F0, F3 |
 | Cold coverage | replicated | derived, no field | F18 |
 | Cold-GC queue | replicated | bounded while GC is healthy | F14b |
-| `bucket_usage`, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
+| Retired usage rows, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
+| Per-stream usage | replicated | about 96 B per stream, in C0 | F20, F9 |
 | Group snapshot | replicated | encodes the above, cadence by bytes | F12a to F12e |
 | Unpurged Raft log | node | near the log budget, hard limit 2 × budget on every Raft node | F12e, F17 |
 | TTL heap | node | ≤ 2 entries per live TTL stream | F8 |
@@ -201,7 +206,6 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Staged-part group totals | node | one entry per stream with staged parts in a led group | F16 |
 | Staged snapshot parts in S3 | S3 | ≤ 8,192 parts and 2 GiB per stream id, plus a leader change's in-flight parts, for at most the sweep grace | F14h, F16 |
 | Registry slots and keys map | node | O(live streams) | F7 |
-| Per-stream append count | node | dies with the stream | F9 |
 | Flush planner index and cursor | node | O(hot streams) | F10 |
 | Page cache and readers map | node | pages and 32 MiB, max(4 × blocks, minimum) | F13 |
 | Compaction debt | node | ≤ 65,536 pages | F14d |

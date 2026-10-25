@@ -50,9 +50,9 @@ impl StreamStateMachine {
     /// group in stream-id order (each removal enqueues its cold-object
     /// prefixes for the GC worker, so every replica stamps the same cold-GC
     /// sequence numbers), then the bucket, and installs a permanent erasure
-    /// fence. The aggregate usage ledger is retained with zero gauges until
-    /// an external accounting system has had a chance to observe its
-    /// monotonic counters.
+    /// fence. The bucket's usage row stays, its counters retired and its
+    /// gauges at zero, so an external accounting system can still observe
+    /// them (F15).
     /// Purging an absent bucket succeeds with zero removals so a crashed
     /// purge can be re-run to convergence.
     pub(super) fn purge_bucket(&mut self, bucket_id: &str) -> StreamResponse {
@@ -135,6 +135,12 @@ impl StreamStateMachine {
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
         let stream_id = input.stream_id.clone();
+        let usage = self.usage_on_create(
+            &stream_id.bucket_id,
+            initial_len,
+            Self::appended_record_count(input.message_count, initial_len),
+            input.now_ms,
+        );
         let slot = StreamSlot {
             metadata,
             hot_buffer,
@@ -145,7 +151,7 @@ impl StreamStateMachine {
             retired_epoch_watermark: None,
             history: self.history_id(),
             inherited: None,
-            append_count: 0,
+            usage,
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
@@ -157,11 +163,6 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        self.usage_on_stream_created(
-            &stream_id.bucket_id,
-            initial_len,
-            Self::appended_record_count(input.message_count, initial_len),
-        );
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -250,6 +251,12 @@ impl StreamStateMachine {
         // page of this generation can reference it; keep it in state.
         cold.push_direct_external_segment(object.clone());
         let stream_id = input.stream_id.clone();
+        let usage = self.usage_on_create(
+            &stream_id.bucket_id,
+            initial_len,
+            Self::appended_record_count(input.message_count, initial_len),
+            input.now_ms,
+        );
         let slot = StreamSlot {
             metadata,
             hot_buffer: HotBuffer::default(),
@@ -260,7 +267,7 @@ impl StreamStateMachine {
             retired_epoch_watermark: None,
             history: self.history_id(),
             inherited: None,
-            append_count: 0,
+            usage,
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
@@ -272,11 +279,6 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        self.usage_on_stream_created(
-            &stream_id.bucket_id,
-            initial_len,
-            Self::appended_record_count(input.message_count, initial_len),
-        );
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -414,12 +416,7 @@ impl StreamStateMachine {
             .shared_object_paths()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        self.usage_on_stream_removed(
-            &stream_id.bucket_id,
-            slot.metadata
-                .tail_offset
-                .saturating_sub(slot.retained_offset),
-        );
+        self.usage_on_removed(&slot);
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).

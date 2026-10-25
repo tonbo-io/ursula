@@ -1064,7 +1064,6 @@ pub struct AppendResponse {
     pub placement: ShardPlacement,
     pub start_offset: u64,
     pub next_offset: u64,
-    pub stream_append_count: u64,
     pub group_commit_index: u64,
     pub closed: bool,
     /// The producer write's answer when the append carried producer headers.

@@ -130,6 +130,18 @@
 //! - a bucket purge removes its streams in stream-id order
 //!   (`compare_stream_ids`), so every replica numbers the purge's cold-GC
 //!   entries alike.
+//! - per-version usage (bounded-state F20): each live stream version's
+//!   committed counters, applied appends (F9), newest write time, usage
+//!   sequence number, counters when its current history began and the
+//!   history its counters began in, counted at the bucket counter's call
+//!   sites by its rule. Bucket totals derive from each bucket's retired
+//!   usage and its live versions. The group keeps its genesis history id.
+//! - an import gives every restored version zero counters, counted since
+//!   the import's history, and retires the backup's bucket totals. A
+//!   restore refuses a backup with two usage rows of one bucket
+//!   (`StreamSnapshotError::DuplicateBucketUsage`, in the group engine
+//!   error).
+//! - `AppendResponse` without `stream_append_count`.
 //!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert

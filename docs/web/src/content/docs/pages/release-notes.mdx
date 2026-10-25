@@ -5,7 +5,7 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.11.0
 
-**0.11.0 is a breaking release.** It moves the storage and protocol format to format epoch 7. A 0.11 node refuses epoch-6 Raft WAL directories and object-storage prefixes at startup and refuses 0.10 peers, and a 0.10 node refuses 0.11 peers. The backup format stays 5, so `ursulactl restore` of 0.11 restores a 0.10 backup. There is no in-place upgrade, no rolling upgrade and no rollback.
+**0.11.0 is a breaking release.** It counts usage per stream version and moves the storage and protocol format to format epoch 7. A 0.11 node refuses epoch-6 Raft WAL directories and object-storage prefixes at startup and refuses 0.10 peers, and a 0.10 node refuses 0.11 peers. The backup format stays 5, so `ursulactl restore` of 0.11 restores a 0.10 backup. There is no in-place upgrade, no rolling upgrade and no rollback.
 
 - **If you cannot move your data yet, stay on 0.10.1.**
 - **Deploy 0.11 fresh:** empty PVCs and never-used object-storage prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.10, or a failed upgrade attempt, wrote to.
@@ -19,7 +19,11 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 ### Formats
 
 - **Format epoch 7.** The Raft WAL journals and state files, the meta journal, the WAL directory and object-storage markers, group snapshots and the Raft gRPC protocol carry format epoch 7. A node refuses data and peers of another epoch.
-- **Backup format 5.** Unchanged: a backup holds each group's stream snapshot, and a 0.10 backup restores on 0.11.
+- **Backup format 5.** Unchanged: a backup holds each group's stream snapshot with its buckets' counters and no per-stream usage, and a 0.10 backup restores on 0.11. A restore refuses a backup that names one bucket's counters twice, which no release writes.
+
+### Admin API
+
+- **Usage report.** `/__ursula/usage` keeps version 2 and its values. Each stream version counts its committed bytes, records, write units and appends in replicated state, where the bucket counter counted them, and a bucket's counters are its retired usage plus its live stream versions, derived when usage is read. A removed stream's usage retires into its bucket's counters. A restore retires each bucket's counters from the backup and starts every restored stream version at zero.
 
 ### Gateway
 
@@ -43,6 +47,7 @@ See [Upgrading to 0.11](/docs/operations#upgrading-to-011).
 
 - **`ursula_headers::MAX_SNAPSHOT_BYTES`** is new: the 1 GiB snapshot limit a node with a cold store advertises in `Ursula-Max-Snapshot-Bytes`. `ursula_stream::MAX_COLD_SNAPSHOT_BYTES` and its `ursula_runtime` re-export are removed. Use `ursula_headers::MAX_SNAPSHOT_BYTES`.
 - **`ursula_headers::answer_allowance`, `STORE_FLOOR_BYTES_PER_SECOND` and `PartCount::copy_bytes`** are new: the time beyond a base wait a node's answer may take for the bytes it stores or copies first, which the gateway and the VFS both add.
+- **Per-stream usage.** `ursula_stream` gains `CommittedUsage`, `VersionCounters`, `VersionUsage` and `LastWrite`, and `StreamStateMachine` gains `version_usage`, `usage_seq` and `usage_genesis` and loses `stream_append_count` and `add_stream_append_count`. `StreamSnapshotError` gains `DuplicateBucketUsage`. `ursula_runtime::AppendResponse` loses `stream_append_count`: a version's applied appends are counted by apply in its usage.
 - **`ursula_headers::PROTOCOL_LINE`** replaces `PROTOCOL_VERSION`. `ServerIdentity::current` sends it, and `ReleaseLine` shows a line as its releases (`0.11`, or `0.8 to 0.10` for `2`).
 
 ## 0.10.1

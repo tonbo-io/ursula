@@ -1,5 +1,6 @@
-//! Engine bookkeeping (F9): per-stream append counts die with the stream on
-//! every removal path, and the admission preview does not copy group state.
+//! Engine bookkeeping (F9): per-stream append counts, which apply keeps in
+//! each version's usage, die with the stream on every removal path, and the
+//! admission preview does not copy group state.
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -35,13 +36,17 @@ fn create(
         .expect("create stream");
 }
 
+/// Appends one byte and answers the version's applied appends (F9).
 fn append(engine: &mut InMemoryGroupEngine, stream_id: &BucketStreamId, now_ms: u64) -> u64 {
     let mut request = AppendRequest::from_bytes(stream_id.clone(), b"x".to_vec());
     request.now_ms = now_ms;
     engine
         .append_with_admission_inner(request, placement(), ColdWriteAdmission::default())
-        .expect("append")
-        .stream_append_count
+        .expect("append");
+    engine
+        .state_machine
+        .version_usage(stream_id)
+        .map_or(0, |usage| usage.counters.appends)
 }
 
 #[test]

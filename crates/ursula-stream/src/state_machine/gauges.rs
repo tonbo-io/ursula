@@ -79,7 +79,7 @@ impl StreamStateMachine {
             ttl_heap_entries: as_u64(self.registry.ttl_heap_len()),
             hot_payload_bytes: self.hot_payload_bytes,
             pending_cold_gc: as_u64(self.cold_gc.len()),
-            bucket_usage_rows: as_u64(self.bucket_usage.len()),
+            bucket_usage_rows: as_u64(self.bucket_usage_rows()),
             erased_buckets: as_u64(self.erased_buckets.len()),
             ..GroupStateGauges::default()
         };

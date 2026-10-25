@@ -22,6 +22,7 @@ use super::StreamSnapshotEntry;
 use super::StreamSnapshotError;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
+use super::usage_ledger::UsageLedger;
 
 impl StreamStateMachine {
     pub fn snapshot(&self) -> StreamSnapshot {
@@ -129,7 +130,10 @@ impl StreamStateMachine {
         // rewrites with no write between them report the token from before
         // both, as any other pair of events does (#581 section 4.8,
         // extensions section 2.4).
-        match Self::restore(snapshot) {
+        // Every restored version counts from zero in the new history, so it
+        // takes a new key: a backup holds its bucket totals, which retire,
+        // and no per-version usage (F20).
+        match Self::restore_counted_since(snapshot, Some(history)) {
             Ok(mut restored) => {
                 // C7: the counter never goes backwards, so a later create
                 // never reuses an incarnation this group already assigned.
@@ -149,6 +153,7 @@ impl StreamStateMachine {
                     },
                     imported: Some(backup_digest),
                 });
+                restored.usage.keep_genesis(&self.usage);
                 *self = restored;
                 StreamResponse::SnapshotImported {
                     buckets,
@@ -171,13 +176,30 @@ impl StreamStateMachine {
         self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
     }
 
+    /// A backup's state (`ImportSnapshot`, `ursulactl backup-verify`, the
+    /// cold check, and group snapshot installs): every bucket total
+    /// retired, and every version at zero counters and history baseline
+    /// with [`LastWrite::Imported`](crate::usage::LastWrite::Imported),
+    /// counted since the backup's own history and stamped `1..=n` in
+    /// `compare_stream_ids` order (F20).
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
+        Self::restore_counted_since(snapshot, None)
+    }
+
+    /// [`Self::restore`], every version counted since `counted_since`, or
+    /// the backup's own history when `None`.
+    fn restore_counted_since(
+        snapshot: StreamSnapshot,
+        counted_since: Option<NonZeroU64>,
+    ) -> Result<Self, StreamSnapshotError> {
         StreamSnapshot::check_format(Some(snapshot.format_version))?;
         let mut machine = Self {
             last_created_at_ms: snapshot.last_created_at_ms,
             history: snapshot.history,
+            usage: UsageLedger::retiring(snapshot.bucket_usage)?,
             ..Self::default()
         };
+        let counted_since = counted_since.unwrap_or_else(|| machine.counting_history());
         for bucket_id in &snapshot.buckets {
             if !machine.buckets.insert(bucket_id.clone()) {
                 return Err(StreamSnapshotError::DuplicateBucket(bucket_id.clone()));
@@ -194,7 +216,12 @@ impl StreamStateMachine {
             }
         }
 
-        for entry in snapshot.streams {
+        // Seqs follow the stream-id order, whatever the order of the entries.
+        let mut entries = snapshot.streams;
+        entries.sort_by(|left, right| {
+            compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
+        });
+        for entry in entries {
             let stream_id = entry.metadata.stream_id.clone();
             if !machine.buckets.contains(&stream_id.bucket_id) {
                 return Err(StreamSnapshotError::MissingBucket(stream_id));
@@ -241,6 +268,9 @@ impl StreamStateMachine {
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
             let hot_buffer = HotBuffer::from_snapshot(entry.payload, &entry.hot_segments);
+            let usage = machine
+                .usage
+                .restored_version(&stream_id.bucket_id, counted_since);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 hot_buffer,
@@ -255,7 +285,7 @@ impl StreamStateMachine {
                 retired_epoch_watermark: entry.retired_epoch_watermark,
                 history: entry.history,
                 inherited: entry.inherited,
-                append_count: 0,
+                usage,
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
@@ -278,30 +308,8 @@ impl StreamStateMachine {
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
         machine.normalize_last_created_at_ms();
-
-        // Usage restore: gauges are recomputed from the restored slots so a
-        // snapshot can never carry gauge drift forward; only the monotonic
-        // counters are taken from the snapshot.
-        let mut recomputed: HashMap<String, super::BucketUsage> = HashMap::new();
-        for slot in machine.registry.slots() {
-            let usage = recomputed
-                .entry(slot.metadata.stream_id.bucket_id.clone())
-                .or_default();
-            usage.stream_count = usage.stream_count.saturating_add(1);
-            usage.retained_bytes = usage.retained_bytes.saturating_add(
-                slot.metadata
-                    .tail_offset
-                    .saturating_sub(slot.retained_offset),
-            );
-        }
-        for persisted in snapshot.bucket_usage {
-            let usage = recomputed.entry(persisted.bucket_id).or_default();
-            usage.committed_append_bytes = persisted.usage.committed_append_bytes;
-            usage.committed_records = persisted.usage.committed_records;
-            usage.committed_write_units = persisted.usage.committed_write_units;
-        }
-        machine.bucket_usage = recomputed;
-
+        // The gauges of the bucket totals derive from the restored slots, so
+        // a snapshot never carries gauge drift forward.
         Ok(machine)
     }
 }

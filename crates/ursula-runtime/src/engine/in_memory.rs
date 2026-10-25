@@ -430,14 +430,11 @@ impl InMemoryGroupEngine {
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
-                    self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
-                let stream_append_count = self.state_machine.stream_append_count(&stream_id);
                 Ok(GroupWriteResponse::Append(AppendResponse {
                     placement,
                     start_offset: offset,
                     next_offset,
-                    stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
                     producer,

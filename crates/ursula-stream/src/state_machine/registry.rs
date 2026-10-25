@@ -267,6 +267,9 @@ mod tests {
     use crate::model::StreamStatus;
     use crate::state_machine::HotBuffer;
     use crate::state_machine::StreamColdState;
+    use crate::usage::LastWrite;
+    use crate::usage::VersionCounters;
+    use crate::usage::VersionUsage;
 
     fn slot(
         name: &str,
@@ -294,7 +297,13 @@ mod tests {
             retired_epoch_watermark: None,
             history: 0,
             inherited: None,
-            append_count: 0,
+            usage: VersionUsage {
+                seq: 1,
+                counters: VersionCounters::default(),
+                history_baseline: VersionCounters::default(),
+                last_write: LastWrite::At(now),
+                counted_since: std::num::NonZeroU64::MIN,
+            },
         }
     }
 

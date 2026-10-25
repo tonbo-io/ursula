@@ -612,6 +612,9 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
         StreamSnapshotError::ColdGcWithoutGeneration { .. } => {
             StreamSnapshotError::ColdGcWithoutGeneration { seq: 6 }
         },
+        StreamSnapshotError::DuplicateBucketUsage(_) => {
+            StreamSnapshotError::DuplicateBucketUsage("bucket".to_owned())
+        },
     });
     let key = || "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap".to_owned();
     let mut errors = every!(GroupSnapshotError {
