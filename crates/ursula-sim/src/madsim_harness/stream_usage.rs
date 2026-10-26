@@ -3,8 +3,8 @@
 //! with the production snapshot driver and real OpenRaft
 //! ([`JournalCluster`] with [`DriverPlan`]). The accepted loss runs without
 //! the driver and with segments larger than its writes, so only the
-//! script's own write-backs make durable what the nodes that lose power
-//! wrote before the power cut.
+//! script's own write-backs make durable the journal entries the nodes
+//! that lose power wrote before the power cut.
 //!
 //! Scenario `stream-usage-bills-exactly`: writers create streams in two
 //! buckets of both groups, write them with producer keys, so every
@@ -1609,7 +1609,8 @@ impl Run {
         // without a cut. Otherwise they lose the whole window, and the plan
         // cuts to the committed markers. The drawn appends are lost either
         // way.
-        if self.draw(2) == 0 {
+        let written_back = self.draw(2) == 0;
+        if written_back {
             for node_id in &others {
                 self.cluster.wals[node_id].write_back();
             }
@@ -1642,22 +1643,40 @@ impl Run {
         self.fault("quorum_lost_power");
         // The groups stall until the operator plans.
         madsim::time::sleep(RECOVERY_STALL_AFTER.saturating_mul(2)).await;
-        let mut points = Vec::new();
+        let mut plans = Vec::new();
         for group in JOURNAL_GROUPS {
             if leader_by_state(&self.cluster, group).is_some() {
                 continue;
             }
             let plan = recover_group(&mut self.cluster, group, &NODES, &self.context).await;
-            points.push((group, plan.point));
+            plans.push((group, plan.point, plan.cut));
         }
-        if points.is_empty() {
+        if plans.is_empty() {
             panic!("{}: no group stalled after the power loss", self.context);
         }
-        for (group, point) in &points {
+        for (group, point, _) in &plans {
             wait_leader(&self.cluster, *group, &self.context).await;
             wait_plan_satisfied(&self.cluster, *group, &NODES, *point, &self.context).await;
         }
         self.fault("loss_accepted");
+        // A written-back window ends the others' logs in the window's term,
+        // which their durable votes reach, so the plan keeps the longest log.
+        // A lost window leaves their logs below that vote floor, so it cuts.
+        for (group, _, cut) in &plans {
+            if *cut == written_back {
+                let context = self.context.clone();
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "loss_accepted",
+                    format!(
+                        "{context}: group {group}: the plan's cut is {cut} after a window \
+                         {}written back",
+                        if written_back { "" } else { "not " }
+                    ),
+                );
+            }
+        }
         self.lost = self.lost_write_units().await;
         if self.lost == 0 {
             let context = self.context.clone();
@@ -1676,6 +1695,18 @@ impl Run {
             if self.versions[&stream.stream_id].created_in_window
                 && !self.stream_exists(&stream).await
             {
+                if written_back {
+                    let context = self.context.clone();
+                    fail(
+                        &mut self.trace,
+                        ACCOUNTING_INVARIANT,
+                        "loss_accepted",
+                        format!(
+                            "{context}: {stream:?}, created in a window written back, is gone \
+                             after the plan"
+                        ),
+                    );
+                }
                 if let Some(version) = self.versions.get_mut(&stream.stream_id) {
                     version.writable = false;
                 }
