@@ -29,6 +29,7 @@ use ursula_proto::admin::RelistReason;
 use ursula_proto::admin::StreamUsageEnd;
 use ursula_proto::admin::StreamUsageEntry;
 use ursula_proto::admin::UsageCursor;
+use ursula_proto::admin::UsageLogId;
 use ursula_proto::admin::UsageNext;
 use ursula_proto::admin::UsagePage;
 use ursula_proto::admin::UsagePosition;
@@ -263,6 +264,11 @@ impl MeteredGroup {
             && self.kept.as_ref().is_some_and(|page| {
                 page.history.id == index.history && page.applied.index >= index.commit_index
             })
+    }
+
+    /// The log position of the kept page, `None` before the first.
+    pub(super) fn kept_applied(&self) -> Option<UsageLogId> {
+        self.kept.as_ref().map(|page| page.applied)
     }
 
     /// The live versions held of `bucket_id`.

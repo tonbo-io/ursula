@@ -1495,15 +1495,17 @@ impl Run {
             );
         }
         for index in &indexes {
-            let live = self.meter.group(index.raft_group_id).live_of(PURGED);
+            let meter = self.meter.group(index.raft_group_id);
+            let live = meter.live_of(PURGED);
             if !live.is_empty() {
+                let kept = meter.kept_applied();
                 fail(
                     &mut self.trace,
                     ACCOUNTING_INVARIANT,
                     "bucket_purged",
                     format!(
                         "{context}: group {}: the consumer holds {live:?} live once the purge \
-                         completed",
+                         completed (purge {index:?}, kept page applied at {kept:?})",
                         index.raft_group_id
                     ),
                 );
