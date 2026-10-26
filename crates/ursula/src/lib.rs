@@ -2217,7 +2217,7 @@ pub(crate) async fn purge_bucket(
             .iter()
             .map(|purge| ursula_proto::admin::GroupPurgeIndex {
                 raft_group_id: purge.raft_group_id.0,
-                commit_index: purge.commit_index,
+                commit_index: purge.entry_index,
                 history: ursula_proto::admin::HistoryId::new(purge.history),
             })
             .collect(),

@@ -1,6 +1,7 @@
 //! Engine bookkeeping (F9): per-stream append counts, which apply keeps in
 //! each version's usage, die with the stream on every removal path, and the
-//! admission preview does not copy group state.
+//! admission preview does not copy group state. A bucket purge answers with
+//! its own log index, not the engine's count of applied writes.
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -9,10 +10,12 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 
+use super::GroupWriteResponse;
 use super::in_memory::InMemoryGroupEngine;
 use crate::request::AppendRequest;
 use crate::request::ColdWriteAdmission;
 use crate::request::CreateStreamRequest;
+use crate::request::PurgeBucketResponse;
 
 fn placement() -> ShardPlacement {
     ShardPlacement {
@@ -102,4 +105,39 @@ fn purge_bucket_drops_append_counts() {
     assert!(usage.streams.is_empty());
     assert_eq!(usage.ends.len(), 8);
     assert!(usage.ends.iter().all(|record| record.counters.appends == 1));
+}
+
+#[test]
+fn purge_bucket_answers_its_log_index() {
+    let mut engine = InMemoryGroupEngine::started();
+    let mut request = CreateStreamRequest::new(
+        BucketStreamId::new("purged", "s0"),
+        "application/octet-stream",
+    );
+    request.now_ms = 1;
+    // The indexes skipped stand for blank and membership entries, which never
+    // reach the engine.
+    engine
+        .apply_committed_entry(StreamCommand::from(request), 4, placement())
+        .expect("create stream");
+    let purged = engine
+        .apply_committed_entry(
+            StreamCommand::PurgeBucket {
+                bucket_id: "purged".to_owned(),
+                now_ms: 2,
+            },
+            6,
+            placement(),
+        )
+        .expect("purge bucket");
+    // Rule 12 compares the answer with the export's `applied.index`, a log
+    // index, not with the count of applied writes.
+    assert!(matches!(
+        purged,
+        GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
+            removed_streams: 1,
+            entry_index: 6,
+            ..
+        })
+    ));
 }

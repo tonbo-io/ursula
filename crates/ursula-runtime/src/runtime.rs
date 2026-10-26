@@ -314,7 +314,7 @@ impl PurgeBucketReport {
             .saturating_add(response.pending_cold_gc_entries);
         let purged = GroupPurge {
             raft_group_id: group,
-            commit_index: response.group_commit_index,
+            entry_index: response.entry_index,
             history: response.history,
         };
         match self
@@ -323,7 +323,7 @@ impl PurgeBucketReport {
         {
             Ok(at) => {
                 if let Some(seen) = self.purges.get_mut(at)
-                    && purged.commit_index > seen.commit_index
+                    && purged.entry_index > seen.entry_index
                 {
                     *seen = purged;
                 }
@@ -339,7 +339,7 @@ impl PurgeBucketReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupPurge {
     pub raft_group_id: RaftGroupId,
-    pub commit_index: u64,
+    pub entry_index: u64,
     pub history: std::num::NonZeroU64,
 }
 

@@ -823,7 +823,10 @@ pub struct PurgeBucketResponse {
     pub removed_streams: u64,
     /// Cold-GC entries this group still holds for the bucket.
     pub pending_cold_gc_entries: u64,
-    pub group_commit_index: u64,
+    /// The index of the log entry that purged the bucket in this group: a
+    /// replica's `applied.index` in the usage export is at or above it once
+    /// the replica applied the purge (rule 12).
+    pub entry_index: u64,
     /// The group's history the purge applied in.
     pub history: std::num::NonZeroU64,
 }

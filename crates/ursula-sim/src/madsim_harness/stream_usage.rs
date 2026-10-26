@@ -1,7 +1,10 @@
 //! Per-stream usage under faults (bounded-state F20, the export's consumer
 //! contract in operations, "Per-stream usage"), on journal-backed replicas
 //! with the production snapshot driver and real OpenRaft
-//! ([`JournalCluster`] with [`DriverPlan`]).
+//! ([`JournalCluster`] with [`DriverPlan`]). The accepted loss runs without
+//! the driver and with segments larger than its writes, so only the
+//! script's own write-backs make durable the journal entries the nodes
+//! that lose power wrote before the power cut.
 //!
 //! Scenario `stream-usage-bills-exactly`: writers create streams in two
 //! buckets of both groups, write them with producer keys, so every
@@ -212,9 +215,9 @@ impl Controls {
 struct Switched;
 
 impl Switched {
-    fn apply(controls: Controls) -> Self {
+    fn apply(controls: Controls, script: Script) -> Self {
         set_defences(controls);
-        set_snapshot_drivers(Some(DRIVERS));
+        set_snapshot_drivers(script.drivers());
         ursula_stream::sim_controls::reset_fired();
         Self
     }
@@ -260,7 +263,9 @@ pub(super) enum Script {
     /// pages after the first go to it first.
     Lagging,
     /// Streams that expire and the leaders' sweeps remove, then a purge of
-    /// their bucket, complete for the consumer by rule 12.
+    /// their bucket, complete for the consumer by rule 12. Each group keeps
+    /// a stream of the purged bucket the writers write and never delete, so
+    /// each group's purge removes one.
     PurgeAndExpiry,
     /// No read for longer than the retention after a version was written
     /// and deleted, and one created, written and deleted unread, so their
@@ -268,7 +273,14 @@ pub(super) enum Script {
     SkipPastRetention,
     /// Under `fsync = never`, the leader cut off, the others take writes
     /// the consumer reads and lose them in a power cut, and a recovery
-    /// plan accepts the loss: a new history.
+    /// plan accepts the loss: a new history. It runs without the snapshot
+    /// driver and with segments no run fills, so no snapshot, rotation or
+    /// reclaim syncs the window before the power cut. On alternate
+    /// accepted-loss seeds ([`window_written_back`]) the others write back
+    /// the window's creates and first appends before its last appends, so
+    /// the plan keeps their longest log without a cut and versions created
+    /// in the window live on into the new history. On the others they lose
+    /// the whole window, and the plan cuts.
     AcceptedLoss,
     /// Both groups backed up, every node wiped, and the backups imported
     /// into the new groups, whose genesis the consumer's cursors do not
@@ -307,12 +319,36 @@ impl Script {
         }
     }
 
-    fn fsync(self) -> WalFsync {
+    /// The journals of its nodes. An accepted loss's segments are larger
+    /// than anything a run writes, so no rotation, and no reclaim, syncs
+    /// the window under `fsync = never`.
+    fn tuning(self) -> JournalTuning {
         match self {
-            Self::AcceptedLoss => WalFsync::Never,
-            _ => WalFsync::Always,
+            Self::AcceptedLoss => JournalTuning {
+                segment_bytes: 64 * 1024 * 1024,
+                ..JournalTuning::new(WalFsync::Never)
+            },
+            _ => JournalTuning::new(WalFsync::Always),
         }
     }
+
+    /// The snapshot drivers its nodes run. An accepted loss runs none: each
+    /// build or install syncs the journal before it publishes, which would
+    /// make the window durable before the power cut. OpenRaft's own policy
+    /// then builds no snapshot within a run.
+    fn drivers(self) -> Option<DriverPlan> {
+        match self {
+            Self::AcceptedLoss => None,
+            _ => Some(DRIVERS),
+        }
+    }
+}
+
+/// Whether the accepted loss of `seed` writes its window's creates and
+/// first appends back before the power cut. Accepted-loss seeds are eight
+/// apart, so they alternate, and any two consecutive ones reach both halves.
+fn window_written_back(seed: u64) -> bool {
+    seed / 8 % 2 == 0
 }
 
 /// One stream version the writers made, as the oracle counts it.
@@ -340,6 +376,8 @@ struct Version {
     ended_unread: bool,
     /// Its writers wrote it in more than one history.
     written_across_history: bool,
+    /// A purge removes it: the writers write it but never delete it.
+    purge_target: bool,
 }
 
 /// What a create without a body commits: one write unit.
@@ -445,12 +483,15 @@ struct Run {
     observations: BTreeMap<u32, Vec<Observation>>,
     /// Replica reads a checkpoint judged.
     judged: u64,
+    /// The write units the accepted loss lost, counted right after its
+    /// plan, before a later delete of a window stream counts as loss.
+    lost: u64,
 }
 
 impl Run {
     async fn start(config: &ThreeNodeRaftSimConfig, controls: Controls) -> Self {
         let script = Script::of(config.seed);
-        let tuning = JournalTuning::new(script.fsync());
+        let tuning = script.tuning();
         let mut trace = SimTrace::default();
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let cluster =
@@ -479,6 +520,7 @@ impl Run {
             next_tidy: now,
             observations: BTreeMap::new(),
             judged: 0,
+            lost: 0,
         }
     }
 
@@ -618,6 +660,7 @@ impl Run {
             created_in_window: self.window,
             ended_unread: false,
             written_across_history: false,
+            purge_target: false,
         });
         stream
     }
@@ -730,12 +773,27 @@ impl Run {
 
     fn draw_writable(&mut self) -> Option<BucketStreamId> {
         let writable = self.writable();
-        let count = u64::try_from(writable.len()).expect("a count");
+        self.draw_of(writable)
+    }
+
+    /// A writable stream the writers may delete: any but a purge's targets.
+    fn draw_deletable(&mut self) -> Option<BucketStreamId> {
+        let deletable = self
+            .versions
+            .values()
+            .filter(|version| version.writable && !version.purge_target)
+            .map(|version| version.stream.clone())
+            .collect();
+        self.draw_of(deletable)
+    }
+
+    fn draw_of(&mut self, streams: Vec<BucketStreamId>) -> Option<BucketStreamId> {
+        let count = u64::try_from(streams.len()).expect("a count");
         if count == 0 {
             return None;
         }
         let index = usize::try_from(self.draw(count)).expect("an index");
-        writable.into_iter().nth(index)
+        streams.into_iter().nth(index)
     }
 
     fn draw_bucket(&mut self) -> &'static str {
@@ -774,7 +832,7 @@ impl Run {
         }
         if self.draw(4) == 0
             && self.writable().len() > 2
-            && let Some(stream) = self.draw_writable()
+            && let Some(stream) = self.draw_deletable()
         {
             self.delete(&stream).await;
         }
@@ -1327,11 +1385,15 @@ impl Run {
 
     async fn purge_and_expiry(&mut self) {
         // Streams that expire, written at once, and a stream of the same
-        // bucket that does not, in each group.
+        // bucket that does not, in each group. The writers never delete the
+        // kept one, so it is live when the purge runs.
         for group in JOURNAL_GROUPS {
             let expiring = self.create(group, PURGED, true).await;
             self.append(&expiring).await;
             let kept = self.create(group, PURGED, false).await;
+            if let Some(version) = self.versions.get_mut(&kept.stream_id) {
+                version.purge_target = true;
+            }
             self.append(&kept).await;
         }
         self.poll_round().await;
@@ -1345,32 +1407,42 @@ impl Run {
             self.pause(Duration::from_millis(500)).await;
         }
         self.poll_until_complete(false, "streams_expired").await;
-        let expired = self
-            .meter
-            .groups
-            .values()
-            .flat_map(|group| group.ends.values())
-            .filter(|end| **end == StreamUsageEnd::Expired)
-            .count();
-        if expired == 0 {
-            let context = self.context.clone();
-            fail(
-                &mut self.trace,
-                ACCOUNTING_INVARIANT,
-                "streams_expired",
-                format!("{context}: the consumer listed no expired version"),
-            );
+        // Each group's leader swept its own expiring stream, which no
+        // writer deletes, and the consumer listed it expired.
+        for group in JOURNAL_GROUPS {
+            let expired = self
+                .meter
+                .group(group)
+                .ends
+                .values()
+                .filter(|end| **end == StreamUsageEnd::Expired)
+                .count();
+            if expired == 0 {
+                let context = self.context.clone();
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "streams_expired",
+                    format!("{context}: group {group}: the consumer listed no expired version"),
+                );
+            }
         }
         // The purge, stamped once for every group.
         let now_ms = self.wall_ms();
         let mut indexes = Vec::new();
-        let mut removed = 0_u64;
+        let mut removed = BTreeMap::new();
         for group in JOURNAL_GROUPS {
             let deadline = madsim::time::Instant::now() + WRITE_WAIT;
+            // Whether a purge sent before the answered one failed with an
+            // outcome unknown (a lost answer or a `503`): it may have
+            // removed the streams, so the answer counts none of them. A
+            // refusal that applied nothing excuses no undercount.
+            let mut interrupted = false;
             let response = loop {
                 if let Some(leader) = self.leader(group)
                     && let Some(engine) = self.cluster.engines.get_mut(&(group, leader))
-                    && let Ok(response) = engine
+                {
+                    match engine
                         .purge_bucket(
                             PurgeBucketRequest {
                                 bucket_id: PURGED.to_owned(),
@@ -1379,15 +1451,17 @@ impl Run {
                             group_placement(group),
                         )
                         .await
-                {
-                    break response;
+                    {
+                        Ok(response) => break response,
+                        Err(error) => interrupted |= !error.applied_nothing(),
+                    }
                 }
                 self.retry(deadline, "the purge").await;
             };
-            removed = removed.saturating_add(response.removed_streams);
+            removed.insert(group, (response.removed_streams, interrupted));
             indexes.push(GroupPurgeIndex {
                 raft_group_id: group,
-                commit_index: response.group_commit_index,
+                commit_index: response.entry_index,
                 history: HistoryId::new(response.history),
             });
         }
@@ -1421,34 +1495,46 @@ impl Run {
             );
         }
         for index in &indexes {
-            let live = self.meter.group(index.raft_group_id).live_of(PURGED);
+            let meter = self.meter.group(index.raft_group_id);
+            let live = meter.live_of(PURGED);
             if !live.is_empty() {
+                let kept = meter.kept_applied();
                 fail(
                     &mut self.trace,
                     ACCOUNTING_INVARIANT,
                     "bucket_purged",
                     format!(
                         "{context}: group {}: the consumer holds {live:?} live once the purge \
-                         completed",
+                         completed (purge {index:?}, kept page applied at {kept:?})",
                         index.raft_group_id
                     ),
                 );
             }
         }
-        let purged = self
-            .meter
-            .groups
-            .values()
-            .flat_map(|group| group.ends.values())
-            .filter(|end| **end == StreamUsageEnd::Purged)
-            .count();
-        if removed == 0 || purged == 0 {
-            fail(
-                &mut self.trace,
-                ACCOUNTING_INVARIANT,
-                "bucket_purged",
-                format!("{context}: the purge removed {removed} streams, {purged} listed purged"),
-            );
+        // Each group's purge removed its kept stream, and the consumer
+        // listed it purged. `removed_streams` counts only what the answered
+        // request removed, so after a try whose outcome is unknown only the
+        // listing shows the removal.
+        for group in JOURNAL_GROUPS {
+            let (removed, interrupted) = removed.get(&group).copied().unwrap_or_default();
+            let purged = self
+                .meter
+                .group(group)
+                .ends
+                .values()
+                .filter(|end| **end == StreamUsageEnd::Purged)
+                .count();
+            if (removed == 0 && !interrupted) || purged == 0 {
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "bucket_purged",
+                    format!(
+                        "{context}: group {group}: the purge removed {removed} streams, \
+                         {purged} listed purged"
+                    ),
+                );
+            }
         }
         for _ in 0..3 {
             self.round().await;
@@ -1516,12 +1602,38 @@ impl Run {
                 madsim::time::sleep(STEP).await;
             }
         }
+        let others: Vec<u64> = NODES
+            .into_iter()
+            .filter(|node_id| *node_id != cut)
+            .collect();
         // The window: writes the others acknowledge and the consumer reads.
         self.window = true;
         for group in JOURNAL_GROUPS {
             let stream = self.create(group, BUCKETS[0], false).await;
             self.append(&stream).await;
             self.append(&stream).await;
+        }
+        // On alternate accepted-loss seeds the others write the window's
+        // creates and first appends back, so those survive the power cut,
+        // their logs end in the window's term, and the plan keeps the
+        // longest log without a cut. Otherwise they lose the whole window,
+        // and the plan cuts to the committed markers. The drawn appends are
+        // lost either way.
+        let written_back = window_written_back(self.seed);
+        // The others' vote terms at the write-back, which the plan's floor
+        // must still be for the window's term to reach it.
+        let mut window_terms = BTreeMap::new();
+        if written_back {
+            for node_id in &others {
+                self.cluster.wals[node_id].write_back();
+                for group in JOURNAL_GROUPS {
+                    window_terms.insert(
+                        (group, *node_id),
+                        metrics(&self.cluster, group, *node_id).current_term,
+                    );
+                }
+            }
+            self.fault("window_prefix_written_back");
         }
         for _ in 0..3 {
             if let Some(stream) = self.draw_writable() {
@@ -1532,12 +1644,22 @@ impl Run {
         // The consumer reads the window from the others, which applied it.
         self.poll_until_complete_via(false, "window_read", Route::Avoid(cut))
             .await;
-        // The others lose power and every page written since the window
-        // began.
-        let others: Vec<u64> = NODES
-            .into_iter()
-            .filter(|node_id| *node_id != cut)
-            .collect();
+        // An election among the others after the write-back raises their
+        // vote floor above the window's term, and the plan then rightly
+        // cuts: the script did not set up its case.
+        for ((group, node_id), term) in &window_terms {
+            let now = metrics(&self.cluster, *group, *node_id).current_term;
+            if now != *term {
+                panic!(
+                    "{}: group {group}: node {node_id}'s term went from {term} to {now} after \
+                     the write-back: the window's term is no longer the others' vote term",
+                    self.context
+                );
+            }
+        }
+        // The others lose power and every page written since the last
+        // write-back: no snapshot driver runs and no segment fills, so
+        // nothing synced their journals since.
         for node_id in &others {
             self.stop(*node_id).await;
         }
@@ -1553,23 +1675,42 @@ impl Run {
         self.fault("quorum_lost_power");
         // The groups stall until the operator plans.
         madsim::time::sleep(RECOVERY_STALL_AFTER.saturating_mul(2)).await;
-        let mut points = Vec::new();
+        let mut plans = Vec::new();
         for group in JOURNAL_GROUPS {
             if leader_by_state(&self.cluster, group).is_some() {
                 continue;
             }
             let plan = recover_group(&mut self.cluster, group, &NODES, &self.context).await;
-            points.push((group, plan.point));
+            plans.push((group, plan.point, plan.cut));
         }
-        if points.is_empty() {
+        if plans.is_empty() {
             panic!("{}: no group stalled after the power loss", self.context);
         }
-        for (group, point) in &points {
+        for (group, point, _) in &plans {
             wait_leader(&self.cluster, *group, &self.context).await;
             wait_plan_satisfied(&self.cluster, *group, &NODES, *point, &self.context).await;
         }
         self.fault("loss_accepted");
-        if self.lost_write_units().await == 0 {
+        // A written-back window ends the others' logs in the window's term,
+        // which their durable votes reach, so the plan keeps the longest log.
+        // A lost window leaves their logs below that vote floor, so it cuts.
+        for (group, _, cut) in &plans {
+            if *cut == written_back {
+                let context = self.context.clone();
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "loss_accepted",
+                    format!(
+                        "{context}: group {group}: the plan's cut is {cut} after a window \
+                         {}written back",
+                        if written_back { "" } else { "not " }
+                    ),
+                );
+            }
+        }
+        self.lost = self.lost_write_units().await;
+        if self.lost == 0 {
             let context = self.context.clone();
             fail(
                 &mut self.trace,
@@ -1586,6 +1727,18 @@ impl Run {
             if self.versions[&stream.stream_id].created_in_window
                 && !self.stream_exists(&stream).await
             {
+                if written_back {
+                    let context = self.context.clone();
+                    fail(
+                        &mut self.trace,
+                        ACCOUNTING_INVARIANT,
+                        "loss_accepted",
+                        format!(
+                            "{context}: {stream:?}, created in a window written back, is gone \
+                             after the plan"
+                        ),
+                    );
+                }
                 if let Some(version) = self.versions.get_mut(&stream.stream_id) {
                     version.writable = false;
                 }
@@ -1790,7 +1943,6 @@ impl Run {
             );
         }
         self.judge_accounting();
-        let lost = self.lost_write_units().await;
         let meter = &self.meter;
         let event = SimEvent::StreamUsageBilled {
             script: self.script.name().to_owned(),
@@ -1802,7 +1954,7 @@ impl Run {
             history_changes: meter.history_changes(),
             folds: meter.folds(),
             replicas_judged: self.judged,
-            lost_write_units: lost,
+            lost_write_units: self.lost,
         };
         self.trace.push(event);
         ThreeNodeRaftSimOutcome {
@@ -1946,7 +2098,7 @@ impl Run {
     }
 
     /// The write units an accepted loss's window acknowledged that the
-    /// final lineage does not hold, for the trace.
+    /// lineage the plan kept does not hold.
     async fn lost_write_units(&mut self) -> u64 {
         let mut lost = 0_u64;
         let windowed: Vec<BucketStreamId> = self
@@ -2144,7 +2296,7 @@ pub(super) async fn run_stream_usage_inner(
     config: ThreeNodeRaftSimConfig,
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
-    let _switched = Switched::apply(controls);
+    let _switched = Switched::apply(controls, Script::of(config.seed));
     let mut run = Run::start(&config, controls).await;
     // The baseline: a `start` listing of every group's newest state before
     // the first write, so every unit the writers commit is accounted after
@@ -2182,6 +2334,7 @@ mod tests {
     use super::SCRIPTS;
     use super::Script;
     use super::TOTALS_INVARIANT;
+    use super::window_written_back;
     use crate::madsim_harness::STREAM_USAGE_EXTENDED_SEEDS;
     use crate::madsim_harness::STREAM_USAGE_SEEDS;
     use crate::madsim_harness::SimEvent;
@@ -2221,7 +2374,9 @@ mod tests {
     }
 
     /// The family's default range runs every script once, and its
-    /// extended range four times.
+    /// extended range four times. The accepted loss's window is written
+    /// back on the default range's seed and on alternate extended seeds,
+    /// so the nightly reaches both halves.
     #[test]
     fn stream_usage_seeds_cover_every_script() {
         for script in SCRIPTS {
@@ -2231,6 +2386,16 @@ mod tests {
             assert_eq!(runs(STREAM_USAGE_SEEDS), 1, "{script:?}");
             assert_eq!(runs(STREAM_USAGE_EXTENDED_SEEDS), 4, "{script:?}");
         }
+        let halves = |seeds: std::ops::RangeInclusive<u64>| {
+            seeds
+                .filter(|seed| Script::of(*seed) == Script::AcceptedLoss)
+                .map(window_written_back)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(halves(STREAM_USAGE_SEEDS), [true]);
+        assert_eq!(halves(STREAM_USAGE_EXTENDED_SEEDS), [
+            false, true, false, true
+        ]);
     }
 
     /// Every script bills exactly, the same way twice per seed, and each
@@ -2260,6 +2425,13 @@ mod tests {
                 Script::SkipPastRetention => assert!(*relists_retired > 0, "seed {seed}"),
                 Script::AcceptedLoss => {
                     assert!(*history_changes > 0 && *lost_write_units > 0, "seed {seed}");
+                    let wrote_back = first.outcome.trace.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            SimEvent::FaultApplied { phase } if phase == "window_prefix_written_back"
+                        )
+                    });
+                    assert_eq!(wrote_back, window_written_back(seed), "seed {seed}");
                 }
                 Script::Restore => assert!(*history_changes > 0, "seed {seed}"),
                 _ => {}
