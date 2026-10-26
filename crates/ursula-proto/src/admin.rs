@@ -480,12 +480,14 @@ mod tests {
             buckets: 1,
             streams: 3,
             group_commit_index: 9,
-            history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).unwrap(),
+            history: super::HistoryId::new(
+                std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).unwrap(),
+            ),
             already: false,
         };
         assert_eq!(
             serde_json::to_string(&answer).unwrap(),
-            r#"{"buckets":1,"streams":3,"group_commit_index":9,"history":81985529216486895,"already":false}"#
+            r#"{"buckets":1,"streams":3,"group_commit_index":9,"history":"0123456789abcdef","already":false}"#
         );
         assert_eq!(
             serde_json::from_str::<BackupImportResponse>(&serde_json::to_string(&answer).unwrap())
@@ -1069,7 +1071,7 @@ pub struct BackupImportResponse {
     pub group_commit_index: u64,
     /// The id of the history the import started: every restored stream has
     /// a new token, and every restored producer record is history-fenced.
-    pub history: std::num::NonZeroU64,
+    pub history: HistoryId,
     /// The group already held this import.
     pub already: bool,
 }
@@ -1782,6 +1784,10 @@ pub struct BucketPurgeReport {
     pub cold_gc_error: Option<String>,
     /// The cold store lists no object below `{bucket}/`.
     pub bucket_prefix_absent: bool,
+    /// Every group the purge reached, ascending, with the index of the
+    /// entry that purged the bucket there. A usage consumer holds the
+    /// purge complete once it read each group past it.
+    pub groups: Vec<GroupPurgeIndex>,
 }
 
 /// One group's usage in a [`UsageReport`], as the answering node's replica
@@ -1938,6 +1944,563 @@ impl UsageReport {
         }
         (buckets, complete)
     }
+}
+
+/// The most items, entries and bucket rows together, one group's page of
+/// `POST /__ursula/usage/streams` holds.
+pub const MAX_STREAM_USAGE_GROUP_ENTRIES: u32 = 10_000;
+/// The most items one answer of `POST /__ursula/usage/streams` holds over
+/// all its groups, about 8 MiB of JSON.
+pub const MAX_STREAM_USAGE_ANSWER_ITEMS: u32 = 20_000;
+
+/// A history id: 16 lowercase hex digits, never zero. The one JSON encoding
+/// of a history id, in the usage export and in
+/// [`BackupImportResponse::history`], and one that a JavaScript `Number`
+/// does not round. Its order is the ids' values, so that it keys a map:
+/// it says nothing about which history came first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HistoryId(std::num::NonZeroU64);
+
+/// Why a string is not a [`HistoryId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidHistoryId {
+    #[error("a history id is 16 lowercase hex digits")]
+    NotSixteenHexDigits,
+    #[error("a history id is never 0")]
+    Zero,
+}
+
+impl HistoryId {
+    pub const fn new(id: std::num::NonZeroU64) -> Self {
+        Self(id)
+    }
+
+    pub const fn get(self) -> std::num::NonZeroU64 {
+        self.0
+    }
+}
+
+impl From<std::num::NonZeroU64> for HistoryId {
+    fn from(id: std::num::NonZeroU64) -> Self {
+        Self(id)
+    }
+}
+
+impl std::fmt::Display for HistoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl std::str::FromStr for HistoryId {
+    type Err = InvalidHistoryId;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.len() != 16
+            || !text
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(InvalidHistoryId::NotSixteenHexDigits);
+        }
+        let id = u64::from_str_radix(text, 16)
+            .map_err(|_not_hex| InvalidHistoryId::NotSixteenHexDigits)?;
+        std::num::NonZeroU64::new(id)
+            .map(Self)
+            .ok_or(InvalidHistoryId::Zero)
+    }
+}
+
+impl TryFrom<String> for HistoryId {
+    type Error = InvalidHistoryId;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl From<HistoryId> for String {
+    fn from(id: HistoryId) -> Self {
+        id.to_string()
+    }
+}
+
+/// The log id of a Raft entry. Ordered by `term`, then `index`: of two
+/// answers of one group, the higher is the newer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct UsageLogId {
+    /// The term of the leader that wrote the entry.
+    pub term: u64,
+    /// The entry's index in the group's log.
+    pub index: u64,
+}
+
+/// Items per group of a [`StreamUsageRequest`], 1 to
+/// [`MAX_STREAM_USAGE_GROUP_ENTRIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct UsageEntryLimit(std::num::NonZeroU32);
+
+/// A `limit` of 0 or above [`MAX_STREAM_USAGE_GROUP_ENTRIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("limit {limit} is not 1 to {MAX_STREAM_USAGE_GROUP_ENTRIES}")]
+pub struct UsageEntryLimitOutOfRange {
+    pub limit: u32,
+}
+
+impl UsageEntryLimit {
+    pub const fn get(self) -> std::num::NonZeroU32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for UsageEntryLimit {
+    type Error = UsageEntryLimitOutOfRange;
+
+    fn try_from(limit: u32) -> Result<Self, Self::Error> {
+        std::num::NonZeroU32::new(limit)
+            .filter(|limit| limit.get() <= MAX_STREAM_USAGE_GROUP_ENTRIES)
+            .map(Self)
+            .ok_or(UsageEntryLimitOutOfRange { limit })
+    }
+}
+
+impl From<UsageEntryLimit> for u32 {
+    fn from(limit: UsageEntryLimit) -> Self {
+        limit.0.get()
+    }
+}
+
+/// The groups of a [`StreamUsageRequest`]: at least one, each named once,
+/// at most [`crate::placement::MAX_GROUP_COUNT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<GroupUsageRequest>", into = "Vec<GroupUsageRequest>")]
+pub struct UsageGroups(Vec<GroupUsageRequest>);
+
+/// Why a request's `groups` is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidUsageGroups {
+    #[error("a usage request names at least one group")]
+    Empty,
+    #[error("group {raft_group_id} is named twice")]
+    Repeated { raft_group_id: u32 },
+    #[error("{count} groups, above the most a cluster has, {max}")]
+    TooMany { count: usize, max: u32 },
+}
+
+impl UsageGroups {
+    pub fn as_slice(&self) -> &[GroupUsageRequest] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<GroupUsageRequest> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<GroupUsageRequest>> for UsageGroups {
+    type Error = InvalidUsageGroups;
+
+    fn try_from(groups: Vec<GroupUsageRequest>) -> Result<Self, Self::Error> {
+        if groups.is_empty() {
+            return Err(InvalidUsageGroups::Empty);
+        }
+        let max = crate::placement::MAX_GROUP_COUNT;
+        if usize::try_from(max).is_ok_and(|max| groups.len() > max) {
+            return Err(InvalidUsageGroups::TooMany {
+                count: groups.len(),
+                max,
+            });
+        }
+        let mut named = BTreeSet::new();
+        for group in &groups {
+            if !named.insert(group.raft_group_id) {
+                return Err(InvalidUsageGroups::Repeated {
+                    raft_group_id: group.raft_group_id,
+                });
+            }
+        }
+        Ok(Self(groups))
+    }
+}
+
+impl From<UsageGroups> for Vec<GroupUsageRequest> {
+    fn from(groups: UsageGroups) -> Self {
+        groups.0
+    }
+}
+
+/// Body of `POST /__ursula/usage/streams`, the per-stream usage export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageRequest {
+    /// Always 1.
+    pub version: SchemaVersion<1>,
+    /// The groups to read, each with its cursor.
+    pub groups: UsageGroups,
+    /// The most items each group's page may hold. The server caps it
+    /// further at what the answer has left of
+    /// [`MAX_STREAM_USAGE_ANSWER_ITEMS`].
+    pub limit: UsageEntryLimit,
+}
+
+/// One group of a [`StreamUsageRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupUsageRequest {
+    /// The group, below `raft_group_count`.
+    pub raft_group_id: u32,
+    /// Where the caller's listing of the group stands.
+    pub cursor: UsageCursor,
+}
+
+/// Where a caller's listing of a group stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageCursor {
+    /// The caller holds nothing of the group: the answer relists it
+    /// (`start`).
+    Start,
+    /// Continues the caller's listing, from the last page it kept.
+    After {
+        /// `genesis` of that page: which cluster's instance of the group.
+        genesis: HistoryId,
+        /// `history.id` of that page.
+        history: HistoryId,
+        /// `applied` of that page: a replica below it answers `behind`.
+        applied: UsageLogId,
+        /// `retired_through` of that page.
+        retired_through: u64,
+        /// `page.next` of a `more` page, else entries after `usage_seq`.
+        position: UsagePosition,
+    },
+}
+
+/// Where a listing continues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsagePosition {
+    /// Bucket rows after `after_bucket`, then entries from seq 0: a
+    /// relisting. Without `after_bucket` it asks for a new relisting
+    /// (`requested`).
+    Rows {
+        /// The last bucket row the caller holds of this relisting. Never
+        /// empty.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "non_empty_bucket"
+        )]
+        after_bucket: Option<String>,
+    },
+    /// Entries with a seq above `after_seq`.
+    Entries {
+        /// The highest seq the caller has listed.
+        after_seq: u64,
+    },
+}
+
+/// `after_bucket` of a [`UsagePosition::Rows`]: absent, or a bucket id,
+/// which is never empty.
+fn non_empty_bucket<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let bucket = Option::<String>::deserialize(deserializer)?;
+    if bucket.as_deref() == Some("") {
+        return Err(serde::de::Error::custom(
+            "after_bucket names a bucket and is never empty",
+        ));
+    }
+    Ok(bucket)
+}
+
+/// Answer of `POST /__ursula/usage/streams`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageReport {
+    /// Always 1.
+    pub version: SchemaVersion<1>,
+    /// The answering node's id, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
+    /// The unit of `committed_write_units`: 10240 bytes.
+    pub write_unit_bytes: u64,
+    /// How long, at least, an end record stays listed after its removal,
+    /// by this node's configuration (half of `raft.deleted_data_max_age`).
+    /// Read every group within a third of the smallest value among nodes.
+    pub end_record_retention_ms: u64,
+    /// The cluster's group count. Groups are numbered from 0.
+    pub raft_group_count: u32,
+    /// One answer per requested group this node hosts and read, ascending.
+    pub groups: Vec<GroupStreamUsage>,
+    /// Requested groups this node hosts that the answer budget left
+    /// unread, ascending: ask again for them.
+    pub omitted: Vec<u32>,
+}
+
+/// One group's answer in a [`StreamUsageReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GroupStreamUsage {
+    /// One page of the group, read from one applied state.
+    Listed(GroupUsagePage),
+    /// The replica has not applied the entry the cursor's page was read
+    /// at. Nothing is listed: use another node's answer, or ask later.
+    Behind {
+        raft_group_id: u32,
+        /// The replica's genesis history id.
+        genesis: HistoryId,
+        /// The replica's current history id.
+        history: HistoryId,
+        /// The replica's last applied entry.
+        applied: UsageLogId,
+    },
+    /// The replica could not be read: use another node's answer.
+    Unavailable {
+        raft_group_id: u32,
+        reason: UsageUnavailable,
+    },
+    /// A variant of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+impl GroupStreamUsage {
+    /// The group the answer is of, `None` for [`Self::Unknown`].
+    pub fn raft_group_id(&self) -> Option<u32> {
+        match self {
+            Self::Listed(page) => Some(page.raft_group_id),
+            Self::Behind { raft_group_id, .. } | Self::Unavailable { raft_group_id, .. } => {
+                Some(*raft_group_id)
+            }
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// One page of a group's per-stream usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupUsagePage {
+    pub raft_group_id: u32,
+    /// The id of the group's genesis history: fixed for the life of this
+    /// cluster's instance of the group. Different values mean different
+    /// clusters.
+    pub genesis: HistoryId,
+    /// The group's latest history event at this read.
+    pub history: UsageHistory,
+    /// The replica's last applied entry, read with everything else on the
+    /// page. Keep the page with the highest.
+    pub applied: UsageLogId,
+    /// The latest seq the group assigned.
+    pub usage_seq: u64,
+    /// The seq of the newest folded end record: every end record at or
+    /// below it is in its bucket's retired usage, every one above it is
+    /// held.
+    pub retired_through: u64,
+    /// Live versions the group holds at this read.
+    pub live_versions: u64,
+    /// Unretired end records the group holds at this read.
+    pub end_records: u64,
+    /// Set on the page that starts a relisting, with why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relist: Option<RelistReason>,
+    /// Bucket rows, on relisting pages only, by bucket id.
+    pub rows: Vec<BucketUsageRow>,
+    /// Entries in seq order, each version once at its newest seq.
+    pub entries: Vec<StreamUsageEntry>,
+    /// Whether the listing is complete at this read.
+    pub page: UsagePage,
+}
+
+impl GroupUsagePage {
+    /// The cursor that continues the listing after this page: its genesis,
+    /// history, log id and fold watermark, and `page.next` of a `more`
+    /// page, else the entries after `usage_seq`. `None` for a page whose
+    /// status this build does not know, which is no answer.
+    pub fn next_cursor(&self) -> Option<UsageCursor> {
+        let position = match &self.page {
+            UsagePage::Complete => UsagePosition::Entries {
+                after_seq: self.usage_seq,
+            },
+            UsagePage::More { next } => next.clone(),
+            UsagePage::Unknown => return None,
+        };
+        Some(UsageCursor::After {
+            genesis: self.genesis,
+            history: self.history.id,
+            applied: self.applied,
+            retired_through: self.retired_through,
+            position,
+        })
+    }
+}
+
+/// A group's latest history event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistory {
+    /// The history id. It changes at a restore and at an accepted loss.
+    pub id: HistoryId,
+    /// The log index of the entry that started it. For display, and for
+    /// the purge rule: never use it to order answers.
+    pub event_index: u64,
+    /// The history it replaced. Absent for the genesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<HistoryId>,
+}
+
+/// Why a page starts a relisting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelistReason {
+    /// The cursor was `start`.
+    Start,
+    /// The cursor asked for it (`rows` without a bucket).
+    Requested,
+    /// An end record the caller had not listed was folded: same history.
+    Retired,
+    /// Another history than the cursor's, or another cluster's group.
+    History,
+    /// A reason of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One bucket of a relisting, at the page's read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketUsageRow {
+    pub bucket_id: String,
+    /// The usage of every folded end record and every restored version.
+    pub retired: CommittedUsageReport,
+    /// The bucket's `/__ursula/usage` v2 counters and gauges at this read,
+    /// `snapshot_bytes` always present.
+    pub totals: BucketUsageReport,
+}
+
+/// Whether a listing is complete at a page's read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UsagePage {
+    /// Nothing remains after this page: the next cursor lists entries
+    /// after `usage_seq`.
+    Complete,
+    /// The limit cut the listing: send `next` as the cursor's position.
+    More { next: UsagePosition },
+    /// A status of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The committed counters of the usage contract, as v2 names them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedUsageReport {
+    /// Payload bytes of counted writes.
+    pub committed_append_bytes: u64,
+    /// Records of counted writes (JSON messages, or 1 per byte append).
+    pub committed_records: u64,
+    /// Units of `write_unit_bytes`: `max(1, ceil(bytes / 10240))` per
+    /// counted write.
+    pub committed_write_units: u64,
+}
+
+/// One version's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionCountersReport {
+    pub committed_append_bytes: u64,
+    pub committed_records: u64,
+    pub committed_write_units: u64,
+    /// Applied, non-deduplicated appends, inline and external.
+    pub appends: u64,
+}
+
+/// One stream version of a page: live, at its newest seq, or ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUsageEntry {
+    /// The version's or end record's seq. Of two entries of one version in
+    /// one history, the higher is the newer.
+    pub seq: u64,
+    pub bucket_id: String,
+    pub stream_id: String,
+    /// With `bucket_id`, `stream_id` and `counted_since`, the version's
+    /// key.
+    pub created_at_ms: u64,
+    /// The history the version's counters began in: its create's, or the
+    /// restore's that restored it. A restore therefore gives a new key.
+    pub counted_since: HistoryId,
+    /// Its `Stream-Incarnation` token, the join with `PUT` and `HEAD`: the
+    /// one the server answers now for a live version, the one it answered
+    /// when the version ended for an end record. Never a key.
+    pub incarnation: u64,
+    /// What the version committed since `counted_since`. Within one
+    /// history it never falls.
+    pub counters: VersionCountersReport,
+    /// Its counters when the group's current history began. On a history
+    /// change, lower your billed level for the version to this.
+    pub history_baseline: VersionCountersReport,
+    /// `now_ms` of its newest counted write. Absent for a restored version
+    /// with no write since the restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write_at_ms: Option<u64>,
+    /// Live, with gauges, or ended.
+    pub lifecycle: VersionLifecycle,
+}
+
+/// A listed version's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum VersionLifecycle {
+    Live {
+        /// `tail_offset - retained_offset` at this read.
+        retained_bytes: u64,
+        /// Body length of the latest visible snapshot at this read, 0
+        /// without one.
+        snapshot_bytes: u64,
+    },
+    Ended {
+        end: StreamUsageEnd,
+        /// `now_ms` of the removal, by the removing node's clock.
+        ended_at_ms: u64,
+    },
+    /// A state of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a version ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamUsageEnd {
+    Deleted,
+    Expired,
+    Purged,
+    /// An end of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a replica could not be read for the usage export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageUnavailable {
+    /// The replica stopped applying after a failed entry.
+    ApplyStopped,
+    /// A leader whose history event is pending serves nothing yet.
+    RecoveryPending,
+    /// The group's Raft is not running on this node.
+    RaftStopped,
+    /// The group's genesis has not applied on this replica.
+    NoHistory,
+    /// Any other failure, and a reason this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// One group a bucket purge reached, in [`BucketPurgeReport::groups`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPurgeIndex {
+    pub raft_group_id: u32,
+    /// The index of the entry that purged the bucket in this group. The
+    /// purge is complete for metering once a kept complete page of the
+    /// group has `applied.index` at or above it and `history.event_index`
+    /// below it.
+    pub commit_index: u64,
 }
 
 #[cfg(test)]
@@ -2216,5 +2779,228 @@ mod recovery_gates_report_tests {
             serde_json::from_str::<RaftTargetKey>("4294967295").expect("a group id"),
             RaftTargetKey::Data(u32::MAX)
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::GroupStreamUsage;
+    use super::HistoryId;
+    use super::InvalidHistoryId;
+    use super::RelistReason;
+    use super::StreamUsageEnd;
+    use super::StreamUsageReport;
+    use super::StreamUsageRequest;
+    use super::UsageCursor;
+    use super::UsageLogId;
+    use super::UsagePage;
+    use super::UsagePosition;
+    use super::UsageUnavailable;
+    use super::VersionLifecycle;
+
+    const ANSWER: &str = r#"{
+        "version": 1,
+        "node_id": 1,
+        "write_unit_bytes": 10240,
+        "end_record_retention_ms": 1800000,
+        "raft_group_count": 4,
+        "groups": [
+            {
+                "state": "listed",
+                "raft_group_id": 1,
+                "genesis": "5d0e9f3a71c2b864",
+                "history": { "id": "5d0e9f3a71c2b864", "event_index": 1 },
+                "applied": { "term": 3, "index": 57 },
+                "usage_seq": 43,
+                "retired_through": 37,
+                "live_versions": 1,
+                "end_records": 1,
+                "rows": [],
+                "entries": [
+                    {
+                        "seq": 43,
+                        "bucket_id": "tenant-a",
+                        "stream_id": "notes",
+                        "created_at_ms": 1700000000100,
+                        "counted_since": "5d0e9f3a71c2b864",
+                        "incarnation": 5124095576030430,
+                        "counters": { "committed_append_bytes": 10250, "committed_records": 2, "committed_write_units": 3, "appends": 1 },
+                        "history_baseline": { "committed_append_bytes": 0, "committed_records": 0, "committed_write_units": 0, "appends": 0 },
+                        "last_write_at_ms": 1700000000200,
+                        "lifecycle": { "state": "ended", "end": "deleted", "ended_at_ms": 1700000000300 }
+                    }
+                ],
+                "page": { "status": "complete" }
+            },
+            { "state": "behind", "raft_group_id": 2, "genesis": "0000000000000001", "history": "0000000000000002", "applied": { "term": 1, "index": 4 } },
+            { "state": "unavailable", "raft_group_id": 3, "reason": "no_history" }
+        ],
+        "omitted": []
+    }"#;
+
+    fn id(text: &str) -> HistoryId {
+        text.parse().unwrap()
+    }
+
+    /// The answer decodes into its typed shape and encodes back to the same
+    /// JSON, absent optional fields left out rather than written as `null`.
+    #[test]
+    fn an_answer_round_trips_without_nulls() {
+        let report: StreamUsageReport = serde_json::from_str(ANSWER).unwrap();
+        let GroupStreamUsage::Listed(page) = &report.groups[0] else {
+            panic!("a listed page: {report:?}");
+        };
+        assert_eq!(page.history.previous, None);
+        assert_eq!(page.relist, None);
+        assert_eq!(page.applied, UsageLogId { term: 3, index: 57 });
+        assert_eq!(page.entries[0].lifecycle, VersionLifecycle::Ended {
+            end: StreamUsageEnd::Deleted,
+            ended_at_ms: 1_700_000_000_300,
+        });
+        assert_eq!(
+            page.next_cursor(),
+            Some(UsageCursor::After {
+                genesis: id("5d0e9f3a71c2b864"),
+                history: id("5d0e9f3a71c2b864"),
+                applied: UsageLogId { term: 3, index: 57 },
+                retired_through: 37,
+                position: UsagePosition::Entries { after_seq: 43 },
+            })
+        );
+        assert_eq!(report.groups[2], GroupStreamUsage::Unavailable {
+            raft_group_id: 3,
+            reason: UsageUnavailable::NoHistory,
+        });
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("null"), "{encoded}");
+        assert_eq!(
+            serde_json::from_str::<StreamUsageReport>(&encoded).unwrap(),
+            report
+        );
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::from_str::<serde_json::Value>(ANSWER).unwrap()
+        );
+    }
+
+    /// A reader of one patch survives the next: every answer enum reads a
+    /// variant it does not know as unknown.
+    #[test]
+    fn answer_enums_read_a_later_variant_as_unknown() {
+        let later = ANSWER
+            .replace(r#""state": "behind""#, r#""state": "later""#)
+            .replace(r#""end": "deleted""#, r#""end": "later""#)
+            .replace(r#""reason": "no_history""#, r#""reason": "later""#)
+            .replace(r#""status": "complete""#, r#""status": "later""#)
+            .replace(r#""rows": []"#, r#""relist": "later", "rows": []"#);
+        let report: StreamUsageReport = serde_json::from_str(&later).unwrap();
+        assert_eq!(report.groups[1], GroupStreamUsage::Unknown);
+        assert_eq!(report.groups[2], GroupStreamUsage::Unavailable {
+            raft_group_id: 3,
+            reason: UsageUnavailable::Other,
+        });
+        let GroupStreamUsage::Listed(page) = &report.groups[0] else {
+            panic!("a listed page: {report:?}");
+        };
+        assert_eq!(page.relist, Some(RelistReason::Unknown));
+        assert_eq!(page.page, UsagePage::Unknown);
+        assert_eq!(page.next_cursor(), None);
+        assert_eq!(page.entries[0].lifecycle, VersionLifecycle::Ended {
+            end: StreamUsageEnd::Unknown,
+            ended_at_ms: 1_700_000_000_300,
+        });
+        let lifecycle: VersionLifecycle =
+            serde_json::from_str(r#"{"state": "later", "since_ms": 1}"#).unwrap();
+        assert_eq!(lifecycle, VersionLifecycle::Unknown);
+    }
+
+    #[test]
+    fn a_history_id_is_sixteen_lowercase_hex_digits_and_never_zero() {
+        assert_eq!(id("00000000000000ff").get().get(), 0xff);
+        assert_eq!(id("00000000000000ff").to_string(), "00000000000000ff");
+        assert_eq!(
+            "0000000000000000".parse::<HistoryId>(),
+            Err(InvalidHistoryId::Zero)
+        );
+        for refused in [
+            "ff",
+            "00000000000000FF",
+            "000000000000000g",
+            "+00000000000000f",
+        ] {
+            assert_eq!(
+                refused.parse::<HistoryId>(),
+                Err(InvalidHistoryId::NotSixteenHexDigits),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The request decodes only in its typed shape: each refusal is the
+    /// decode error that the route answers `422` with.
+    #[test]
+    fn a_request_out_of_shape_does_not_decode() {
+        let request = |groups: &str, limit: &str| {
+            format!(r#"{{"version": 1, "groups": {groups}, "limit": {limit}}}"#)
+        };
+        let after = |position: &str| {
+            format!(
+                r#"[{{"raft_group_id": 0, "cursor": {{"kind": "after", "genesis": "0000000000000001", "history": "0000000000000002", "applied": {{"term": 1, "index": 2}}, "retired_through": 0, "position": {position}}}}}]"#
+            )
+        };
+        let start = r#"[{"raft_group_id": 0, "cursor": {"kind": "start"}}]"#;
+        let decoded: StreamUsageRequest = serde_json::from_str(&request(
+            &after(r#"{"kind": "rows", "after_bucket": "b"}"#),
+            "10000",
+        ))
+        .unwrap();
+        assert_eq!(decoded.limit.get().get(), 10_000);
+        assert_eq!(decoded.groups.as_slice()[0].cursor, UsageCursor::After {
+            genesis: id("0000000000000001"),
+            history: id("0000000000000002"),
+            applied: UsageLogId { term: 1, index: 2 },
+            retired_through: 0,
+            position: UsagePosition::Rows {
+                after_bucket: Some("b".to_owned()),
+            },
+        });
+        let rows: StreamUsageRequest =
+            serde_json::from_str(&request(&after(r#"{"kind": "rows"}"#), "1")).unwrap();
+        assert!(matches!(
+            rows.groups.as_slice()[0].cursor,
+            UsageCursor::After {
+                position: UsagePosition::Rows { after_bucket: None },
+                ..
+            }
+        ));
+        for refused in [
+            request(start, "1").replace(r#""version": 1"#, r#""version": 2"#),
+            request(start, "0"),
+            request(start, "10001"),
+            request("[]", "1"),
+            request(
+                r#"[{"raft_group_id": 0, "cursor": {"kind": "start"}}, {"raft_group_id": 0, "cursor": {"kind": "start"}}]"#,
+                "1",
+            ),
+            request(
+                r#"[{"raft_group_id": 0, "cursor": {"kind": "later"}}]"#,
+                "1",
+            ),
+            request(&after(r#"{"kind": "later"}"#), "1"),
+            request(&after(r#"{"kind": "rows", "after_bucket": ""}"#), "1"),
+            request(
+                &after(r#"{"kind": "entries", "after_seq": 1}"#)
+                    .replace("0000000000000002", "0000000000000000"),
+                "1",
+            ),
+            request(
+                &after(r#"{"kind": "entries", "after_seq": 1}"#).replace("0000000000000002", "2"),
+                "1",
+            ),
+        ] {
+            if let Ok(decoded) = serde_json::from_str::<StreamUsageRequest>(&refused) {
+                panic!("{refused} decoded as {decoded:?}");
+            }
+        }
     }
 }

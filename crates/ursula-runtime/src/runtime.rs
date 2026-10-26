@@ -287,6 +287,9 @@ pub struct PurgeBucketReport {
     /// The groups whose purge removed a stream, ascending.
     pub groups_with_streams: Vec<RaftGroupId>,
     pub pending_cold_gc_entries: u64,
+    /// Every group the purge reached, ascending, with the index of the
+    /// entry that purged the bucket there.
+    pub commit_indexes: Vec<(RaftGroupId, u64)>,
     /// The groups this node hosts no replica of, which the pass did not
     /// purge. The caller purges each through its leader and adds the
     /// answer ([`Self::add`]).
@@ -308,6 +311,18 @@ impl PurgeBucketReport {
         self.pending_cold_gc_entries = self
             .pending_cold_gc_entries
             .saturating_add(response.pending_cold_gc_entries);
+        let purged = (group, response.group_commit_index);
+        match self
+            .commit_indexes
+            .binary_search_by_key(&group, |(group, _)| *group)
+        {
+            Ok(at) => {
+                if let Some(seen) = self.commit_indexes.get_mut(at) {
+                    seen.1 = seen.1.max(purged.1);
+                }
+            }
+            Err(at) => self.commit_indexes.insert(at, purged),
+        }
     }
 }
 
