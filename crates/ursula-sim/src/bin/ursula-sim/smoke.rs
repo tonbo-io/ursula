@@ -1,12 +1,15 @@
 //! `ursula-sim smoke`: corpus replays plus a seed sweep with failure
-//! artifacts. `--shard INDEX/COUNT` runs one share of the sweep.
+//! artifacts. `--shard INDEX/COUNT` runs one share of the sweep. The sweep
+//! runs every seed of its share and then fails listing each failed seed.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::num::ParseIntError;
 use std::panic;
+use std::path::Path;
 use std::path::PathBuf;
 
 use ursula_sim::SIM_REGRESSION_SCHEMA_VERSION;
@@ -36,14 +39,20 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&failure_dir)?;
 
     let listed = args.seeds.len();
+    // Taken from the whole list, so every share of one command names a
+    // run's artifacts alike.
+    let shared = seeds_under_several_generators(&args.seeds);
     let seeds = shard.select(args.seeds);
     if args.shard.is_some() {
         println!("shard {shard}: {} of {listed} seeds", seeds.len());
     }
 
-    let mut observed_failures = 0usize;
+    // Every seed runs: a failure is recorded and the sweep goes on, so one
+    // failing seed cannot hide the verdict of the seeds after it.
+    let mut failures = Vec::new();
     for schedule_seed in seeds {
         let seed = schedule_seed.seed;
+        let stem = schedule_seed.artifact_stem(&shared);
         let mut schedule = schedule_seed.generate_schedule();
         apply_runtime_panic_after(
             &mut schedule,
@@ -64,67 +73,142 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         match result {
             Ok(record) => {
                 if args.write_artifacts {
-                    write_success_artifacts(&failure_dir, &record)?;
+                    write_success_artifacts(&failure_dir, &stem, &record)?;
                 }
             }
             Err(payload) => {
-                observed_failures += 1;
-                let raw_event_log = SimTrace::last_recorded().events;
-                let stable_trace = SimTrace {
-                    events: raw_event_log.clone(),
-                }
-                .stable_replay();
-                let stable_artifact = StableTraceArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    schedule: schedule.clone(),
-                    stable_trace,
-                };
-                let stable_path = failure_dir.join(format!("seed-{seed}-stable-trace.json"));
-                let raw_path = failure_dir.join(format!("seed-{seed}-raw-events.json"));
-                let summary_path = failure_dir.join(format!("seed-{seed}-failure.json"));
-
-                let mut stable_body = serde_json::to_string_pretty(&stable_artifact)?;
-                stable_body.push('\n');
-                fs::write(&stable_path, stable_body)?;
-
-                let mut raw_body = serde_json::to_string_pretty(&RawEventLogArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    seed,
-                    events: raw_event_log,
-                })?;
-                raw_body.push('\n');
-                fs::write(&raw_path, raw_body)?;
-
-                let panic = panic_payload_to_string(payload);
-                let artifact = FailedSeedArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    seed,
+                let failure = write_failure_artifacts(
+                    &failure_dir,
+                    &stem,
+                    schedule_seed,
                     schedule,
-                    stable_trace_path: stable_path.display().to_string(),
-                    raw_event_log_path: raw_path.display().to_string(),
-                    panic,
-                };
-                let mut body = serde_json::to_string_pretty(&artifact)?;
-                body.push('\n');
-                fs::write(&summary_path, body)?;
-                if !args.expect_failures {
-                    return Err(format!(
-                        "sim seed {seed} failed; wrote {}, {}, {}",
-                        summary_path.display(),
-                        stable_path.display(),
-                        raw_path.display()
-                    )
-                    .into());
-                }
+                    panic_payload_to_string(payload),
+                )?;
+                println!("sim {failure}");
+                failures.push(failure);
             }
         }
     }
 
-    if args.expect_failures && observed_failures == 0 {
-        return Err("--expect-failures was set but no seed failed".into());
-    }
+    Ok(sweep_verdict(failures, args.expect_failures)?)
+}
 
-    Ok(())
+/// A seed the sweep saw fail and the artifacts it wrote for it.
+#[derive(Debug)]
+struct FailedSeed {
+    seed: u64,
+    kind: &'static str,
+    summary_path: PathBuf,
+    stable_path: PathBuf,
+    raw_path: PathBuf,
+}
+
+impl fmt::Display for FailedSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "seed {} ({}) failed; wrote {}, {}, {}",
+            self.seed,
+            self.kind,
+            self.summary_path.display(),
+            self.stable_path.display(),
+            self.raw_path.display()
+        )
+    }
+}
+
+/// Why a sweep that ran every seed of its share fails.
+#[derive(Debug, thiserror::Error)]
+enum SweepError {
+    #[error("{}", seeds_failed_message(.failures))]
+    SeedsFailed { failures: Vec<FailedSeed> },
+    #[error("--expect-failures was set but no seed failed")]
+    NoSeedFailed,
+}
+
+fn seeds_failed_message(failures: &[FailedSeed]) -> String {
+    let mut message = format!("{} sim seeds failed:", failures.len());
+    for failure in failures {
+        message.push_str("\n  ");
+        message.push_str(&failure.to_string());
+    }
+    message
+}
+
+/// The verdict of a sweep over the failures of all its seeds: without
+/// `--expect-failures` any failure fails it, with the flag none does.
+fn sweep_verdict(failures: Vec<FailedSeed>, expect_failures: bool) -> Result<(), SweepError> {
+    match (expect_failures, failures.is_empty()) {
+        (false, true) | (true, false) => Ok(()),
+        (false, false) => Err(SweepError::SeedsFailed { failures }),
+        (true, true) => Err(SweepError::NoSeedFailed),
+    }
+}
+
+/// The seed numbers that the sorted, deduplicated list names under more
+/// than one generator.
+fn seeds_under_several_generators(seeds: &[ScheduleSeed]) -> BTreeSet<u64> {
+    seeds
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [first, second] if first.seed == second.seed => Some(first.seed),
+            _ => None,
+        })
+        .collect()
+}
+
+fn write_failure_artifacts(
+    failure_dir: &Path,
+    stem: &str,
+    schedule_seed: ScheduleSeed,
+    schedule: SimSchedule,
+    panic: String,
+) -> Result<FailedSeed, Box<dyn Error>> {
+    let seed = schedule_seed.seed;
+    let raw_event_log = SimTrace::last_recorded().events;
+    let stable_trace = SimTrace {
+        events: raw_event_log.clone(),
+    }
+    .stable_replay();
+    let stable_artifact = StableTraceArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        schedule: schedule.clone(),
+        stable_trace,
+    };
+    let stable_path = failure_dir.join(format!("{stem}-stable-trace.json"));
+    let raw_path = failure_dir.join(format!("{stem}-raw-events.json"));
+    let summary_path = failure_dir.join(format!("{stem}-failure.json"));
+
+    let mut stable_body = serde_json::to_string_pretty(&stable_artifact)?;
+    stable_body.push('\n');
+    fs::write(&stable_path, stable_body)?;
+
+    let mut raw_body = serde_json::to_string_pretty(&RawEventLogArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        seed,
+        events: raw_event_log,
+    })?;
+    raw_body.push('\n');
+    fs::write(&raw_path, raw_body)?;
+
+    let artifact = FailedSeedArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        seed,
+        schedule,
+        stable_trace_path: stable_path.display().to_string(),
+        raw_event_log_path: raw_path.display().to_string(),
+        panic,
+    };
+    let mut body = serde_json::to_string_pretty(&artifact)?;
+    body.push('\n');
+    fs::write(&summary_path, body)?;
+    Ok(FailedSeed {
+        seed,
+        kind: schedule_seed.kind,
+        summary_path,
+        stable_path,
+        raw_path,
+    })
 }
 
 /// The three checked-in corpora.
@@ -391,6 +475,17 @@ impl ScheduleSeed {
 
     fn generate_schedule(self) -> SimSchedule {
         (self.generate)(self.seed)
+    }
+
+    /// The file-name stem of this run's artifacts: `seed-N`, or
+    /// `seed-N-KIND` when the command runs seed N under several generators,
+    /// so no run of the command overwrites another's artifacts.
+    fn artifact_stem(self, shared: &BTreeSet<u64>) -> String {
+        if shared.contains(&self.seed) {
+            format!("seed-{}-{}", self.seed, self.kind)
+        } else {
+            format!("seed-{}", self.seed)
+        }
     }
 }
 
@@ -1088,11 +1183,12 @@ fn apply_cold_corrupt_read_node(
 }
 
 fn write_success_artifacts(
-    failure_dir: &std::path::Path,
+    failure_dir: &Path,
+    stem: &str,
     record: &SimScheduledRecord,
 ) -> Result<(), Box<dyn Error>> {
-    let stable_path = failure_dir.join(format!("seed-{}-replay.json", record.schedule.seed));
-    let raw_path = failure_dir.join(format!("seed-{}-raw-events.json", record.schedule.seed));
+    let stable_path = failure_dir.join(format!("{stem}-replay.json"));
+    let raw_path = failure_dir.join(format!("{stem}-raw-events.json"));
     let mut stable_body = serde_json::to_string_pretty(record)?;
     stable_body.push('\n');
     fs::write(stable_path, stable_body)?;
@@ -1105,4 +1201,81 @@ fn write_success_artifacts(
     raw_body.push('\n');
     fs::write(raw_path, raw_body)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    use super::FailedSeed;
+    use super::ScheduleSeed;
+    use super::SweepError;
+    use super::generate_leader_failover;
+    use super::seeds_under_several_generators;
+    use super::sweep_verdict;
+
+    fn leader_failover(seed: u64) -> ScheduleSeed {
+        ScheduleSeed {
+            seed,
+            kind: "leader-failover",
+            generate: generate_leader_failover,
+        }
+    }
+
+    fn failed(seed: u64) -> FailedSeed {
+        FailedSeed {
+            seed,
+            kind: "normal",
+            summary_path: PathBuf::from(format!("dir/seed-{seed}-failure.json")),
+            stable_path: PathBuf::from(format!("dir/seed-{seed}-stable-trace.json")),
+            raw_path: PathBuf::from(format!("dir/seed-{seed}-raw-events.json")),
+        }
+    }
+
+    #[test]
+    fn a_sweep_with_failures_fails_naming_every_failed_seed() {
+        let err = sweep_verdict(vec![failed(61), failed(64)], false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(&err, SweepError::SeedsFailed { failures } if failures.len() == 2),
+            "{err:?}"
+        );
+        assert!(message.contains("2 sim seeds failed"), "{message}");
+        assert!(message.contains("dir/seed-61-failure.json"), "{message}");
+        assert!(message.contains("dir/seed-64-failure.json"), "{message}");
+    }
+
+    #[test]
+    fn a_sweep_verdict_follows_expect_failures() {
+        assert!(matches!(sweep_verdict(Vec::new(), false), Ok(())));
+        assert!(matches!(sweep_verdict(vec![failed(61)], true), Ok(())));
+        assert!(matches!(
+            sweep_verdict(Vec::new(), true),
+            Err(SweepError::NoSeedFailed)
+        ));
+    }
+
+    #[test]
+    fn a_seed_under_several_generators_names_its_artifacts_by_generator() {
+        let seeds = vec![
+            ScheduleSeed::normal(121),
+            ScheduleSeed::normal(122),
+            leader_failover(122),
+            leader_failover(123),
+        ];
+        let shared = seeds_under_several_generators(&seeds);
+        assert_eq!(shared, BTreeSet::from([122]));
+
+        let stems = seeds
+            .iter()
+            .map(|seed| seed.artifact_stem(&shared))
+            .collect::<Vec<_>>();
+        assert_eq!(stems, [
+            "seed-121",
+            "seed-122-normal",
+            "seed-122-leader-failover",
+            "seed-123",
+        ]);
+    }
 }

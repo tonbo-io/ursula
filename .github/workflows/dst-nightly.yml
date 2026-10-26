@@ -85,7 +85,8 @@ jobs:
 
       # Each leg runs every COUNT-th seed of the sweep's sorted, deduplicated
       # list (`ursula-sim smoke --shard`), so each seed runs once. Share 0
-      # also replays the corpora.
+      # also replays the corpora. A failing seed does not stop the leg: it
+      # runs its whole share, then fails listing every failed seed.
       - name: Run nightly madsim seed sweep
         run: |
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
@@ -287,11 +288,12 @@ jobs:
       - name: Test Raft units under madsim
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
 
-      # Smoke corpus replays, and the minimization, shape assertion and
+      # Smoke corpus replays, the unit tests of `ursula-sim smoke` (which
+      # builds only under madsim), and the minimization, shape assertion and
       # replay of corpus seeds 146, 147 and 155.
       - name: Run smoke corpus replays and seed minimizations
         run: |
-          RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --no-fail-fast smoke_corpus_replays
+          RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --no-fail-fast smoke_corpus_replays smoke::tests
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
