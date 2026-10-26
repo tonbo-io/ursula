@@ -1,5 +1,7 @@
-//! `ursula-sim smoke`: corpus replays plus a seed sweep with failure
-//! artifacts. `--shard INDEX/COUNT` runs one share of the sweep.
+//! `ursula-sim smoke`: a seed sweep with failure artifacts. `--shard
+//! INDEX/COUNT` runs one share of the sweep. The sweep runs every seed of
+//! its share and then fails listing each failed seed. The checked-in
+//! corpora replay in the `smoke_corpus_replays` test.
 
 use std::error::Error;
 use std::fmt;
@@ -7,11 +9,10 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::num::ParseIntError;
 use std::panic;
+use std::path::Path;
 use std::path::PathBuf;
 
 use ursula_sim::SIM_REGRESSION_SCHEMA_VERSION;
-use ursula_sim::SimFailureRegressionRecord;
-use ursula_sim::SimRegressionRecord;
 use ursula_sim::SimScenario;
 use ursula_sim::SimSchedule;
 use ursula_sim::SimScheduledRecord;
@@ -25,11 +26,6 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let args = Args::parse(args)?;
     let shard = args.shard.unwrap_or(Shard::WHOLE);
 
-    // The corpora replay once per sweep: in its first share.
-    if shard.index == 0 {
-        replay_corpora()?;
-    }
-
     let failure_dir = args
         .failure_dir
         .unwrap_or_else(|| PathBuf::from("target/ursula-sim-failures"));
@@ -41,7 +37,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         println!("shard {shard}: {} of {listed} seeds", seeds.len());
     }
 
-    let mut observed_failures = 0usize;
+    // Every seed runs: a failure is recorded and the sweep goes on, so one
+    // failing seed cannot hide the verdict of the seeds after it.
+    let mut failures = Vec::new();
     for schedule_seed in seeds {
         let seed = schedule_seed.seed;
         let mut schedule = schedule_seed.generate_schedule();
@@ -68,86 +66,161 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 }
             }
             Err(payload) => {
-                observed_failures += 1;
-                let raw_event_log = SimTrace::last_recorded().events;
-                let stable_trace = SimTrace {
-                    events: raw_event_log.clone(),
-                }
-                .stable_replay();
-                let stable_artifact = StableTraceArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    schedule: schedule.clone(),
-                    stable_trace,
-                };
-                let stable_path = failure_dir.join(format!("seed-{seed}-stable-trace.json"));
-                let raw_path = failure_dir.join(format!("seed-{seed}-raw-events.json"));
-                let summary_path = failure_dir.join(format!("seed-{seed}-failure.json"));
-
-                let mut stable_body = serde_json::to_string_pretty(&stable_artifact)?;
-                stable_body.push('\n');
-                fs::write(&stable_path, stable_body)?;
-
-                let mut raw_body = serde_json::to_string_pretty(&RawEventLogArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    seed,
-                    events: raw_event_log,
-                })?;
-                raw_body.push('\n');
-                fs::write(&raw_path, raw_body)?;
-
-                let panic = panic_payload_to_string(payload);
-                let artifact = FailedSeedArtifact {
-                    schema_version: SIM_REGRESSION_SCHEMA_VERSION,
-                    seed,
+                let failure = write_failure_artifacts(
+                    &failure_dir,
+                    schedule_seed,
                     schedule,
-                    stable_trace_path: stable_path.display().to_string(),
-                    raw_event_log_path: raw_path.display().to_string(),
-                    panic,
-                };
-                let mut body = serde_json::to_string_pretty(&artifact)?;
-                body.push('\n');
-                fs::write(&summary_path, body)?;
-                if !args.expect_failures {
-                    return Err(format!(
-                        "sim seed {seed} failed; wrote {}, {}, {}",
-                        summary_path.display(),
-                        stable_path.display(),
-                        raw_path.display()
-                    )
-                    .into());
-                }
+                    panic_payload_to_string(payload),
+                )?;
+                println!("sim {failure}");
+                failures.push(failure);
             }
         }
     }
 
-    if args.expect_failures && observed_failures == 0 {
-        return Err("--expect-failures was set but no seed failed".into());
-    }
+    Ok(sweep_verdict(failures, args.expect_failures)?)
+}
 
+/// A seed the sweep saw fail and the artifacts it wrote for it.
+#[derive(Debug)]
+struct FailedSeed {
+    seed: u64,
+    kind: &'static str,
+    summary_path: PathBuf,
+    stable_path: PathBuf,
+    raw_path: PathBuf,
+}
+
+impl fmt::Display for FailedSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "seed {} ({}) failed; wrote {}, {}, {}",
+            self.seed,
+            self.kind,
+            self.summary_path.display(),
+            self.stable_path.display(),
+            self.raw_path.display()
+        )
+    }
+}
+
+/// Why a sweep that ran every seed of its share fails.
+#[derive(thiserror::Error)]
+enum SweepError {
+    #[error("{}", seeds_failed_message(.failures))]
+    SeedsFailed { failures: Vec<FailedSeed> },
+    #[error("--expect-failures was set but no seed failed")]
+    NoSeedFailed,
+}
+
+/// `main` prints the error it returns with `Debug`: print the message.
+impl fmt::Debug for SweepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+fn seeds_failed_message(failures: &[FailedSeed]) -> String {
+    let mut message = format!("{} sim seeds failed:", failures.len());
+    for failure in failures {
+        message.push_str("\n  ");
+        message.push_str(&failure.to_string());
+    }
+    message
+}
+
+/// The verdict of a sweep over the failures of all its seeds: without
+/// `--expect-failures` any failure fails it, with the flag none does.
+fn sweep_verdict(failures: Vec<FailedSeed>, expect_failures: bool) -> Result<(), SweepError> {
+    match (expect_failures, failures.is_empty()) {
+        (false, true) | (true, false) => Ok(()),
+        (false, false) => Err(SweepError::SeedsFailed { failures }),
+        (true, true) => Err(SweepError::NoSeedFailed),
+    }
+}
+
+/// Why the seed list of a sweep is refused.
+#[derive(Debug, thiserror::Error)]
+enum SeedListError {
+    #[error(
+        "seed {seed} is listed under generators `{first}` and `{second}`; a sweep runs each seed under one generator, so its artifacts are named by the seed alone"
+    )]
+    SeedUnderSeveralGenerators {
+        seed: u64,
+        first: &'static str,
+        second: &'static str,
+    },
+}
+
+/// Refuses a list, sorted by seed, that names a seed under more than one
+/// generator: its runs would write the same `seed-N-*` files.
+fn one_generator_per_seed(seeds: &[ScheduleSeed]) -> Result<(), SeedListError> {
+    for pair in seeds.windows(2) {
+        if let [first, second] = pair
+            && first.seed == second.seed
+        {
+            return Err(SeedListError::SeedUnderSeveralGenerators {
+                seed: first.seed,
+                first: first.kind,
+                second: second.kind,
+            });
+        }
+    }
     Ok(())
 }
 
-/// The three checked-in corpora.
-fn replay_corpora() -> Result<(), Box<dyn Error>> {
-    let regression_corpus = include_str!("../../../corpus/smoke.json");
-    let regression_records = serde_json::from_str::<Vec<SimRegressionRecord>>(regression_corpus)?;
-    for record in regression_records {
-        record.assert_replays();
+fn write_failure_artifacts(
+    failure_dir: &Path,
+    schedule_seed: ScheduleSeed,
+    schedule: SimSchedule,
+    panic: String,
+) -> Result<FailedSeed, Box<dyn Error>> {
+    let seed = schedule_seed.seed;
+    let raw_event_log = SimTrace::last_recorded().events;
+    let stable_trace = SimTrace {
+        events: raw_event_log.clone(),
     }
+    .stable_replay();
+    let stable_artifact = StableTraceArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        schedule: schedule.clone(),
+        stable_trace,
+    };
+    let stable_path = failure_dir.join(format!("seed-{seed}-stable-trace.json"));
+    let raw_path = failure_dir.join(format!("seed-{seed}-raw-events.json"));
+    let summary_path = failure_dir.join(format!("seed-{seed}-failure.json"));
 
-    let schedule_corpus = include_str!("../../../corpus/schedule-smoke.json");
-    let schedule_records = serde_json::from_str::<Vec<SimScheduledRecord>>(schedule_corpus)?;
-    for record in schedule_records {
-        assert_eq!(record.schedule, SimSchedule::generate(record.schedule.seed));
-        record.assert_replays();
-    }
+    let mut stable_body = serde_json::to_string_pretty(&stable_artifact)?;
+    stable_body.push('\n');
+    fs::write(&stable_path, stable_body)?;
 
-    let failure_corpus = include_str!("../../../corpus/failure-smoke.json");
-    let failure_records = serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)?;
-    for record in failure_records {
-        record.assert_replays();
-    }
-    Ok(())
+    let mut raw_body = serde_json::to_string_pretty(&RawEventLogArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        seed,
+        events: raw_event_log,
+    })?;
+    raw_body.push('\n');
+    fs::write(&raw_path, raw_body)?;
+
+    let artifact = FailedSeedArtifact {
+        schema_version: SIM_REGRESSION_SCHEMA_VERSION,
+        seed,
+        schedule,
+        stable_trace_path: stable_path.display().to_string(),
+        raw_event_log_path: raw_path.display().to_string(),
+        panic,
+    };
+    let mut body = serde_json::to_string_pretty(&artifact)?;
+    body.push('\n');
+    fs::write(&summary_path, body)?;
+    Ok(FailedSeed {
+        seed,
+        kind: schedule_seed.kind,
+        summary_path,
+        stable_path,
+        raw_path,
+    })
 }
 
 /// One share of a sweep: the seeds at positions INDEX, INDEX + COUNT, ...
@@ -330,6 +403,7 @@ impl Args {
         }
         seeds.sort_unstable_by_key(|seed| (seed.seed, seed.kind));
         seeds.dedup_by_key(|seed| (seed.seed, seed.kind));
+        one_generator_per_seed(&seeds)?;
         if panic_message.is_some() && runtime_panic_after.is_none() {
             return Err(format!(
                 "--panic-message requires --runtime-panic-after\nusage: {}",
@@ -374,8 +448,9 @@ type Generator = fn(u64) -> SimSchedule;
 #[derive(Clone, Copy)]
 struct ScheduleSeed {
     seed: u64,
-    /// Stable generator identifier; part of the sort/dedup key so the same
-    /// seed can run under different generators.
+    /// Stable generator identifier; part of the sort/dedup key so families
+    /// sharing a generator run a seed once, and a seed under two generators
+    /// is refused.
     kind: &'static str,
     generate: Generator,
 }
@@ -1088,11 +1163,12 @@ fn apply_cold_corrupt_read_node(
 }
 
 fn write_success_artifacts(
-    failure_dir: &std::path::Path,
+    failure_dir: &Path,
     record: &SimScheduledRecord,
 ) -> Result<(), Box<dyn Error>> {
-    let stable_path = failure_dir.join(format!("seed-{}-replay.json", record.schedule.seed));
-    let raw_path = failure_dir.join(format!("seed-{}-raw-events.json", record.schedule.seed));
+    let seed = record.schedule.seed;
+    let stable_path = failure_dir.join(format!("seed-{seed}-replay.json"));
+    let raw_path = failure_dir.join(format!("seed-{seed}-raw-events.json"));
     let mut stable_body = serde_json::to_string_pretty(record)?;
     stable_body.push('\n');
     fs::write(stable_path, stable_body)?;
@@ -1105,4 +1181,76 @@ fn write_success_artifacts(
     raw_body.push('\n');
     fs::write(raw_path, raw_body)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Args;
+    use super::FailedSeed;
+    use super::SeedListError;
+    use super::SweepError;
+    use super::sweep_verdict;
+
+    fn failed(seed: u64) -> FailedSeed {
+        FailedSeed {
+            seed,
+            kind: "normal",
+            summary_path: PathBuf::from(format!("dir/seed-{seed}-failure.json")),
+            stable_path: PathBuf::from(format!("dir/seed-{seed}-stable-trace.json")),
+            raw_path: PathBuf::from(format!("dir/seed-{seed}-raw-events.json")),
+        }
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, Box<dyn std::error::Error>> {
+        Args::parse(args.iter().map(|arg| (*arg).to_owned()).collect())
+    }
+
+    #[test]
+    fn a_sweep_with_failures_fails_naming_every_failed_seed() {
+        let err = sweep_verdict(vec![failed(61), failed(64)], false).unwrap_err();
+        assert!(
+            matches!(&err, SweepError::SeedsFailed { failures } if failures.len() == 2),
+            "{err}"
+        );
+        // `main` prints the error with `Debug`, so that is the message.
+        let printed = format!("{err:?}");
+        assert_eq!(printed, err.to_string());
+        assert!(printed.contains("2 sim seeds failed"), "{printed}");
+        assert!(printed.contains("dir/seed-61-failure.json"), "{printed}");
+        assert!(printed.contains("dir/seed-64-failure.json"), "{printed}");
+    }
+
+    #[test]
+    fn a_sweep_verdict_follows_expect_failures() {
+        assert!(matches!(sweep_verdict(Vec::new(), false), Ok(())));
+        assert!(matches!(sweep_verdict(vec![failed(61)], true), Ok(())));
+        assert!(matches!(
+            sweep_verdict(Vec::new(), true),
+            Err(SweepError::NoSeedFailed)
+        ));
+    }
+
+    #[test]
+    fn a_seed_listed_under_two_generators_is_refused() {
+        let err = parse(&["--seed", "122", "--seed-family", "leader-failover"])
+            .err()
+            .expect("seed 122 under two generators");
+        assert!(
+            matches!(
+                err.downcast_ref::<SeedListError>(),
+                Some(SeedListError::SeedUnderSeveralGenerators {
+                    seed: 122,
+                    first: "leader-failover",
+                    second: "normal",
+                })
+            ),
+            "{err}"
+        );
+
+        let args = parse(&["--seed", "121", "--seed-family", "leader-failover"])
+            .expect("seed 121 is outside the family");
+        assert_eq!(args.seeds.len(), 6);
+    }
 }

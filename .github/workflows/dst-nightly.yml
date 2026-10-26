@@ -84,8 +84,9 @@ jobs:
           rustflags: ""
 
       # Each leg runs every COUNT-th seed of the sweep's sorted, deduplicated
-      # list (`ursula-sim smoke --shard`), so each seed runs once. Share 0
-      # also replays the corpora.
+      # list (`ursula-sim smoke --shard`), so each seed runs once. A failing
+      # seed does not stop the leg: it runs its whole share, then fails
+      # listing every failed seed.
       - name: Run nightly madsim seed sweep
         run: |
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
@@ -287,11 +288,33 @@ jobs:
       - name: Test Raft units under madsim
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
 
-      # Smoke corpus replays, and the minimization, shape assertion and
+      # A sweep goes on past a failed seed: seed 60 fails by an injected
+      # panic, seed 61 still runs, and the command fails listing seed 60.
+      # The files go outside `target/ursula-sim-*`, so the reports do not
+      # count seed 60 as a failed seed.
+      - name: Check that a sweep runs every seed past a failure
+        run: |
+          mkdir -p target/smoke-keep-going
+          status=0
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
+            --seed 60 --seed 61 --inject-panic-seed 60 \
+            --write-artifacts --failure-dir target/smoke-keep-going > "target/smoke-keep-going/smoke.log" 2>&1 || status=$?
+          cat "target/smoke-keep-going/smoke.log"
+          test "$status" -eq 1
+          grep -F "1 sim seeds failed:" "target/smoke-keep-going/smoke.log"
+          grep -F "seed 60 (normal) failed; wrote target/smoke-keep-going/seed-60-failure.json" "target/smoke-keep-going/smoke.log"
+          test -s "target/smoke-keep-going/seed-60-failure.json"
+          test -s "target/smoke-keep-going/seed-60-stable-trace.json"
+          test -s "target/smoke-keep-going/seed-60-raw-events.json"
+          test -s "target/smoke-keep-going/seed-61-replay.json"
+          test ! -e "target/smoke-keep-going/seed-61-failure.json"
+
+      # Smoke corpus replays, the unit tests of `ursula-sim smoke` (which
+      # builds only under madsim), and the minimization, shape assertion and
       # replay of corpus seeds 146, 147 and 155.
       - name: Run smoke corpus replays and seed minimizations
         run: |
-          RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --no-fail-fast smoke_corpus_replays
+          RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --no-fail-fast smoke_corpus_replays smoke::tests
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
