@@ -2,8 +2,7 @@
 //!
 //! Subcommands:
 //!
-//! - `smoke`: replay the checked-in corpora, then sweep seeds and write
-//!   failure artifacts.
+//! - `smoke`: sweep seeds and write failure artifacts.
 //! - `replay`: re-run a seed or recorded artifact and check its outcome.
 //! - `minimize`: shrink a failing schedule while preserving a target
 //!   predicate.
