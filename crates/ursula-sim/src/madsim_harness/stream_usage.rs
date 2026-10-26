@@ -275,11 +275,12 @@ pub(super) enum Script {
     /// the consumer reads and lose them in a power cut, and a recovery
     /// plan accepts the loss: a new history. It runs without the snapshot
     /// driver and with segments no run fills, so no snapshot, rotation or
-    /// reclaim syncs the window before the power cut. On half of the seeds
-    /// the others write back the window's creates and first appends before
-    /// its last appends, so the plan keeps their longest log without a cut
-    /// and versions created in the window live on into the new history. On
-    /// the other half they lose the whole window, and the plan cuts.
+    /// reclaim syncs the window before the power cut. On alternate
+    /// accepted-loss seeds ([`window_written_back`]) the others write back
+    /// the window's creates and first appends before its last appends, so
+    /// the plan keeps their longest log without a cut and versions created
+    /// in the window live on into the new history. On the others they lose
+    /// the whole window, and the plan cuts.
     AcceptedLoss,
     /// Both groups backed up, every node wiped, and the backups imported
     /// into the new groups, whose genesis the consumer's cursors do not
@@ -341,6 +342,13 @@ impl Script {
             _ => Some(DRIVERS),
         }
     }
+}
+
+/// Whether the accepted loss of `seed` writes its window's creates and
+/// first appends back before the power cut. Accepted-loss seeds are eight
+/// apart, so they alternate, and any two consecutive ones reach both halves.
+fn window_written_back(seed: u64) -> bool {
+    seed / 8 % 2 == 0
 }
 
 /// One stream version the writers made, as the oracle counts it.
@@ -1603,16 +1611,25 @@ impl Run {
             self.append(&stream).await;
             self.append(&stream).await;
         }
-        // On half of the seeds the others write the window's creates and
-        // first appends back, so those survive the power cut, their logs
-        // end in the window's term, and the plan keeps the longest log
-        // without a cut. Otherwise they lose the whole window, and the plan
-        // cuts to the committed markers. The drawn appends are lost either
-        // way.
-        let written_back = self.draw(2) == 0;
+        // On alternate accepted-loss seeds the others write the window's
+        // creates and first appends back, so those survive the power cut,
+        // their logs end in the window's term, and the plan keeps the
+        // longest log without a cut. Otherwise they lose the whole window,
+        // and the plan cuts to the committed markers. The drawn appends are
+        // lost either way.
+        let written_back = window_written_back(self.seed);
+        // The others' vote terms at the write-back, which the plan's floor
+        // must still be for the window's term to reach it.
+        let mut window_terms = BTreeMap::new();
         if written_back {
             for node_id in &others {
                 self.cluster.wals[node_id].write_back();
+                for group in JOURNAL_GROUPS {
+                    window_terms.insert(
+                        (group, *node_id),
+                        metrics(&self.cluster, group, *node_id).current_term,
+                    );
+                }
             }
             self.fault("window_prefix_written_back");
         }
@@ -1625,6 +1642,19 @@ impl Run {
         // The consumer reads the window from the others, which applied it.
         self.poll_until_complete_via(false, "window_read", Route::Avoid(cut))
             .await;
+        // An election among the others after the write-back raises their
+        // vote floor above the window's term, and the plan then rightly
+        // cuts: the script did not set up its case.
+        for ((group, node_id), term) in &window_terms {
+            let now = metrics(&self.cluster, *group, *node_id).current_term;
+            if now != *term {
+                panic!(
+                    "{}: group {group}: node {node_id}'s term went from {term} to {now} after \
+                     the write-back: the window's term is no longer the others' vote term",
+                    self.context
+                );
+            }
+        }
         // The others lose power and every page written since the last
         // write-back: no snapshot driver runs and no segment fills, so
         // nothing synced their journals since.
@@ -2302,6 +2332,7 @@ mod tests {
     use super::SCRIPTS;
     use super::Script;
     use super::TOTALS_INVARIANT;
+    use super::window_written_back;
     use crate::madsim_harness::STREAM_USAGE_EXTENDED_SEEDS;
     use crate::madsim_harness::STREAM_USAGE_SEEDS;
     use crate::madsim_harness::SimEvent;
@@ -2341,7 +2372,9 @@ mod tests {
     }
 
     /// The family's default range runs every script once, and its
-    /// extended range four times.
+    /// extended range four times. The accepted loss's window is written
+    /// back on the default range's seed and on alternate extended seeds,
+    /// so the nightly reaches both halves.
     #[test]
     fn stream_usage_seeds_cover_every_script() {
         for script in SCRIPTS {
@@ -2351,6 +2384,16 @@ mod tests {
             assert_eq!(runs(STREAM_USAGE_SEEDS), 1, "{script:?}");
             assert_eq!(runs(STREAM_USAGE_EXTENDED_SEEDS), 4, "{script:?}");
         }
+        let halves = |seeds: std::ops::RangeInclusive<u64>| {
+            seeds
+                .filter(|seed| Script::of(*seed) == Script::AcceptedLoss)
+                .map(window_written_back)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(halves(STREAM_USAGE_SEEDS), [true]);
+        assert_eq!(halves(STREAM_USAGE_EXTENDED_SEEDS), [
+            false, true, false, true
+        ]);
     }
 
     /// Every script bills exactly, the same way twice per seed, and each
@@ -2380,6 +2423,13 @@ mod tests {
                 Script::SkipPastRetention => assert!(*relists_retired > 0, "seed {seed}"),
                 Script::AcceptedLoss => {
                     assert!(*history_changes > 0 && *lost_write_units > 0, "seed {seed}");
+                    let wrote_back = first.outcome.trace.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            SimEvent::FaultApplied { phase } if phase == "window_prefix_written_back"
+                        )
+                    });
+                    assert_eq!(wrote_back, window_written_back(seed), "seed {seed}");
                 }
                 Script::Restore => assert!(*history_changes > 0, "seed {seed}"),
                 _ => {}
