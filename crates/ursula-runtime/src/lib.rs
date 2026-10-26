@@ -319,6 +319,7 @@ pub use runtime::COLD_ORPHAN_SWEEP_GRACE_MS;
 pub use runtime::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR;
 pub use runtime::ColdIndexRepairStep;
 pub use runtime::EXCLUSIVE_FLUSH_MIN_BYTES;
+pub use runtime::GroupPurge;
 pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;

@@ -85,6 +85,9 @@ pub enum StreamResponse {
         bucket_id: String,
         removed_streams: u64,
         pending_cold_gc_entries: u64,
+        /// The group's history the purge applied in: with the entry's
+        /// index, it names the purge on one lineage of the group's log.
+        history: NonZeroU64,
     },
     /// A whole-group state import accepted by [`StreamCommand::ImportSnapshot`].
     ///

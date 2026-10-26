@@ -640,6 +640,7 @@ impl InMemoryGroupEngine {
                 bucket_id: _,
                 removed_streams,
                 pending_cold_gc_entries,
+                history,
             } => {
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
@@ -647,6 +648,7 @@ impl InMemoryGroupEngine {
                     removed_streams,
                     pending_cold_gc_entries,
                     group_commit_index: self.commit_index,
+                    history,
                 }))
             }
             StreamResponse::Error {

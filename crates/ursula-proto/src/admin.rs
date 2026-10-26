@@ -1784,9 +1784,9 @@ pub struct BucketPurgeReport {
     pub cold_gc_error: Option<String>,
     /// The cold store lists no object below `{bucket}/`.
     pub bucket_prefix_absent: bool,
-    /// Every group the purge reached, ascending, with the index of the
-    /// entry that purged the bucket there. A usage consumer holds the
-    /// purge complete once it read each group past it.
+    /// Every group the purge reached, ascending, with the entry that purged
+    /// the bucket there. A usage consumer holds the purge complete once it
+    /// read each group past it in the history it applied in.
     pub groups: Vec<GroupPurgeIndex>,
 }
 
@@ -1950,7 +1950,12 @@ impl UsageReport {
 /// `POST /__ursula/usage/streams` holds.
 pub const MAX_STREAM_USAGE_GROUP_ENTRIES: u32 = 10_000;
 /// The most items one answer of `POST /__ursula/usage/streams` holds over
-/// all its groups, about 8 MiB of JSON.
+/// all its groups. An entry takes about 470 B of JSON at short ids and
+/// small counters, so a full answer about 9 MiB. At most it takes about
+/// 1.4 KiB, with 20-digit counters and a stream id of control characters
+/// that JSON escapes into six bytes each, and a listed group's header about
+/// 0.6 KiB, so an answer holds at most about 29 MiB: 20,000 such entries
+/// and the headers of up to 4,096 groups.
 pub const MAX_STREAM_USAGE_ANSWER_ITEMS: u32 = 20_000;
 
 /// A history id: 16 lowercase hex digits, never zero. The one JSON encoding
@@ -2314,13 +2319,22 @@ impl GroupUsagePage {
     /// The cursor that continues the listing after this page: its genesis,
     /// history, log id and fold watermark, and `page.next` of a `more`
     /// page, else the entries after `usage_seq`. `None` for a page whose
-    /// status this build does not know, which is no answer.
+    /// status or next position this build does not know, which is no
+    /// answer.
     pub fn next_cursor(&self) -> Option<UsageCursor> {
         let position = match &self.page {
             UsagePage::Complete => UsagePosition::Entries {
                 after_seq: self.usage_seq,
             },
-            UsagePage::More { next } => next.clone(),
+            UsagePage::More { next } => match next {
+                UsageNext::Rows { after_bucket } => UsagePosition::Rows {
+                    after_bucket: after_bucket.clone(),
+                },
+                UsageNext::Entries { after_seq } => UsagePosition::Entries {
+                    after_seq: *after_seq,
+                },
+                UsageNext::Unknown => return None,
+            },
             UsagePage::Unknown => return None,
         };
         Some(UsageCursor::After {
@@ -2382,8 +2396,29 @@ pub enum UsagePage {
     /// after `usage_seq`.
     Complete,
     /// The limit cut the listing: send `next` as the cursor's position.
-    More { next: UsagePosition },
+    More { next: UsageNext },
     /// A status of a later release: no answer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a `more` page's listing continues: the position its next cursor
+/// sends ([`GroupUsagePage::next_cursor`]). The answer's own type, so a
+/// position kind of a later release reads as [`Self::Unknown`] rather than
+/// failing the whole answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageNext {
+    /// The relisting's bucket rows after `after_bucket`, the last row the
+    /// page listed.
+    Rows {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_bucket: Option<String>,
+    },
+    /// Entries with a seq above `after_seq`, the last entry the page
+    /// listed.
+    Entries { after_seq: u64 },
+    /// A position of a later release: no answer.
     #[serde(other)]
     Unknown,
 }
@@ -2496,11 +2531,14 @@ pub enum UsageUnavailable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPurgeIndex {
     pub raft_group_id: u32,
-    /// The index of the entry that purged the bucket in this group. The
-    /// purge is complete for metering once a kept complete page of the
-    /// group has `applied.index` at or above it and `history.event_index`
-    /// below it.
+    /// The index of the entry that purged the bucket in this group.
     pub commit_index: u64,
+    /// The group's history that entry applied in. The purge is complete
+    /// for metering once a kept complete page of the group has this
+    /// `history.id` and `applied.index` at or above `commit_index`. A page
+    /// of another history may come from a lineage that replaced the purge:
+    /// purge again and use the new report.
+    pub history: HistoryId,
 }
 
 #[cfg(test)]
@@ -2793,6 +2831,7 @@ mod stream_usage_tests {
     use super::StreamUsageRequest;
     use super::UsageCursor;
     use super::UsageLogId;
+    use super::UsageNext;
     use super::UsagePage;
     use super::UsagePosition;
     use super::UsageUnavailable;
@@ -2912,6 +2951,50 @@ mod stream_usage_tests {
         let lifecycle: VersionLifecycle =
             serde_json::from_str(r#"{"state": "later", "since_ms": 1}"#).unwrap();
         assert_eq!(lifecycle, VersionLifecycle::Unknown);
+    }
+
+    /// A `more` page whose next position is of a later release reads it as
+    /// unknown and gives no cursor, while the answer's other groups still
+    /// decode. A known next position continues the listing.
+    #[test]
+    fn a_later_next_position_reads_as_unknown() {
+        let more = |next: &str| {
+            ANSWER.replace(
+                r#""status": "complete""#,
+                &format!(r#""status": "more", "next": {next}"#),
+            )
+        };
+        let report: StreamUsageReport =
+            serde_json::from_str(&more(r#"{"kind": "later", "after": 1}"#)).unwrap();
+        let GroupStreamUsage::Listed(page) = &report.groups[0] else {
+            panic!("a listed page: {report:?}");
+        };
+        assert_eq!(page.page, UsagePage::More {
+            next: UsageNext::Unknown,
+        });
+        assert_eq!(page.next_cursor(), None);
+        assert!(
+            matches!(report.groups[1], GroupStreamUsage::Behind { .. }),
+            "{report:?}"
+        );
+
+        let report: StreamUsageReport =
+            serde_json::from_str(&more(r#"{"kind": "rows", "after_bucket": "tenant-a"}"#)).unwrap();
+        let GroupStreamUsage::Listed(page) = &report.groups[0] else {
+            panic!("a listed page: {report:?}");
+        };
+        assert!(
+            matches!(
+                page.next_cursor(),
+                Some(UsageCursor::After {
+                    position: UsagePosition::Rows {
+                        after_bucket: Some(ref bucket),
+                    },
+                    ..
+                }) if bucket == "tenant-a"
+            ),
+            "{page:?}"
+        );
     }
 
     #[test]

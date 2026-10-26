@@ -55,7 +55,6 @@ use crate::core_worker::CoreCommand;
 use crate::core_worker::CoreMailbox;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::WaitReadCancel;
-use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineFactory;
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
 use crate::error::RuntimeError;
@@ -249,6 +248,8 @@ pub struct ShardRuntime {
     read_barriers: ReadIndexBarriers,
     /// Told of the staged snapshot parts the orphan sweep deletes.
     swept_parts: Arc<std::sync::RwLock<Option<Arc<dyn SweptPartsObserver>>>>,
+    /// Whether this node hosts a group, as its cores decide it.
+    hosting: Hosting,
 }
 
 /// One staged snapshot part the orphan sweep deleted: its object path and
@@ -287,9 +288,9 @@ pub struct PurgeBucketReport {
     /// The groups whose purge removed a stream, ascending.
     pub groups_with_streams: Vec<RaftGroupId>,
     pub pending_cold_gc_entries: u64,
-    /// Every group the purge reached, ascending, with the index of the
-    /// entry that purged the bucket there.
-    pub commit_indexes: Vec<(RaftGroupId, u64)>,
+    /// Every group the purge reached, ascending, with the entry that
+    /// purged the bucket there.
+    pub purges: Vec<GroupPurge>,
     /// The groups this node hosts no replica of, which the pass did not
     /// purge. The caller purges each through its leader and adds the
     /// answer ([`Self::add`]).
@@ -311,33 +312,72 @@ impl PurgeBucketReport {
         self.pending_cold_gc_entries = self
             .pending_cold_gc_entries
             .saturating_add(response.pending_cold_gc_entries);
-        let purged = (group, response.group_commit_index);
+        let purged = GroupPurge {
+            raft_group_id: group,
+            commit_index: response.group_commit_index,
+            history: response.history,
+        };
         match self
-            .commit_indexes
-            .binary_search_by_key(&group, |(group, _)| *group)
+            .purges
+            .binary_search_by_key(&group, |purge| purge.raft_group_id)
         {
             Ok(at) => {
-                if let Some(seen) = self.commit_indexes.get_mut(at) {
-                    seen.1 = seen.1.max(purged.1);
+                if let Some(seen) = self.purges.get_mut(at)
+                    && purged.commit_index > seen.commit_index
+                {
+                    *seen = purged;
                 }
             }
-            Err(at) => self.commit_indexes.insert(at, purged),
+            Err(at) => self.purges.insert(at, purged),
         }
     }
+}
+
+/// The entry that purged a bucket in one group: its index, and the group's
+/// history it applied in, which together name the purge on one lineage of
+/// the group's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupPurge {
+    pub raft_group_id: RaftGroupId,
+    pub commit_index: u64,
+    pub history: std::num::NonZeroU64,
 }
 
 /// One answer of [`ShardRuntime::stream_usage_groups`].
 #[derive(Debug, Default)]
 pub struct StreamUsageGroups {
     /// Each requested group this node hosts and read, ascending: its page,
-    /// or why its engine refused the read.
+    /// or why the read was refused.
     pub groups: Vec<(
         RaftGroupId,
-        Result<ursula_stream::GroupUsageView, GroupEngineError>,
+        Result<ursula_stream::GroupUsageView, RuntimeError>,
     )>,
     /// Requested groups this node hosts that the answer's item budget left
     /// unread, ascending.
     pub omitted: Vec<RaftGroupId>,
+}
+
+/// The limit of one group's read in [`ShardRuntime::stream_usage_groups`]:
+/// the requested limit, capped at what the answer has left of `max_items`
+/// once it holds `items`. `None` when nothing is left: the group is
+/// omitted.
+pub(crate) fn group_read_limit(
+    requested: std::num::NonZeroUsize,
+    max_items: usize,
+    items: usize,
+) -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(requested.get().min(max_items.saturating_sub(items)))
+}
+
+/// The engine factory the cores open groups with, kept to ask whether this
+/// node hosts a group without opening it.
+#[derive(Clone)]
+struct Hosting(Arc<dyn GroupEngineFactory>);
+
+impl std::fmt::Debug for Hosting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hosting")
+    }
 }
 
 /// One group's answer in a node-wide pass, which covers the groups this
@@ -427,6 +467,7 @@ impl ShardRuntime {
             )),
             read_barriers,
             swept_parts: Arc::default(),
+            hosting: Hosting(engine_factory),
         })
     }
 
@@ -1066,10 +1107,10 @@ impl ShardRuntime {
     /// With `max_items` at least the largest limit, the first hosted group
     /// gets its whole limit, so it is never omitted.
     ///
-    /// A group whose engine refuses the read keeps its error, so one group
-    /// never fails the others. Any other failure, the runtime's own (a core
-    /// that does not serve, a group whose engine is opening), ends the
-    /// answer with it.
+    /// A group the read is refused for keeps its refusal, whether its engine
+    /// refused it or its core did (a group that opens or reopens, or whose
+    /// restart did not finish), so one group never fails the others. Only a
+    /// core that does not serve at all ends the answer.
     pub async fn stream_usage_groups(
         &self,
         mut reads: Vec<(RaftGroupId, ursula_stream::StreamUsageRead)>,
@@ -1079,16 +1120,13 @@ impl ShardRuntime {
         let mut answer = StreamUsageGroups::default();
         let mut items = 0_usize;
         for (group, mut read) in reads {
-            let Some(limit) =
-                std::num::NonZeroUsize::new(read.limit.get().min(max_items.saturating_sub(items)))
-            else {
-                // The group's core answers whether it hosts the group
-                // without reading any of it. Whatever else stops the group,
-                // the caller asks again and meets it then.
-                if !matches!(
-                    self.warm_group(group).await,
-                    Err(RuntimeError::GroupNotHosted { .. })
-                ) {
+            let Some(limit) = group_read_limit(read.limit, max_items, items) else {
+                // Asked of the engine factory, so the group is not opened
+                // for a read the answer does not make.
+                if self
+                    .placement_for_group(group)
+                    .is_ok_and(|placement| self.hosting.0.hosts_group(placement))
+                {
                     answer.omitted.push(group);
                 }
                 continue;
@@ -1104,10 +1142,11 @@ impl ShardRuntime {
                     answer.groups.push((group, Ok(view)));
                 }
                 Err(RuntimeError::GroupNotHosted { .. }) => {}
-                Err(RuntimeError::GroupEngine { error, .. }) => {
-                    answer.groups.push((group, Err(error)));
-                }
-                Err(err) => return Err(err),
+                Err(
+                    err @ (RuntimeError::MailboxClosed { .. }
+                    | RuntimeError::ResponseDropped { .. }),
+                ) => return Err(err),
+                Err(err) => answer.groups.push((group, Err(err))),
             }
         }
         Ok(answer)

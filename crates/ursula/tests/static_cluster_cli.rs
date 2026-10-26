@@ -5737,8 +5737,8 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
                     stream_usage(&client, node, start_cursors([purged.raft_group_id])).await?;
                 if let [GroupStreamUsage::Listed(page)] = report.groups.as_slice()
                     && page.page == UsagePage::Complete
+                    && page.history.id == purged.history
                     && page.applied.index >= purged.commit_index
-                    && page.history.event_index < purged.commit_index
                 {
                     assert!(
                         matches!(page.entries.as_slice(), [StreamUsageEntry {
@@ -6368,6 +6368,14 @@ impl MeteredGroup {
                     });
                 add_committed(self.to_buckets.entry(bucket.clone()).or_default(), share);
             }
+            // A bucket the relisting lists no row for keeps its retired
+            // view, and the levels of its closed versions join it, so a
+            // later relisting that lists its row accounts against both.
+            for (bucket, level) in closed_levels {
+                if !rows.contains_key(&bucket) {
+                    add_committed(self.retired_view.entry(bucket).or_default(), level);
+                }
+            }
         } else {
             // The first relisting is the baseline: what it lists is what
             // the consumer accounted before.
@@ -6376,10 +6384,9 @@ impl MeteredGroup {
             }
             self.baselined = true;
         }
-        self.retired_view = rows
-            .iter()
-            .map(|(bucket, row)| (bucket.clone(), row.retired))
-            .collect();
+        for (bucket, row) in &rows {
+            self.retired_view.insert(bucket.clone(), row.retired);
+        }
         self.relists.push(reason);
         self.rows = rows.values().cloned().collect();
         // Contract item 8: a relisting that completed in its first page

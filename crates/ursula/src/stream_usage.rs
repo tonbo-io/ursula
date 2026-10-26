@@ -4,8 +4,9 @@
 //!
 //! A read, so it takes no process-incarnation precondition. It names every
 //! tenant's streams, so no other listener serves it. A group that cannot be
-//! read answers `unavailable` with why, and never fails the answer: only a
-//! runtime that does not serve at all answers `503`.
+//! read, whether its engine or its core refused it, answers `unavailable`
+//! with why, and never fails the answer: only a runtime that does not serve
+//! at all answers `503`.
 
 use std::num::NonZeroUsize;
 
@@ -30,6 +31,7 @@ use ursula_proto::admin::StreamUsageRequest;
 use ursula_proto::admin::UsageCursor;
 use ursula_proto::admin::UsageHistory;
 use ursula_proto::admin::UsageLogId;
+use ursula_proto::admin::UsageNext;
 use ursula_proto::admin::UsagePage;
 use ursula_proto::admin::UsagePosition;
 use ursula_proto::admin::UsageUnavailable;
@@ -37,6 +39,7 @@ use ursula_proto::admin::VersionCountersReport;
 use ursula_proto::admin::VersionLifecycle;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
+use ursula_runtime::RuntimeError;
 use ursula_shard::RaftGroupId;
 use ursula_stream::GroupUsageView;
 use ursula_stream::LastWrite;
@@ -139,7 +142,7 @@ fn cursor(cursor: UsageCursor) -> ursula_stream::UsageCursor {
 /// One group's answer: its page, `behind`, or why it is unavailable.
 fn group_answer(
     group: RaftGroupId,
-    view: Result<GroupUsageView, GroupEngineError>,
+    view: Result<GroupUsageView, RuntimeError>,
 ) -> GroupStreamUsage {
     match view {
         Ok(GroupUsageView::Listed(listing)) => GroupStreamUsage::Listed(page(group, listing)),
@@ -164,22 +167,26 @@ fn group_answer(
     }
 }
 
-/// Why a group's engine refused the read, as the export reports it. A
-/// refusal the caller cannot act on but by asking another node is `other`,
-/// logged here so the operator sees what it was.
-fn usage_unavailable(group: RaftGroupId, error: &GroupEngineError) -> UsageUnavailable {
-    match error {
-        GroupEngineError::Infra(GroupInfraError::ApplyStopped { .. }) => {
-            UsageUnavailable::ApplyStopped
-        }
-        GroupEngineError::Infra(GroupInfraError::RecoveryPending { .. }) => {
-            UsageUnavailable::RecoveryPending
-        }
-        GroupEngineError::Infra(GroupInfraError::OwnerStopped) => UsageUnavailable::RaftStopped,
-        other => {
+/// Why the read of a group was refused, by its engine or by its core, as
+/// the export reports it. A refusal the caller cannot act on but by asking
+/// another node, such as a group that opens or reopens on its core, is
+/// `other`, logged here so the operator sees what it was.
+fn usage_unavailable(group: RaftGroupId, error: &RuntimeError) -> UsageUnavailable {
+    let infra = match error {
+        RuntimeError::GroupEngine {
+            error: GroupEngineError::Infra(infra),
+            ..
+        } => Some(infra),
+        _ => None,
+    };
+    match infra {
+        Some(GroupInfraError::ApplyStopped { .. }) => UsageUnavailable::ApplyStopped,
+        Some(GroupInfraError::RecoveryPending { .. }) => UsageUnavailable::RecoveryPending,
+        Some(GroupInfraError::OwnerStopped) => UsageUnavailable::RaftStopped,
+        _ => {
             tracing::warn!(
                 raft_group_id = group.0,
-                error = %other,
+                error = %error,
                 "per-stream usage read refused"
             );
             UsageUnavailable::Other
@@ -226,10 +233,10 @@ fn page(group: RaftGroupId, listing: UsageListing) -> GroupUsagePage {
             ursula_stream::UsagePage::More { next } => UsagePage::More {
                 next: match next {
                     ursula_stream::UsagePosition::Rows { after_bucket } => {
-                        UsagePosition::Rows { after_bucket }
+                        UsageNext::Rows { after_bucket }
                     }
                     ursula_stream::UsagePosition::Entries { after_seq } => {
-                        UsagePosition::Entries { after_seq }
+                        UsageNext::Entries { after_seq }
                     }
                 },
             },

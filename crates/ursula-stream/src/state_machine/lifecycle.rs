@@ -62,6 +62,12 @@ impl StreamStateMachine {
         if let Err(message) = validate_bucket_id(bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
         }
+        let Some(history) = self.history.map(|history| history.id) else {
+            return StreamResponse::error(
+                StreamErrorCode::HistoryPending,
+                "the group's genesis has not applied; it purges nothing before it",
+            );
+        };
         let mut removed_streams = 0u64;
         // Removal stamps cold-GC sequence numbers, so it follows the
         // stream-id order, never the order of this replica's hash map.
@@ -77,6 +83,7 @@ impl StreamStateMachine {
             removed_streams,
             pending_cold_gc_entries: u64::try_from(self.pending_cold_gc_len_for_bucket(bucket_id))
                 .unwrap_or(u64::MAX),
+            history,
         }
     }
 

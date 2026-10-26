@@ -4176,6 +4176,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
         bucket_id,
         removed_streams,
         pending_cold_gc_entries,
+        history,
     } = response
     else {
         panic!("expected BucketPurged, got {response:?}");
@@ -4183,6 +4184,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     assert_eq!(bucket_id, "benchcmp");
     assert_eq!(removed_streams, 2);
     assert_eq!(pending_cold_gc_entries, 0);
+    assert_eq!(history.get(), machine.history_id());
 
     // Content and the bucket are gone. The aggregate ledger remains with zero
     // gauges so an asynchronous meter cannot miss the committed writes.

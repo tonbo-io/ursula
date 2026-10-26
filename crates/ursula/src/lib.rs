@@ -2211,14 +2211,13 @@ pub(crate) async fn purge_bucket(
         // bucket in its group, after any history event that replaced the
         // first purge's.
         groups: proof
-            .commit_indexes
+            .purges
             .iter()
-            .map(
-                |(group, commit_index)| ursula_proto::admin::GroupPurgeIndex {
-                    raft_group_id: group.0,
-                    commit_index: *commit_index,
-                },
-            )
+            .map(|purge| ursula_proto::admin::GroupPurgeIndex {
+                raft_group_id: purge.raft_group_id.0,
+                commit_index: purge.commit_index,
+                history: ursula_proto::admin::HistoryId::new(purge.history),
+            })
             .collect(),
     })
     .into_response()
