@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
+use std::num::ParseIntError;
 use std::panic;
 use std::path::PathBuf;
 
@@ -164,14 +165,22 @@ impl Shard {
         count: NonZeroUsize::MIN,
     };
 
-    fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
-        let (index, count) = text
-            .split_once('/')
-            .ok_or_else(|| format!("--shard takes INDEX/COUNT, got `{text}`"))?;
-        let index = index.parse::<usize>()?;
-        let count = count.parse::<NonZeroUsize>()?;
+    fn parse(text: &str) -> Result<Self, ShardError> {
+        let (index, count) = text.split_once('/').ok_or_else(|| ShardError::Shape {
+            text: text.to_owned(),
+        })?;
+        let index = index.parse::<usize>().map_err(|source| ShardError::Index {
+            text: text.to_owned(),
+            source,
+        })?;
+        let count = count
+            .parse::<NonZeroUsize>()
+            .map_err(|source| ShardError::Count {
+                text: text.to_owned(),
+                source,
+            })?;
         if index >= count.get() {
-            return Err(format!("--shard index {index} is not below its count {count}").into());
+            return Err(ShardError::IndexNotBelowCount { index, count });
         }
         Ok(Self { index, count })
     }
@@ -183,6 +192,27 @@ impl Shard {
             .step_by(self.count.get())
             .collect()
     }
+}
+
+/// Why `--shard` refuses its value.
+#[derive(Debug, thiserror::Error)]
+enum ShardError {
+    #[error("--shard takes INDEX/COUNT, got `{text}`")]
+    Shape { text: String },
+    #[error("--shard INDEX in `{text}` is not a number")]
+    Index {
+        text: String,
+        #[source]
+        source: ParseIntError,
+    },
+    #[error("--shard COUNT in `{text}` is not a positive number")]
+    Count {
+        text: String,
+        #[source]
+        source: ParseIntError,
+    },
+    #[error("--shard index {index} is not below its count {count}")]
+    IndexNotBelowCount { index: usize, count: NonZeroUsize },
 }
 
 impl fmt::Display for Shard {

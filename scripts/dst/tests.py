@@ -108,6 +108,24 @@ def test_nondeterminism_flags_a_madsim_runtime_outside_run_isolated(monkeypatch,
         ("needs: [audits, sweep, ", "needs: [audits, "),
         ("\n    if: always()\n", "\n"),
         ('all(.[]; .result == "success")', 'any(.[]; .result == "success")'),
+        (
+            "      - name: Run nightly madsim seed sweep\n        run: |\n",
+            "      - name: Run nightly madsim seed sweep\n        env:\n"
+            "          DST_SHARD: 0/7\n        run: |\n",
+        ),
+        (
+            "      - name: Run nightly madsim seed sweep\n        run: |\n",
+            "      - name: Run nightly madsim seed sweep\n        run: |\n"
+            "          export DST_SHARD=0/7\n",
+        ),
+        ("  report:\n", "  cold_extra: # not needed by report\n    runs-on: ubuntu-24.04\n"
+         "    steps:\n      - run: true\n\n  report:\n"),
+        ("          jq -e 'all(", "          # jq -e 'all("),
+        (
+            "      - name: Every DST job passed\n",
+            "      - name: Every DST job passed\n        continue-on-error: true\n",
+        ),
+        ("\n    if: always()\n", "\n    if: always()\n    continue-on-error: true\n"),
     ],
 )
 def test_shard_wiring_flags_a_run_that_could_pass_in_part(old, new):

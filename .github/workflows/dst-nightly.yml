@@ -63,9 +63,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One leg per share of the sweep. Keep the count coprime to the
-        # moduli scenario generators pick a script with (2, 3, 4, 8, 9 and
-        # 12 today), or each share runs only some of a family's scripts.
+        # One leg per share of the sweep. Each seed runs once whatever the
+        # count, but a count sharing a factor with a `seed % N` a generator
+        # picks a script with gives each share only some of those scripts
+        # (seven: the `seed % 7` ones). See the DST architecture doc, CI.
         share: [0, 1, 2, 3, 4, 5, 6]
     env:
       DST_SHARD: ${{ strategy.job-index }}/${{ strategy.job-total }}
@@ -1022,7 +1023,8 @@ jobs:
 
       # One issue with a stable title collects every scheduled failure. The
       # repository is public, so the comment carries only the run link and
-      # the names of the failing steps.
+      # what failed: each failed or cancelled step with its job, or a job's
+      # own result when no step of it failed (a lost runner, a skipped job).
       - name: Report a scheduled failure
         if: failure() && !cancelled() && github.event_name == 'schedule'
         env:
@@ -1030,10 +1032,15 @@ jobs:
           TITLE: DST Nightly failing on main
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # shellcheck disable=SC2016 # $job is a jq variable
+          # shellcheck disable=SC2016 # $job and $result are jq variables
           failed="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
-            --jq '[.jobs[] | .name as $job | .steps[] | select(.conclusion == "failure") | "\($job): \(.name)"] | join(", ")')"
-          body="$(printf 'Run %s failed.\n\nFailing steps: %s' "$RUN_URL" "${failed:-unknown}")"
+            --jq '[.jobs[] | .name as $job | .conclusion as $result
+              | [(.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled")
+                 | "\($job): \(.name) (\(.conclusion))"]
+              | if length > 0 then .[]
+                elif $result != null and $result != "success" then "\($job): \($result)"
+                else empty end] | join(", ")')"
+          body="$(printf 'Run %s failed.\n\nFailed: %s' "$RUN_URL" "${failed:-unknown}")"
           issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "\"$TITLE\" in:title" --limit 20 --json number,title \
             --jq "[.[] | select(.title == \"$TITLE\")][0].number // empty")"

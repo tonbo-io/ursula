@@ -516,14 +516,29 @@ def _unwired_replay_tests() -> list[str]:
 
 # A matrix job's legs each run one share of a sharded command: share
 # INDEX of COUNT, from the leg's own index in its matrix.
-SHARD_ENV = "DST_SHARD: ${{ strategy.job-index }}/${{ strategy.job-total }}"
+SHARD_VALUE = "${{ strategy.job-index }}/${{ strategy.job-total }}"
+SHARD_ENV = f"DST_SHARD: {SHARD_VALUE}"
+VERDICT_STEP = "Every DST job passed"
+VERDICT_CHECK = """jq -e 'all(.[]; .result == "success")'"""
 
 
 def _workflow_jobs(text: str) -> dict[str, str]:
     """The workflow's jobs by id, each with the text of its body."""
     body = text.split("\njobs:\n", 1)[1]
-    parts = re.split(r"^  ([a-z][a-z0-9-]*):\n", body, flags=re.MULTILINE)
+    parts = re.split(
+        r"^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(?:#[^\n]*)?\n", body, flags=re.MULTILINE
+    )
     return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _job_steps(body: str) -> list[str]:
+    """A job body's steps, each as its own text."""
+    return re.split(r"^      - ", body, flags=re.MULTILINE)[1:]
+
+
+def _code_lines(text: str) -> list[str]:
+    """The lines of `text` that are not YAML or shell comments."""
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
 
 
 def _shard_wiring_errors(text: str) -> list[str]:
@@ -531,11 +546,19 @@ def _shard_wiring_errors(text: str) -> list[str]:
     a share not taken from the leg's matrix index, or a job whose failure,
     skip or cancellation the `report` job's verdict does not see."""
     jobs = _workflow_jobs(text)
+    code = _code_lines(text)
     errors = [
-        f"`--shard {value}`: a share must be `--shard \"$DST_SHARD\"`"
-        for value in re.findall(r"^[^#\n]*--shard\s+(\S+)", text, re.MULTILINE)
-        if value != '"$DST_SHARD"'
+        f"`--shard {m.group(1)}`: a share must be `--shard \"$DST_SHARD\"`"
+        for line in code
+        if (m := re.search(r"--shard\s+(\S+)", line)) and m.group(1) != '"$DST_SHARD"'
     ]
+    for line in code:
+        if m := re.search(r"\bDST_SHARD:(.*)$", line):
+            value = re.sub(r"\s+#.*$", "", m.group(1)).strip()
+            if value != SHARD_VALUE:
+                errors.append(f"`DST_SHARD: {value}`: a share must be `{SHARD_VALUE}`")
+        if re.search(r"\bDST_SHARD=", line):
+            errors.append(f"`{line.strip()}`: only a job's `{SHARD_ENV}` may set the share")
     errors += [
         f"job `{job}` uses $DST_SHARD but does not set `{SHARD_ENV}`"
         for job, body in jobs.items()
@@ -549,8 +572,17 @@ def _shard_wiring_errors(text: str) -> list[str]:
         errors.append(f"the `report` job does not need {missing}")
     if "\n    if: always()\n" not in report:
         errors.append("the `report` job must run `if: always()`")
-    if 'all(.[]; .result == "success")' not in report:
-        errors.append("the `report` job has no step that fails unless every job succeeded")
+    if re.search(r"^    continue-on-error:", report, re.MULTILINE):
+        errors.append("the `report` job must not set `continue-on-error:`")
+    verdicts = [
+        step for step in _job_steps(report) if step.startswith(f"name: {VERDICT_STEP}\n")
+    ]
+    if len(verdicts) != 1 or not any(VERDICT_CHECK in line for line in _code_lines(verdicts[0])):
+        errors.append(
+            f"the `report` job needs one step `{VERDICT_STEP}` that runs `{VERDICT_CHECK}`"
+        )
+    elif re.search(r"^        (if|continue-on-error):", verdicts[0], re.MULTILINE):
+        errors.append(f"the `{VERDICT_STEP}` step must not set `if:` or `continue-on-error:`")
     return errors
 
 
