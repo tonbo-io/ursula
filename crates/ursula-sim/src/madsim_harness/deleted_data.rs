@@ -33,6 +33,16 @@
 //! expiry. Seeds stop a follower across the expiry, stop the leader just
 //! before it, or cut a replica's power right after its covering snapshot.
 //!
+//! Invariant `end_records_leave_within_bound` (the same runs, F20): the
+//! removal's end record, which holds the stream's id and final usage,
+//! leaves each replica's state, its current snapshot and its retained log
+//! within the bound of when the replica removed the stream, or, for a
+//! replica that restarted since, within a quarter of the bound and a second
+//! of its return, since a fold it applies after its return owes its
+//! snapshot that much later. The run plays every replica's tidy pass in
+//! every run, so each group engine's retirement clock samples on virtual
+//! time and the leader's sweep folds the end record.
+//!
 //! A second scenario interleaves an operator's snapshot with a purge
 //! through a covering snapshot that the leader defers while a slow
 //! follower's replication reads the range: the operator's build starts only
@@ -52,12 +62,18 @@
 //!   snapshot that dropped the stream and the purge through it does not
 //!   purge through the snapshot it restores, so its log keeps the records.
 //!   With the purge on ([`Controls::CRASH_BEFORE_PURGE`]) the bound holds.
+//!   Both hold the end record unfolded, since the snapshot after its fold
+//!   would purge the log through what the restore left, and judge the
+//!   stream's records alone.
 //! - [`Controls::WAL_AGE_OFF`]: the log drops the records, but a journal
 //!   segment that held their dead frames is freed only once the journal
 //!   outgrows its budget, so a small journal keeps them in its files (a).
 //! - [`Controls::SWEEP_OFF`]: no leader sweeps, so an expired stream that
 //!   nothing reads stays in the group, quiet or taking writes to other
 //!   streams, and in its snapshot.
+//! - [`Controls::RETIREMENT_OFF`]: the retirement clock names no seq, so
+//!   the end record never folds and stays in every replica's state and
+//!   snapshot past the bound.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -83,6 +99,10 @@ use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::expiry_sweep;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
+use ursula_stream::GroupUsageView;
+use ursula_stream::Lifecycle;
+use ursula_stream::StreamUsageRead;
+use ursula_stream::UsageCursor;
 
 use super::SimEvent;
 use super::SimTrace;
@@ -101,6 +121,7 @@ use super::journal_cluster::wait_leader;
 use super::recovery_wiring::REVERSION_INVARIANT;
 
 pub(super) const BOUND_INVARIANT: &str = "deleted_data_leaves_within_bound";
+pub(super) const END_RECORDS_INVARIANT: &str = "end_records_leave_within_bound";
 #[cfg(test)]
 pub(super) const HOLD_INVARIANT: &str = "operator_snapshot_waits_for_a_scrub_purge";
 
@@ -123,15 +144,22 @@ pub(super) const DRIVERS: DriverPlan = DriverPlan {
     interval: Duration::from_millis(200),
     permits: 1,
 };
-/// The drivers' settings the bound is checked with: twelve seconds, so the
-/// floor is three. The bound covers a pass of the driver too, which may wait
-/// [`ursula_raft::SNAPSHOT_HANDOFF_WAIT`] for a trigger another group's
-/// build does not claim, and a run fits the simulation's 30 s of virtual
-/// time.
-const BOUND_DRIVERS: DriverPlan = DriverPlan {
-    max_age: Duration::from_secs(12),
+/// The drivers' settings the bound is checked with: sixteen seconds, above
+/// the floor the server's config sets for their drive interval
+/// ([`ursula_config::end_record_residence_floor`]), so the removal floor is
+/// four. A removal's snapshot follows within the floor and a pass of the
+/// driver, which may wait [`ursula_raft::SNAPSHOT_HANDOFF_WAIT`] for a
+/// trigger another group's build does not claim. Its end record folds
+/// within half the bound and two sweep intervals, ten seconds, and the
+/// snapshot after the fold follows a floor and a drive interval later, so
+/// the bound leaves room for that build. A run fits
+/// [`DELETED_DATA_LIMIT`] of virtual time.
+pub(super) const BOUND_DRIVERS: DriverPlan = DriverPlan {
+    max_age: Duration::from_secs(16),
     ..DRIVERS
 };
+/// The virtual time a run of the bound scenario may take.
+pub(super) const DELETED_DATA_LIMIT: Duration = Duration::from_secs(120);
 #[cfg(test)]
 /// How long the leader's appends to the slow follower take in the
 /// operator-snapshot scenario.
@@ -139,8 +167,9 @@ const SLOW_FOLLOWER: Duration = Duration::from_secs(5);
 /// How long a stopped follower stays down after the removal applied.
 const FOLLOWER_DOWN_AFTER_REMOVAL: Duration = Duration::from_secs(1);
 /// How long the leader stays down after it applied the removal: longer
-/// than the bound less a quarter of it.
-const LEADER_DOWN: Duration = Duration::from_secs(10);
+/// than the bound less a quarter of it, and past the fold of the removal's
+/// end record.
+const LEADER_DOWN: Duration = Duration::from_secs(13);
 /// How long past half the bound after its restart a replica's files may
 /// still hold the marker: the replayed removal's snapshot and purge, and the
 /// driver's passes that free the segments (invariant (a)).
@@ -231,6 +260,17 @@ pub(super) struct Controls {
     wal_age_off: bool,
     /// No leader sweeps expired streams in the background.
     sweep_off: bool,
+    /// No retirement clock names a seq to fold through.
+    retirement_off: bool,
+}
+
+impl Controls {
+    /// Whether the run judges `end_records_leave_within_bound`: every run
+    /// but the crash between the covering snapshot and its purge, which
+    /// holds the end record unfolded.
+    fn judges_end_records(self) -> bool {
+        !self.purge_after_restart
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +283,7 @@ impl Controls {
         purge_after_restart: false,
         wal_age_off: false,
         sweep_off: false,
+        retirement_off: false,
     };
     pub(super) const FLOOR_OFF: Self = Self {
         floor_off: true,
@@ -256,16 +297,22 @@ impl Controls {
         hold_off: true,
         ..Self::NONE
     };
-    /// Every defence on, and the crash between the covering snapshot and
-    /// the purge through it.
+    /// The crash between the covering snapshot and the purge through it,
+    /// with every defence on but `EndRecordRetirement`, as in its control
+    /// [`Self::RESTORE_OFF`]. With the retirement off the end record stays
+    /// unfolded, so no snapshot after a fold purges the log through what
+    /// the restore left, which would hide the control: the run judges the
+    /// stream's records alone.
     pub(super) const CRASH_BEFORE_PURGE: Self = Self {
         purge_after_restart: true,
+        retirement_off: true,
         ..Self::NONE
     };
     /// The same crash without the purge through the restored snapshot.
     pub(super) const RESTORE_OFF: Self = Self {
         restore_off: true,
         purge_after_restart: true,
+        retirement_off: true,
         ..Self::NONE
     };
     pub(super) const WAL_AGE_OFF: Self = Self {
@@ -274,6 +321,10 @@ impl Controls {
     };
     pub(super) const SWEEP_OFF: Self = Self {
         sweep_off: true,
+        ..Self::NONE
+    };
+    pub(super) const RETIREMENT_OFF: Self = Self {
+        retirement_off: true,
         ..Self::NONE
     };
 }
@@ -307,6 +358,7 @@ fn set_defences(controls: Controls) {
     set_off(Defence::RestorePurge, controls.restore_off);
     set_off(Defence::WalDirtyAge, controls.wal_age_off);
     set_off(Defence::ExpirySweep, controls.sweep_off);
+    set_off(Defence::EndRecordRetirement, controls.retirement_off);
     if controls.purge_after_restart {
         set_off(Defence::ScrubPurge, true);
     }
@@ -701,6 +753,114 @@ async fn check_replica(
     }
 }
 
+/// The seq of the end record of the removed stream that `node_id`'s state
+/// holds, read through the per-stream usage export's read of its local
+/// state, or why the read did not answer.
+async fn state_end_record(
+    cluster: &mut JournalCluster,
+    node_id: u64,
+) -> Result<Option<u64>, String> {
+    let read = StreamUsageRead {
+        cursor: UsageCursor::Start,
+        limit: std::num::NonZeroUsize::new(10_000).expect("a page limit"),
+    };
+    let mut last = String::new();
+    for _ in 0..20 {
+        let Some(engine) = cluster.engines.get_mut(&(GROUP, node_id)) else {
+            return Err("the replica does not run".to_owned());
+        };
+        match engine
+            .stream_usage(read.clone(), group_placement(GROUP))
+            .await
+        {
+            Ok(GroupUsageView::Listed(listing)) => {
+                return Ok(listing
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.stream_id == marked_stream()
+                            && matches!(entry.lifecycle, Lifecycle::Ended { .. })
+                    })
+                    .map(|entry| entry.seq));
+            }
+            other => last = format!("{other:?}"),
+        }
+        madsim::time::sleep(POLL).await;
+    }
+    Err(format!("its usage read answered {last}"))
+}
+
+/// What of the removed stream's end record `node_id` still holds: in its
+/// state, its current snapshot, or an entry its log retains that names the
+/// stream.
+async fn end_record_held(cluster: &mut JournalCluster, node_id: u64) -> Option<String> {
+    match state_end_record(cluster, node_id).await {
+        Ok(None) => {}
+        Ok(Some(seq)) => return Some(format!("its state holds the end record at seq {seq}")),
+        Err(error) => return Some(error),
+    }
+    let raft = cluster.engines[&(GROUP, node_id)].raft_handle();
+    if let Some(snapshot) = raft
+        .get_snapshot()
+        .await
+        .unwrap_or_else(|error| panic!("node {node_id}: read the current snapshot: {error}"))
+    {
+        let pointer = SnapshotPointer::decode(snapshot.snapshot.pointer_bytes())
+            .unwrap_or_else(|error| panic!("node {node_id}: decode the snapshot pointer: {error}"));
+        let SnapshotLocation::Inline { bytes } = &pointer.location else {
+            panic!("node {node_id}: a simulated snapshot is inline");
+        };
+        let group = ursula_raft::decode_group_snapshot(bytes)
+            .unwrap_or_else(|error| panic!("node {node_id}: decode the snapshot: {error}"));
+        if let Some(record) = group
+            .usage
+            .ends
+            .iter()
+            .find(|record| record.stream_id == marked_stream())
+        {
+            return Some(format!(
+                "snapshot {} holds the end record at seq {}",
+                pointer.snapshot_id, record.seq
+            ));
+        }
+    }
+    let mut store = cluster.wals[&node_id]
+        .store(RaftGroupId(GROUP))
+        .expect("a running replica holds its store");
+    let entries = store
+        .try_get_log_entries(..)
+        .await
+        .unwrap_or_else(|error| panic!("node {node_id}: read the log: {error}"));
+    let id = marked_stream().stream_id;
+    entries.iter().find_map(|entry| {
+        let encoded = ursula_stream::msgpack::encode(entry).expect("encode a log entry");
+        encoded
+            .windows(id.len())
+            .any(|window| window == id.as_bytes())
+            .then(|| format!("log entry {} names the stream", entry.log_id))
+    })
+}
+
+/// Fails `end_records_leave_within_bound` when `remover`, which just
+/// removed the stream, holds no end record of it: the bound would be
+/// judged on nothing.
+async fn assert_end_record_left(
+    cluster: &mut JournalCluster,
+    remover: u64,
+    trace: &mut SimTrace,
+    context: &str,
+) {
+    match state_end_record(cluster, remover).await {
+        Ok(Some(_)) => {}
+        held => fail(
+            trace,
+            END_RECORDS_INVARIANT,
+            "removal_applied",
+            format!("{context}: node {remover}: the removal left no end record: {held:?}"),
+        ),
+    }
+}
+
 /// How the run sees that a replica removed the stream.
 #[derive(Debug, Clone, Copy)]
 enum Detect {
@@ -972,16 +1132,19 @@ pub(super) async fn run_deleted_data_inner(
     // The quiet group's entries go first, so they share the segments of
     // the removed records and pin them.
     cluster.append(QUIET_GROUP, journals.quiet_entries).await;
-    let mut background = match plan.removal {
-        Removal::Expiry(traffic) => Some(Background::new(traffic, clock)),
-        Removal::Deletion | Removal::BucketPurge => None,
+    // Every run plays the tidy worker: its sweep removes an expired stream
+    // and folds the removal's end record (F20).
+    let traffic = match plan.removal {
+        Removal::Expiry(traffic) => traffic,
+        Removal::Deletion | Removal::BucketPurge => Traffic::Quiet,
     };
-    // When the expiry comes in this run, and on its virtual wall clock:
-    // with the cluster up, past the stream's writes and snapshots.
-    let expiry = background.as_ref().map(|background| {
+    let mut background = Some(Background::new(traffic, clock));
+    // When the expiry comes in an expiry run, and on its virtual wall
+    // clock: with the cluster up, past the stream's writes and snapshots.
+    let expiry = matches!(plan.removal, Removal::Expiry(_)).then(|| {
         let at = madsim::time::Instant::now() + EXPIRES_AFTER;
-        let at_ms = background
-            .wall_ms()
+        let at_ms = clock
+            .now_ms()
             .saturating_add(u64::try_from(EXPIRES_AFTER.as_millis()).expect("a short expiry"));
         (at, at_ms)
     });
@@ -1051,6 +1214,7 @@ pub(super) async fn run_deleted_data_inner(
                 })
             };
             let removal_index = removal_applied(&cluster, remover, before, &context).await;
+            assert_end_record_left(&mut cluster, remover, &mut trace, &context).await;
             let mut seen = Applied::new(Detect::Applied(removal_index));
             seen.observe(&cluster).await;
             (remover, removal_index, seen)
@@ -1089,6 +1253,7 @@ pub(super) async fn run_deleted_data_inner(
                 let first = seen.at.keys().next().copied();
                 if let Some(node_id) = first {
                     let index = applied(&cluster, node_id).unwrap_or(0);
+                    assert_end_record_left(&mut cluster, node_id, &mut trace, &context).await;
                     break (node_id, index, seen);
                 }
                 if madsim::time::Instant::now() >= deadline {
@@ -1232,11 +1397,21 @@ pub(super) async fn run_deleted_data_inner(
     }
 
     // Every replica is checked once the bound passed since it removed the
-    // stream, and its files once the bound passed since it last did.
+    // stream, its files once the bound passed since it last did, and its
+    // end record once the bound passed since it removed the stream and a
+    // quarter of it since it last did.
     let mut checked = BTreeSet::new();
     let mut files_checked = BTreeSet::new();
+    let mut ends_checked = if controls.judges_end_records() {
+        BTreeSet::new()
+    } else {
+        NODES.into_iter().collect()
+    };
     let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(2);
-    while checked.len() < NODES.len() || files_checked.len() < NODES.len() {
+    while checked.len() < NODES.len()
+        || files_checked.len() < NODES.len()
+        || ends_checked.len() < NODES.len()
+    {
         tick(&mut background, &mut cluster).await;
         seen.observe(&cluster).await;
         let now = madsim::time::Instant::now();
@@ -1287,6 +1462,31 @@ pub(super) async fn run_deleted_data_inner(
             }
             files_checked.insert(node_id);
         }
+        let ends_due = seen
+            .last
+            .iter()
+            .filter(|(node_id, _)| !ends_checked.contains(*node_id))
+            .filter_map(|(node_id, last)| {
+                let first = seen.at.get(node_id)?;
+                let due = (*first + BOUND_DRIVERS.max_age)
+                    .max(*last + BOUND_DRIVERS.max_age / 4 + RESTART_FILES_SLACK);
+                (now >= due).then_some(*node_id)
+            })
+            .collect::<Vec<_>>();
+        for node_id in ends_due {
+            if let Some(held) = end_record_held(&mut cluster, node_id).await {
+                fail(
+                    &mut trace,
+                    END_RECORDS_INVARIANT,
+                    "end_record_bound_passed",
+                    format!(
+                        "{context}: node {node_id}: {held} ({})",
+                        replica_state(&cluster, node_id)
+                    ),
+                );
+            }
+            ends_checked.insert(node_id);
+        }
         assert!(
             now < deadline,
             "{context}: replicas {:?} never removed the stream (removal at {removal_index})",
@@ -1298,6 +1498,11 @@ pub(super) async fn run_deleted_data_inner(
         madsim::time::sleep(POLL).await;
     }
     let replicas = u64::try_from(checked.len()).expect("replica count fits u64");
+    let end_records = if controls.judges_end_records() {
+        u64::try_from(ends_checked.len()).expect("replica count fits u64")
+    } else {
+        0
+    };
     match (plan.removal, background, expiry) {
         (Removal::Expiry(traffic), Some(background), Some((expires_at, _))) => {
             // The expiry anchor: every replica kept the bound within the
@@ -1329,6 +1534,7 @@ pub(super) async fn run_deleted_data_inner(
                 traffic: traffic.name().to_owned(),
                 fault: plan.fault.name().to_owned(),
                 replicas,
+                end_records,
                 sweeps: background.sweeps,
             });
         }
@@ -1337,6 +1543,7 @@ pub(super) async fn run_deleted_data_inner(
             purge: plan.removal == Removal::BucketPurge,
             fault: plan.fault.name().to_owned(),
             replicas,
+            end_records,
             restore_purges: ursula_stream::sim_controls::fired(
                 ursula_stream::sim_controls::Defence::RestorePurge,
             ),
@@ -1495,6 +1702,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
 mod tests {
     use super::BOUND_INVARIANT;
     use super::Controls;
+    use super::END_RECORDS_INVARIANT;
     use crate::madsim_harness::SimEvent;
     use crate::madsim_harness::SimScenario;
     use crate::madsim_harness::SimTrace;
@@ -1525,12 +1733,14 @@ mod tests {
             );
             assert_eq!(first, second, "seed {seed}");
             assert!(
-                first
-                    .outcome
-                    .trace
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, SimEvent::DeletedDataLeft { replicas: 3, .. })),
+                first.outcome.trace.events.iter().any(|event| matches!(
+                    event,
+                    SimEvent::DeletedDataLeft {
+                        replicas: 3,
+                        end_records: 3,
+                        ..
+                    }
+                )),
                 "seed {seed}: {:?}",
                 first.outcome.trace.events.last()
             );
@@ -1555,12 +1765,14 @@ mod tests {
             );
             assert_eq!(first, second, "seed {seed}");
             assert!(
-                first
-                    .outcome
-                    .trace
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, SimEvent::DeletedDataLeft { replicas: 3, .. })),
+                first.outcome.trace.events.iter().any(|event| matches!(
+                    event,
+                    SimEvent::DeletedDataLeft {
+                        replicas: 3,
+                        end_records: 3,
+                        ..
+                    }
+                )),
                 "seed {seed}: {:?}",
                 first.outcome.trace.events.last()
             );
@@ -1589,6 +1801,7 @@ mod tests {
                     event,
                     SimEvent::ExpiredDataLeft {
                         replicas: 3,
+                        end_records: 3,
                         sweeps: 1..,
                         ..
                     }
@@ -1616,6 +1829,27 @@ mod tests {
         let _guard = sim_test_guard();
         let message = assert_fails(536, Controls::SWEEP_OFF, BOUND_INVARIANT);
         assert!(message.contains("holds stream"), "{message}");
+    }
+
+    /// Without the retirement clock's watermark, the removal's end record
+    /// never folds: each replica's state and snapshot keep the stream's id
+    /// and final usage past the bound, though the stream itself left it.
+    #[test]
+    fn negative_control_an_end_record_without_its_retirement_outlives_the_bound() {
+        let _guard = sim_test_guard();
+        let message = assert_fails(520, Controls::RETIREMENT_OFF, END_RECORDS_INVARIANT);
+        assert!(message.contains("end record"), "{message}");
+    }
+
+    /// The drivers' bound is at or above the floor ursula-config derives
+    /// for an end record's residence from their drive interval, with no
+    /// install timeout for the simulation's inline snapshots (F20).
+    #[test]
+    fn the_bound_is_at_or_above_the_config_floor() {
+        assert!(
+            super::BOUND_DRIVERS.max_age
+                >= ursula_config::end_record_residence_floor(super::BOUND_DRIVERS.interval)
+        );
     }
 
     /// Runs `seed` under `controls`, which must fail `invariant`, and

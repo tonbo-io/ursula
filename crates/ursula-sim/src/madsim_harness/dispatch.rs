@@ -17,6 +17,7 @@ use super::accepted_loss::Controls as RecoveryPlanControls;
 use super::accepted_loss::Shape as RecoveryPlanShape;
 use super::accepted_loss::run_recovery_plan_inner;
 use super::deleted_data::Controls as DeletedDataControls;
+use super::deleted_data::DELETED_DATA_LIMIT;
 use super::deleted_data::run_deleted_data_inner;
 #[cfg(test)]
 use super::deleted_data::run_operator_snapshot_under_purge_inner;
@@ -88,6 +89,9 @@ use super::runtime_interleaving_plan_from_fault_plan;
 use super::runtime_raft_network_workload_plan_from_fault_plan;
 use super::snapshot_objects::Controls as SnapshotObjectsControls;
 use super::snapshot_objects::run_snapshot_objects_inner;
+use super::stream_usage::Controls as StreamUsageControls;
+use super::stream_usage::STREAM_USAGE_LIMIT;
+use super::stream_usage::run_stream_usage_inner;
 use super::write_keys::Controls;
 use super::write_keys::run_idle_expiry_cannot_reopen_an_epoch_inner;
 use super::write_keys::run_producer_repeats_are_exactly_once_inner;
@@ -335,7 +339,25 @@ impl ThreeNodeRaftSim {
                 config,
                 IdentityFenceControls::default(),
             ),
+            SimScenario::StreamUsageBillsExactly => {
+                Self::run_stream_usage_with_controls_report(config, StreamUsageControls::default())
+            }
         }
+    }
+
+    /// Runs the per-stream usage family (F20) with `controls`, with room
+    /// for an accepted loss's stall and plan or a restore's wipe.
+    pub(super) fn run_stream_usage_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: StreamUsageControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        run_with_madsim_for(seed, STREAM_USAGE_LIMIT, async move {
+            SimReport {
+                scenario: SimScenario::StreamUsageBillsExactly,
+                outcome: run_stream_usage_inner(config, controls).await,
+            }
+        })
     }
 
     /// Runs the placement-move family's meta seeds with `controls`, with
@@ -400,11 +422,12 @@ impl ThreeNodeRaftSim {
         controls: DeletedDataControls,
     ) -> SimReport {
         let seed = config.seed;
-        report_of(
-            SimScenario::DeletedDataLeavesWithinBound,
-            seed,
-            run_deleted_data_inner(config, controls),
-        )
+        run_with_madsim_for(seed, DELETED_DATA_LIMIT, async move {
+            SimReport {
+                scenario: SimScenario::DeletedDataLeavesWithinBound,
+                outcome: run_deleted_data_inner(config, controls).await,
+            }
+        })
     }
 
     #[cfg(test)]

@@ -280,6 +280,9 @@ impl RetirementClock {
             let dated = ended_by(wall_ms.saturating_sub(retain_ms), samples.seeded_through);
             samples.due_through = samples.due_through.max(dated.min(samples.seeded_through));
         }
+        if ursula_stream::sim_controls::off(Defence::EndRecordRetirement) {
+            return 0;
+        }
         samples.due_through
     }
 }

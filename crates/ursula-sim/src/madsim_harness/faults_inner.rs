@@ -137,6 +137,7 @@ impl SimFaultPlan {
             SimScenario::SnapshotObjectsStayOwned => Vec::new(),
             SimScenario::PlacementMove => Vec::new(),
             SimScenario::IdentityFence => Vec::new(),
+            SimScenario::StreamUsageBillsExactly => Vec::new(),
             SimScenario::HttpProtocolSurfaceRandomized => vec![SimFaultStep {
                 phase: "http_protocol_surface_workload".to_owned(),
                 action: SimFaultAction::RunHttpProtocolSurfaceWorkload {

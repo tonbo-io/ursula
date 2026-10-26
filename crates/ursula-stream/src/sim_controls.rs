@@ -290,6 +290,34 @@ pub enum Defence {
     /// removed node id, cut off from meta, collects a new life's objects
     /// under the shared node directory.
     DeleteAfterRegistration,
+    /// A removal leaves an end record with the version's final usage, which
+    /// the per-stream usage export lists until the group sweep folds it
+    /// (F20). Off, the removal folds the final usage straight into its
+    /// bucket's retired usage, so a version created, written and removed
+    /// between two reads of a metering consumer is never listed.
+    EndRecords,
+    /// An install and a start restore a group snapshot with its usage
+    /// ledger (`restore_group`, F20). Off, they restore it as a backup is
+    /// restored: every bucket total retires and every version counts from
+    /// zero, so a replica that installed a snapshot lists each version
+    /// below what it listed before.
+    SnapshotUsage,
+    /// A leader's sweep folds the end records its retirement clock saw
+    /// removed the end-record retention ago (F20). Off, the clock names no
+    /// seq, so end records fold only at the cap and outlive
+    /// `raft.deleted_data_max_age`.
+    EndRecordRetirement,
+    /// A version's first write after a history event records its counters
+    /// as its history baseline before the write counts (F20, W5). Off, the
+    /// baseline keeps its earlier value, so after an accepted loss a
+    /// metering consumer that lowers its billed level to the baseline
+    /// accounts the kept prefix again.
+    HistoryBaseline,
+    /// A replica that has not applied the entry a usage cursor's page was
+    /// read at answers `behind` (F20, rule 4 of the export's read). Off, it
+    /// lists from its older state, so a listing continued on a lagging
+    /// replica misses what the caller's earlier page saw.
+    UsageReadOrder,
 }
 
 #[cfg(madsim)]
@@ -299,8 +327,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 57]> = const { Cell::new([false; 57]) };
-        static FIRED: Cell<[u64; 57]> = const { Cell::new([0; 57]) };
+        static OFF: Cell<[bool; 62]> = const { Cell::new([false; 62]) };
+        static FIRED: Cell<[u64; 62]> = const { Cell::new([0; 62]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -362,6 +390,11 @@ mod switches {
             Defence::LogGeneration => 54,
             Defence::EmptyReplicaVote => 55,
             Defence::DeleteAfterRegistration => 56,
+            Defence::EndRecords => 57,
+            Defence::SnapshotUsage => 58,
+            Defence::EndRecordRetirement => 59,
+            Defence::HistoryBaseline => 60,
+            Defence::UsageReadOrder => 61,
         }
     }
 
@@ -384,7 +417,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 57]));
+        FIRED.with(|fired| fired.set([0; 62]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

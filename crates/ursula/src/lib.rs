@@ -108,6 +108,8 @@ use chrono::DateTime;
 use futures_util::stream;
 use openraft::error::Fatal;
 use openraft::rt::WatchReceiver;
+pub use stream_usage::group_usage_answer;
+pub use stream_usage::stream_usage_read;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
