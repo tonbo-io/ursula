@@ -316,7 +316,7 @@ RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- minimize \
   --output minimized.json
 ```
 
-**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios. It is the only workflow that runs DST: pull request CI runs only the `scripts.dst` audits. Before releasing, dispatch DST Nightly on the release HEAD (`gh workflow run dst-nightly.yml --ref <branch>`). The Stable Release workflow requires a successful DST Nightly run for the released commit, unless its dispatch waives that gate with a reason in `dst_waiver`, which the run summary and the GitHub Release body record.
+**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios. It runs as parallel jobs, the seed sweep in seven shares and the simulation tests under cargo-nextest, and its report job fails the run unless every job passed. It is the only workflow that runs DST: pull request CI runs only the `scripts.dst` audits. Before releasing, dispatch DST Nightly on the release HEAD (`gh workflow run dst-nightly.yml --ref <branch>`). The Stable Release workflow requires a successful DST Nightly run for the released commit, unless its dispatch waives that gate with a reason in `dst_waiver`, which the run summary and the GitHub Release body record.
 
 ### 6. Property-Based Tests
 

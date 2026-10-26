@@ -480,12 +480,12 @@ MULTI_ELEMENT_SHAPE_RE = re.compile(
 SIM_TEST_FN_RE = re.compile(
     r"#\[test\]\s*(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>\w+)",
 )
-SIM_CARGO_TEST_RE = re.compile(r"cargo test -p ursula-sim\b(?P<args>[^\n]*)")
+SIM_CARGO_TEST_RE = re.compile(r"cargo nextest run -p ursula-sim\b(?P<args>[^\n]*)")
 
 
 def _sim_test_filters(path: Path) -> set[str]:
-    """The libtest filters of every `cargo test -p ursula-sim` command in
-    `path`, with `\\` line continuations joined."""
+    """The test-name filters of every `cargo nextest run -p ursula-sim`
+    command in `path`, with `\\` line continuations joined."""
     text = re.sub(r"\\\n\s*", " ", path.read_text())
     filters: set[str] = set()
     for m in SIM_CARGO_TEST_RE.finditer(text):
@@ -498,8 +498,9 @@ def _sim_test_filters(path: Path) -> set[str]:
 
 def _unwired_replay_tests() -> list[str]:
     """Every non-ignored `*_replays` test in the simulation harness that no
-    `cargo test -p ursula-sim` filter of the nightly workflow matches. libtest
-    matches a filter against the test's path, so the file stem counts."""
+    `cargo nextest run -p ursula-sim` filter of the nightly workflow matches.
+    nextest matches a filter against the test's path, as libtest does, so the
+    file stem counts."""
     filters = _sim_test_filters(NIGHTLY_WORKFLOW)
     unwired = []
     for path in sorted(HARNESS_ROOT.rglob("*.rs")):
@@ -513,10 +514,83 @@ def _unwired_replay_tests() -> list[str]:
     return unwired
 
 
+# A matrix job's legs each run one share of a sharded command: share
+# INDEX of COUNT, from the leg's own index in its matrix.
+SHARD_VALUE = "${{ strategy.job-index }}/${{ strategy.job-total }}"
+SHARD_ENV = f"DST_SHARD: {SHARD_VALUE}"
+VERDICT_STEP = "Every DST job passed"
+VERDICT_CHECK = """jq -e 'all(.[]; .result == "success")'"""
+
+
+def _workflow_jobs(text: str) -> dict[str, str]:
+    """The workflow's jobs by id, each with the text of its body."""
+    body = text.split("\njobs:\n", 1)[1]
+    parts = re.split(
+        r"^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(?:#[^\n]*)?\n", body, flags=re.MULTILINE
+    )
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _job_steps(body: str) -> list[str]:
+    """A job body's steps, each as its own text."""
+    return re.split(r"^      - ", body, flags=re.MULTILINE)[1:]
+
+
+def _code_lines(text: str) -> list[str]:
+    """The lines of `text` that are not YAML or shell comments."""
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def _shard_wiring_errors(text: str) -> list[str]:
+    """What would let a command the nightly workflow names run only in part:
+    a share not taken from the leg's matrix index, or a job whose failure,
+    skip or cancellation the `report` job's verdict does not see."""
+    jobs = _workflow_jobs(text)
+    code = _code_lines(text)
+    errors = [
+        f"`--shard {m.group(1)}`: a share must be `--shard \"$DST_SHARD\"`"
+        for line in code
+        if (m := re.search(r"--shard\s+(\S+)", line)) and m.group(1) != '"$DST_SHARD"'
+    ]
+    for line in code:
+        if m := re.search(r"\bDST_SHARD:(.*)$", line):
+            value = re.sub(r"\s+#.*$", "", m.group(1)).strip()
+            if value != SHARD_VALUE:
+                errors.append(f"`DST_SHARD: {value}`: a share must be `{SHARD_VALUE}`")
+        if re.search(r"\bDST_SHARD=", line):
+            errors.append(f"`{line.strip()}`: only a job's `{SHARD_ENV}` may set the share")
+    errors += [
+        f"job `{job}` uses $DST_SHARD but does not set `{SHARD_ENV}`"
+        for job, body in jobs.items()
+        if "$DST_SHARD" in body and SHARD_ENV not in body
+    ]
+    report = jobs.get("report", "")
+    needs = re.search(r"^    needs: \[([^\]]*)\]", report, re.MULTILINE)
+    named = {job.strip() for job in needs.group(1).split(",")} if needs else set()
+    missing = sorted(set(jobs) - {"report"} - named)
+    if missing:
+        errors.append(f"the `report` job does not need {missing}")
+    if "\n    if: always()\n" not in report:
+        errors.append("the `report` job must run `if: always()`")
+    if re.search(r"^    continue-on-error:", report, re.MULTILINE):
+        errors.append("the `report` job must not set `continue-on-error:`")
+    verdicts = [
+        step for step in _job_steps(report) if step.startswith(f"name: {VERDICT_STEP}\n")
+    ]
+    if len(verdicts) != 1 or not any(VERDICT_CHECK in line for line in _code_lines(verdicts[0])):
+        errors.append(
+            f"the `report` job needs one step `{VERDICT_STEP}` that runs `{VERDICT_CHECK}`"
+        )
+    elif re.search(r"^        (if|continue-on-error):", verdicts[0], re.MULTILINE):
+        errors.append(f"the `{VERDICT_STEP}` step must not set `if:` or `continue-on-error:`")
+    return errors
+
+
 def audit_ci_shape(argv: list[str]) -> int:
     """The nightly workflow must not contain multi-element strict-equality
-    jq assertions on SimFaultAction discriminants, and must run every
-    non-ignored `*_replays` simulation test."""
+    jq assertions on SimFaultAction discriminants, must run every
+    non-ignored `*_replays` simulation test, and must run each sharded
+    command whole, with a `report` job whose verdict sees every job."""
     argparse.ArgumentParser(prog="dst ci-shape").parse_args(argv)
 
     path = NIGHTLY_WORKFLOW
@@ -530,7 +604,8 @@ def audit_ci_shape(argv: list[str]) -> int:
         for line in unwired:
             print(line, file=sys.stderr)
         print(
-            "Fix: keep the `_replays` filter in the nightly DST job, or name the test so it matches.",
+            "Fix: keep the `_replays` filter in the nightly's `replays` job "
+            "(`cargo nextest run -p ursula-sim`), or name the test so it matches.",
             file=sys.stderr,
         )
         return 1
@@ -558,8 +633,16 @@ def audit_ci_shape(argv: list[str]) -> int:
         )
         return 1
 
+    wiring = _shard_wiring_errors(text)
+    if wiring:
+        print("ERROR: the nightly workflow's jobs could run a command only in part:", file=sys.stderr)
+        for line in wiring:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+
     print("OK: no multi-element strict-equality step-shape jq assertions found in the nightly workflow.")
     print("OK: the nightly workflow runs every `*_replays` simulation test.")
+    print("OK: every share comes from its leg's matrix index, and the report job sees every job.")
     return 0
 
 
@@ -685,8 +768,10 @@ EXPECTED_FAMILIES = {
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}
 
-# Nightly ≤ 30 min at ~70 seeds/min/core conservative. See the `CI` section
-# of docs/architecture/deterministic-simulation-testing.md.
+# Caps the seeds the nightly names. The sweep's cost grows with it, and its
+# wall clock is that cost spread over the `sweep` job's shares
+# (dst-nightly.yml). See the `CI` section of
+# docs/architecture/deterministic-simulation-testing.md.
 NIGHTLY_SEED_BUDGET = 1500
 
 
@@ -764,7 +849,7 @@ def audit_seed_inventory(argv: list[str]) -> int:
     if total > NIGHTLY_SEED_BUDGET:
         errors.append(
             f"nightly: total seed count {total} exceeds budget {NIGHTLY_SEED_BUDGET} "
-            "(re-run `dst throughput` if the runner got faster)"
+            "(add sweep shares before raising the cap)"
         )
 
     if errors:

@@ -98,3 +98,48 @@ def test_nondeterminism_flags_a_madsim_runtime_outside_run_isolated(monkeypatch,
     monkeypatch.setattr(audits, "ROOT", tmp_path)
     misplaced = audits._misplaced_madsim_runtimes()
     assert len(misplaced) == 1 and "crates/demo/src/tests.rs:1" in misplaced[0]
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ('--shard "$DST_SHARD"', "--shard 0/7"),
+        ("      DST_SHARD: ${{ strategy.job-index }}/${{ strategy.job-total }}\n", ""),
+        ("needs: [audits, sweep, ", "needs: [audits, "),
+        ("\n    if: always()\n", "\n"),
+        ('all(.[]; .result == "success")', 'any(.[]; .result == "success")'),
+        (
+            "      - name: Run nightly madsim seed sweep\n        run: |\n",
+            "      - name: Run nightly madsim seed sweep\n        env:\n"
+            "          DST_SHARD: 0/7\n        run: |\n",
+        ),
+        (
+            "      - name: Run nightly madsim seed sweep\n        run: |\n",
+            "      - name: Run nightly madsim seed sweep\n        run: |\n"
+            "          export DST_SHARD=0/7\n",
+        ),
+        ("  report:\n", "  cold_extra: # not needed by report\n    runs-on: ubuntu-24.04\n"
+         "    steps:\n      - run: true\n\n  report:\n"),
+        ("          jq -e 'all(", "          # jq -e 'all("),
+        (
+            "      - name: Every DST job passed\n",
+            "      - name: Every DST job passed\n        continue-on-error: true\n",
+        ),
+        ("\n    if: always()\n", "\n    if: always()\n    continue-on-error: true\n"),
+    ],
+)
+def test_shard_wiring_flags_a_run_that_could_pass_in_part(old, new):
+    text = common.NIGHTLY_WORKFLOW.read_text()
+    assert audits._shard_wiring_errors(text) == []
+    assert old in text
+    assert audits._shard_wiring_errors(text.replace(old, new, 1))
+
+
+def test_sim_test_filters_count_only_nextest_commands(tmp_path):
+    workflow = tmp_path / "dst-nightly.yml"
+    workflow.write_text(
+        'RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --lib --no-fail-fast -- \\\n'
+        "  recovery_tests poison_marker\n"
+        'RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- _replays\n'
+    )
+    assert audits._sim_test_filters(workflow) == {"recovery_tests", "poison_marker"}
