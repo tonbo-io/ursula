@@ -76,6 +76,7 @@ use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
+use ursula_runtime::GroupStreamUsageFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngineFactory;
@@ -913,6 +914,16 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.bucket_usage(placement).await
+        }))
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.stream_usage(read, placement).await
         }))
     }
 

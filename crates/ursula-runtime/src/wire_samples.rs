@@ -414,6 +414,7 @@ pub fn group_write_responses() -> Vec<GroupWriteResponse> {
             removed_streams: 3,
             pending_cold_gc_entries: 4,
             group_commit_index: 51,
+            history: history(),
         }),
         GroupWriteResponse::ImportGroupState(_) => {
             GroupWriteResponse::ImportGroupState(ImportGroupStateResponse {
@@ -1045,11 +1046,13 @@ pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteRespo
             removed_streams,
             pending_cold_gc_entries,
             group_commit_index,
+            history,
         }) => GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
             placement,
             removed_streams,
             pending_cold_gc_entries,
             group_commit_index,
+            history,
         }),
         GroupWriteResponse::ImportGroupState(ImportGroupStateResponse {
             placement,

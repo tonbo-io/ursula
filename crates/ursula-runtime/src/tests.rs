@@ -4155,6 +4155,14 @@ impl GroupEngine for BlockingReadEngine {
         self.inner.bucket_usage(placement)
     }
 
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -4346,6 +4354,15 @@ impl GroupEngine for RecordingEngine {
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        _read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        // No state machine, so no genesis applied.
+        Box::pin(async { Ok(ursula_stream::GroupUsageView::NoHistory) })
     }
 
     fn accepts_local_writes(&self) -> bool {
@@ -4632,6 +4649,14 @@ impl GroupEngine for BlockingFirstCreateEngine {
         self.inner.bucket_usage(placement)
     }
 
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -4732,6 +4757,15 @@ impl GroupEngine for FailingEngine {
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        _read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        // No state machine, so no genesis applied.
+        Box::pin(async { Ok(ursula_stream::GroupUsageView::NoHistory) })
     }
 
     fn create_stream<'a>(
@@ -5195,6 +5229,77 @@ async fn reopens_on_a_silent_store_never_hold_the_core() {
         .await
         .expect("a later open of the shut-down group serves");
     assert_eq!(factory.opens(), opens.checked_add(1).unwrap());
+}
+
+/// The per-stream usage export reads a node's groups one by one, and a
+/// group that reopens after an open back-off refuses its read at once with
+/// `GroupOpening`. That refusal is the group's own answer: the node's other
+/// groups are read in the same answer.
+#[tokio::test(start_paused = true)]
+async fn a_reopening_group_does_not_fail_the_usage_export() {
+    let factory = StalledStoreFactory::stalling([RaftGroupId(0)]);
+    factory.store_down.store(true, Ordering::SeqCst);
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 4, 16), factory.clone())
+        .expect("spawn runtime");
+    let stalled = stream_on_group(&runtime, RaftGroupId(0), "stalled");
+    let serving = stream_on_group(&runtime, RaftGroupId(2), "serving");
+    // The first open gets an answer: the store did not answer it.
+    factory.release.add_permits(1);
+    let err = runtime
+        .create_stream(CreateStreamRequest::new(stalled, DEFAULT_CONTENT_TYPE))
+        .await
+        .expect_err("the store is down");
+    assert!(err.leaves_group_closed(), "{err}");
+    // Its back-off ends and the reopen hangs.
+    tokio::time::sleep(
+        crate::core_worker::open_backoff(1)
+            .checked_add(Duration::from_millis(1))
+            .unwrap(),
+    )
+    .await;
+    until(|| factory.opens() == 2).await;
+    create_stream(&runtime, &serving).await;
+
+    let reads = (0..4)
+        .map(|group| {
+            (RaftGroupId(group), ursula_stream::StreamUsageRead {
+                cursor: ursula_stream::UsageCursor::Start,
+                limit: std::num::NonZeroUsize::new(10).unwrap(),
+            })
+        })
+        .collect();
+    let answer = runtime
+        .stream_usage_groups(reads, 100)
+        .await
+        .expect("one group's refusal does not fail the answer");
+    assert_eq!(
+        answer
+            .groups
+            .iter()
+            .map(|(group, _)| *group)
+            .collect::<Vec<_>>(),
+        [
+            RaftGroupId(0),
+            RaftGroupId(1),
+            RaftGroupId(2),
+            RaftGroupId(3)
+        ]
+    );
+    assert!(
+        matches!(
+            &answer.groups[0].1,
+            Err(RuntimeError::GroupOpening {
+                raft_group_id: RaftGroupId(0),
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
+    let Ok(ursula_stream::GroupUsageView::Listed(listing)) = &answer.groups[2].1 else {
+        panic!("the serving group is listed: {answer:?}");
+    };
+    assert_eq!(listing.entries.len(), 1, "{listing:?}");
+    assert!(answer.omitted.is_empty());
 }
 
 /// #741: an engine that opened before its core saw the group's shutdown

@@ -20,6 +20,8 @@
 //!   the commit that assembles and publishes them.
 //! - [`staged_parts`]: the bound on a stream's staged, unused snapshot
 //!   parts, counted by the leader.
+//! - [`stream_usage`]: `POST /__ursula/usage/streams`, the per-stream usage
+//!   export on the admin listener.
 //! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
 //!   every HEAD answer, and the request limit on a `413` that names none.
 //! - [`placement_status`]: `GET /__ursula/placement`, this node's placement
@@ -49,6 +51,7 @@ mod render;
 mod response_metadata;
 mod snapshot_parts;
 mod staged_parts;
+mod stream_usage;
 mod wal_disk;
 
 use std::collections::HashMap;
@@ -334,6 +337,15 @@ impl WallClock for SystemWallClock {
     }
 }
 
+/// The end-record retention of a node without a configuration: that of the
+/// default `raft.deleted_data_max_age`.
+fn default_end_record_retention_ms() -> u64 {
+    let retention = ursula_config::RaftConfig::end_record_retention(
+        ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE,
+    );
+    u64::try_from(retention.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The node's HTTP state, shared by every handler. Cloning it is one
 /// reference count: the router clones it for every request (#602), so its
 /// fields live behind one `Arc` rather than as many reference counts as it
@@ -405,6 +417,11 @@ mod http_state_fields {
         pub(crate) snapshot_commits: snapshot_parts::SnapshotCommits,
         /// The staged, unused snapshot parts of the streams this node leads.
         pub(crate) staged_parts: staged_parts::StagedParts,
+        /// How long, at least, an end record stays listed after its
+        /// removal, by this node's `raft.deleted_data_max_age`: what the
+        /// usage export tells its consumer
+        /// (`ursula_config::UrsulaConfig::end_record_retention`).
+        pub(crate) end_record_retention_ms: u64,
     }
 }
 
@@ -581,6 +598,7 @@ impl HttpState {
             meta: crate::bootstrap::MetaSlot::default(),
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
+            end_record_retention_ms: default_end_record_retention_ms(),
         }
         .into()
     }
@@ -614,6 +632,7 @@ impl HttpState {
             meta: crate::bootstrap::MetaSlot::default(),
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
+            end_record_retention_ms: default_end_record_retention_ms(),
         }
         .into()
     }
@@ -625,6 +644,14 @@ impl HttpState {
 
     pub fn with_wall_clock_handle(mut self, wall_clock: Arc<dyn WallClock>) -> Self {
         self.fields_mut().wall_clock = wall_clock;
+        self
+    }
+
+    /// The end-record retention the usage export reports, from the node's
+    /// configuration ([`ursula_config::UrsulaConfig::end_record_retention`]).
+    pub fn with_end_record_retention(mut self, retention: std::time::Duration) -> Self {
+        self.fields_mut().end_record_retention_ms =
+            u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
@@ -1311,6 +1338,8 @@ pub fn admin_router(state: HttpState) -> Router {
             )
             .route(READINESS_PATH, get(readiness))
             .route("/__ursula/usage", get(bucket_usage))
+            // Admin listener only: it names every tenant's streams.
+            .route("/__ursula/usage/streams", post(stream_usage::stream_usage))
             .with_state(state),
     )
 }
@@ -2178,6 +2207,18 @@ pub(crate) async fn purge_bucket(
         cold_gc_complete,
         cold_gc_error,
         bucket_prefix_absent,
+        // The proof purge's entries: each is the latest that purged the
+        // bucket in its group, after any history event that replaced the
+        // first purge's.
+        groups: proof
+            .purges
+            .iter()
+            .map(|purge| ursula_proto::admin::GroupPurgeIndex {
+                raft_group_id: purge.raft_group_id.0,
+                commit_index: purge.commit_index,
+                history: ursula_proto::admin::HistoryId::new(purge.history),
+            })
+            .collect(),
     })
     .into_response()
 }
@@ -2236,6 +2277,24 @@ pub(crate) async fn create_bucket(Path(bucket): Path<String>) -> Response {
     }
 }
 
+/// A bucket's `/__ursula/usage` v2 counters and gauges, as v2 and the
+/// rows of the per-stream export report them. Every bucket this node
+/// reports carries a known `snapshot_bytes`: `None` is left for a report
+/// without the field.
+pub(crate) fn bucket_usage_report(
+    usage: &ursula_stream::BucketUsage,
+    snapshot_bytes: u64,
+) -> ursula_proto::admin::BucketUsageReport {
+    ursula_proto::admin::BucketUsageReport {
+        committed_append_bytes: usage.committed_append_bytes,
+        committed_records: usage.committed_records,
+        committed_write_units: usage.committed_write_units,
+        retained_bytes: usage.retained_bytes,
+        stream_count: usage.stream_count,
+        snapshot_bytes: Some(snapshot_bytes),
+    }
+}
+
 /// Versioned, self-described per-bucket usage of each Raft group this node
 /// hosts, with the index its replica applied. Served from local replica
 /// state; consumers tolerate replication lag, keep the newest replica's
@@ -2250,19 +2309,7 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
                     let mut buckets = usage
                         .buckets
                         .into_iter()
-                        .map(|entry| {
-                            (entry.bucket_id, ursula_proto::admin::BucketUsageReport {
-                                committed_append_bytes: entry.usage.committed_append_bytes,
-                                committed_records: entry.usage.committed_records,
-                                committed_write_units: entry.usage.committed_write_units,
-                                retained_bytes: entry.usage.retained_bytes,
-                                stream_count: entry.usage.stream_count,
-                                // Every bucket this node reports carries a
-                                // known value; `None` is left for a report
-                                // without the field.
-                                snapshot_bytes: Some(0),
-                            })
-                        })
+                        .map(|entry| (entry.bucket_id, bucket_usage_report(&entry.usage, 0)))
                         .collect::<std::collections::BTreeMap<_, _>>();
                     // A stream with a snapshot is live, so its bucket already
                     // has a usage entry; `or_default` only keeps the bytes if
@@ -2823,7 +2870,7 @@ pub(crate) async fn import_backup_group(
                 buckets: response.buckets,
                 streams: response.streams,
                 group_commit_index: response.group_commit_index,
-                history: response.history,
+                history: ursula_proto::admin::HistoryId::new(response.history),
                 already: response.already,
             }),
         )

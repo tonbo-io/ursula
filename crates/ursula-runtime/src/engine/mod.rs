@@ -112,6 +112,9 @@ pub type GroupColdHotBacklogFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ColdHotBacklog, GroupEngineError>> + Send + 'a>>;
 pub type GroupBucketUsageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupBucketUsage, GroupEngineError>> + Send + 'a>>;
+pub type GroupStreamUsageFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ursula_stream::GroupUsageView, GroupEngineError>> + Send + 'a>,
+>;
 
 /// One group's per-bucket committed usage, as its replica on this node
 /// applied it.
@@ -400,6 +403,18 @@ pub trait GroupEngine: Send + 'static {
     /// Deliberately a required method — an engine that silently reported
     /// nothing would underbill.
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a>;
+
+    /// One page of this group's per-stream usage export (F20), read from
+    /// local applied state, leader or follower, like
+    /// [`GroupEngine::bucket_usage`]:
+    /// [`ursula_stream::StreamStateMachine::stream_usage`] at the log id of
+    /// the entry the replica applied last, read with the state. A required
+    /// method, so no engine answers an empty group for one it holds.
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a>;
 
     fn read_stream<'a>(
         &'a mut self,

@@ -336,6 +336,13 @@ macro_rules! runtime_operations {
                 handle { call bucket_usage(engine, metrics, placement) }
                 client { pub group fn bucket_usage }
             }
+            op StreamUsage {
+                fields { read: ursula_stream::StreamUsageRead }
+                reply { response_tx: ursula_stream::GroupUsageView }
+                guard { none }
+                handle { call stream_usage(engine, metrics, read, placement) }
+                client { pub group fn stream_usage }
+            }
             op StateGauges {
                 fields {}
                 reply { response_tx: ursula_stream::GroupStateGauges }

@@ -13,7 +13,11 @@
 //! - [`history`]: history events (`NewHistory`), the token every response
 //!   renders, and what a stream inherited from the history before (W5).
 //! - [`usage_ledger`]: per-version usage, counted at the bucket counter's
-//!   call sites, and the bucket totals derived from it (F20).
+//!   call sites, the bucket totals derived from it, and the node-local
+//!   index of live versions by seq (F20).
+//! - [`usage_export`]: the export's pure read: one page of a group's
+//!   per-stream usage, and the cursor rule that continues, relists or
+//!   refuses as behind (F20).
 //! - [`producer_record`]: the producer record and the evaluation of a producer
 //!   write (#581 section 2.3).
 //! - [`producers`]: F3 producer bounds (idle expiry, the producer cap, the
@@ -132,6 +136,7 @@ mod producers;
 mod query;
 mod registry;
 mod ttl;
+mod usage_export;
 mod usage_ledger;
 
 /// Size of the self-described derived write unit exported by Ursula.
@@ -342,7 +347,9 @@ impl StreamStateMachine {
     fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
+        let seq = slot.usage.seq;
         let key = self.registry.insert(slot)?;
+        self.usage.index_live(seq, key);
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
         if let Some(stream_id) = stream_id {
             self.flush_planner.mark_hot(&stream_id);
@@ -433,13 +440,9 @@ impl StreamStateMachine {
     pub fn snapshot_bytes_by_bucket(&self) -> BTreeMap<String, u64> {
         let mut bytes = BTreeMap::<String, u64>::new();
         for slot in self.registry.slots() {
-            let Some(snapshot) = slot.visible_snapshot.as_ref() else {
+            let Some(body_len) = usage_ledger::visible_snapshot_bytes(slot) else {
                 continue;
             };
-            let body_len = snapshot.object.as_ref().map_or_else(
-                || u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX),
-                |object| object.payload_len,
-            );
             let bucket_id = &slot.metadata.stream_id.bucket_id;
             match bytes.get_mut(bucket_id.as_str()) {
                 Some(total) => *total = total.saturating_add(body_len),
@@ -898,6 +901,8 @@ mod producer_record_tests;
 mod sweep_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_export_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
 #[cfg(test)]

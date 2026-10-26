@@ -189,6 +189,7 @@ async fn init_state(
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
+        .with_end_record_retention(config.end_record_retention())
         .with_configured_cluster_id(config.server.cluster_id.clone())
         .with_raft_wal(raft_wal)
         .with_meta(meta);

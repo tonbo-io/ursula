@@ -7,13 +7,20 @@
 //! each bucket's retired usage, its live versions and its end records on
 //! every read ([`crate::StreamStateMachine::bucket_usage_report`]), so they
 //! equal the per-version sums by construction.
+//!
+//! The export reads a group in pages ([`StreamUsageRead`],
+//! [`GroupUsageView`]): [`crate::StreamStateMachine::stream_usage`] decides
+//! from the cursor and one applied state whether the page continues the
+//! caller's listing, relists the group or is behind.
 
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
+use crate::history::HistoryEvent;
 use crate::model::BucketUsage;
 use crate::state_machine::COMMITTED_WRITE_UNIT_BYTES;
 
@@ -226,6 +233,161 @@ impl CommittedUsage {
             None
         }
     }
+}
+
+/// The log id of an applied entry. Ordered by term, then index: the order
+/// of a group's replica states in one cluster, because every entry of a
+/// lineage that replaced a suffix carries a higher term than every entry it
+/// replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UsageLogId {
+    /// The term of the leader that wrote the entry.
+    pub term: u64,
+    /// The entry's index in the group's log.
+    pub index: u64,
+}
+
+/// One group's read of the per-stream usage export
+/// ([`crate::StreamStateMachine::stream_usage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUsageRead {
+    pub cursor: UsageCursor,
+    /// Items, entries and bucket rows together, this page may hold.
+    pub limit: NonZeroUsize,
+}
+
+/// Where the caller's listing of a group stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageCursor {
+    /// The caller holds nothing of the group: the read relists it.
+    Start,
+    /// Continues the caller's listing from the last page it kept.
+    After {
+        /// That page's genesis history id: which cluster's instance of the
+        /// group.
+        genesis: NonZeroU64,
+        /// That page's history id.
+        history: NonZeroU64,
+        /// The log id that page was read at: a replica below it is behind.
+        applied: UsageLogId,
+        /// That page's fold watermark.
+        retired_through: u64,
+        position: UsagePosition,
+    },
+}
+
+/// Where a listing continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsagePosition {
+    /// Bucket rows after `after_bucket`, from the first when `None`, then
+    /// entries from seq 0: a relisting. Without a bucket it asks for a new
+    /// relisting.
+    Rows { after_bucket: Option<String> },
+    /// Entries with a seq above `after_seq`.
+    Entries { after_seq: u64 },
+}
+
+/// One group's answer to a [`StreamUsageRead`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupUsageView {
+    Listed(UsageListing),
+    /// The replica has not applied the entry the cursor's page was read at.
+    Behind {
+        genesis: NonZeroU64,
+        history: NonZeroU64,
+        applied: UsageLogId,
+    },
+    /// The group's genesis has not applied on this replica.
+    NoHistory,
+}
+
+/// One page of a group's usage, read from one applied state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageListing {
+    pub genesis: NonZeroU64,
+    /// The group's latest history event at this read.
+    pub history: HistoryEvent,
+    /// The log id of the entry the replica applied last.
+    pub applied: UsageLogId,
+    pub usage_seq: u64,
+    pub retired_through: u64,
+    /// Live versions the group holds at this read.
+    pub live_versions: u64,
+    /// Unretired end records the group holds at this read.
+    pub end_records: u64,
+    /// Set on the page that starts a relisting.
+    pub relist: Option<RelistReason>,
+    /// Bucket rows, on relisting pages only, by bucket id.
+    pub rows: Vec<BucketUsageRow>,
+    /// Entries in seq order, each version once at its newest seq.
+    pub entries: Vec<UsageEntry>,
+    pub page: UsagePage,
+}
+
+/// Why a page starts a relisting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelistReason {
+    /// The cursor was [`UsageCursor::Start`].
+    Start,
+    /// The cursor asked for it: rows without a bucket.
+    Requested,
+    /// An end record above the caller's listing was folded.
+    Retired,
+    /// The cursor names another history, or another cluster's group.
+    History,
+}
+
+/// One bucket of a relisting, at the page's read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketUsageRow {
+    pub bucket_id: String,
+    /// The usage of every folded end record and every restored version.
+    pub retired: CommittedUsage,
+    /// The bucket's `/__ursula/usage` counters and gauges at this read.
+    pub totals: BucketUsage,
+    /// Body length of its live streams' latest visible snapshots.
+    pub snapshot_bytes: u64,
+}
+
+/// Whether anything remains after a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsagePage {
+    /// Nothing remains after the page's last item.
+    Complete,
+    /// The limit cut the listing: `next` continues it.
+    More { next: UsagePosition },
+}
+
+/// One version of a page: live, at its newest seq, or ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEntry {
+    pub seq: u64,
+    pub stream_id: BucketStreamId,
+    pub created_at_ms: u64,
+    pub counted_since: NonZeroU64,
+    /// Its `Stream-Incarnation` token: in the current history for a live
+    /// version, in the history it ended in for an end record.
+    pub incarnation: u64,
+    pub counters: VersionCounters,
+    /// Its counters at the start of the group's current history.
+    pub history_baseline: VersionCounters,
+    pub last_write: LastWrite,
+    pub lifecycle: Lifecycle,
+}
+
+/// A listed version's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Gauges at this read: `tail_offset - retained_offset`, and the body
+    /// length of the latest visible snapshot, 0 without one.
+    Live {
+        retained_bytes: u64,
+        snapshot_bytes: u64,
+    },
+    Ended {
+        end: StreamEnd,
+        ended_at_ms: u64,
+    },
 }
 
 #[cfg(test)]

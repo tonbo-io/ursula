@@ -591,7 +591,7 @@ pub struct RestoreReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoredGroup {
     pub raft_group_id: u32,
-    pub history: std::num::NonZeroU64,
+    pub history: ursula_proto::admin::HistoryId,
     pub already: bool,
 }
 
@@ -1110,8 +1110,9 @@ mod tests {
                             buckets: 1,
                             streams: u64::from(group).saturating_add(2),
                             group_commit_index: 3,
-                            history: std::num::NonZeroU64::new(u64::from(group) + 40)
-                                .expect("non-zero"),
+                            history: ursula_proto::admin::HistoryId::new(
+                                std::num::NonZeroU64::new(u64::from(group) + 40).expect("non-zero"),
+                            ),
                             already: group == 0,
                         })
                     },
@@ -1153,12 +1154,16 @@ mod tests {
         assert_eq!(report.imports, vec![
             RestoredGroup {
                 raft_group_id: 0,
-                history: std::num::NonZeroU64::new(40).unwrap(),
+                history: ursula_proto::admin::HistoryId::new(
+                    std::num::NonZeroU64::new(40).unwrap()
+                ),
                 already: true,
             },
             RestoredGroup {
                 raft_group_id: 1,
-                history: std::num::NonZeroU64::new(41).unwrap(),
+                history: ursula_proto::admin::HistoryId::new(
+                    std::num::NonZeroU64::new(41).unwrap()
+                ),
                 already: false,
             },
         ]);

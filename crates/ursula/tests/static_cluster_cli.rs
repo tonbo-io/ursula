@@ -38,8 +38,27 @@ use ursula_ctl::placement::moves::Intent;
 use ursula_ctl::placement::moves::MoveOptions;
 use ursula_ctl::placement::moves::Replacement;
 use ursula_ctl::placement::moves::run_moves;
+use ursula_proto::admin::BucketUsageRow;
+use ursula_proto::admin::CommittedUsageReport;
+use ursula_proto::admin::GroupStreamUsage;
+use ursula_proto::admin::GroupUsagePage;
+use ursula_proto::admin::GroupUsageRequest;
+use ursula_proto::admin::HistoryId;
+use ursula_proto::admin::MAX_STREAM_USAGE_GROUP_ENTRIES;
 use ursula_proto::admin::RaftGroupMetrics;
 use ursula_proto::admin::RecoveryGateStatus;
+use ursula_proto::admin::RelistReason;
+use ursula_proto::admin::StreamUsageEnd;
+use ursula_proto::admin::StreamUsageEntry;
+use ursula_proto::admin::StreamUsageReport;
+use ursula_proto::admin::StreamUsageRequest;
+use ursula_proto::admin::UsageCursor;
+use ursula_proto::admin::UsageEntryLimit;
+use ursula_proto::admin::UsageGroups;
+use ursula_proto::admin::UsagePage;
+use ursula_proto::admin::UsagePosition;
+use ursula_proto::admin::VersionCountersReport;
+use ursula_proto::admin::VersionLifecycle;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
@@ -5619,6 +5638,58 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
     )
     .await;
 
+    // Each node's usage export answers exactly the groups it hosts, each
+    // listing its one stream with the snapshot, and omits none within its
+    // answer budget. The newest page of each group is a consumer's cursor
+    // into this cluster.
+    let mut before_backup = BTreeMap::<u32, GroupUsagePage>::new();
+    for node in &nodes {
+        let what = format!("node {} lists the usage of its groups", node.id);
+        let pages = eventually(&mut procs, &what, async || {
+            let report =
+                stream_usage(&client, node, start_cursors(every_group.iter().copied())).await?;
+            assert!(report.omitted.is_empty(), "{report:?}");
+            let mut pages = Vec::new();
+            for answer in report.groups {
+                match answer {
+                    GroupStreamUsage::Listed(page)
+                        if page.page == UsagePage::Complete
+                            && matches!(page.entries.as_slice(), [StreamUsageEntry {
+                                lifecycle: VersionLifecycle::Live {
+                                    snapshot_bytes: 5,
+                                    ..
+                                },
+                                ..
+                            }]) =>
+                    {
+                        pages.push(page);
+                    }
+                    other => return Err(format!("{other:?}")),
+                }
+            }
+            let listed: BTreeSet<u32> = pages.iter().map(|page| page.raft_group_id).collect();
+            if listed == hosted(node) {
+                Ok(pages)
+            } else {
+                Err(format!("lists {listed:?}"))
+            }
+        })
+        .await;
+        for page in pages {
+            if before_backup
+                .get(&page.raft_group_id)
+                .is_none_or(|kept| kept.applied < page.applied)
+            {
+                before_backup.insert(page.raft_group_id, page);
+            }
+        }
+    }
+    assert_eq!(
+        before_backup.keys().copied().collect::<Vec<_>>(),
+        every_group,
+        "some node answers every group"
+    );
+
     let backup_store = ursula_ctl::backup::BackupStore::open(
         root.path().join("backup").to_str().expect("a UTF-8 path"),
     )
@@ -5643,7 +5714,53 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
     let purge = purge_bucket(&client, &mut procs, purger, "wide").await;
     assert_eq!(purge.removed_streams, 4, "{purge:?}");
     assert_eq!(purge.groups_with_streams, every_group, "{purge:?}");
+    assert_eq!(
+        purge
+            .groups
+            .iter()
+            .map(|group| group.raft_group_id)
+            .collect::<Vec<_>>(),
+        every_group,
+        "the report names each group's purge index: {purge:?}"
+    );
     wait_bucket_streams(&client, &mut procs, &nodes, "wide", 0).await;
+    // A complete page at or past a group's purge index, read in the history
+    // the purge applied in, lists the purged version as ended.
+    for purged in &purge.groups {
+        let what = format!("a page of group {} past its purge", purged.raft_group_id);
+        eventually(&mut procs, &what, async || {
+            for node in nodes
+                .iter()
+                .filter(|node| hosted(node).contains(&purged.raft_group_id))
+            {
+                let report =
+                    stream_usage(&client, node, start_cursors([purged.raft_group_id])).await?;
+                if let [GroupStreamUsage::Listed(page)] = report.groups.as_slice()
+                    && page.page == UsagePage::Complete
+                    && page.history.id == purged.history
+                    && page.applied.index >= purged.commit_index
+                {
+                    assert!(
+                        matches!(page.entries.as_slice(), [StreamUsageEntry {
+                            lifecycle: VersionLifecycle::Ended {
+                                end: StreamUsageEnd::Purged,
+                                ..
+                            },
+                            ..
+                        }]),
+                        "{page:?}"
+                    );
+                    assert_eq!(page.live_versions, 0);
+                    return Ok(());
+                }
+            }
+            Err(format!(
+                "no complete page past index {}",
+                purged.commit_index
+            ))
+        })
+        .await;
+    }
 
     // A wiped cluster, whose cold flush takes any hot byte.
     for node in &nodes {
@@ -5672,6 +5789,80 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
         every_group
     );
     wait_bucket_streams(&client, &mut procs, &nodes, "wide", 4).await;
+    // A cursor of the wiped cluster names other groups: every node relists
+    // it (`history`). Each restored version counts from the import, under
+    // its history, and the bucket's retired usage is the backup's totals.
+    let imported: BTreeMap<u32, HistoryId> = restored
+        .imports
+        .iter()
+        .map(|import| (import.raft_group_id, import.history))
+        .collect();
+    let mut relisted = BTreeSet::new();
+    for node in &nodes {
+        let cursors: Vec<GroupUsageRequest> = before_backup
+            .values()
+            .map(|page| GroupUsageRequest {
+                raft_group_id: page.raft_group_id,
+                cursor: page.next_cursor().expect("a page of this build"),
+            })
+            .collect();
+        let what = format!("node {} relists the restored groups", node.id);
+        let listed = eventually(&mut procs, &what, async || {
+            let report = stream_usage(&client, node, cursors.clone()).await?;
+            let mut listed = BTreeSet::new();
+            for answer in &report.groups {
+                let GroupStreamUsage::Listed(page) = answer else {
+                    return Err(format!("{answer:?}"));
+                };
+                let group = page.raft_group_id;
+                let before = &before_backup[&group];
+                let history = imported[&group];
+                assert_ne!(page.genesis, before.genesis, "a new cluster's group");
+                assert_eq!(page.relist, Some(RelistReason::History), "{page:?}");
+                assert_eq!(page.page, UsagePage::Complete);
+                assert_eq!(
+                    (page.history.id, page.history.previous),
+                    (history, Some(page.genesis))
+                );
+                match page.entries.as_slice() {
+                    [entry] => {
+                        assert_eq!(entry.counted_since, history, "{entry:?}");
+                        assert_eq!(entry.counters, VersionCountersReport::default());
+                        assert_eq!(entry.history_baseline, VersionCountersReport::default());
+                        assert_eq!(entry.last_write_at_ms, None);
+                        assert!(
+                            matches!(entry.lifecycle, VersionLifecycle::Live { .. }),
+                            "{entry:?}"
+                        );
+                    }
+                    entries => panic!("one restored version: {entries:?}"),
+                }
+                let [row] = page.rows.as_slice() else {
+                    panic!("one bucket row: {page:?}");
+                };
+                let [backed_up] = before.rows.as_slice() else {
+                    panic!("one bucket row: {before:?}");
+                };
+                assert_eq!(
+                    (row.retired, committed_of(&row.totals)),
+                    (
+                        committed_of(&backed_up.totals),
+                        committed_of(&backed_up.totals)
+                    ),
+                    "group {group} keeps the backup's totals as retired usage"
+                );
+                listed.insert(group);
+            }
+            Ok(listed)
+        })
+        .await;
+        relisted.extend(listed);
+    }
+    assert_eq!(
+        relisted.into_iter().collect::<Vec<_>>(),
+        every_group,
+        "some node relists every group"
+    );
     // The restored streams' snapshots count again, derived from the
     // imported state.
     eventually(
@@ -5861,6 +6052,1058 @@ async fn purge_bucket(
         }
     })
     .await
+}
+
+/// `node`'s answer to `POST /__ursula/usage/streams` on its admin listener
+/// for `groups`, at the largest per-group limit.
+async fn stream_usage(
+    client: &reqwest::Client,
+    node: &MetaNode,
+    groups: Vec<GroupUsageRequest>,
+) -> Result<StreamUsageReport, String> {
+    let url = format!("{}/__ursula/usage/streams", node.admin());
+    let request = StreamUsageRequest {
+        version: ursula_proto::admin::SchemaVersion,
+        groups: UsageGroups::try_from(groups).map_err(|err| format!("{url}: {err}"))?,
+        limit: UsageEntryLimit::try_from(MAX_STREAM_USAGE_GROUP_ENTRIES)
+            .map_err(|err| format!("{url}: {err}"))?,
+    };
+    let response = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("POST {url}: {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))
+}
+
+/// A `start` cursor for each of `groups`.
+fn start_cursors(groups: impl IntoIterator<Item = u32>) -> Vec<GroupUsageRequest> {
+    groups
+        .into_iter()
+        .map(|raft_group_id| GroupUsageRequest {
+            raft_group_id,
+            cursor: UsageCursor::Start,
+        })
+        .collect()
+}
+
+/// A stream version's key in the usage export: bucket, stream, creation
+/// time and the history its counters began in.
+type VersionKey = (String, String, u64, HistoryId);
+
+fn version_key(entry: &StreamUsageEntry) -> VersionKey {
+    (
+        entry.bucket_id.clone(),
+        entry.stream_id.clone(),
+        entry.created_at_ms,
+        entry.counted_since,
+    )
+}
+
+/// The committed counters of a version's counters.
+fn committed_part(counters: &VersionCountersReport) -> CommittedUsageReport {
+    CommittedUsageReport {
+        committed_append_bytes: counters.committed_append_bytes,
+        committed_records: counters.committed_records,
+        committed_write_units: counters.committed_write_units,
+    }
+}
+
+/// The committed counters of a v2 bucket report.
+fn committed_of(totals: &ursula_proto::admin::BucketUsageReport) -> CommittedUsageReport {
+    CommittedUsageReport {
+        committed_append_bytes: totals.committed_append_bytes,
+        committed_records: totals.committed_records,
+        committed_write_units: totals.committed_write_units,
+    }
+}
+
+fn add_committed(to: &mut CommittedUsageReport, by: CommittedUsageReport) {
+    to.committed_append_bytes = to
+        .committed_append_bytes
+        .saturating_add(by.committed_append_bytes);
+    to.committed_records = to.committed_records.saturating_add(by.committed_records);
+    to.committed_write_units = to
+        .committed_write_units
+        .saturating_add(by.committed_write_units);
+}
+
+/// `from - by`, `None` when a counter of `by` is above `from`'s.
+fn committed_minus(
+    from: CommittedUsageReport,
+    by: CommittedUsageReport,
+) -> Option<CommittedUsageReport> {
+    Some(CommittedUsageReport {
+        committed_append_bytes: from
+            .committed_append_bytes
+            .checked_sub(by.committed_append_bytes)?,
+        committed_records: from.committed_records.checked_sub(by.committed_records)?,
+        committed_write_units: from
+            .committed_write_units
+            .checked_sub(by.committed_write_units)?,
+    })
+}
+
+fn add_counters(to: &mut VersionCountersReport, by: VersionCountersReport) {
+    to.committed_append_bytes = to
+        .committed_append_bytes
+        .saturating_add(by.committed_append_bytes);
+    to.committed_records = to.committed_records.saturating_add(by.committed_records);
+    to.committed_write_units = to
+        .committed_write_units
+        .saturating_add(by.committed_write_units);
+    to.appends = to.appends.saturating_add(by.appends);
+}
+
+/// `counters - level`, which never falls within a history.
+fn counters_minus(
+    counters: VersionCountersReport,
+    level: VersionCountersReport,
+) -> VersionCountersReport {
+    let field = |counter: u64, level: u64| {
+        counter
+            .checked_sub(level)
+            .unwrap_or_else(|| panic!("a version's counters fell: {counters:?} below {level:?}"))
+    };
+    VersionCountersReport {
+        committed_append_bytes: field(
+            counters.committed_append_bytes,
+            level.committed_append_bytes,
+        ),
+        committed_records: field(counters.committed_records, level.committed_records),
+        committed_write_units: field(counters.committed_write_units, level.committed_write_units),
+        appends: field(counters.appends, level.appends),
+    }
+}
+
+/// What a test's writes committed to one stream version, by the counting
+/// rule: a create without a body counts one write unit and no record, and
+/// each byte append its bytes, one record, `max(1, ceil(bytes / 10240))`
+/// units and one append.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OracleVersion(VersionCountersReport);
+
+impl OracleVersion {
+    fn created() -> Self {
+        Self(VersionCountersReport {
+            committed_write_units: 1,
+            ..VersionCountersReport::default()
+        })
+    }
+
+    fn appended(&mut self, bytes: u64) {
+        add_counters(&mut self.0, VersionCountersReport {
+            committed_append_bytes: bytes,
+            committed_records: 1,
+            committed_write_units: bytes.div_ceil(10_240).max(1),
+            appends: 1,
+        });
+    }
+}
+
+/// One group as a metering consumer follows it, by the consumer contract
+/// of `POST /__ursula/usage/streams` (operations, "Per-stream usage"),
+/// for one history: what it holds and what it accounted.
+#[derive(Debug, Default)]
+struct MeteredGroup {
+    /// The cursor of the next poll, `start` before the first.
+    cursor: Option<UsageCursor>,
+    /// The page the consumer kept last.
+    kept: Option<GroupUsagePage>,
+    /// The pages of a relisting in progress, from its first.
+    relisting: Vec<GroupUsagePage>,
+    /// Whether a relisting was applied.
+    baselined: bool,
+    /// The relistings applied, by reason.
+    relists: Vec<RelistReason>,
+    /// The bucket rows of the last relisting applied.
+    rows: Vec<BucketUsageRow>,
+    /// The billed level of each version held.
+    billed: BTreeMap<VersionKey, VersionCountersReport>,
+    /// The versions held that ended, by end-record seq, until
+    /// `retired_through` reaches it.
+    ended: BTreeMap<VersionKey, u64>,
+    /// How each version listed as ended ended.
+    ends: BTreeMap<VersionKey, StreamUsageEnd>,
+    /// The retired usage accounted per bucket.
+    retired_view: BTreeMap<String, CommittedUsageReport>,
+    /// What was accounted to each version, its baseline counters included.
+    accounted: BTreeMap<VersionKey, VersionCountersReport>,
+    /// What was accounted to each bucket rather than to a version: the
+    /// usage of versions whose end record was folded before a poll read it.
+    to_buckets: BTreeMap<String, CommittedUsageReport>,
+}
+
+impl MeteredGroup {
+    fn cursor(&self) -> UsageCursor {
+        self.cursor.clone().unwrap_or(UsageCursor::Start)
+    }
+
+    /// A complete page was kept last, and no relisting is in progress.
+    fn complete(&self) -> bool {
+        self.relisting.is_empty()
+            && self
+                .kept
+                .as_ref()
+                .is_some_and(|page| page.page == UsagePage::Complete)
+    }
+
+    /// Asks the next poll to relist the group (`requested`).
+    fn request_relisting(&mut self) {
+        if let Some(UsageCursor::After { position, .. }) = &mut self.cursor {
+            *position = UsagePosition::Rows { after_bucket: None };
+        }
+    }
+
+    fn keep(&mut self, page: GroupUsagePage) {
+        if let Some(kept) = &self.kept {
+            assert_eq!(page.genesis, kept.genesis, "one cluster's group");
+            assert!(
+                page.applied >= kept.applied,
+                "a kept page is never older than the last: {page:?} after {kept:?}"
+            );
+        }
+        self.cursor = Some(page.next_cursor().expect("a page of this build"));
+        if page.relist.is_some() {
+            self.relisting = vec![page.clone()];
+        } else if !self.relisting.is_empty() {
+            self.relisting.push(page.clone());
+        } else {
+            self.continue_listing(&page);
+        }
+        if page.page == UsagePage::Complete && !self.relisting.is_empty() {
+            let pages = std::mem::take(&mut self.relisting);
+            self.apply_relisting(&pages);
+        }
+        self.retire_held(page.retired_through);
+        if self.relisting.is_empty() && page.page == UsagePage::Complete {
+            let live = self.billed.len().saturating_sub(self.ended.len());
+            assert_eq!(
+                (page.live_versions, page.end_records),
+                (
+                    u64::try_from(live).unwrap(),
+                    u64::try_from(self.ended.len()).unwrap()
+                ),
+                "the page's counts are the versions held: {page:?}"
+            );
+        }
+        self.kept = Some(page);
+    }
+
+    /// Contract item 6: account each entry above the billed level.
+    fn continue_listing(&mut self, page: &GroupUsagePage) {
+        for entry in &page.entries {
+            self.account(entry, VersionCountersReport::default());
+        }
+    }
+
+    fn account(&mut self, entry: &StreamUsageEntry, unheld: VersionCountersReport) {
+        let key = version_key(entry);
+        let level = self.billed.get(&key).copied().unwrap_or(unheld);
+        add_counters(
+            self.accounted.entry(key.clone()).or_default(),
+            counters_minus(entry.counters, level),
+        );
+        self.billed.insert(key.clone(), entry.counters);
+        if let VersionLifecycle::Ended { end, .. } = entry.lifecycle {
+            self.ended.insert(key.clone(), entry.seq);
+            self.ends.insert(key, end);
+        }
+    }
+
+    /// Contract item 7, for the first relisting and for relistings of the
+    /// same history: the tests here keep one history.
+    fn apply_relisting(&mut self, pages: &[GroupUsagePage]) {
+        let reason = pages[0].relist.expect("a relisting's first page");
+        assert_ne!(reason, RelistReason::History, "one history: {pages:?}");
+        let rows: BTreeMap<String, BucketUsageRow> = pages
+            .iter()
+            .flat_map(|page| &page.rows)
+            .map(|row| (row.bucket_id.clone(), row.clone()))
+            .collect();
+        let mut listed = BTreeMap::<VersionKey, StreamUsageEntry>::new();
+        for entry in pages.iter().flat_map(|page| &page.entries) {
+            let key = version_key(entry);
+            if listed.get(&key).is_none_or(|seen| seen.seq < entry.seq) {
+                listed.insert(key, entry.clone());
+            }
+        }
+        if self.baselined {
+            for entry in listed.values() {
+                self.account(entry, VersionCountersReport::default());
+            }
+            let closed: Vec<VersionKey> = self
+                .billed
+                .keys()
+                .filter(|key| !listed.contains_key(*key))
+                .cloned()
+                .collect();
+            let mut closed_levels = BTreeMap::<String, CommittedUsageReport>::new();
+            for key in closed {
+                let level = self.billed.remove(&key).expect("a held version");
+                self.ended.remove(&key);
+                add_committed(
+                    closed_levels.entry(key.0.clone()).or_default(),
+                    committed_part(&level),
+                );
+            }
+            for (bucket, row) in &rows {
+                let view = self.retired_view.get(bucket).copied().unwrap_or_default();
+                let share = committed_minus(row.retired, view)
+                    .and_then(|share| {
+                        committed_minus(
+                            share,
+                            closed_levels.get(bucket).copied().unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("bucket {bucket}'s retired usage fell: {row:?} below {view:?}")
+                    });
+                add_committed(self.to_buckets.entry(bucket.clone()).or_default(), share);
+            }
+            // A bucket the relisting lists no row for keeps its retired
+            // view, and the levels of its closed versions join it, so a
+            // later relisting that lists its row accounts against both.
+            for (bucket, level) in closed_levels {
+                if !rows.contains_key(&bucket) {
+                    add_committed(self.retired_view.entry(bucket).or_default(), level);
+                }
+            }
+        } else {
+            // The first relisting is the baseline: what it lists is what
+            // the consumer accounted before.
+            for entry in listed.values() {
+                self.account(entry, VersionCountersReport::default());
+            }
+            self.baselined = true;
+        }
+        for (bucket, row) in &rows {
+            self.retired_view.insert(bucket.clone(), row.retired);
+        }
+        self.relists.push(reason);
+        self.rows = rows.values().cloned().collect();
+        // Contract item 8: a relisting that completed in its first page
+        // explains each row's totals by its parts.
+        if let [page] = pages {
+            for row in &page.rows {
+                let mut parts = row.retired;
+                let mut retained_bytes = 0;
+                let mut snapshot_bytes = 0;
+                let mut stream_count = 0;
+                for entry in listed
+                    .values()
+                    .filter(|entry| entry.bucket_id == row.bucket_id)
+                {
+                    add_committed(&mut parts, committed_part(&entry.counters));
+                    if let VersionLifecycle::Live {
+                        retained_bytes: retained,
+                        snapshot_bytes: snapshot,
+                    } = entry.lifecycle
+                    {
+                        retained_bytes = u64::saturating_add(retained_bytes, retained);
+                        snapshot_bytes = u64::saturating_add(snapshot_bytes, snapshot);
+                        stream_count = u64::saturating_add(stream_count, 1);
+                    }
+                }
+                assert_eq!(
+                    (
+                        parts,
+                        row.totals.retained_bytes,
+                        row.totals.snapshot_bytes,
+                        row.totals.stream_count
+                    ),
+                    (
+                        committed_of(&row.totals),
+                        retained_bytes,
+                        Some(snapshot_bytes),
+                        stream_count
+                    ),
+                    "the row's totals are its retired usage plus its versions: {page:?}"
+                );
+            }
+        }
+    }
+
+    /// Contract item 6: an ended version is held until `retired_through`
+    /// reaches its seq, then it is in its bucket's retired usage.
+    fn retire_held(&mut self, retired_through: u64) {
+        let due: Vec<VersionKey> = self
+            .ended
+            .iter()
+            .filter(|(_, seq)| **seq <= retired_through)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            self.ended.remove(&key);
+            let level = self.billed.remove(&key).expect("a held version");
+            add_committed(
+                self.retired_view.entry(key.0.clone()).or_default(),
+                committed_part(&level),
+            );
+        }
+    }
+
+    /// What was accounted to the versions of `bucket`'s stream `stream`:
+    /// one version per stream in these tests.
+    fn accounted_to(&self, bucket: &str, stream: &str) -> Option<VersionCountersReport> {
+        let mut versions = self
+            .accounted
+            .iter()
+            .filter(|(key, _)| key.0 == bucket && key.1 == stream);
+        let (_, accounted) = versions.next()?;
+        assert!(
+            versions.next().is_none(),
+            "one version of {bucket}/{stream}"
+        );
+        Some(*accounted)
+    }
+
+    /// How the version of `bucket`'s stream `stream` ended, as a page
+    /// listed it.
+    fn end_of(&self, bucket: &str, stream: &str) -> Option<StreamUsageEnd> {
+        self.ends
+            .iter()
+            .find(|(key, _)| key.0 == bucket && key.1 == stream)
+            .map(|(_, end)| *end)
+    }
+}
+
+/// A metering consumer of every group of a cluster.
+#[derive(Debug)]
+struct UsageMeter {
+    groups: BTreeMap<u32, MeteredGroup>,
+}
+
+impl UsageMeter {
+    fn new(group_count: u32) -> Self {
+        Self {
+            groups: (0..group_count)
+                .map(|group| (group, MeteredGroup::default()))
+                .collect(),
+        }
+    }
+
+    fn group(&self, group: u32) -> &MeteredGroup {
+        &self.groups[&group]
+    }
+
+    /// One poll round over every node of `nodes` (contract items 1 to 3):
+    /// per group, the listed answer with the highest `applied` is kept.
+    /// `Ok` once every group's kept page is complete with no relisting in
+    /// progress (item 9), else what is missing.
+    async fn poll(&mut self, client: &reqwest::Client, nodes: &[MetaNode]) -> Result<(), String> {
+        let request: Vec<GroupUsageRequest> = self
+            .groups
+            .iter()
+            .map(|(group, metered)| GroupUsageRequest {
+                raft_group_id: *group,
+                cursor: metered.cursor(),
+            })
+            .collect();
+        let mut newest = BTreeMap::<u32, GroupUsagePage>::new();
+        let mut seen = Vec::new();
+        for node in nodes {
+            let report = match stream_usage(client, node, request.clone()).await {
+                Ok(report) => report,
+                Err(err) => {
+                    seen.push(err);
+                    continue;
+                }
+            };
+            assert!(report.omitted.is_empty(), "{report:?}");
+            for answer in report.groups {
+                match answer {
+                    GroupStreamUsage::Listed(page) => {
+                        if newest
+                            .get(&page.raft_group_id)
+                            .is_none_or(|kept| kept.applied < page.applied)
+                        {
+                            newest.insert(page.raft_group_id, page);
+                        }
+                    }
+                    other => seen.push(format!("node {}: {other:?}", node.id)),
+                }
+            }
+        }
+        for (group, page) in newest {
+            self.groups
+                .get_mut(&group)
+                .expect("a requested group")
+                .keep(page);
+        }
+        let incomplete: Vec<u32> = self
+            .groups
+            .iter()
+            .filter(|(_, metered)| !metered.complete())
+            .map(|(group, _)| *group)
+            .collect();
+        if incomplete.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("groups {incomplete:?} incomplete: {seen:?}"))
+        }
+    }
+
+    /// Polls until a poll is complete and `done` holds of the meter.
+    async fn poll_until(
+        &mut self,
+        client: &reqwest::Client,
+        procs: &mut Processes,
+        nodes: &[MetaNode],
+        what: &str,
+        done: impl Fn(&Self) -> Result<(), String>,
+    ) {
+        eventually(procs, what, async || {
+            self.poll(client, nodes).await?;
+            done(self)
+        })
+        .await;
+    }
+}
+
+/// `stream` of `bucket` accounted exactly its oracle counters in `meter`.
+fn accounted_exactly(
+    meter: &UsageMeter,
+    group: u32,
+    bucket: &str,
+    stream: &str,
+    oracle: OracleVersion,
+) -> Result<(), String> {
+    match meter.group(group).accounted_to(bucket, stream) {
+        Some(accounted) if accounted == oracle.0 => Ok(()),
+        accounted => Err(format!(
+            "{bucket}/{stream} accounted {accounted:?}, the oracle {oracle:?}"
+        )),
+    }
+}
+
+/// `count` stream names of `bucket` in data group `group` of a cluster of
+/// `groups` data groups.
+fn streams_in_group(bucket: &str, groups: usize, group: u32, count: usize) -> Vec<String> {
+    let map = ursula_shard::StaticShardMap::new(1, groups).expect("shard map");
+    (0_u32..)
+        .map(|candidate| format!("u{candidate}"))
+        .filter(|stream| {
+            map.locate(&ursula_shard::BucketStreamId::new(bucket, stream))
+                .raft_group_id
+                .0
+                == group
+        })
+        .take(count)
+        .collect()
+}
+
+/// Deletes the stream at `url`, again until it is gone.
+async fn delete_until_gone(client: &reqwest::Client, procs: &mut Processes, url: &str) {
+    let mut tried = false;
+    let what = format!("{url} is deleted");
+    eventually(procs, &what, async || {
+        let response = client
+            .delete(url)
+            .send()
+            .await
+            .map_err(|err| format!("DELETE {url}: {err}"))?;
+        let status = response.status();
+        // A retry after an answer that was lost finds it gone.
+        let gone = status.is_success() || (tried && status == reqwest::StatusCode::NOT_FOUND);
+        tried = true;
+        if gone {
+            Ok(())
+        } else {
+            Err(format!("DELETE {url}: {status}"))
+        }
+    })
+    .await;
+}
+
+/// Hands `group`'s leadership to node `to`, once a replica of `nodes` leads
+/// it live, and waits until `to` leads it live.
+async fn transfer_leadership(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    group: u32,
+    to: u64,
+) {
+    let all: BTreeSet<u64> = nodes.iter().map(|node| node.id).collect();
+    let what = format!("node {to} leads group {group}");
+    eventually(procs, &what, async || {
+        let target = replica_of(client, node_of(nodes, to), RaftGroupId(group)).await?;
+        if target.current_leader == Some(to) && target.leads_live {
+            return Ok(());
+        }
+        let leader = leading_replica(client, nodes, &all, RaftGroupId(group)).await?;
+        let transfer = format!(
+            "{}/__ursula/raft/{group}/leader/transfer/{to}",
+            node_of(nodes, leader.node_id).admin()
+        );
+        let response = try_admin_test_post(client, transfer.clone())
+            .await?
+            .send()
+            .await
+            .map_err(|err| format!("POST {transfer}: {err}"))?;
+        Err(format!(
+            "asked node {} to hand over: {}",
+            leader.node_id,
+            response.status()
+        ))
+    })
+    .await;
+}
+
+/// The v2 bucket totals of `bucket` across every node's report, as a
+/// collector keeps them per group, once every group is reported.
+async fn v2_bucket_totals(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    bucket: &str,
+) -> ursula_proto::admin::BucketUsageReport {
+    let what = format!("every group reports the usage of {bucket}");
+    eventually(procs, &what, async || {
+        let mut reports = Vec::new();
+        for node in nodes {
+            reports.push(usage_report(client, node).await?);
+        }
+        let (buckets, complete) = ursula_proto::admin::UsageReport::bucket_usage(&reports);
+        match buckets.get(bucket) {
+            Some(totals) if complete => Ok(*totals),
+            _ => Err(format!("complete {complete}, {buckets:?}")),
+        }
+    })
+    .await
+}
+
+/// The per-stream usage export, end to end, as a metering consumer polls
+/// every node's admin listener by its contract: a baseline `start` listing
+/// with the versions' exact counters, a leader change between polls that
+/// keeps the highest applied page, a stream created, written and deleted
+/// between two polls and a polled stream deleted, both listed as ended
+/// with their exact counters, a follower cut off from its peers answering
+/// `behind`, a stream that ended unread and whose end record was folded
+/// past the retention, which relists the group (`retired`) with the
+/// bucket's retired usage explaining what the consumer did not see while
+/// v2 totals stay where they were, and a requested relisting whose rows
+/// equal v2 at the same read. The route is the admin listener's only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_stream_usage_export_survives_a_leader_change_and_a_delete_between_polls() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the usage export test");
+        return;
+    };
+    const GROUPS: usize = 2;
+    const BUCKET: &str = "meter";
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    // Every node reaches node 3's Raft plane through a relay, so node 3
+    // can be cut off from its peers while it serves its listeners.
+    let relay = Relay::start(nodes[2].port).await;
+    let sink = Sink::start().await;
+    let peers_for = |me: &MetaNode| -> Vec<(u64, String)> {
+        nodes
+            .iter()
+            .map(|node| match (node.id, me.id) {
+                (3, 3) => me.peer(),
+                (3, _) => (3, relay.url()),
+                _ => node.peer(),
+            })
+            .collect()
+    };
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        leadership_balance_interval: Some("0s"),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write_with_groups(&peers_for(node), meta, GROUPS);
+        // A retention of 45 s: half of the bound, which the inline
+        // snapshot store's floor allows with a 10 s install timeout.
+        let text = std::fs::read_to_string(&node.config).expect("read node config");
+        assert!(text.contains("[raft]\n"));
+        std::fs::write(
+            &node.config,
+            text.replace(
+                "[raft]\n",
+                "[raft]\ndeleted_data_max_age = \"90s\"\ninstall_snapshot_timeout = \"10s\"\n",
+            ),
+        )
+        .expect("write node config");
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+
+    // The route is the admin listener's: the client listener does not
+    // serve it, and the admin listener refuses a group the cluster lacks.
+    let body = serde_json::to_string(&StreamUsageRequest {
+        version: ursula_proto::admin::SchemaVersion,
+        groups: UsageGroups::try_from(start_cursors([0])).unwrap(),
+        limit: UsageEntryLimit::try_from(1).unwrap(),
+    })
+    .unwrap();
+    let answer = client
+        .post(format!("{}/__ursula/usage/streams", nodes[0].url()))
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("POST the client listener");
+    assert_eq!(answer.status(), reqwest::StatusCode::NOT_FOUND);
+    let refused = client
+        .post(format!("{}/__ursula/usage/streams", nodes[0].admin()))
+        .header("content-type", "application/json")
+        .body(body.replace(r#""raft_group_id":0"#, r#""raft_group_id":2"#))
+        .send()
+        .await
+        .expect("POST a group the cluster lacks");
+    assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let refused = client
+        .post(format!("{}/__ursula/usage/streams", nodes[0].admin()))
+        .body(body)
+        .send()
+        .await
+        .expect("POST without a content type");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+
+    // One stream per group, written before the baseline.
+    let url = |stream: &str| format!("{}/{BUCKET}/{stream}", nodes[0].url());
+    let [kept, brief, unseen]: [String; 3] = streams_in_group(BUCKET, GROUPS, 0, 3)
+        .try_into()
+        .expect("three streams of group 0");
+    let [polled]: [String; 1] = streams_in_group(BUCKET, GROUPS, 1, 1)
+        .try_into()
+        .expect("a stream of group 1");
+    let mut oracle = BTreeMap::<String, OracleVersion>::new();
+    for (stream, bytes) in [(&kept, 10_241_usize), (&polled, 5)] {
+        create_stream(&client, &mut procs, &url(stream)).await;
+        let version = oracle
+            .entry(stream.clone())
+            .or_insert(OracleVersion::created());
+        append_until_done(&client, &mut procs, &url(stream), &"k".repeat(bytes)).await;
+        version.appended(u64::try_from(bytes).unwrap());
+    }
+
+    // 1. The baseline: a `start` relisting of each group with its stream's
+    // exact counters and the bucket's row.
+    let mut meter = UsageMeter::new(u32::try_from(GROUPS).unwrap());
+    meter
+        .poll_until(
+            &client,
+            &mut procs,
+            &nodes,
+            "the baseline lists every stream",
+            |meter| {
+                accounted_exactly(meter, 0, BUCKET, &kept, oracle[&kept])?;
+                accounted_exactly(meter, 1, BUCKET, &polled, oracle[&polled])
+            },
+        )
+        .await;
+    for group in 0..2 {
+        let metered = meter.group(group);
+        assert_eq!(metered.relists, vec![RelistReason::Start]);
+        let page = metered.kept.as_ref().expect("a kept page");
+        assert_eq!(page.history.previous, None, "the genesis history");
+        assert_eq!(
+            metered
+                .rows
+                .iter()
+                .map(|row| (row.bucket_id.as_str(), row.retired))
+                .collect::<Vec<_>>(),
+            vec![(BUCKET, CommittedUsageReport::default())]
+        );
+    }
+    let baseline_term = meter.group(0).kept.as_ref().unwrap().applied.term;
+
+    // 2. Group 0's leadership moves, and node 3 leads no group, so it can
+    // be cut off later without a leader change.
+    let every_node = BTreeSet::from([1, 2, 3]);
+    let leader = eventually(&mut procs, "group 0 has a live leader", async || {
+        leading_replica(&client, &nodes, &every_node, RaftGroupId(0)).await
+    })
+    .await;
+    transfer_leadership(
+        &client,
+        &mut procs,
+        &nodes,
+        0,
+        if leader.node_id == 1 { 2 } else { 1 },
+    )
+    .await;
+    let leader = eventually(&mut procs, "group 1 has a live leader", async || {
+        leading_replica(&client, &nodes, &every_node, RaftGroupId(1)).await
+    })
+    .await;
+    if leader.node_id == 3 {
+        transfer_leadership(&client, &mut procs, &nodes, 1, 1).await;
+    }
+
+    // 3. Between two polls: an append to a polled stream, a stream created,
+    // written and deleted, and a polled stream deleted.
+    append_until_done(&client, &mut procs, &url(&kept), "after the move").await;
+    oracle
+        .get_mut(&kept)
+        .unwrap()
+        .appended(u64::try_from("after the move".len()).unwrap());
+    create_stream(&client, &mut procs, &url(&brief)).await;
+    let mut brief_version = OracleVersion::created();
+    append_until_done(&client, &mut procs, &url(&brief), "brief").await;
+    brief_version.appended(5);
+    oracle.insert(brief.clone(), brief_version);
+    delete_until_gone(&client, &mut procs, &url(&brief)).await;
+    delete_until_gone(&client, &mut procs, &url(&polled)).await;
+    meter
+        .poll_until(
+            &client,
+            &mut procs,
+            &nodes,
+            "the poll lists the deletes as ended",
+            |meter| {
+                accounted_exactly(meter, 0, BUCKET, &kept, oracle[&kept])?;
+                accounted_exactly(meter, 0, BUCKET, &brief, oracle[&brief])?;
+                accounted_exactly(meter, 1, BUCKET, &polled, oracle[&polled])?;
+                if meter.group(0).end_of(BUCKET, &brief) == Some(StreamUsageEnd::Deleted)
+                    && meter.group(1).end_of(BUCKET, &polled) == Some(StreamUsageEnd::Deleted)
+                {
+                    Ok(())
+                } else {
+                    Err(format!("ends {:?}", meter.groups))
+                }
+            },
+        )
+        .await;
+    for group in 0..2 {
+        assert_eq!(meter.group(group).relists, vec![RelistReason::Start]);
+        assert_eq!(meter.group(group).ended.len(), 1, "{meter:?}");
+    }
+    let moved = meter.group(0).kept.as_ref().unwrap().applied;
+    assert!(
+        moved.term > baseline_term,
+        "the kept page is the new leader's, the highest applied: {moved:?} after term {baseline_term}"
+    );
+
+    // 4. Node 3, cut off from its peers, has not applied the next write the
+    // consumer kept: it answers `behind`, and lists again once it caught up.
+    relay.point(sink.port, Open::Closed);
+    append_until_done(&client, &mut procs, &url(&kept), "while cut").await;
+    oracle
+        .get_mut(&kept)
+        .unwrap()
+        .appended(u64::try_from("while cut".len()).unwrap());
+    meter
+        .poll_until(
+            &client,
+            &mut procs,
+            &nodes,
+            "the poll lists the write",
+            |meter| accounted_exactly(meter, 0, BUCKET, &kept, oracle[&kept]),
+        )
+        .await;
+    let cursor = vec![GroupUsageRequest {
+        raft_group_id: 0,
+        cursor: meter.group(0).cursor(),
+    }];
+    let kept_page = meter.group(0).kept.clone().unwrap();
+    let report = stream_usage(&client, &nodes[2], cursor.clone())
+        .await
+        .expect("node 3 answers");
+    match report.groups.as_slice() {
+        [
+            GroupStreamUsage::Behind {
+                raft_group_id: 0,
+                genesis,
+                history,
+                applied,
+            },
+        ] => {
+            assert_eq!(
+                (*genesis, *history),
+                (kept_page.genesis, kept_page.history.id)
+            );
+            assert!(*applied < kept_page.applied, "{applied:?}");
+        }
+        other => panic!("node 3 is behind the kept page: {other:?}"),
+    }
+    relay.point(nodes[2].port, Open::Closed);
+    eventually(&mut procs, "node 3 lists again", async || {
+        let report = stream_usage(&client, &nodes[2], cursor.clone()).await?;
+        match report.groups.as_slice() {
+            [GroupStreamUsage::Listed(page)] if page.relist.is_none() => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+
+    // 5. A stream created, written and deleted that no poll reads before
+    // its end record is folded, past the retention.
+    create_stream(&client, &mut procs, &url(&unseen)).await;
+    let mut unseen_version = OracleVersion::created();
+    append_until_done(&client, &mut procs, &url(&unseen), &"u".repeat(20_481)).await;
+    unseen_version.appended(20_481);
+    delete_until_gone(&client, &mut procs, &url(&unseen)).await;
+    let before = v2_bucket_totals(&client, &mut procs, &nodes, BUCKET).await;
+    eventually_for(
+        &mut procs,
+        "every replica folded the three end records",
+        Duration::from_secs(150),
+        async || {
+            for node in &nodes {
+                let metrics = runtime_metrics(&client, node).await?;
+                let folded = metrics["usage_end_records_retired"].as_u64();
+                if folded < Some(3) {
+                    return Err(format!("node {} folded {folded:?}", node.id));
+                }
+            }
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(
+        v2_bucket_totals(&client, &mut procs, &nodes, BUCKET).await,
+        before,
+        "a fold moves usage, it adds none"
+    );
+    meter
+        .poll_until(
+            &client,
+            &mut procs,
+            &nodes,
+            "the poll relists the fold",
+            |meter| {
+                if meter.group(0).relists.last() == Some(&RelistReason::Retired) {
+                    Ok(())
+                } else {
+                    Err(format!("relists {:?}", meter.group(0).relists))
+                }
+            },
+        )
+        .await;
+    let group_0 = meter.group(0);
+    assert_eq!(group_0.accounted_to(BUCKET, &unseen), None, "never listed");
+    assert_eq!(
+        group_0.to_buckets.get(BUCKET).copied(),
+        Some(committed_part(&unseen_version.0)),
+        "the bucket is accounted what ended unread"
+    );
+    let mut retired = committed_part(&oracle[&brief].0);
+    add_committed(&mut retired, committed_part(&unseen_version.0));
+    assert_eq!(
+        group_0
+            .rows
+            .iter()
+            .map(|row| (row.bucket_id.as_str(), row.retired))
+            .collect::<Vec<_>>(),
+        vec![(BUCKET, retired)],
+        "the row's retired usage holds both folded versions"
+    );
+    accounted_exactly(&meter, 0, BUCKET, &kept, oracle[&kept]).unwrap();
+    // Group 1's fold was of a record the consumer had listed: it continues.
+    assert_eq!(meter.group(1).relists, vec![RelistReason::Start]);
+    assert!(meter.group(1).ended.is_empty(), "{meter:?}");
+    assert_eq!(
+        meter.group(1).retired_view.get(BUCKET).copied(),
+        Some(committed_part(&oracle[&polled].0))
+    );
+    // Every unit the writes committed is accounted once: to its version,
+    // or to the bucket.
+    let mut accounted = CommittedUsageReport::default();
+    for metered in meter.groups.values() {
+        for counters in metered.accounted.values() {
+            add_committed(&mut accounted, committed_part(counters));
+        }
+        for share in metered.to_buckets.values() {
+            add_committed(&mut accounted, *share);
+        }
+    }
+    let mut written = committed_part(&unseen_version.0);
+    for version in oracle.values() {
+        add_committed(&mut written, committed_part(&version.0));
+    }
+    assert_eq!(accounted, written);
+    assert_eq!(committed_of(&before), written, "v2 counts the same units");
+
+    // 6. A requested relisting checks each row against its parts, and its
+    // rows equal v2 at the same read on every node.
+    for metered in meter.groups.values_mut() {
+        metered.request_relisting();
+    }
+    meter
+        .poll_until(
+            &client,
+            &mut procs,
+            &nodes,
+            "the requested relisting",
+            |meter| {
+                if meter
+                    .groups
+                    .values()
+                    .all(|metered| metered.relists.last() == Some(&RelistReason::Requested))
+                {
+                    Ok(())
+                } else {
+                    Err(format!("{meter:?}"))
+                }
+            },
+        )
+        .await;
+    for node in &nodes {
+        let what = format!("node {}'s requested rows equal its v2 report", node.id);
+        eventually(&mut procs, &what, async || {
+            let groups: Vec<GroupUsageRequest> = meter
+                .groups
+                .iter()
+                .map(|(group, metered)| {
+                    let mut cursor = metered.cursor();
+                    if let UsageCursor::After { position, .. } = &mut cursor {
+                        *position = UsagePosition::Rows { after_bucket: None };
+                    }
+                    GroupUsageRequest {
+                        raft_group_id: *group,
+                        cursor,
+                    }
+                })
+                .collect();
+            let export = stream_usage(&client, node, groups).await?;
+            let v2 = usage_report(&client, node).await?;
+            for answer in &export.groups {
+                let GroupStreamUsage::Listed(page) = answer else {
+                    return Err(format!("{answer:?}"));
+                };
+                let group = v2
+                    .groups
+                    .iter()
+                    .find(|group| group.raft_group_id == page.raft_group_id)
+                    .ok_or_else(|| format!("v2 lacks group {}", page.raft_group_id))?;
+                if group.applied_index != page.applied.index {
+                    return Err(format!(
+                        "v2 read {} and the export {:?}",
+                        group.applied_index, page.applied
+                    ));
+                }
+                assert_eq!(page.relist, Some(RelistReason::Requested));
+                assert_eq!(page.page, UsagePage::Complete);
+                let rows: BTreeMap<String, ursula_proto::admin::BucketUsageReport> = page
+                    .rows
+                    .iter()
+                    .map(|row| (row.bucket_id.clone(), row.totals))
+                    .collect();
+                assert_eq!(rows, group.buckets, "group {}", page.raft_group_id);
+            }
+            Ok(())
+        })
+        .await;
+    }
 }
 
 /// Waits until `node` runs a replica of exactly the groups `groups`.

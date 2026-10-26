@@ -22,7 +22,7 @@ A node serves three planes, each on its own listener:
 | ----- | -------- | ------ | ------------ |
 | Client | `server.listen` | The Durable Streams protocol, plus read-only `/__ursula/metrics`, `/__ursula/ready`, `/__ursula/usage` and `/__ursula/live`, the liveness route the gateway probes | Applications, the gateway, and clients following a leader redirect |
 | Cluster | `server.cluster_listen`, or `server.listen` when it is unset | Raft gRPC (append entries, votes, snapshots, leader-read checks, group reads and writes one node forwards to another, leadership transfer), `/__ursula/leadership-shed` and `/__ursula/cluster-probe` | Other voters and learners, at the `url` of their `[[raft.peers]]` entry |
-| Admin | `server.admin_listen`, loopback `127.0.0.1:4438` by default | The mutating operator routes (Raft group operations, maintenance drains, cold flush, bucket purge, backups) plus metrics, readiness and usage | Operators and `ursulactl` through a tunnel such as `kubectl port-forward` |
+| Admin | `server.admin_listen`, loopback `127.0.0.1:4438` by default | The mutating operator routes (Raft group operations, maintenance drains, cold flush, bucket purge, backups) plus metrics, readiness, usage and the per-stream usage export `/__ursula/usage/streams`, which names every tenant's streams and no other plane serves | Operators and `ursulactl` through a tunnel such as `kubectl port-forward` |
 
 None of the three authenticates its caller. The admin plane is protected by its loopback bind, not by a credential, so bind it to a reachable address only for a trusted in-cluster operator.
 

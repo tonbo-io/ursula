@@ -619,7 +619,7 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     );
     for import in &report.imports {
         println!(
-            "group {}: history {:#018x}{}",
+            "group {}: history {}{}",
             import.raft_group_id,
             import.history,
             if import.already {

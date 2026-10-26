@@ -824,6 +824,8 @@ pub struct PurgeBucketResponse {
     /// Cold-GC entries this group still holds for the bucket.
     pub pending_cold_gc_entries: u64,
     pub group_commit_index: u64,
+    /// The group's history the purge applied in.
+    pub history: std::num::NonZeroU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

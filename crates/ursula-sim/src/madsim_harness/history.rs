@@ -254,7 +254,7 @@ async fn import_once(
             buckets: response.buckets,
             streams: response.streams,
             group_commit_index: response.group_commit_index,
-            history: response.history,
+            history: ursula_proto::admin::HistoryId::new(response.history),
             already: response.already,
         }),
         Err(error)
@@ -472,8 +472,11 @@ pub(super) async fn run_rewind_applies_exactly_once_inner(
         );
     }
     answers.push(repeat);
-    let history = answers[0].history;
-    if let Some(other) = answers.iter().find(|answer| answer.history != history) {
+    let history = answers[0].history.get();
+    if let Some(other) = answers
+        .iter()
+        .find(|answer| answer.history.get() != history)
+    {
         fail(
             &mut trace,
             REWIND_INVARIANT,

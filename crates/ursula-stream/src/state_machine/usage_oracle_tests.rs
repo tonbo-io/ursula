@@ -15,12 +15,21 @@
 //! `usage_snapshot` and `restore_group` reproduces the ledger whatever the
 //! order of the streams. A second property runs at a cap of three end
 //! records, so removals fold at the cap.
+//!
+//! The export's read is checked against the same oracle after every step:
+//! the node-local index of live versions holds exactly each live version at
+//! its seq (L1), a relisting lists every bucket's row and every live version
+//! and end record at its newest seq, the pages of a listing at any limit
+//! join to the same listing, and a consumer that keeps its cursor across
+//! the steps is continued with the entries above its listing, or relisted
+//! for exactly the reason the cursor rule gives.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -33,12 +42,25 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
 use super::usage_ledger::test_cap;
+use crate::history::incarnation_token;
+use crate::model::BucketUsage;
 use crate::model::ExternalPayloadRef;
 use crate::usage::BucketRetired;
+use crate::usage::BucketUsageRow;
 use crate::usage::CommittedUsage;
 use crate::usage::EndRecord;
+use crate::usage::GroupUsageView;
 use crate::usage::LastWrite;
+use crate::usage::Lifecycle;
+use crate::usage::RelistReason;
 use crate::usage::StreamEnd;
+use crate::usage::StreamUsageRead;
+use crate::usage::UsageCursor;
+use crate::usage::UsageEntry;
+use crate::usage::UsageListing;
+use crate::usage::UsageLogId;
+use crate::usage::UsagePage;
+use crate::usage::UsagePosition;
 use crate::usage::VersionCounters;
 
 const OCTET: &str = "application/octet-stream";
@@ -179,6 +201,8 @@ struct Version {
     tail: u64,
     retained: u64,
     snapshot_offset: Option<u64>,
+    /// The body length of its visible snapshot, 0 without one.
+    snapshot_bytes: u64,
     closed: bool,
     /// Created with a TTL, renewed by its writes and touches.
     ttl: bool,
@@ -257,6 +281,7 @@ impl Oracle {
             tail: bytes,
             retained: 0,
             snapshot_offset: None,
+            snapshot_bytes: 0,
             closed: false,
             ttl,
             last_touch_ms: now_ms,
@@ -341,6 +366,94 @@ impl Oracle {
         expired.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// The baseline of the group's current history of the live version
+    /// `id`: its counters at the latest event, zero when created or
+    /// restored since.
+    fn baseline_of(&self, id: &BucketStreamId, version: &Version) -> VersionCounters {
+        self.at_event
+            .get(&(id.clone(), version.created_at_ms))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Every bucket's row of a relisting, by bucket id: its retired usage,
+    /// its totals by the counting rule and its live versions' gauges.
+    fn rows(&self) -> Vec<BucketUsageRow> {
+        self.retired
+            .iter()
+            .map(|(bucket_id, retired)| {
+                let mut totals = BucketUsage::default();
+                self.totals
+                    .get(bucket_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .add_to(&mut totals);
+                let mut snapshot_bytes = 0_u64;
+                for (_, version) in self
+                    .live
+                    .iter()
+                    .filter(|(id, _)| id.bucket_id == *bucket_id)
+                {
+                    totals.stream_count = totals.stream_count.saturating_add(1);
+                    totals.retained_bytes = totals
+                        .retained_bytes
+                        .saturating_add(version.tail.saturating_sub(version.retained));
+                    snapshot_bytes = snapshot_bytes.saturating_add(version.snapshot_bytes);
+                }
+                BucketUsageRow {
+                    bucket_id: bucket_id.clone(),
+                    retired: *retired,
+                    totals,
+                    snapshot_bytes,
+                }
+            })
+            .collect()
+    }
+
+    /// Every live version and end record as the export lists it, by seq.
+    fn entries(&self) -> Vec<UsageEntry> {
+        let mut entries = self
+            .live
+            .iter()
+            .map(|(id, version)| UsageEntry {
+                seq: version.seq,
+                stream_id: id.clone(),
+                created_at_ms: version.created_at_ms,
+                counted_since: non_zero(version.counted_since),
+                incarnation: incarnation_token(version.created_at_ms, self.history),
+                counters: version.counters,
+                history_baseline: self.baseline_of(id, version),
+                last_write: version.last_write,
+                lifecycle: Lifecycle::Live {
+                    retained_bytes: version.tail.saturating_sub(version.retained),
+                    snapshot_bytes: version.snapshot_bytes,
+                },
+            })
+            .chain(self.ends.values().map(|record| UsageEntry {
+                seq: record.seq,
+                stream_id: record.stream_id.clone(),
+                created_at_ms: record.created_at_ms,
+                counted_since: record.counted_since,
+                incarnation: incarnation_token(record.created_at_ms, record.ended_in.get()),
+                counters: record.counters,
+                // Ended before the current history began: nothing changed
+                // since, so its baseline there is its final usage.
+                history_baseline: if record.ended_in.get() == self.history {
+                    record.history_baseline
+                } else {
+                    record.counters
+                },
+                last_write: record.last_write,
+                lifecycle: Lifecycle::Ended {
+                    end: record.end,
+                    ended_at_ms: record.ended_at_ms,
+                },
+            }))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.seq);
+        entries
+    }
+
     /// The bucket's live versions in stream-id order.
     fn in_bucket(&self, bucket_id: &str) -> Vec<BucketStreamId> {
         let mut ids = self
@@ -362,6 +475,43 @@ struct Run {
     index: u64,
     next_history: u64,
     external_objects: u64,
+    /// The last page a consumer of the export kept: it is complete.
+    kept: Option<UsageListing>,
+}
+
+/// A page of `listing`'s group that continues it at `position`.
+fn continuing(listing: &UsageListing, position: UsagePosition) -> UsageCursor {
+    UsageCursor::After {
+        genesis: listing.genesis,
+        history: listing.history.id,
+        applied: listing.applied,
+        retired_through: listing.retired_through,
+        position,
+    }
+}
+
+fn read_page(
+    machine: &StreamStateMachine,
+    cursor: UsageCursor,
+    limit: usize,
+    applied: UsageLogId,
+) -> Result<UsageListing, TestCaseError> {
+    let read = StreamUsageRead {
+        cursor,
+        limit: NonZeroUsize::new(limit).expect("a positive limit"),
+    };
+    match machine.stream_usage(&read, applied) {
+        GroupUsageView::Listed(listing) => {
+            prop_assert!(
+                listing.rows.len().saturating_add(listing.entries.len()) <= limit,
+                "{} items above the limit {}",
+                listing.rows.len().saturating_add(listing.entries.len()),
+                limit
+            );
+            Ok(listing)
+        }
+        other => Err(TestCaseError::fail(format!("not listed: {other:?}"))),
+    }
 }
 
 fn appended_non_repeat(response: &StreamResponse) -> bool {
@@ -381,6 +531,7 @@ impl Run {
             index: 0,
             next_history: GENESIS,
             external_objects: 0,
+            kept: None,
         };
         let genesis = run.history_event(0);
         assert!(matches!(genesis, StreamResponse::HistoryStarted { .. }));
@@ -654,11 +805,13 @@ impl Run {
                 let expired = self.oracle.expired(&id);
                 let version = self.oracle.version(&id).cloned();
                 let snapshot_offset = version.as_ref().map_or(0, |version| version.tail);
+                let body = format!("snapshot at {now_ms}");
+                let body_len = u64::try_from(body.len()).expect("a short body");
                 let response = self.apply(StreamCommand::PublishSnapshot {
                     stream_id: id.clone(),
                     snapshot_offset,
                     content_type: OCTET.to_owned(),
-                    payload: Bytes::from(format!("snapshot at {now_ms}")),
+                    payload: Bytes::from(body),
                     now_ms,
                     expected_incarnation: None,
                 });
@@ -677,11 +830,9 @@ impl Run {
                     );
                     if replaces {
                         self.oracle.restamp(&id);
-                        self.oracle
-                            .live
-                            .get_mut(&id)
-                            .expect("a live version")
-                            .snapshot_offset = Some(snapshot_offset);
+                        let version = self.oracle.live.get_mut(&id).expect("a live version");
+                        version.snapshot_offset = Some(snapshot_offset);
+                        version.snapshot_bytes = body_len;
                     }
                 }
             }
@@ -974,18 +1125,30 @@ impl Run {
             // is the counters at the event, or zero for a version created
             // or restored since. L6: it never exceeds the counters.
             let baseline = slot.history_baseline_in(oracle.history);
-            let at_event = oracle
-                .at_event
-                .get(&(id.clone(), version.created_at_ms))
-                .copied()
-                .unwrap_or_default();
-            prop_assert_eq!(baseline, at_event, "{}", id);
+            prop_assert_eq!(baseline, oracle.baseline_of(id, version), "{}", id);
             prop_assert!(baseline.appends <= usage.counters.appends);
             prop_assert!(
                 baseline.committed.committed_write_units
                     <= usage.counters.committed.committed_write_units
             );
         }
+        // L1: the node-local index holds exactly each live version at its
+        // seq.
+        let index = machine
+            .usage
+            .live_index()
+            .iter()
+            .map(|(seq, key)| {
+                let slot = machine.registry.slot_by_key(*key);
+                (*seq, slot.map(|slot| slot.metadata.stream_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let live_seqs = oracle
+            .live
+            .iter()
+            .map(|(id, version)| (version.seq, Some(id.clone())))
+            .collect::<BTreeMap<_, _>>();
+        prop_assert_eq!(index, live_seqs);
         // L2 and L8.
         prop_assert!(machine.end_records().len() <= MAX_END_RECORDS.min(oracle.cap));
         for record in machine.end_records() {
@@ -1010,15 +1173,124 @@ impl Run {
     }
 }
 
+impl Run {
+    /// The log id the run's group applied last.
+    fn applied(&self) -> UsageLogId {
+        UsageLogId {
+            term: 0,
+            index: self.index,
+        }
+    }
+
+    /// The export's read against the oracle. A relisting lists every row
+    /// and entry, and its pages at limits 1 to 3 join to the same listing.
+    /// Then the consumer's kept cursor is continued with exactly the
+    /// entries above its listing, or relisted for the reason the cursor
+    /// rule gives, and keeps the new page.
+    fn check_export(&mut self) -> Result<(), TestCaseError> {
+        let applied = self.applied();
+        let oracle = &self.oracle;
+        let rows = oracle.rows();
+        let entries = oracle.entries();
+        let whole = read_page(&self.machine, UsageCursor::Start, usize::MAX, applied)?;
+        prop_assert_eq!(whole.relist, Some(RelistReason::Start));
+        prop_assert_eq!(&whole.page, &UsagePage::Complete);
+        prop_assert_eq!(whole.genesis.get(), oracle.genesis);
+        prop_assert_eq!(whole.history.id.get(), oracle.history);
+        prop_assert_eq!(whole.applied, applied);
+        prop_assert_eq!(whole.usage_seq, oracle.usage_seq);
+        prop_assert_eq!(whole.retired_through, oracle.retired_through);
+        prop_assert_eq!(
+            whole.live_versions,
+            u64::try_from(oracle.live.len()).unwrap_or(u64::MAX)
+        );
+        prop_assert_eq!(
+            whole.end_records,
+            u64::try_from(oracle.ends.len()).unwrap_or(u64::MAX)
+        );
+        prop_assert_eq!(&whole.rows, &rows);
+        prop_assert_eq!(&whole.entries, &entries);
+
+        for limit in 1..=3 {
+            let mut paged_rows = Vec::new();
+            let mut paged_entries = Vec::new();
+            let mut cursor = UsageCursor::Start;
+            let mut first = true;
+            loop {
+                let page = read_page(&self.machine, cursor, limit, applied)?;
+                // Only the first page relists, and every page counts the
+                // whole group.
+                prop_assert_eq!(page.relist, first.then_some(RelistReason::Start));
+                prop_assert_eq!(page.live_versions, whole.live_versions);
+                prop_assert_eq!(page.end_records, whole.end_records);
+                first = false;
+                paged_rows.extend(page.rows.iter().cloned());
+                paged_entries.extend(page.entries.iter().cloned());
+                match &page.page {
+                    UsagePage::Complete => break,
+                    UsagePage::More { next } => {
+                        prop_assert_eq!(
+                            page.rows.len().saturating_add(page.entries.len()),
+                            limit,
+                            "a page cut below its limit"
+                        );
+                        cursor = continuing(&page, next.clone());
+                    }
+                }
+            }
+            prop_assert_eq!(&paged_rows, &rows, "rows at limit {}", limit);
+            prop_assert_eq!(&paged_entries, &entries, "entries at limit {}", limit);
+        }
+
+        let (cursor, expected_relist, after_seq) = match &self.kept {
+            None => (UsageCursor::Start, Some(RelistReason::Start), 0),
+            Some(kept) => {
+                let relist = if kept.genesis.get() != oracle.genesis
+                    || kept.history.id.get() != oracle.history
+                {
+                    Some(RelistReason::History)
+                } else if oracle.retired_through > kept.usage_seq.max(kept.retired_through) {
+                    Some(RelistReason::Retired)
+                } else {
+                    None
+                };
+                let position = UsagePosition::Entries {
+                    after_seq: kept.usage_seq,
+                };
+                (continuing(kept, position), relist, kept.usage_seq)
+            }
+        };
+        let page = read_page(&self.machine, cursor, usize::MAX, applied)?;
+        prop_assert_eq!(page.relist, expected_relist);
+        prop_assert_eq!(&page.page, &UsagePage::Complete);
+        if expected_relist.is_some() {
+            prop_assert_eq!(&page.rows, &rows);
+            prop_assert_eq!(&page.entries, &entries);
+        } else {
+            let above = entries
+                .iter()
+                .filter(|entry| entry.seq > after_seq)
+                .cloned()
+                .collect::<Vec<_>>();
+            prop_assert!(page.rows.is_empty());
+            prop_assert_eq!(&page.entries, &above);
+        }
+        self.kept = Some(page);
+        Ok(())
+    }
+}
+
 /// Runs `ops` on a fresh group at an end-record cap of `cap`, checking the
 /// ledger after every step.
 fn run_against_the_oracle(cap: usize, ops: &[Op]) -> Result<(), TestCaseError> {
     test_cap::with(cap, || {
         let mut run = Run::new(cap);
         run.check()?;
+        run.check_export()?;
         for op in ops {
             run.step(op)?;
             run.check()?;
+            run.check_export()?;
         }
         Ok(())
     })

@@ -77,6 +77,7 @@ use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupStreamUsageFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
@@ -316,6 +317,14 @@ impl GroupEngine for ScriptedEngine {
 
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         self.inner.bucket_usage(placement)
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
     }
 
     fn read_stream<'a>(
