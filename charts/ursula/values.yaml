@@ -215,8 +215,8 @@ raft:
   # Raft snapshot and its Raft log after it applies the removal. At least the server's floor: eight
   # times the install snapshot timeout, and long enough that a removed stream's end record leaves
   # within it (980 seconds with S3 snapshots and 964 seconds inline at the default install
-  # timeout). Unset, each server keeps its own default, the larger of 1 hour and the floor, so a
-  # pod that still runs an older image never gets a key it does not know.
+  # timeout and drive interval). Unset, each server keeps its own default, the larger of 1 hour
+  # and the floor, so a pod that still runs an older image never gets a key it does not know.
   deletedDataMaxAgeMs: null
 
 # Every server pod gets a raft-data PVC for its Raft WAL.
