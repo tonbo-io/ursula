@@ -38,12 +38,16 @@
 //! requested relisting whose rows check the totals, each version is
 //! accounted exactly the units its acknowledged writes committed, which in
 //! an accepted loss are the units the final lineage holds plus those the
-//! consumer listed in the replaced suffix. A version whose end record
-//! folded before the consumer read it, which only the skipped reads allow,
-//! is accounted at most that. Per group and bucket, what is accounted to
+//! consumer listed in the replaced suffix. The versions the skipped reads
+//! script ends while reads are skipped are accounted at most that: their
+//! end records fold before the consumer reads them, and what they committed
+//! unread goes to their bucket. Per group and bucket, what is accounted to
 //! the versions and to the bucket equals what they committed. In a
 //! restore, a second consumer that starts on the restored nodes once the
-//! import applied accounts exactly what was written after it.
+//! import applied accounts exactly what was written after it. The accepted
+//! loss's replaced suffix holds writes and creates but no fold and no
+//! history event, so rule 7's case of a folded version held again is not
+//! reached.
 //!
 //! Negative controls switch off one defence each ([`Controls`]):
 //!
@@ -57,7 +61,7 @@
 //!   again.
 //! - [`Controls::READ_ORDER_OFF`]: the cut-off follower lists the rest of a
 //!   relisting from its older state, which misses a version the consumer
-//!   holds.
+//!   holds, so that version's bucket share is negative.
 //!
 //! [`Controls::START_BEFORE_IMPORT`] switches off no defence: the restore's
 //! second consumer starts before the import, against what operations tells
@@ -95,6 +99,7 @@ use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::expiry_sweep;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
+use ursula_stream::sim_controls::Defence;
 
 use super::SimEvent;
 use super::SimTrace;
@@ -223,7 +228,6 @@ impl Drop for Switched {
 }
 
 fn set_defences(controls: Controls) {
-    use ursula_stream::sim_controls::Defence;
     use ursula_stream::sim_controls::set_off;
     set_off(Defence::EndRecords, controls.end_records_off);
     set_off(Defence::SnapshotUsage, controls.snapshot_usage_off);
@@ -331,6 +335,11 @@ struct Version {
     window: Vec<(Vec<u8>, Counters)>,
     /// It was created during that window.
     created_in_window: bool,
+    /// It ended while the skipped reads script read nothing, so its end
+    /// record may fold before the consumer reads it.
+    ended_unread: bool,
+    /// Its writers wrote it in more than one history.
+    written_across_history: bool,
 }
 
 /// What a create without a body commits: one write unit.
@@ -607,6 +616,8 @@ impl Run {
             seq: 0,
             window: Vec::new(),
             created_in_window: self.window,
+            ended_unread: false,
+            written_across_history: false,
         });
         stream
     }
@@ -662,6 +673,9 @@ impl Run {
             .get_mut(&stream.stream_id)
             .expect("a version the writers made");
         add(&mut version.counters, appended(len));
+        if version.generation != generation {
+            version.written_across_history = true;
+        }
         version.generation = generation;
         version.seq = seq.saturating_add(1);
         if window {
@@ -732,13 +746,14 @@ impl Run {
     }
 
     /// A version created, written and deleted between two reads.
-    async fn ephemeral(&mut self) {
+    async fn ephemeral(&mut self) -> BucketStreamId {
         let group = JOURNAL_GROUPS[usize::try_from(self.draw(2)).expect("an index")];
         let bucket_id = self.draw_bucket();
         let stream = self.create(group, bucket_id, false).await;
         self.append(&stream).await;
         self.append(&stream).await;
         self.delete(&stream).await;
+        stream
     }
 
     /// One round of writes: a new stream with up to two writes now and
@@ -901,14 +916,13 @@ impl Run {
         let cursor = self.meter_mut(fresh).groups[&group].cursor();
         let answers = read_answers(&mut self.cluster, group, nodes, cursor, limit).await;
         let now = madsim::time::Instant::now();
-        let wall_ms = self.wall_ms();
         let meter = self.meter_mut(fresh);
         let retention = meter.retention;
         let UsageMeter { groups, behind, .. } = meter;
         groups
             .get_mut(&group)
             .expect("a metered group")
-            .take_answers(answers, now, wall_ms, retention, behind)
+            .take_answers(answers, now, retention, behind)
     }
 
     /// Each round's reads: of the run's consumer, and of the restore's
@@ -961,9 +975,19 @@ impl Run {
             }
             let mut reads = Vec::new();
             for node_id in self.running(group) {
-                if let Some(read) = replica_read(&mut self.cluster, group, node_id).await {
-                    reads.push(read);
-                }
+                let Some(read) = replica_read(&mut self.cluster, group, node_id).await else {
+                    let context = self.context.clone();
+                    fail(
+                        &mut self.trace,
+                        TOTALS_INVARIANT,
+                        phase,
+                        format!(
+                            "{context}: group {group}: node {node_id} gave no settled read of \
+                             its relisting and totals"
+                        ),
+                    );
+                };
+                reads.push(read);
             }
             self.judge(group, &reads, phase);
         }
@@ -1240,6 +1264,9 @@ impl Run {
             self.round().await;
         }
         let lagging = self.follower(0).await;
+        // It holds everything before the cut, so a relisting it answers
+        // from its older state misses only the stream created next.
+        self.wait_caught_up(0).await;
         self.fault("follower_cut_off");
         self.cut(lagging);
         // A stream the cut-off follower never sees, which the consumer
@@ -1259,13 +1286,16 @@ impl Run {
             );
         }
         // A relisting whose first page comes from the others and whose
-        // later pages go to the cut-off follower first.
+        // later pages go to the cut-off follower first. Pages of one item:
+        // the first is a row, and group 0 holds at least the new stream
+        // besides, so the relisting always has a later page.
         self.meter
             .groups
             .get_mut(&0)
             .expect("a metered group")
             .request_relisting();
-        if !self.read_group(false, 0, 2, Route::LaterTo(lagging)).await {
+        let fired_before = ursula_stream::sim_controls::fired(Defence::UsageReadOrder);
+        if !self.read_group(false, 0, 1, Route::LaterTo(lagging)).await {
             let context = self.context.clone();
             fail(
                 &mut self.trace,
@@ -1274,13 +1304,14 @@ impl Run {
                 format!("{context}: the relisting never completed"),
             );
         }
-        if self.meter.behind == 0 {
+        // Rule 4 answered the relisting's later pages `behind`.
+        if ursula_stream::sim_controls::fired(Defence::UsageReadOrder) <= fired_before {
             let context = self.context.clone();
             fail(
                 &mut self.trace,
                 ACCOUNTING_INVARIANT,
                 "relisting_on_a_lagging_replica",
-                format!("{context}: node {lagging} never answered behind"),
+                format!("{context}: node {lagging} never answered the relisting behind"),
             );
         }
         self.round().await;
@@ -1436,7 +1467,12 @@ impl Run {
         self.append(&read).await;
         self.delete(&read).await;
         // One created, written and deleted unread.
-        self.ephemeral().await;
+        let unread = self.ephemeral().await;
+        for stream in [&read, &unread] {
+            if let Some(version) = self.versions.get_mut(&stream.stream_id) {
+                version.ended_unread = true;
+            }
+        }
         self.fault("reads_skipped");
         self.pause(DRIVERS.max_age / 2 + expiry_sweep::interval(DRIVERS.max_age) * 4)
             .await;
@@ -1533,6 +1569,15 @@ impl Run {
             wait_plan_satisfied(&self.cluster, *group, &NODES, *point, &self.context).await;
         }
         self.fault("loss_accepted");
+        if self.lost_write_units().await == 0 {
+            let context = self.context.clone();
+            fail(
+                &mut self.trace,
+                ACCOUNTING_INVARIANT,
+                "loss_accepted",
+                format!("{context}: the accepted loss lost nothing the consumer listed"),
+            );
+        }
         // The writers of the new history are new producers. Each live
         // stream is written before the consumer reads it again, so its
         // first write after the event records its baseline.
@@ -1775,7 +1820,6 @@ impl Run {
     fn judge_accounting(&mut self) {
         let context = self.context.clone();
         let mut failures = Vec::new();
-        let skipped = self.script == Script::SkipPastRetention;
         // Per version.
         for version in self.versions.values() {
             let metered = self.meter.group(version.group);
@@ -1789,17 +1833,33 @@ impl Run {
                 && accounted.committed_write_units <= version.counters.committed_write_units
                 && accounted.appends <= version.counters.appends;
             let exact = accounted == version.counters;
-            if !(exact || (skipped && unread && within)) {
+            if !(exact || (version.ended_unread && within)) {
+                let above = accounted.committed_append_bytes
+                    >= version.counters.committed_append_bytes
+                    && accounted.committed_records >= version.counters.committed_records
+                    && accounted.committed_write_units >= version.counters.committed_write_units
+                    && accounted.appends >= version.counters.appends;
+                let relation = if above {
+                    "above"
+                } else if within {
+                    "below"
+                } else {
+                    "apart from"
+                };
                 failures.push(format!(
-                    "{} accounted {accounted:?}, its writes committed {:?} (folded unread: \
+                    "{} accounted {accounted:?}, {relation} what its writes committed {:?} \
+                     (written across a history change: {}, ended unread: {}, folded unread: \
                      {unread})",
-                    version.stream, version.counters
+                    version.stream,
+                    version.counters,
+                    version.written_across_history,
+                    version.ended_unread
                 ));
             }
-            if unread && !skipped {
+            if unread && !version.ended_unread {
                 failures.push(format!(
-                    "{}'s end record folded before the consumer read it, in a run that read \
-                     within the retention",
+                    "{}'s end record folded before the consumer read it, though the consumer \
+                     read within the retention while it ended",
                     version.stream
                 ));
             }
@@ -2188,6 +2248,7 @@ mod tests {
                 history_changes,
                 folds,
                 replicas_judged,
+                lost_write_units,
                 ..
             }) = billed(&first)
             else {
@@ -2197,17 +2258,24 @@ mod tests {
             match Script::of(seed) {
                 Script::Lagging => assert!(*behind > 0, "seed {seed}"),
                 Script::SkipPastRetention => assert!(*relists_retired > 0, "seed {seed}"),
-                Script::AcceptedLoss | Script::Restore => {
-                    assert!(*history_changes > 0, "seed {seed}");
+                Script::AcceptedLoss => {
+                    assert!(*history_changes > 0 && *lost_write_units > 0, "seed {seed}");
                 }
+                Script::Restore => assert!(*history_changes > 0, "seed {seed}"),
                 _ => {}
             }
         }
     }
 
     /// Runs `seed` under `controls`, which must fail `invariant` after
-    /// `phase`, and returns the failure's message.
-    fn assert_fails(seed: u64, controls: Controls, invariant: &str, phase: &str) -> String {
+    /// `phase`, and returns the failure's message and the failed run's
+    /// trace.
+    fn assert_fails(
+        seed: u64,
+        controls: Controls,
+        invariant: &str,
+        phase: &str,
+    ) -> (String, SimTrace) {
         assert!(
             billed(&run(seed, Controls::default())).is_some(),
             "seed {seed} passes with every defence on"
@@ -2223,7 +2291,7 @@ mod tests {
             "{controls:?} did not fail `{invariant}` on seed {seed}: {:?}",
             trace.events.last()
         );
-        trace
+        let message = trace
             .events
             .iter()
             .find_map(|event| match event {
@@ -2237,7 +2305,8 @@ mod tests {
                 }
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (message, trace)
     }
 
     /// Without end records, a removal folds the version's usage straight
@@ -2247,7 +2316,7 @@ mod tests {
     #[test]
     fn negative_control_a_version_without_its_end_record_is_never_billed() {
         let _guard = sim_test_guard();
-        let message = assert_fails(
+        let (message, _) = assert_fails(
             seed_of(Script::Churn),
             Controls::END_RECORDS_OFF,
             ACCOUNTING_INVARIANT,
@@ -2262,13 +2331,28 @@ mod tests {
     #[test]
     fn negative_control_an_install_without_its_usage_resets_every_version() {
         let _guard = sim_test_guard();
-        let message = assert_fails(
+        let (message, trace) = assert_fails(
             seed_of(Script::Install),
             Controls::SNAPSHOT_USAGE_OFF,
             TOTALS_INVARIANT,
             "snapshot_installed",
         );
-        assert!(message.contains("node"), "{message}");
+        // The install script stops the follower that installs before any
+        // other node.
+        let installed = trace
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SimEvent::NodeStopped { node_id } => Some(*node_id),
+                _ => None,
+            })
+            .expect("the install script stops a follower");
+        assert!(message.contains("list different pages"), "{message}");
+        assert!(
+            message.contains(&format!("nodes {installed} and"))
+                || message.contains(&format!("and {installed} list")),
+            "node {installed}: {message}"
+        );
     }
 
     /// Without the baseline of the first write after the accepted loss, the
@@ -2277,25 +2361,34 @@ mod tests {
     #[test]
     fn negative_control_a_write_without_its_baseline_bills_the_kept_prefix_again() {
         let _guard = sim_test_guard();
-        let message = assert_fails(
+        let (message, _) = assert_fails(
             seed_of(Script::AcceptedLoss),
             Controls::HISTORY_BASELINE_OFF,
             ACCOUNTING_INVARIANT,
             "relisting_requested",
         );
-        assert!(message.contains("accounted"), "{message}");
+        assert!(
+            message.contains("above what its writes committed")
+                && message.contains("written across a history change: true"),
+            "{message}"
+        );
     }
 
     /// A cut-off follower that answers a relisting's later pages from its
-    /// older state misses the version the consumer holds.
+    /// older state misses the version the consumer holds, whose level the
+    /// consumer then takes out of its bucket's share.
     #[test]
     fn negative_control_a_relisting_continued_on_a_lagging_replica_misses_a_version() {
         let _guard = sim_test_guard();
-        assert_fails(
+        let (message, _) = assert_fails(
             seed_of(Script::Lagging),
             Controls::READ_ORDER_OFF,
             ACCOUNTING_INVARIANT,
             "page_kept",
+        );
+        assert!(
+            message.contains("bucket tenant-a's share is negative"),
+            "{message}"
         );
     }
 
@@ -2306,7 +2399,7 @@ mod tests {
     #[test]
     fn negative_control_a_consumer_started_before_the_import_bills_the_backup_twice() {
         let _guard = sim_test_guard();
-        let message = assert_fails(
+        let (message, _) = assert_fails(
             seed_of(Script::Restore),
             Controls::START_BEFORE_IMPORT,
             ACCOUNTING_INVARIANT,

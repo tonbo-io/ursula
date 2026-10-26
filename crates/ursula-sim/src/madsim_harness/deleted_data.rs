@@ -297,10 +297,12 @@ impl Controls {
         hold_off: true,
         ..Self::NONE
     };
-    /// Every defence on, and the crash between the covering snapshot and
-    /// the purge through it. The end record stays unfolded, so no snapshot
-    /// after a fold purges the log through what the restore left: the run
-    /// judges the stream's records alone.
+    /// The crash between the covering snapshot and the purge through it,
+    /// with every defence on but `EndRecordRetirement`, as in its control
+    /// [`Self::RESTORE_OFF`]. With the retirement off the end record stays
+    /// unfolded, so no snapshot after a fold purges the log through what
+    /// the restore left, which would hide the control: the run judges the
+    /// stream's records alone.
     pub(super) const CRASH_BEFORE_PURGE: Self = Self {
         purge_after_restart: true,
         retirement_off: true,

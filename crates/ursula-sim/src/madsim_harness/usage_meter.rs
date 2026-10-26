@@ -1,7 +1,9 @@
 //! A metering consumer of the per-stream usage export, as the export's
 //! contract tells one to read it (operations, "Per-stream usage", rules 1
-//! to 12), for the `stream-usage-bills-exactly` family
-//! ([`super::stream_usage`]).
+//! to 9 and 12), for the `stream-usage-bills-exactly` family
+//! ([`super::stream_usage`]). It models what a consumer accounts, not when
+//! it reads or what gauges it samples: rules 10 and 11, and the zero gauge
+//! samples of rules 6 and 7, are not modelled.
 //!
 //! It reads each replica through the route's own conversions: a read
 //! built by [`ursula::stream_usage_read`] from its cursor, and the answer of
@@ -172,16 +174,6 @@ fn holds_unknown(page: &GroupUsagePage) -> bool {
         })
 }
 
-/// A gauge sample the consumer writes (rules 6, 7 and 11): a version's
-/// retained and snapshot bytes at a wall clock time, zero once it ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct GaugeSample {
-    pub(super) key: VersionKey,
-    pub(super) at_ms: u64,
-    pub(super) retained_bytes: u64,
-    pub(super) snapshot_bytes: u64,
-}
-
 /// One group as the consumer follows it.
 #[derive(Debug, Default)]
 pub(super) struct MeteredGroup {
@@ -221,19 +213,10 @@ pub(super) struct MeteredGroup {
     pub(super) relists: Vec<RelistReason>,
     /// What the contract tells a consumer to alarm on.
     pub(super) alarms: Vec<String>,
-    /// The gauges each live version held was last listed with.
-    gauges: BTreeMap<VersionKey, (u64, u64)>,
-    /// The gauge samples written.
-    pub(super) samples: Vec<GaugeSample>,
-    /// Complete reads that came later than half the retention after the
-    /// one before (rule 10).
-    pub(super) late_reads: u64,
     /// Held versions whose end record the consumer saw fold (rule 6).
     pub(super) folds: u64,
     /// Relistings applied across a history change (rule 7).
     pub(super) history_changes: u64,
-    /// The wall clock of the last complete read.
-    last_complete_ms: Option<u64>,
 }
 
 impl MeteredGroup {
@@ -300,7 +283,6 @@ impl MeteredGroup {
         &mut self,
         answers: Vec<GroupStreamUsage>,
         now: madsim::time::Instant,
-        wall_ms: u64,
         retention: Duration,
         behind: &mut u64,
     ) -> bool {
@@ -323,7 +305,7 @@ impl MeteredGroup {
         }
         match newest {
             Some(page) => {
-                self.keep(page, now, wall_ms, retention);
+                self.keep(page, now, retention);
                 true
             }
             None => false,
@@ -332,14 +314,8 @@ impl MeteredGroup {
 
     /// Keeps `page`: the next cursor is its own (rule 3), it continues the
     /// listing (rule 6) or a relisting (rule 7), and a complete page checks
-    /// the counts (rule 8) and samples the live versions' gauges (rule 11).
-    fn keep(
-        &mut self,
-        page: GroupUsagePage,
-        now: madsim::time::Instant,
-        wall_ms: u64,
-        retention: Duration,
-    ) {
+    /// the counts (rule 8).
+    fn keep(&mut self, page: GroupUsagePage, now: madsim::time::Instant, retention: Duration) {
         let Some(cursor) = page.next_cursor() else {
             return;
         };
@@ -372,25 +348,6 @@ impl MeteredGroup {
                     page.raft_group_id, page.live_versions, page.end_records, page.applied
                 ));
             }
-            // Rule 11: a sample of each live version on each complete read.
-            for (key, (retained_bytes, snapshot_bytes)) in &self.gauges {
-                self.samples.push(GaugeSample {
-                    key: key.clone(),
-                    at_ms: wall_ms,
-                    retained_bytes: *retained_bytes,
-                    snapshot_bytes: *snapshot_bytes,
-                });
-            }
-            // Rule 10: a complete read later than half the retention after
-            // the one before is one the consumer alarms on.
-            let half_ms = u64::try_from(retention.as_millis() / 2).unwrap_or(u64::MAX);
-            if self
-                .last_complete_ms
-                .is_some_and(|last| wall_ms.saturating_sub(last) > half_ms)
-            {
-                self.late_reads = self.late_reads.saturating_add(1);
-            }
-            self.last_complete_ms = Some(wall_ms);
         }
         self.kept = Some(page);
         self.folded
@@ -427,29 +384,17 @@ impl MeteredGroup {
             )),
         }
         self.billed.insert(key.clone(), entry.counters);
-        if let VersionLifecycle::Live {
-            retained_bytes,
-            snapshot_bytes,
-        } = entry.lifecycle
-        {
+        match entry.lifecycle {
             // Across histories a version held as ended can relist live: the
             // removal was in a replaced suffix.
-            self.ended.remove(&key);
-            self.gauges
-                .insert(key.clone(), (retained_bytes, snapshot_bytes));
-        } else {
-            self.gauges.remove(&key);
-        }
-        if let VersionLifecycle::Ended { end, ended_at_ms } = entry.lifecycle {
-            if self.ended.insert(key.clone(), entry.seq).is_none() {
-                self.samples.push(GaugeSample {
-                    key: key.clone(),
-                    at_ms: ended_at_ms,
-                    retained_bytes: 0,
-                    snapshot_bytes: 0,
-                });
+            VersionLifecycle::Live { .. } => {
+                self.ended.remove(&key);
             }
-            self.ends.insert(key, end);
+            VersionLifecycle::Ended { end, .. } => {
+                self.ended.insert(key.clone(), entry.seq);
+                self.ends.insert(key, end);
+            }
+            VersionLifecycle::Unknown => {}
         }
     }
 
@@ -480,18 +425,9 @@ impl MeteredGroup {
                 for entry in listed.values() {
                     let key = VersionKey::of(entry);
                     self.billed.insert(key.clone(), entry.counters);
-                    match entry.lifecycle {
-                        VersionLifecycle::Ended { end, .. } => {
-                            self.ended.insert(key.clone(), entry.seq);
-                            self.ends.insert(key, end);
-                        }
-                        VersionLifecycle::Live {
-                            retained_bytes,
-                            snapshot_bytes,
-                        } => {
-                            self.gauges.insert(key, (retained_bytes, snapshot_bytes));
-                        }
-                        VersionLifecycle::Unknown => {}
+                    if let VersionLifecycle::Ended { end, .. } = entry.lifecycle {
+                        self.ended.insert(key.clone(), entry.seq);
+                        self.ends.insert(key, end);
                     }
                 }
                 for (bucket_id, row) in &rows {
@@ -509,14 +445,21 @@ impl MeteredGroup {
                     self.account(group, entry, level);
                 }
                 let closed = self.close_unlisted(&listed, false);
-                for (bucket_id, row) in &rows {
+                // Rows are never removed within one history: a bucket that
+                // closed a version and lists no row has retired nothing.
+                let buckets: BTreeSet<String> = rows.keys().chain(closed.keys()).cloned().collect();
+                for bucket_id in buckets {
+                    let retired = rows
+                        .get(&bucket_id)
+                        .map(|row| row.retired)
+                        .unwrap_or_default();
                     let view = self
                         .retired_view
-                        .get(bucket_id)
+                        .get(&bucket_id)
                         .copied()
                         .unwrap_or_default();
-                    let levels = closed.get(bucket_id).copied().unwrap_or_default();
-                    match committed_minus(row.retired, view)
+                    let levels = closed.get(&bucket_id).copied().unwrap_or_default();
+                    match committed_minus(retired, view)
                         .and_then(|share| committed_minus(share, levels))
                     {
                         Some(share) => add_committed(
@@ -525,13 +468,11 @@ impl MeteredGroup {
                         ),
                         None => self.alarm(format!(
                             "group {group}: bucket {bucket_id}'s share is negative: retired \
-                             {:?}, retired view {view:?}, closed levels {levels:?}",
-                            row.retired
+                             {retired:?}, retired view {view:?}, closed levels {levels:?}"
                         )),
                     }
-                    self.retired_view.insert(bucket_id.clone(), row.retired);
+                    self.retired_view.insert(bucket_id, retired);
                 }
-                self.keep_unlisted_rows(&rows, closed);
             }
             // Another history: an accepted loss, a restore, or another
             // cluster's group.
@@ -629,8 +570,7 @@ impl MeteredGroup {
     }
 
     /// Closes each held version `listed` does not list, and returns their
-    /// billed levels per bucket. Its zero sample goes at the previous
-    /// complete read.
+    /// billed levels per bucket.
     fn close_unlisted(
         &mut self,
         listed: &BTreeMap<VersionKey, StreamUsageEntry>,
@@ -647,15 +587,7 @@ impl MeteredGroup {
             let Some(level) = self.billed.remove(&key) else {
                 continue;
             };
-            self.gauges.remove(&key);
-            if self.ended.remove(&key).is_none() {
-                self.samples.push(GaugeSample {
-                    key: key.clone(),
-                    at_ms: self.last_complete_ms.unwrap_or(0),
-                    retained_bytes: 0,
-                    snapshot_bytes: 0,
-                });
-            }
+            self.ended.remove(&key);
             add_committed(
                 levels.entry(key.bucket_id.clone()).or_default(),
                 committed(&level),
@@ -669,8 +601,9 @@ impl MeteredGroup {
         levels
     }
 
-    /// A bucket the relisting lists no row for keeps its retired view, and
-    /// the levels of its closed versions join it (rule 7).
+    /// Of another history: a bucket the relisting lists no row for keeps
+    /// its retired view, and the levels of its closed versions join it
+    /// (rule 7).
     fn keep_unlisted_rows(
         &mut self,
         rows: &BTreeMap<String, BucketUsageRow>,

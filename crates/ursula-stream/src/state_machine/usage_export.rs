@@ -85,6 +85,7 @@ impl StreamStateMachine {
                 } else if *cursor_applied > applied
                     && !crate::sim_controls::off(crate::sim_controls::Defence::UsageReadOrder)
                 {
+                    crate::sim_controls::note_fired(crate::sim_controls::Defence::UsageReadOrder);
                     return GroupUsageView::Behind {
                         genesis,
                         history: history.id,
