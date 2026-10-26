@@ -57,7 +57,21 @@ impl StreamRegistry {
 
     pub(super) fn slot_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamSlot> {
         let key = self.key(stream_id)?;
+        self.slot_by_key_mut(key)
+    }
+
+    /// The live slot `key`, as the usage index names it (F20).
+    pub(super) fn slot_by_key(&self, key: StreamKey) -> Option<&StreamSlot> {
+        self.slots.get(key).map(|slot| &**slot)
+    }
+
+    pub(super) fn slot_by_key_mut(&mut self, key: StreamKey) -> Option<&mut StreamSlot> {
         self.slots.get_mut(key).map(|slot| &mut **slot)
+    }
+
+    /// How many live slots the registry holds.
+    pub(super) fn len(&self) -> usize {
+        self.keys.len()
     }
 
     pub(super) fn metadata(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {

@@ -12,14 +12,21 @@
 //! usage into its bucket's retired usage. None creates or loses usage, so
 //! the bucket totals that [`StreamStateMachine::bucket_usage_report`]
 //! derives on every read equal the per-version sums at every entry.
+//!
+//! Beside the replicated ledger each replica keeps a node-local index of
+//! live versions by seq, which every slot insert, restamp and removal keeps
+//! exact (L1) and a restore rebuilds, so an export page
+//! ([`StreamStateMachine::stream_usage`]) costs the entries it lists.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
+use std::ops::Bound;
 
 use ursula_shard::BucketStreamId;
 
 use super::MAX_END_RECORDS;
+use super::StreamKey;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
@@ -101,6 +108,12 @@ pub(super) struct UsageLedger {
     retired_through: u64,
     /// Unretired end records by seq (F20), at most [`MAX_END_RECORDS`].
     ends: BTreeMap<u64, EndRecord>,
+    /// Each live version's slot at its seq (L1), so an export page costs
+    /// the entries it lists. Node-local and derived: never replicated or
+    /// persisted. Every slot insert indexes its version, every restamp
+    /// moves it and every removal drops it, so a restore, which inserts
+    /// every slot, rebuilds it.
+    live_by_seq: BTreeMap<u64, StreamKey>,
 }
 
 impl UsageLedger {
@@ -118,6 +131,7 @@ impl UsageLedger {
             usage_seq: 0,
             retired_through: 0,
             ends: BTreeMap::new(),
+            live_by_seq: BTreeMap::new(),
         }
     }
 
@@ -146,6 +160,7 @@ impl UsageLedger {
             usage_seq,
             retired_through,
             ends: BTreeMap::new(),
+            live_by_seq: BTreeMap::new(),
         };
         for row in retired {
             if ledger
@@ -203,6 +218,28 @@ impl UsageLedger {
         }
     }
 
+    /// Indexes the live version `key` at its seq `seq`: its slot was just
+    /// inserted.
+    pub(super) fn index_live(&mut self, seq: u64, key: StreamKey) {
+        let earlier = self.live_by_seq.insert(seq, key);
+        debug_assert!(earlier.is_none(), "two live versions at seq {seq}");
+    }
+
+    /// Drops the live version at `seq` from the index: its slot was just
+    /// removed.
+    fn unindex_live(&mut self, seq: u64) {
+        let removed = self.live_by_seq.remove(&seq);
+        debug_assert!(removed.is_some(), "no live version at seq {seq}");
+    }
+
+    /// Gives the live version `version`, whose slot is `key`, the next seq,
+    /// and moves it there in the index.
+    fn restamp(&mut self, version: &mut VersionUsage, key: StreamKey) {
+        self.unindex_live(version.seq);
+        version.seq = self.stamp();
+        self.index_live(version.seq, key);
+    }
+
     /// Inserts the bucket's retired row at zero if it has none (F15).
     pub(super) fn insert_bucket(&mut self, bucket_id: &str) {
         if !self.retired.contains_key(bucket_id) {
@@ -222,6 +259,36 @@ impl UsageLedger {
             .add(record.counters.committed);
         self.retired_through = seq;
         Some(record)
+    }
+
+    /// The retired rows after `after_bucket`, from the first without one,
+    /// by bucket id.
+    pub(super) fn retired_after(
+        &self,
+        after_bucket: Option<&str>,
+    ) -> impl Iterator<Item = (&String, &CommittedUsage)> {
+        let start = after_bucket.map_or(Bound::Unbounded, Bound::Excluded);
+        self.retired.range::<str, _>((start, Bound::Unbounded))
+    }
+
+    /// The live versions above `after_seq`, by seq.
+    pub(super) fn live_after(&self, after_seq: u64) -> impl Iterator<Item = (u64, StreamKey)> {
+        self.live_by_seq
+            .range((Bound::Excluded(after_seq), Bound::Unbounded))
+            .map(|(seq, key)| (*seq, *key))
+    }
+
+    /// The end records above `after_seq`, by seq.
+    pub(super) fn ends_after(&self, after_seq: u64) -> impl Iterator<Item = &EndRecord> {
+        self.ends
+            .range((Bound::Excluded(after_seq), Bound::Unbounded))
+            .map(|(_, record)| record)
+    }
+
+    /// The live versions the index holds, each at its seq (L1).
+    #[cfg(test)]
+    pub(super) fn live_index(&self) -> &BTreeMap<u64, StreamKey> {
+        &self.live_by_seq
     }
 
     /// Records the genesis history event's id. Every later event keeps it.
@@ -275,7 +342,10 @@ impl StreamStateMachine {
             usage, registry, ..
         } = self;
         // The caller applied the append to this live stream.
-        let Some(slot) = registry.slot_mut(stream_id) else {
+        let Some(key) = registry.key(stream_id) else {
+            return;
+        };
+        let Some(slot) = registry.slot_by_key_mut(key) else {
             return;
         };
         let counters = &mut slot.usage.counters;
@@ -284,7 +354,7 @@ impl StreamStateMachine {
             .add(CommittedUsage::of_write(bytes, records));
         counters.appends = counters.appends.saturating_add(1);
         slot.usage.last_write = LastWrite::At(now_ms);
-        slot.usage.seq = usage.stamp();
+        usage.restamp(&mut slot.usage, key);
     }
 
     /// The live stream `stream_id`'s retained or visible snapshot bytes
@@ -293,8 +363,10 @@ impl StreamStateMachine {
         let Self {
             usage, registry, ..
         } = self;
-        if let Some(slot) = registry.slot_mut(stream_id) {
-            slot.usage.seq = usage.stamp();
+        if let Some(key) = registry.key(stream_id)
+            && let Some(slot) = registry.slot_by_key_mut(key)
+        {
+            usage.restamp(&mut slot.usage, key);
         }
     }
 
@@ -303,6 +375,7 @@ impl StreamStateMachine {
     /// the next seq. A group that holds [`MAX_END_RECORDS`] first folds its
     /// lowest-seq end record, early.
     pub(super) fn usage_on_end(&mut self, slot: &StreamSlot, end: StreamEnd, now_ms: u64) {
+        self.usage.unindex_live(slot.usage.seq);
         if self.usage.ends.len() >= end_record_cap()
             && let Some(folded) = self.usage.fold_first_end_record()
         {
@@ -430,11 +503,7 @@ impl StreamStateMachine {
                 .or_default();
             slot.usage.counters.committed.add_to(row);
             row.stream_count = row.stream_count.saturating_add(1);
-            row.retained_bytes = row.retained_bytes.saturating_add(
-                slot.metadata
-                    .tail_offset
-                    .saturating_sub(slot.retained_offset),
-            );
+            row.retained_bytes = row.retained_bytes.saturating_add(retained_bytes(slot));
         }
         for record in self.usage.ends.values() {
             record
@@ -536,6 +605,27 @@ pub(super) fn committed_by_bucket(
         }
     }
     Ok(totals)
+}
+
+/// The bytes `slot` retains: `tail_offset - retained_offset`, the one rule
+/// of the `retained_bytes` gauge, per bucket and per version.
+pub(super) fn retained_bytes(slot: &StreamSlot) -> u64 {
+    slot.metadata
+        .tail_offset
+        .saturating_sub(slot.retained_offset)
+}
+
+/// Body length of `slot`'s latest visible snapshot, as uploaded: the inline
+/// payload's length, or `payload_len` of the cold object that holds the
+/// body. `None` without a published snapshot. The one rule of the
+/// `snapshot_bytes` gauge, per bucket and per version.
+pub(super) fn visible_snapshot_bytes(slot: &StreamSlot) -> Option<u64> {
+    slot.visible_snapshot.as_ref().map(|snapshot| {
+        snapshot.object.as_ref().map_or_else(
+            || u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX),
+            |object| object.payload_len,
+        )
+    })
 }
 
 /// What `record` adds to a group snapshot: its ids and

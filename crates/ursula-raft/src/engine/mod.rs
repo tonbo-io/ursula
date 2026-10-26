@@ -94,6 +94,7 @@ use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
+use ursula_runtime::GroupStreamUsageFuture;
 use ursula_runtime::GroupTidyStreamFuture;
 use ursula_runtime::GroupTidyStreamsFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
@@ -1662,6 +1663,31 @@ impl GroupEngine for RaftGroupEngine {
                         buckets: state_machine.engine.bucket_usage_report(),
                         snapshot_bytes: state_machine.engine.snapshot_bytes_by_bucket(),
                     })
+                })
+            })
+            .await?
+        })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        Box::pin(async move {
+            // Local applied state, follower or leader, like `bucket_usage`.
+            // One call reads the last applied log id with the state it
+            // applied, so the page and its log id come from one state.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    let applied = state_machine.last_applied_log_id.map_or(
+                        ursula_stream::UsageLogId { term: 0, index: 0 },
+                        |log_id| ursula_stream::UsageLogId {
+                            term: log_id.committed_leader_id().term,
+                            index: log_id.index(),
+                        },
+                    );
+                    Ok(state_machine.engine.stream_usage_view(&read, applied))
                 })
             })
             .await?

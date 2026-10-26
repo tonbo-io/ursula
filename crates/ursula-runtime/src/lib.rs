@@ -210,6 +210,7 @@ pub use engine::GroupShutdownFuture;
 pub use engine::GroupSnapshotError;
 pub use engine::GroupSnapshotFuture;
 pub use engine::GroupStateGaugesFuture;
+pub use engine::GroupStreamUsageFuture;
 pub use engine::GroupTidyStreamFuture;
 pub use engine::GroupTidyStreamsFuture;
 pub use engine::GroupTouchStreamAccessFuture;
@@ -322,6 +323,7 @@ pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;
 pub use runtime::ShardRuntime;
+pub use runtime::StreamUsageGroups;
 pub use runtime::SweptPart;
 pub use runtime::SweptPartsObserver;
 pub use runtime::unix_time_ms;
@@ -407,6 +409,8 @@ mod cold_upload_fence_tests;
 mod external_offload_tests;
 #[cfg(test)]
 mod incarnation_gc_tests;
+#[cfg(test)]
+mod stream_usage_groups_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

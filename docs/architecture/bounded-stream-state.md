@@ -192,6 +192,8 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 
 **Retirement** (`ursula-runtime/src/expiry_sweep.rs`). The group sweep (F0) folds an end record into its bucket's retired usage half of `raft.deleted_data_max_age` after its removal, by the monotonic clock of the node that leads the group, and the fold counts as a removal for the snapshot driver. Each replica's group engine keeps a retirement clock: samples of the group's latest sequence number taken in every tidy pass, at most one per half sweep interval. The leader's `Sweep` names as `retire_through` the sequence number of the clock's newest sample at least the retention old, so no proposer's wall clock decides the fold of an end record the leader's replica saw removed, and apply folds what the entry names. The clock seeds at its first sample after the engine starts and after a history change, and a snapshot install seeds it again at the installed sequence number. The end records at or below the seed's sequence number were held or installed before the replica sampled them, so the wall clock dates them: until the seed's own sample is the retention old, every pass also folds through the highest sequence number through which every one of them was removed the retention before the pass's wall clock. A restart or an install therefore keeps each end record's age when the nodes' clocks agree. The retention is half of the node's `raft.deleted_data_max_age`, which the tidy driver passes to every group, and `RaftConfig::end_record_retention` and `RaftConfig::sweep_interval` derive the retention and the clock's sample spacing from it. `raft.deleted_data_max_age` is refused below the floor within which an end record leaves: half of it, two sweep intervals, a quarter of it until the fold's snapshot, a drive interval and an install timeout (`ursula_config::end_record_residence_floor`).
 
+**Export index** (`ursula-stream/src/state_machine/usage_ledger.rs`). Each replica keeps a map from sequence number to live version, one entry of about 40 B per live stream. It is node-local and derived: never replicated or persisted. Every slot insert indexes its version, every new sequence number moves it and every removal drops it, and a restore inserts every slot, so an install or a restart rebuilds it. An export page merges it with the end records in sequence order (`StreamStateMachine::stream_usage`), so a page costs the entries it lists, not the group's streams.
+
 ## 5. Structure, bound and mechanism
 
 | Structure | Scope | Bound | Mechanism |
@@ -207,6 +209,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Retired usage rows, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
 | Per-stream usage | replicated | about 96 B per stream, in C0 | F20, F9 |
 | End records | replicated | removals of the last half of `raft.deleted_data_max_age` plus two sweep intervals, at most 65,536 per group | F20 |
+| Usage sequence index | node | one entry per live stream | F20 |
 | Retirement clock | node | at most twice the retention over the sweep interval, plus two, samples per group | F20 |
 | Group snapshot | replicated | encodes the above, cadence by bytes | F12a to F12e |
 | Unpurged Raft log | node | near the log budget, hard limit 2 × budget on every Raft node | F12e, F17 |

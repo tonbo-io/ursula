@@ -4155,6 +4155,14 @@ impl GroupEngine for BlockingReadEngine {
         self.inner.bucket_usage(placement)
     }
 
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -4346,6 +4354,15 @@ impl GroupEngine for RecordingEngine {
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        _read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        // No state machine, so no genesis applied.
+        Box::pin(async { Ok(ursula_stream::GroupUsageView::NoHistory) })
     }
 
     fn accepts_local_writes(&self) -> bool {
@@ -4632,6 +4649,14 @@ impl GroupEngine for BlockingFirstCreateEngine {
         self.inner.bucket_usage(placement)
     }
 
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -4732,6 +4757,15 @@ impl GroupEngine for FailingEngine {
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        _read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        // No state machine, so no genesis applied.
+        Box::pin(async { Ok(ursula_stream::GroupUsageView::NoHistory) })
     }
 
     fn create_stream<'a>(

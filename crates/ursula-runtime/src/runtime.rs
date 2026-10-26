@@ -55,6 +55,7 @@ use crate::core_worker::CoreCommand;
 use crate::core_worker::CoreMailbox;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::WaitReadCancel;
+use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineFactory;
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
 use crate::error::RuntimeError;
@@ -308,6 +309,20 @@ impl PurgeBucketReport {
             .pending_cold_gc_entries
             .saturating_add(response.pending_cold_gc_entries);
     }
+}
+
+/// One answer of [`ShardRuntime::stream_usage_groups`].
+#[derive(Debug, Default)]
+pub struct StreamUsageGroups {
+    /// Each requested group this node hosts and read, ascending: its page,
+    /// or why its engine refused the read.
+    pub groups: Vec<(
+        RaftGroupId,
+        Result<ursula_stream::GroupUsageView, GroupEngineError>,
+    )>,
+    /// Requested groups this node hosts that the answer's item budget left
+    /// unread, ascending.
+    pub omitted: Vec<RaftGroupId>,
 }
 
 /// One group's answer in a node-wide pass, which covers the groups this
@@ -1022,6 +1037,65 @@ impl ShardRuntime {
             }
         }
         Ok(groups)
+    }
+
+    /// One page of the per-stream usage export (F20) of each group of
+    /// `reads` this node hosts, read serially in ascending group order from
+    /// local applied state, leader or follower. A group this node hosts no
+    /// replica of is left out.
+    ///
+    /// The answer holds at most `max_items` items, entries and bucket rows
+    /// together: each group's read gets its own limit capped at what the
+    /// groups before it left of `max_items`, and a hosted group that would
+    /// get none is not read but listed in [`StreamUsageGroups::omitted`].
+    /// With `max_items` at least the largest limit, the first hosted group
+    /// gets its whole limit, so it is never omitted.
+    ///
+    /// A group whose engine refuses the read keeps its error, so one group
+    /// never fails the others. Any other failure, the runtime's own (a core
+    /// that does not serve, a group whose engine is opening), ends the
+    /// answer with it.
+    pub async fn stream_usage_groups(
+        &self,
+        mut reads: Vec<(RaftGroupId, ursula_stream::StreamUsageRead)>,
+        max_items: usize,
+    ) -> Result<StreamUsageGroups, RuntimeError> {
+        reads.sort_by_key(|(group, _)| *group);
+        let mut answer = StreamUsageGroups::default();
+        let mut items = 0_usize;
+        for (group, mut read) in reads {
+            let Some(limit) =
+                std::num::NonZeroUsize::new(read.limit.get().min(max_items.saturating_sub(items)))
+            else {
+                // The group's core answers whether it hosts the group
+                // without reading any of it. Whatever else stops the group,
+                // the caller asks again and meets it then.
+                if !matches!(
+                    self.warm_group(group).await,
+                    Err(RuntimeError::GroupNotHosted { .. })
+                ) {
+                    answer.omitted.push(group);
+                }
+                continue;
+            };
+            read.limit = limit;
+            match self.stream_usage(group, read).await {
+                Ok(view) => {
+                    if let ursula_stream::GroupUsageView::Listed(listing) = &view {
+                        items = items
+                            .saturating_add(listing.rows.len())
+                            .saturating_add(listing.entries.len());
+                    }
+                    answer.groups.push((group, Ok(view)));
+                }
+                Err(RuntimeError::GroupNotHosted { .. }) => {}
+                Err(RuntimeError::GroupEngine { error, .. }) => {
+                    answer.groups.push((group, Err(error)));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(answer)
     }
 
     /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`

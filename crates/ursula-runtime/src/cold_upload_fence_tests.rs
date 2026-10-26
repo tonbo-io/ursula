@@ -36,6 +36,7 @@ use crate::engine::GroupPlanNextColdFlushBatchFuture;
 use crate::engine::GroupReadStreamFuture;
 use crate::engine::GroupRouteWriteFuture;
 use crate::engine::GroupSnapshotFuture;
+use crate::engine::GroupStreamUsageFuture;
 use crate::engine::GroupTouchStreamAccessFuture;
 use crate::engine::in_memory::InMemoryGroupEngine;
 use crate::error::RuntimeError;
@@ -104,6 +105,14 @@ impl GroupEngine for FencedEngine {
 
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         self.inner.bucket_usage(placement)
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        self.inner.stream_usage(read, placement)
     }
 
     fn create_stream<'a>(

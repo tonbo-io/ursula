@@ -57,6 +57,7 @@ use super::GroupRouteWriteFuture;
 use super::GroupSnapshotError;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
+use super::GroupStreamUsageFuture;
 use super::GroupTidyStreamFuture;
 use super::GroupTidyStreamsFuture;
 use super::GroupTouchStreamAccessFuture;
@@ -859,6 +860,17 @@ impl InMemoryGroupEngine {
     /// Raft engine can serve usage reads from its applied state machine.
     pub fn bucket_usage_report(&self) -> Vec<ursula_stream::BucketUsageSnapshot> {
         self.state_machine.bucket_usage_report()
+    }
+
+    /// One page of this group's per-stream usage, read at `applied`
+    /// ([`ursula_stream::StreamStateMachine::stream_usage`]). Public so the
+    /// Raft engine can serve the export from its applied state machine.
+    pub fn stream_usage_view(
+        &self,
+        read: &ursula_stream::StreamUsageRead,
+        applied: ursula_stream::UsageLogId,
+    ) -> ursula_stream::GroupUsageView {
+        self.state_machine.stream_usage(read, applied)
     }
 
     /// Per-bucket bytes of the latest visible snapshot bodies in this
@@ -1847,6 +1859,22 @@ impl GroupEngine for InMemoryGroupEngine {
                 buckets: self.state_machine.bucket_usage_report(),
                 snapshot_bytes: self.state_machine.snapshot_bytes_by_bucket(),
             })
+        })
+    }
+
+    fn stream_usage<'a>(
+        &'a mut self,
+        read: ursula_stream::StreamUsageRead,
+        _placement: ShardPlacement,
+    ) -> GroupStreamUsageFuture<'a> {
+        Box::pin(async move {
+            // No replication: every entry is the one term's, and the commit
+            // index is the index of the entry applied last.
+            let applied = ursula_stream::UsageLogId {
+                term: 0,
+                index: self.commit_index,
+            };
+            Ok(self.stream_usage_view(&read, applied))
         })
     }
 
