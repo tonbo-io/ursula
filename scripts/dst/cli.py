@@ -8,7 +8,7 @@ Subcommand list (verb-first, flat namespace):
     nondeterminism      no silent fallback in sim-reachable code
     pipeline-smoke      corrupt_*_expectation only in pipeline-smoke families
     layer2              no fail_point! macros in crates/
-    ci-shape            no multi-element strict-equality jq step matches
+    ci-shape            jq step shapes, *_replays wiring, shard and report wiring
     modularity          ratcheting line budget on madsim_harness/mod.rs
     seed-inventory      family discipline and seed budget
     failure-guards      every failure-smoke entry has fresh nightly coverage

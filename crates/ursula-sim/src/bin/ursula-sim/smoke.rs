@@ -1,8 +1,10 @@
 //! `ursula-sim smoke`: corpus replays plus a seed sweep with failure
-//! artifacts.
+//! artifacts. `--shard INDEX/COUNT` runs one share of the sweep.
 
 use std::error::Error;
+use std::fmt;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::panic;
 use std::path::PathBuf;
 
@@ -20,24 +22,11 @@ use ursula_sim::artifact::panic_payload_to_string;
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let args = Args::parse(args)?;
+    let shard = args.shard.unwrap_or(Shard::WHOLE);
 
-    let regression_corpus = include_str!("../../../corpus/smoke.json");
-    let regression_records = serde_json::from_str::<Vec<SimRegressionRecord>>(regression_corpus)?;
-    for record in regression_records {
-        record.assert_replays();
-    }
-
-    let schedule_corpus = include_str!("../../../corpus/schedule-smoke.json");
-    let schedule_records = serde_json::from_str::<Vec<SimScheduledRecord>>(schedule_corpus)?;
-    for record in schedule_records {
-        assert_eq!(record.schedule, SimSchedule::generate(record.schedule.seed));
-        record.assert_replays();
-    }
-
-    let failure_corpus = include_str!("../../../corpus/failure-smoke.json");
-    let failure_records = serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)?;
-    for record in failure_records {
-        record.assert_replays();
+    // The corpora replay once per sweep: in its first share.
+    if shard.index == 0 {
+        replay_corpora()?;
     }
 
     let failure_dir = args
@@ -45,8 +34,14 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| PathBuf::from("target/ursula-sim-failures"));
     fs::create_dir_all(&failure_dir)?;
 
+    let listed = args.seeds.len();
+    let seeds = shard.select(args.seeds);
+    if args.shard.is_some() {
+        println!("shard {shard}: {} of {listed} seeds", seeds.len());
+    }
+
     let mut observed_failures = 0usize;
-    for schedule_seed in args.seeds {
+    for schedule_seed in seeds {
         let seed = schedule_seed.seed;
         let mut schedule = schedule_seed.generate_schedule();
         apply_runtime_panic_after(
@@ -131,8 +126,74 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The three checked-in corpora.
+fn replay_corpora() -> Result<(), Box<dyn Error>> {
+    let regression_corpus = include_str!("../../../corpus/smoke.json");
+    let regression_records = serde_json::from_str::<Vec<SimRegressionRecord>>(regression_corpus)?;
+    for record in regression_records {
+        record.assert_replays();
+    }
+
+    let schedule_corpus = include_str!("../../../corpus/schedule-smoke.json");
+    let schedule_records = serde_json::from_str::<Vec<SimScheduledRecord>>(schedule_corpus)?;
+    for record in schedule_records {
+        assert_eq!(record.schedule, SimSchedule::generate(record.schedule.seed));
+        record.assert_replays();
+    }
+
+    let failure_corpus = include_str!("../../../corpus/failure-smoke.json");
+    let failure_records = serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)?;
+    for record in failure_records {
+        record.assert_replays();
+    }
+    Ok(())
+}
+
+/// One share of a sweep: the seeds at positions INDEX, INDEX + COUNT, ...
+/// of its sorted, deduplicated list. The COUNT shares of one command run
+/// each of its seeds once.
+#[derive(Clone, Copy)]
+struct Shard {
+    index: usize,
+    count: NonZeroUsize,
+}
+
+impl Shard {
+    const WHOLE: Self = Self {
+        index: 0,
+        count: NonZeroUsize::MIN,
+    };
+
+    fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
+        let (index, count) = text
+            .split_once('/')
+            .ok_or_else(|| format!("--shard takes INDEX/COUNT, got `{text}`"))?;
+        let index = index.parse::<usize>()?;
+        let count = count.parse::<NonZeroUsize>()?;
+        if index >= count.get() {
+            return Err(format!("--shard index {index} is not below its count {count}").into());
+        }
+        Ok(Self { index, count })
+    }
+
+    fn select(self, seeds: Vec<ScheduleSeed>) -> Vec<ScheduleSeed> {
+        seeds
+            .into_iter()
+            .skip(self.index)
+            .step_by(self.count.get())
+            .collect()
+    }
+}
+
+impl fmt::Display for Shard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.index, self.count)
+    }
+}
+
 struct Args {
     seeds: Vec<ScheduleSeed>,
+    shard: Option<Shard>,
     failure_dir: Option<PathBuf>,
     inject_panic_seed: Option<u64>,
     runtime_panic_after: Option<String>,
@@ -147,6 +208,7 @@ struct Args {
 impl Args {
     fn parse(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
         let mut seeds = Vec::new();
+        let mut shard = None;
         let mut failure_dir = None;
         let mut inject_panic_seed = None;
         let mut runtime_panic_after = None;
@@ -178,6 +240,10 @@ impl Args {
                 "--seed-family" => {
                     let family = args.next().ok_or_else(|| format!("usage: {}", usage()))?;
                     seeds.extend(parse_seed_family(&family)?);
+                }
+                "--shard" => {
+                    let text = args.next().ok_or_else(|| format!("usage: {}", usage()))?;
+                    shard = Some(Shard::parse(&text)?);
                 }
                 "--failure-dir" => {
                     let dir = args.next().ok_or_else(|| format!("usage: {}", usage()))?;
@@ -248,9 +314,17 @@ impl Args {
             )
             .into());
         }
+        if shard.is_some() && expect_failures {
+            return Err(format!(
+                "--shard does not combine with --expect-failures, which needs a failure in each invocation\nusage: {}",
+                usage()
+            )
+            .into());
+        }
 
         Ok(Self {
             seeds,
+            shard,
             failure_dir,
             inject_panic_seed,
             runtime_panic_after,
@@ -901,7 +975,7 @@ fn usage() -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!(
-        "ursula-sim smoke [--seed N]... [--seed-range START..=END] [--seed-family {families}] [--failure-dir DIR] [--inject-panic-seed N] [--runtime-panic-after EVENT --panic-message TEXT --runtime-invariant NAME] [--runtime-corrupt-read-client CLIENT_ID] [--cold-corrupt-read-node NODE_ID] [--write-artifacts] [--expect-failures]"
+        "ursula-sim smoke [--seed N]... [--seed-range START..=END] [--seed-family {families}] [--failure-dir DIR] [--inject-panic-seed N] [--runtime-panic-after EVENT --panic-message TEXT --runtime-invariant NAME] [--runtime-corrupt-read-client CLIENT_ID] [--cold-corrupt-read-node NODE_ID] [--write-artifacts] [--expect-failures] [--shard INDEX/COUNT]"
     )
 }
 
