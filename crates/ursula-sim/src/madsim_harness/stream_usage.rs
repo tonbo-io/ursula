@@ -1,7 +1,9 @@
 //! Per-stream usage under faults (bounded-state F20, the export's consumer
 //! contract in operations, "Per-stream usage"), on journal-backed replicas
 //! with the production snapshot driver and real OpenRaft
-//! ([`JournalCluster`] with [`DriverPlan`]).
+//! ([`JournalCluster`] with [`DriverPlan`]). The accepted loss runs without
+//! the driver and with segments larger than its writes, so nothing syncs
+//! the journals of the nodes that lose power until the power cut.
 //!
 //! Scenario `stream-usage-bills-exactly`: writers create streams in two
 //! buckets of both groups, write them with producer keys, so every
@@ -212,9 +214,9 @@ impl Controls {
 struct Switched;
 
 impl Switched {
-    fn apply(controls: Controls) -> Self {
+    fn apply(controls: Controls, script: Script) -> Self {
         set_defences(controls);
-        set_snapshot_drivers(Some(DRIVERS));
+        set_snapshot_drivers(script.drivers());
         ursula_stream::sim_controls::reset_fired();
         Self
     }
@@ -260,7 +262,9 @@ pub(super) enum Script {
     /// pages after the first go to it first.
     Lagging,
     /// Streams that expire and the leaders' sweeps remove, then a purge of
-    /// their bucket, complete for the consumer by rule 12.
+    /// their bucket, complete for the consumer by rule 12. Each group keeps
+    /// a stream of the purged bucket the writers write and never delete, so
+    /// each group's purge removes one.
     PurgeAndExpiry,
     /// No read for longer than the retention after a version was written
     /// and deleted, and one created, written and deleted unread, so their
@@ -268,7 +272,9 @@ pub(super) enum Script {
     SkipPastRetention,
     /// Under `fsync = never`, the leader cut off, the others take writes
     /// the consumer reads and lose them in a power cut, and a recovery
-    /// plan accepts the loss: a new history.
+    /// plan accepts the loss: a new history. It runs without the snapshot
+    /// driver and with segments no run fills, so no snapshot, rotation or
+    /// reclaim syncs the window before the power cut.
     AcceptedLoss,
     /// Both groups backed up, every node wiped, and the backups imported
     /// into the new groups, whose genesis the consumer's cursors do not
@@ -307,10 +313,27 @@ impl Script {
         }
     }
 
-    fn fsync(self) -> WalFsync {
+    /// The journals of its nodes. An accepted loss's segments are larger
+    /// than anything a run writes, so no rotation, and no reclaim, syncs
+    /// the window under `fsync = never`.
+    fn tuning(self) -> JournalTuning {
         match self {
-            Self::AcceptedLoss => WalFsync::Never,
-            _ => WalFsync::Always,
+            Self::AcceptedLoss => JournalTuning {
+                segment_bytes: 64 * 1024 * 1024,
+                ..JournalTuning::new(WalFsync::Never)
+            },
+            _ => JournalTuning::new(WalFsync::Always),
+        }
+    }
+
+    /// The snapshot drivers its nodes run. An accepted loss runs none: each
+    /// build or install syncs the journal before it publishes, which would
+    /// make the window durable before the power cut. OpenRaft's own policy
+    /// then builds no snapshot within a run.
+    fn drivers(self) -> Option<DriverPlan> {
+        match self {
+            Self::AcceptedLoss => None,
+            _ => Some(DRIVERS),
         }
     }
 }
@@ -340,6 +363,8 @@ struct Version {
     ended_unread: bool,
     /// Its writers wrote it in more than one history.
     written_across_history: bool,
+    /// A purge removes it: the writers write it but never delete it.
+    purge_target: bool,
 }
 
 /// What a create without a body commits: one write unit.
@@ -450,7 +475,7 @@ struct Run {
 impl Run {
     async fn start(config: &ThreeNodeRaftSimConfig, controls: Controls) -> Self {
         let script = Script::of(config.seed);
-        let tuning = JournalTuning::new(script.fsync());
+        let tuning = script.tuning();
         let mut trace = SimTrace::default();
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let cluster =
@@ -618,6 +643,7 @@ impl Run {
             created_in_window: self.window,
             ended_unread: false,
             written_across_history: false,
+            purge_target: false,
         });
         stream
     }
@@ -730,12 +756,27 @@ impl Run {
 
     fn draw_writable(&mut self) -> Option<BucketStreamId> {
         let writable = self.writable();
-        let count = u64::try_from(writable.len()).expect("a count");
+        self.draw_of(writable)
+    }
+
+    /// A writable stream the writers may delete: any but a purge's targets.
+    fn draw_deletable(&mut self) -> Option<BucketStreamId> {
+        let deletable = self
+            .versions
+            .values()
+            .filter(|version| version.writable && !version.purge_target)
+            .map(|version| version.stream.clone())
+            .collect();
+        self.draw_of(deletable)
+    }
+
+    fn draw_of(&mut self, streams: Vec<BucketStreamId>) -> Option<BucketStreamId> {
+        let count = u64::try_from(streams.len()).expect("a count");
         if count == 0 {
             return None;
         }
         let index = usize::try_from(self.draw(count)).expect("an index");
-        writable.into_iter().nth(index)
+        streams.into_iter().nth(index)
     }
 
     fn draw_bucket(&mut self) -> &'static str {
@@ -774,7 +815,7 @@ impl Run {
         }
         if self.draw(4) == 0
             && self.writable().len() > 2
-            && let Some(stream) = self.draw_writable()
+            && let Some(stream) = self.draw_deletable()
         {
             self.delete(&stream).await;
         }
@@ -1327,11 +1368,15 @@ impl Run {
 
     async fn purge_and_expiry(&mut self) {
         // Streams that expire, written at once, and a stream of the same
-        // bucket that does not, in each group.
+        // bucket that does not, in each group. The writers never delete the
+        // kept one, so it is live when the purge runs.
         for group in JOURNAL_GROUPS {
             let expiring = self.create(group, PURGED, true).await;
             self.append(&expiring).await;
             let kept = self.create(group, PURGED, false).await;
+            if let Some(version) = self.versions.get_mut(&kept.stream_id) {
+                version.purge_target = true;
+            }
             self.append(&kept).await;
         }
         self.poll_round().await;
@@ -1364,13 +1409,17 @@ impl Run {
         // The purge, stamped once for every group.
         let now_ms = self.wall_ms();
         let mut indexes = Vec::new();
-        let mut removed = 0_u64;
+        let mut removed = BTreeMap::new();
         for group in JOURNAL_GROUPS {
             let deadline = madsim::time::Instant::now() + WRITE_WAIT;
+            // Whether a purge sent before the answered one failed: it may
+            // have removed the streams, so the answer counts none of them.
+            let mut interrupted = false;
             let response = loop {
                 if let Some(leader) = self.leader(group)
                     && let Some(engine) = self.cluster.engines.get_mut(&(group, leader))
-                    && let Ok(response) = engine
+                {
+                    match engine
                         .purge_bucket(
                             PurgeBucketRequest {
                                 bucket_id: PURGED.to_owned(),
@@ -1379,12 +1428,14 @@ impl Run {
                             group_placement(group),
                         )
                         .await
-                {
-                    break response;
+                    {
+                        Ok(response) => break response,
+                        Err(_retry) => interrupted = true,
+                    }
                 }
                 self.retry(deadline, "the purge").await;
             };
-            removed = removed.saturating_add(response.removed_streams);
+            removed.insert(group, (response.removed_streams, interrupted));
             indexes.push(GroupPurgeIndex {
                 raft_group_id: group,
                 commit_index: response.group_commit_index,
@@ -1435,20 +1486,30 @@ impl Run {
                 );
             }
         }
-        let purged = self
-            .meter
-            .groups
-            .values()
-            .flat_map(|group| group.ends.values())
-            .filter(|end| **end == StreamUsageEnd::Purged)
-            .count();
-        if removed == 0 || purged == 0 {
-            fail(
-                &mut self.trace,
-                ACCOUNTING_INVARIANT,
-                "bucket_purged",
-                format!("{context}: the purge removed {removed} streams, {purged} listed purged"),
-            );
+        // Each group's purge removed its kept stream, and the consumer
+        // listed it purged. `removed_streams` counts only what the answered
+        // request removed, so after an interrupted try only the listing
+        // shows the removal.
+        for group in JOURNAL_GROUPS {
+            let (removed, interrupted) = removed.get(&group).copied().unwrap_or_default();
+            let purged = self
+                .meter
+                .group(group)
+                .ends
+                .values()
+                .filter(|end| **end == StreamUsageEnd::Purged)
+                .count();
+            if (removed == 0 && !interrupted) || purged == 0 {
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "bucket_purged",
+                    format!(
+                        "{context}: group {group}: the purge removed {removed} streams, \
+                         {purged} listed purged"
+                    ),
+                );
+            }
         }
         for _ in 0..3 {
             self.round().await;
@@ -1533,7 +1594,8 @@ impl Run {
         self.poll_until_complete_via(false, "window_read", Route::Avoid(cut))
             .await;
         // The others lose power and every page written since the window
-        // began.
+        // began: no snapshot driver runs and no segment fills, so nothing
+        // synced their journals since the write-back.
         let others: Vec<u64> = NODES
             .into_iter()
             .filter(|node_id| *node_id != cut)
@@ -2144,7 +2206,7 @@ pub(super) async fn run_stream_usage_inner(
     config: ThreeNodeRaftSimConfig,
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
-    let _switched = Switched::apply(controls);
+    let _switched = Switched::apply(controls, Script::of(config.seed));
     let mut run = Run::start(&config, controls).await;
     // The baseline: a `start` listing of every group's newest state before
     // the first write, so every unit the writers commit is accounted after
