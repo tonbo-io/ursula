@@ -79,10 +79,10 @@ pub(crate) async fn stream_usage(
         .into_inner()
         .into_iter()
         .map(|group| {
-            (RaftGroupId(group.raft_group_id), StreamUsageRead {
-                cursor: cursor(group.cursor),
-                limit,
-            })
+            (
+                RaftGroupId(group.raft_group_id),
+                stream_usage_read(group.cursor, limit),
+            )
         })
         .collect();
     let max_items = usize::try_from(MAX_STREAM_USAGE_ANSWER_ITEMS).unwrap_or(usize::MAX);
@@ -110,7 +110,19 @@ pub(crate) async fn stream_usage(
     }
 }
 
-fn cursor(cursor: UsageCursor) -> ursula_stream::UsageCursor {
+/// The read the route makes of each replica for one requested group: its
+/// cursor, and `limit` items. The simulation's metering consumer builds its
+/// reads of each replica's
+/// [`ursula_runtime::GroupEngine::stream_usage`] through it, as
+/// [`group_usage_answer`] renders their answers.
+pub fn stream_usage_read(cursor: UsageCursor, limit: NonZeroUsize) -> StreamUsageRead {
+    StreamUsageRead {
+        cursor: read_cursor(cursor),
+        limit,
+    }
+}
+
+fn read_cursor(cursor: UsageCursor) -> ursula_stream::UsageCursor {
     match cursor {
         UsageCursor::Start => ursula_stream::UsageCursor::Start,
         UsageCursor::After {
@@ -145,24 +157,35 @@ fn group_answer(
     view: Result<GroupUsageView, RuntimeError>,
 ) -> GroupStreamUsage {
     match view {
-        Ok(GroupUsageView::Listed(listing)) => GroupStreamUsage::Listed(page(group, listing)),
-        Ok(GroupUsageView::Behind {
+        Ok(view) => group_usage_answer(group, view),
+        Err(error) => GroupStreamUsage::Unavailable {
+            raft_group_id: group.0,
+            reason: usage_unavailable(group, &error),
+        },
+    }
+}
+
+/// The route's answer for one group whose replica read `view`: its page,
+/// `behind`, or `unavailable` with `no_history` before the group's genesis
+/// applied. The simulation's metering consumer renders each replica's
+/// [`ursula_runtime::GroupEngine::stream_usage`] through it, so it reads
+/// what the route serves.
+pub fn group_usage_answer(group: RaftGroupId, view: GroupUsageView) -> GroupStreamUsage {
+    match view {
+        GroupUsageView::Listed(listing) => GroupStreamUsage::Listed(page(group, listing)),
+        GroupUsageView::Behind {
             genesis,
             history,
             applied,
-        }) => GroupStreamUsage::Behind {
+        } => GroupStreamUsage::Behind {
             raft_group_id: group.0,
             genesis: HistoryId::new(genesis),
             history: HistoryId::new(history),
             applied: log_id(applied),
         },
-        Ok(GroupUsageView::NoHistory) => GroupStreamUsage::Unavailable {
+        GroupUsageView::NoHistory => GroupStreamUsage::Unavailable {
             raft_group_id: group.0,
             reason: UsageUnavailable::NoHistory,
-        },
-        Err(error) => GroupStreamUsage::Unavailable {
-            raft_group_id: group.0,
-            reason: usage_unavailable(group, &error),
         },
     }
 }

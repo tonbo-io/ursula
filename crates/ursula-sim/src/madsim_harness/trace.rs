@@ -766,6 +766,9 @@ pub enum SimEvent {
         purge: bool,
         fault: String,
         replicas: u64,
+        /// Replicas whose state, snapshot and log the removal's end record
+        /// left within the bound (`end_records_leave_within_bound`).
+        end_records: u64,
         /// How often a restored snapshot raised a replica's purge
         /// watermark (`Defence::RestorePurge`).
         restore_purges: u64,
@@ -783,6 +786,9 @@ pub enum SimEvent {
         traffic: String,
         fault: String,
         replicas: u64,
+        /// Replicas whose state, snapshot and log the removal's end record
+        /// left within the bound (`end_records_leave_within_bound`).
+        end_records: u64,
         sweeps: u64,
     },
     /// An operator's snapshot of a group whose leader deferred a purge
@@ -842,6 +848,26 @@ pub enum SimEvent {
     /// cold-index repair step did once its lease ended.
     ZombieColdRepair {
         outcome: ColdRepairOutcome,
+    },
+    /// The `stream-usage-bills-exactly` family's invariants held through a
+    /// run of `script` over `versions` stream versions: its consumer kept
+    /// `pages` pages, saw `behind` answers that were no answer, applied
+    /// `relists_retired` relistings `retired`, `relists_history` relistings
+    /// `history` and `history_changes` relistings across a history change,
+    /// and saw `folds` end records it held fold. Checkpoints judged
+    /// `replicas_judged` replica reads, and an accepted loss replaced
+    /// `lost_write_units` write units the consumer had listed.
+    StreamUsageBilled {
+        script: String,
+        versions: u64,
+        pages: u64,
+        behind: u64,
+        relists_retired: u64,
+        relists_history: u64,
+        history_changes: u64,
+        folds: u64,
+        replicas_judged: u64,
+        lost_write_units: u64,
     },
     InvariantFailed {
         invariant: String,

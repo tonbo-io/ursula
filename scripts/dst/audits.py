@@ -680,6 +680,8 @@ EXPECTED_FAMILIES = {
     "placement-move-extended",
     "identity-fence",
     "identity-fence-extended",
+    "stream-usage-bills-exactly",
+    "stream-usage-bills-exactly-extended",
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}
 

@@ -143,7 +143,9 @@ impl StreamSlot {
                 history: self.history,
                 offset: self.metadata.tail_offset,
             });
-            self.usage.history_baseline = self.usage.counters;
+            if !crate::sim_controls::off(crate::sim_controls::Defence::HistoryBaseline) {
+                self.usage.history_baseline = self.usage.counters;
+            }
             self.history = group;
         }
     }

@@ -378,6 +378,14 @@ impl StreamStateMachine {
     /// lowest-seq end record, early.
     pub(super) fn usage_on_end(&mut self, slot: &StreamSlot, end: StreamEnd, now_ms: u64) {
         self.usage.unindex_live(slot.usage.seq);
+        if crate::sim_controls::off(crate::sim_controls::Defence::EndRecords) {
+            self.usage
+                .retired
+                .entry(slot.metadata.stream_id.bucket_id.clone())
+                .or_default()
+                .add(slot.usage.counters.committed);
+            return;
+        }
         if self.usage.ends.len() >= end_record_cap()
             && let Some(folded) = self.usage.fold_first_end_record()
         {

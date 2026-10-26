@@ -167,6 +167,7 @@ pub enum SimScenario {
     SnapshotObjectsStayOwned,
     PlacementMove,
     IdentityFence,
+    StreamUsageBillsExactly,
 }
 
 #[derive(Clone)]
@@ -222,6 +223,7 @@ impl SimScenario {
             Self::SnapshotObjectsStayOwned => "snapshot-objects-stay-owned",
             Self::PlacementMove => "placement-move",
             Self::IdentityFence => "identity-fence",
+            Self::StreamUsageBillsExactly => "stream-usage-bills-exactly",
         }
     }
 }
@@ -311,6 +313,9 @@ impl SimSchedule {
         if IDENTITY_FENCE_SEEDS.contains(&seed) || IDENTITY_FENCE_EXTENDED_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::IdentityFence);
         }
+        if STREAM_USAGE_SEEDS.contains(&seed) || STREAM_USAGE_EXTENDED_SEEDS.contains(&seed) {
+            return Self::for_scenario(seed, SimScenario::StreamUsageBillsExactly);
+        }
         let scenario = match seed % 12 {
             0 => SimScenario::NoFaultBaseline,
             1 => SimScenario::PartitionHeal,
@@ -376,6 +381,8 @@ pub const PLACEMENT_MOVE_SEEDS: std::ops::RangeInclusive<u64> = 1100..=1109;
 pub const PLACEMENT_MOVE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1120..=1159;
 pub const IDENTITY_FENCE_SEEDS: std::ops::RangeInclusive<u64> = 1110..=1119;
 pub const IDENTITY_FENCE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1160..=1163;
+pub const STREAM_USAGE_SEEDS: std::ops::RangeInclusive<u64> = 1170..=1177;
+pub const STREAM_USAGE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1180..=1211;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
     322..=326;
@@ -605,6 +612,8 @@ mod routing;
 mod runtime_network;
 mod snapshot_checks;
 mod snapshot_objects;
+mod stream_usage;
+mod usage_meter;
 mod write_keys;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;

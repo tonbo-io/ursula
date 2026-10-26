@@ -228,6 +228,17 @@ impl StreamStateMachine {
                 Some(counted_since),
                 None,
             ),
+            // A negative control's install restores as a backup restores,
+            // in the group's genesis.
+            RestoredUsage::Group(usage)
+                if crate::sim_controls::off(crate::sim_controls::Defence::SnapshotUsage) =>
+            {
+                let mut ledger = UsageLedger::retiring(totals);
+                if let Some(genesis) = NonZeroU64::new(usage.genesis) {
+                    ledger.record_genesis(genesis);
+                }
+                (ledger, None, None, None)
+            }
             RestoredUsage::Group(usage) => {
                 if usage.streams.len() != snapshot.streams.len() {
                     return Err(UsageSnapshotError::StreamCount {

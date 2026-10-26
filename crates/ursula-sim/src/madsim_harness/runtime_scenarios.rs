@@ -400,18 +400,30 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         .await
         .expect("append after runtime raft snapshot install");
     // The version's applied appends live in its replicated usage (F9),
-    // which the group snapshot carries.
-    let restored_snapshot = restore_runtime
-        .snapshot_group(placement.raft_group_id)
+    // which the group snapshot carries, and the per-stream usage export
+    // reads them from the installed replica's state.
+    let usage = restore_runtime
+        .stream_usage_groups(
+            vec![(placement.raft_group_id, ursula_stream::StreamUsageRead {
+                cursor: ursula_stream::UsageCursor::Start,
+                limit: std::num::NonZeroUsize::new(10_000).expect("a page limit"),
+            })],
+            10_000,
+        )
         .await
-        .expect("snapshot the restored runtime raft group");
-    let restore_append_count = restored_snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .zip(&restored_snapshot.usage.streams)
-        .find(|(entry, _)| entry.metadata.stream_id == config.stream)
-        .map_or(0, |(_, usage)| usage.counters.appends);
+        .expect("read the restored group's per-stream usage");
+    let restore_append_count = usage
+        .groups
+        .into_iter()
+        .find_map(|(_, view)| match view {
+            Ok(ursula_stream::GroupUsageView::Listed(listing)) => listing
+                .entries
+                .into_iter()
+                .find(|entry| entry.stream_id == config.stream)
+                .map(|entry| entry.counters.appends),
+            _ => None,
+        })
+        .unwrap_or(0);
     let expected_restore_append_count = 3;
     if restore_append_count != expected_restore_append_count {
         let message = format!(

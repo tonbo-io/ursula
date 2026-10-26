@@ -357,6 +357,11 @@ fn generate_identity_fence(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::IdentityFence)
 }
 
+/// The per-stream usage family: the run draws its script from the seed.
+fn generate_stream_usage_bills_exactly(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::StreamUsageBillsExactly)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -538,6 +543,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 1163,
         kind: "identity-fence",
         generate: generate_identity_fence,
+    },
+    SeedFamily {
+        name: "stream-usage-bills-exactly",
+        start: 1170,
+        end: 1177,
+        kind: "stream-usage-bills-exactly",
+        generate: generate_stream_usage_bills_exactly,
+    },
+    SeedFamily {
+        name: "stream-usage-bills-exactly-extended",
+        start: 1180,
+        end: 1211,
+        kind: "stream-usage-bills-exactly",
+        generate: generate_stream_usage_bills_exactly,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",
