@@ -856,7 +856,8 @@ pub enum SimEvent {
     /// `history` and `history_changes` relistings across a history change,
     /// and saw `folds` end records it held fold. Checkpoints judged
     /// `replicas_judged` replica reads, and an accepted loss replaced
-    /// `lost_write_units` write units the consumer had listed.
+    /// `lost_write_units` write units the consumer had listed, counted
+    /// right after its plan.
     StreamUsageBilled {
         script: String,
         versions: u64,

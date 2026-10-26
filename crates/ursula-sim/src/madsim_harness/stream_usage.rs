@@ -475,6 +475,9 @@ struct Run {
     observations: BTreeMap<u32, Vec<Observation>>,
     /// Replica reads a checkpoint judged.
     judged: u64,
+    /// The write units the accepted loss lost, counted right after its
+    /// plan, before a later delete of a window stream counts as loss.
+    lost: u64,
 }
 
 impl Run {
@@ -509,6 +512,7 @@ impl Run {
             next_tidy: now,
             observations: BTreeMap::new(),
             judged: 0,
+            lost: 0,
         }
     }
 
@@ -1654,7 +1658,8 @@ impl Run {
             wait_plan_satisfied(&self.cluster, *group, &NODES, *point, &self.context).await;
         }
         self.fault("loss_accepted");
-        if self.lost_write_units().await == 0 {
+        self.lost = self.lost_write_units().await;
+        if self.lost == 0 {
             let context = self.context.clone();
             fail(
                 &mut self.trace,
@@ -1875,7 +1880,6 @@ impl Run {
             );
         }
         self.judge_accounting();
-        let lost = self.lost_write_units().await;
         let meter = &self.meter;
         let event = SimEvent::StreamUsageBilled {
             script: self.script.name().to_owned(),
@@ -1887,7 +1891,7 @@ impl Run {
             history_changes: meter.history_changes(),
             folds: meter.folds(),
             replicas_judged: self.judged,
-            lost_write_units: lost,
+            lost_write_units: self.lost,
         };
         self.trace.push(event);
         ThreeNodeRaftSimOutcome {
@@ -2031,7 +2035,7 @@ impl Run {
     }
 
     /// The write units an accepted loss's window acknowledged that the
-    /// final lineage does not hold, for the trace.
+    /// lineage the plan kept does not hold.
     async fn lost_write_units(&mut self) -> u64 {
         let mut lost = 0_u64;
         let windowed: Vec<BucketStreamId> = self
