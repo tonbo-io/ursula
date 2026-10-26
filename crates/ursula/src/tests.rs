@@ -7414,7 +7414,6 @@ mod snapshot_driver {
     use crate::bootstrap::plan_purges;
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
-    use crate::bootstrap::resolve_snapshot_drive_interval;
     use crate::bootstrap::snapshot_cadence;
     use crate::bootstrap::spawn_snapshot_driver;
     use crate::bootstrap::trigger_snapshot_build;
@@ -7486,45 +7485,23 @@ mod snapshot_driver {
         );
     }
 
-    #[test]
-    fn snapshot_driver_default_interval_follows_external_store() {
-        // F12e: the inline backend runs the byte-based driver too.
-        let fifteen = Duration::from_secs(15);
-        assert_eq!(
-            resolve_snapshot_drive_interval(None, false),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(None, true),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(Some(fifteen), false),
-            fifteen
-        );
-        assert_eq!(
-            resolve_snapshot_drive_interval(Some(fifteen), true),
-            fifteen
-        );
-    }
-
     /// #669: every Raft node, a single node included, drives its snapshots
     /// under one cadence of `raft.snapshot_log_budget` and
     /// `raft.snapshot_backstop_logs`.
     #[test]
     fn every_raft_node_drives_its_snapshots_under_one_cadence() {
-        let mut raft = ursula_config::RaftConfig::default();
-        let cadence = snapshot_cadence(&raft, 64);
+        let mut config = ursula_config::UrsulaConfig::default();
+        let cadence = snapshot_cadence(&config, 64);
         assert_eq!(cadence.backstop_entries, 100_000);
         assert_eq!(cadence.floor_bytes, 8 * MIB);
         assert_eq!(
             cadence.removal_floor,
-            SnapshotCadence::new(raft.snapshot_log_budget.as_bytes(), 64, 100_000)
-                .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+            SnapshotCadence::new(config.raft.snapshot_log_budget.as_bytes(), 64, 100_000)
+                .with_deleted_data_max_age(config.effective_deleted_data_max_age())
                 .removal_floor
         );
-        raft.snapshot_backstop_logs = 1_000;
-        assert_eq!(snapshot_cadence(&raft, 64).backstop_entries, 1_000);
+        config.raft.snapshot_backstop_logs = 1_000;
+        assert_eq!(snapshot_cadence(&config, 64).backstop_entries, 1_000);
     }
 
     #[test]
@@ -8278,12 +8255,11 @@ mod snapshot_driver {
     /// carries.
     const DELETED_MARKER: &[u8] = b"deleted-data-marker-669;";
 
-    /// What of the removed stream `raft`'s current snapshot holds, if any:
-    /// inline snapshots hold the whole group.
-    async fn snapshot_holds_marker(
+    /// `raft`'s current snapshot, decoded: inline snapshots hold the whole
+    /// group.
+    async fn current_group_snapshot(
         raft: &ursula_raft::OwnerRaftHandle,
-        stream_id: &BucketStreamId,
-    ) -> bool {
+    ) -> ursula_runtime::GroupSnapshot {
         let snapshot = raft
             .get_snapshot()
             .await
@@ -8294,8 +8270,16 @@ mod snapshot_driver {
         let SnapshotLocation::Inline { bytes } = &pointer.location else {
             panic!("an inline snapshot: {:?}", pointer.location);
         };
-        ursula_raft::decode_group_snapshot(bytes)
-            .expect("decode the snapshot")
+        ursula_raft::decode_group_snapshot(bytes).expect("decode the snapshot")
+    }
+
+    /// What of the removed stream `raft`'s current snapshot holds, if any.
+    async fn snapshot_holds_marker(
+        raft: &ursula_raft::OwnerRaftHandle,
+        stream_id: &BucketStreamId,
+    ) -> bool {
+        current_group_snapshot(raft)
+            .await
             .stream_snapshot
             .streams
             .iter()
@@ -8308,24 +8292,73 @@ mod snapshot_driver {
             })
     }
 
+    /// Whether `raft`'s current snapshot holds an end record of `stream_id`
+    /// (F20).
+    async fn snapshot_holds_end_record(
+        raft: &ursula_raft::OwnerRaftHandle,
+        stream_id: &BucketStreamId,
+    ) -> bool {
+        current_group_snapshot(raft)
+            .await
+            .usage
+            .ends
+            .iter()
+            .any(|end| &end.stream_id == stream_id)
+    }
+
     /// The first file under `root` that holds [`DELETED_MARKER`].
     fn file_holding_marker(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        file_holding(root, DELETED_MARKER)
+    }
+
+    /// The first file under `root` that holds `needle`.
+    fn file_holding(root: &std::path::Path, needle: &[u8]) -> Option<std::path::PathBuf> {
         let mut dirs = vec![root.to_path_buf()];
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).expect("list a WAL directory") {
                 let path = entry.expect("a WAL directory entry").path();
                 if path.is_dir() {
                     dirs.push(path);
-                } else if std::fs::read(&path).is_ok_and(|bytes| {
-                    bytes
-                        .windows(DELETED_MARKER.len())
-                        .any(|window| window == DELETED_MARKER)
-                }) {
+                } else if std::fs::read(&path)
+                    .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+                {
                     return Some(path);
                 }
             }
         }
         None
+    }
+
+    /// Waits until `raft`'s log is purged through a snapshot at or past
+    /// `index`, at most `within`.
+    async fn wait_snapshot_and_purge(
+        raft: &ursula_raft::OwnerRaftHandle,
+        index: u64,
+        within: Duration,
+        what: &str,
+    ) {
+        raft.wait(Some(within))
+            .metrics(
+                |metrics| {
+                    metrics.snapshot.map(|snapshot| snapshot.index) >= Some(index)
+                        && metrics.purged.map(|purged| purged.index)
+                            >= metrics.snapshot.map(|snapshot| snapshot.index)
+                },
+                "the log is purged through the snapshot that covers the entry",
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{what} within the bound: {err:?}"));
+    }
+
+    /// The end records `group` holds, by its gauges.
+    async fn end_records_of(runtime: &ursula_runtime::ShardRuntime, group: RaftGroupId) -> u64 {
+        runtime
+            .state_gauges_all_groups()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == group)
+            .and_then(|(_, gauges)| gauges.ok())
+            .map_or(u64::MAX, |gauges| gauges.end_records)
     }
 
     fn wall_ms() -> u64 {
@@ -8339,17 +8372,26 @@ mod snapshot_driver {
     }
 
     /// A single node with Raft over a fresh WAL root, its snapshot driver at
-    /// the default interval, `raft.deleted_data_max_age` of 8 s and OpenRaft
-    /// keeping 8 entries below a snapshot.
+    /// the default interval, `raft.deleted_data_max_age` of 16 s and
+    /// OpenRaft keeping 8 entries below a snapshot.
     fn single_node() -> (
         crate::bootstrap::SpawnedRuntime,
         super::TestWalRoot,
         Duration,
     ) {
         let root = super::TestWalRoot::new();
+        let (spawned, max_age) = single_node_on(&root);
+        (spawned, root, max_age)
+    }
+
+    /// [`single_node`] over `root`, fresh or the root of an earlier run.
+    fn single_node_on(root: &super::TestWalRoot) -> (crate::bootstrap::SpawnedRuntime, Duration) {
         let mut config = super::test_config(1, 2);
         config.raft.install_snapshot_timeout = ursula_config::HumanDuration::sec(1);
-        config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
+        // The floor for a 1 s install timeout with inline snapshots: eight
+        // times the drive interval and the install timeout, so an end
+        // record's fold also leaves within the bound (F20).
+        config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(16));
         config.raft.max_in_snapshot_log_to_keep = 8;
         config.raft.wal.segment_size = ursula_config::HumanSize::kib(64);
         let spawned = crate::bootstrap::spawn_runtime_with_placement(
@@ -8358,9 +8400,9 @@ mod snapshot_driver {
             ursula_raft::FixedPlacement::single(1),
         )
         .expect("spawn a single node");
-        // No meta runs here, so the test settles the fresh root's binding.
+        // No meta runs here, so the test settles the root's binding.
         spawned.bind_without_meta();
-        (spawned, root, config.raft.effective_deleted_data_max_age())
+        (spawned, config.effective_deleted_data_max_age())
     }
 
     /// Creates `stream_id`, expiring at `expires_at_ms` when set, and appends
@@ -8422,7 +8464,8 @@ mod snapshot_driver {
     /// #669: a single node runs the snapshot driver. A deleted stream and an
     /// expired stream that nothing reads, in groups that take no other write,
     /// leave the node's snapshots, its logs and every file under its WAL root
-    /// within `raft.deleted_data_max_age`, its gauges go back to 0, and reads
+    /// within `raft.deleted_data_max_age`, and so do their end records (F20),
+    /// whose fold is a removal of its own. The gauges go back to 0, and reads
     /// of them answer 404.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_single_node_scrubs_deleted_and_expired_streams_within_the_bound() {
@@ -8433,10 +8476,10 @@ mod snapshot_driver {
             .await
             .expect("warm the groups in time")
             .expect("warm the groups");
-        // Two streams in different groups.
-        let deleted = BucketStreamId::new("scrub", "deleted");
+        // Two streams in different groups, with ids no other entry names.
+        let deleted = BucketStreamId::new("scrub", "f20-deleted-669");
         let expiring = (0..64)
-            .map(|index| BucketStreamId::new("scrub", format!("expiring-{index}")))
+            .map(|index| BucketStreamId::new("scrub", format!("f20-expiring-669-{index}")))
             .find(|id| runtime.locate(id).raft_group_id != runtime.locate(&deleted).raft_group_id)
             .expect("a stream in the other group");
         write_marked(&runtime, &deleted, None).await;
@@ -8492,17 +8535,7 @@ mod snapshot_driver {
             let left = max_age
                 .saturating_add(Duration::from_secs(2))
                 .saturating_sub(removed_at.elapsed());
-            raft.wait(Some(left))
-                .metrics(
-                    |metrics| {
-                        metrics.snapshot.map(|snapshot| snapshot.index) >= Some(removal)
-                            && metrics.purged.map(|purged| purged.index)
-                                >= metrics.snapshot.map(|snapshot| snapshot.index)
-                    },
-                    "the log is purged through the snapshot that covers the removal",
-                )
-                .await
-                .expect("scrub the removed stream within the bound");
+            wait_snapshot_and_purge(raft, removal, left, "scrub the removed stream").await;
         }
         assert!(!snapshot_holds_marker(&deleted_raft, &deleted).await);
         assert!(!snapshot_holds_marker(&expiring_raft, &expiring).await);
@@ -8519,18 +8552,63 @@ mod snapshot_driver {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(2))
+        // The end records fold half the bound after their removals, and the
+        // folds leave the snapshots and the logs within the bound too: a
+        // snapshot at or past each fold names neither stream, and no file
+        // under the WAL root holds their ids.
+        for (raft, group, stream_id, removed_at) in [
+            (&deleted_raft, deleted_group, &deleted, deleted_at),
+            (&expiring_raft, expiring_group, &expiring, expired_at),
+        ] {
+            let deadline = removed_at
+                .checked_add(max_age.saturating_add(Duration::from_secs(2)))
+                .expect("deadline");
+            while end_records_of(&runtime, group).await > 0 {
+                assert!(Instant::now() < deadline, "{stream_id}'s end record stays");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let fold = raft
+                .metrics()
+                .borrow_watched()
+                .last_applied
+                .expect("applied the fold")
+                .index;
+            wait_snapshot_and_purge(
+                raft,
+                fold,
+                deadline.saturating_duration_since(Instant::now()),
+                "scrub the folded end record",
+            )
+            .await;
+            assert!(
+                !snapshot_holds_end_record(raft, stream_id).await,
+                "{stream_id}"
+            );
+            while let Some(path) = file_holding(root.path(), stream_id.stream_id.as_bytes()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} holds {stream_id}'s id",
+                    path.display()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let deadline = expired_at
+            .checked_add(max_age.saturating_add(Duration::from_secs(2)))
             .expect("deadline");
         loop {
             let metrics = runtime.metrics().snapshot();
-            if metrics.raft_deleted_data_oldest_age_ms == 0
+            if metrics.usage_end_records_retired >= 2
+                && metrics.raft_deleted_data_oldest_age_ms == 0
                 && metrics.raft_deleted_data_overdue_groups == 0
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "the removals are still reported");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                Instant::now() < deadline,
+                "the removals are still reported: {metrics:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let app = crate::router(runtime.clone());
         for stream_id in [&deleted, &expiring] {
@@ -8542,6 +8620,114 @@ mod snapshot_driver {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{stream_id}");
         }
         drop(app);
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
+        drop(spawned);
+        drop(root);
+    }
+
+    /// F20: a node that restarts after a removal keeps its end record's age.
+    /// A stream is deleted, the node restarts three quarters of the
+    /// retention later, and the restarted node's retirement clock dates the
+    /// end record it held by its removal time: the record folds about the
+    /// retention after the removal, not a whole retention after the
+    /// restart, and its id leaves the snapshot and every file under the WAL
+    /// root within the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_single_node_folds_its_end_records_on_their_removal_clock() {
+        let root = super::TestWalRoot::new();
+        let (spawned, max_age) = single_node_on(&root);
+        let retain = ursula_config::RaftConfig::end_record_retention(max_age);
+        let interval = ursula_runtime::expiry_sweep::interval(max_age);
+        let runtime = spawned.runtime.clone();
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let deleted = BucketStreamId::new("scrub", "f20-restart-deleted-669");
+        let group = runtime.locate(&deleted).raft_group_id;
+        write_marked(&runtime, &deleted, None).await;
+        runtime
+            .delete_stream(ursula_runtime::DeleteStreamRequest {
+                stream_id: deleted.clone(),
+                now_ms: wall_ms(),
+                if_incarnation: None,
+            })
+            .await
+            .expect("delete the stream");
+        let deleted_at = Instant::now();
+        assert_eq!(end_records_of(&runtime, group).await, 1);
+
+        // Restart three quarters of the retention after the removal.
+        tokio::time::sleep(
+            retain
+                .saturating_mul(3)
+                .checked_div(4)
+                .expect("non-zero divisor"),
+        )
+        .await;
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
+        drop(runtime);
+        drop(spawned);
+        let (spawned, _) = single_node_on(&root);
+        let runtime = spawned.runtime.clone();
+        let registry = spawned.raft_registry.clone().expect("a Raft registry");
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the restarted groups in time")
+            .expect("warm the restarted groups");
+        let raft = registry.get(group).expect("registered group");
+
+        // Due at the retention after the removal, folded within two sweep
+        // intervals of it. A clock that dated the record at the restart
+        // would hold it three quarters of the retention longer.
+        let folded_by = deleted_at
+            .checked_add(
+                retain
+                    .saturating_add(interval.saturating_mul(2))
+                    .saturating_add(Duration::from_secs(1)),
+            )
+            .expect("deadline");
+        while end_records_of(&runtime, group).await > 0 {
+            assert!(
+                Instant::now() < folded_by,
+                "the restarted node holds the end record past its retention"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let fold = raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("applied the fold")
+            .index;
+        let deadline = deleted_at
+            .checked_add(max_age.saturating_add(Duration::from_secs(2)))
+            .expect("deadline");
+        wait_snapshot_and_purge(
+            &raft,
+            fold,
+            deadline.saturating_duration_since(Instant::now()),
+            "scrub the folded end record",
+        )
+        .await;
+        assert!(!snapshot_holds_end_record(&raft, &deleted).await);
+        assert!(!snapshot_holds_marker(&raft, &deleted).await);
+        while let Some(path) = file_holding(root.path(), deleted.stream_id.as_bytes()) {
+            assert!(
+                Instant::now() < deadline,
+                "{} holds the removed stream's id",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let raft_wal = spawned
             .raft_wal
             .as_ref()

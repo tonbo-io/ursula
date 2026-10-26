@@ -5,15 +5,20 @@ package ursula.durable.v1;
 import "types.proto";
 
 message SnapshotFrameV1 {
+  // Field 3 held the per-stream append counts (F9): `appends` in the stream
+  // frame's usage holds them since format epoch 7.
+  reserved 3;
+  reserved "append_count";
   oneof frame {
     SnapshotHeaderV1 header = 1;
     StreamSnapshotEntryV1 stream = 2;
-    StreamAppendCountV1 append_count = 3;
     ColdGcEntryV1 cold_gc = 4;
     SnapshotFooterV1 footer = 5;
     // Always the first frame, checked before any other frame is decoded.
     // Snapshots from Ursula 0.5.x and earlier (format epoch 1) have none.
     FormatEpochV1 format_epoch = 6;
+    // One per unretired end record, by ascending seq (F20).
+    EndRecordV1 end_record = 8;
   }
 }
 
@@ -26,8 +31,10 @@ message SnapshotHeaderV1 {
   uint64 group_commit_index = 2;
   repeated string buckets = 3;
   uint64 next_cold_gc_seq = 4;
-  // Monotonic per-bucket usage counters; gauges are recomputed from the
-  // restored streams.
+  // Per-bucket usage totals: each bucket's retired usage plus its live
+  // versions plus its end records. An install requires the committed
+  // counters to equal those parts exactly (F20), and recomputes the gauges
+  // from the restored streams.
   repeated BucketUsageV1 bucket_usage = 5;
   // Field 6 held the removed per-bucket data-plane quota records.
   reserved 6;
@@ -51,6 +58,17 @@ message SnapshotHeaderV1 {
   // The group's latest history event (#581 section 4.2). Absent before the
   // group's genesis applied.
   HistoryEventV1 history = 12;
+  // The latest usage seq the group assigned. Required: a header without it
+  // is refused.
+  optional uint64 usage_seq = 13;
+  // Every end record at or below it is folded. Required.
+  optional uint64 retired_through = 14;
+  // Per bucket, the usage of every folded end record and of every version
+  // a backup import restored, one row per bucket the group ever wrote
+  // (F15).
+  repeated BucketRetiredV1 retired = 15;
+  // The id of the group's genesis history, 0 before its genesis. Required.
+  optional uint64 genesis = 16;
 }
 
 // A history event: the group's genesis, an import or an accepted loss.
@@ -138,6 +156,74 @@ message StreamSnapshotEntryV1 {
   // What the stream's current history began from, recorded by its first
   // write after a history event.
   InheritedHistoryV1 inherited = 23;
+  // The version's usage (F20). Required: a stream frame without it is
+  // refused as corruption.
+  StreamUsageV1 usage = 24;
+}
+
+// A live version's usage (F20).
+message StreamUsageV1 {
+  // Its usage seq, unique in the group. Zero is refused.
+  uint64 seq = 1;
+  // What it committed, and its applied appends. Required.
+  VersionCountersV1 counters = 2;
+  // Its counters when the history in field 22 began for it. Required.
+  VersionCountersV1 history_baseline = 3;
+  // now_ms of its newest counted write, its create included. Absent for a
+  // version restored from a backup that counted no write since.
+  optional uint64 last_write_at_ms = 4;
+  // The history its counters began in. Zero is refused.
+  uint64 counted_since = 5;
+}
+
+message VersionCountersV1 {
+  uint64 committed_append_bytes = 1;
+  uint64 committed_records = 2;
+  uint64 committed_write_units = 3;
+  uint64 appends = 4;
+}
+
+message CommittedUsageV1 {
+  uint64 committed_append_bytes = 1;
+  uint64 committed_records = 2;
+  uint64 committed_write_units = 3;
+}
+
+message BucketRetiredV1 {
+  string bucket_id = 1;
+  // Required.
+  CommittedUsageV1 retired = 2;
+}
+
+enum StreamEndV1 {
+  // Refused: an end record without an end is corruption.
+  STREAM_END_UNSPECIFIED = 0;
+  STREAM_END_DELETED = 1;
+  STREAM_END_EXPIRED = 2;
+  STREAM_END_PURGED = 3;
+}
+
+// The final usage of a version that ended, until the group's sweep folds
+// it into its bucket's retired usage (F20).
+message EndRecordV1 {
+  // The seq of its end. Zero is refused.
+  uint64 seq = 1;
+  // Required.
+  BucketStreamIdV1 stream_id = 2;
+  uint64 created_at_ms = 3;
+  // The history its counters began in. Zero is refused.
+  uint64 counted_since = 4;
+  // The group's history when it ended. Zero is refused.
+  uint64 ended_in = 5;
+  StreamEndV1 end = 6;
+  // now_ms of the entry that removed it.
+  uint64 ended_at_ms = 7;
+  // Required.
+  VersionCountersV1 counters = 8;
+  // Its counters when `ended_in` began for it. Required.
+  VersionCountersV1 history_baseline = 9;
+  // As in StreamUsageV1.
+  optional uint64 last_write_at_ms = 10;
 }
 
 message StreamMetadataV1 {
@@ -222,11 +308,6 @@ message ProducerSnapshotV1 {
 message ClosedEpochV1 {
   uint64 epoch = 1;
   uint64 seq = 2;
-}
-
-message StreamAppendCountV1 {
-  BucketStreamIdV1 stream_id = 1;
-  uint64 append_count = 2;
 }
 
 message ColdGcEntryV1 {

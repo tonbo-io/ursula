@@ -1,5 +1,6 @@
-//! Engine bookkeeping (F9): per-stream append counts die with the stream on
-//! every removal path, and the admission preview does not copy group state.
+//! Engine bookkeeping (F9): per-stream append counts, which apply keeps in
+//! each version's usage, die with the stream on every removal path, and the
+//! admission preview does not copy group state.
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -35,13 +36,17 @@ fn create(
         .expect("create stream");
 }
 
+/// Appends one byte and answers the version's applied appends (F9).
 fn append(engine: &mut InMemoryGroupEngine, stream_id: &BucketStreamId, now_ms: u64) -> u64 {
     let mut request = AppendRequest::from_bytes(stream_id.clone(), b"x".to_vec());
     request.now_ms = now_ms;
     engine
         .append_with_admission_inner(request, placement(), ColdWriteAdmission::default())
-        .expect("append")
-        .stream_append_count
+        .expect("append");
+    engine
+        .state_machine
+        .version_usage(stream_id)
+        .map_or(0, |usage| usage.counters.appends)
 }
 
 #[test]
@@ -87,15 +92,14 @@ fn purge_bucket_drops_append_counts() {
         .apply_committed_write(
             StreamCommand::PurgeBucket {
                 bucket_id: "purged".to_owned(),
+                now_ms: 2,
             },
             placement(),
         )
         .expect("purge bucket");
-    assert_eq!(engine.tracked_append_count_entries(), 0);
-    assert!(
-        engine
-            .build_snapshot(placement())
-            .stream_append_counts
-            .is_empty()
-    );
+    // Every count left with its slot, into the stream's end record (F20).
+    let usage = engine.build_snapshot(placement()).usage;
+    assert!(usage.streams.is_empty());
+    assert_eq!(usage.ends.len(), 8);
+    assert!(usage.ends.iter().all(|record| record.counters.appends == 1));
 }

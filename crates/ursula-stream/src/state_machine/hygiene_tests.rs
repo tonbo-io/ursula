@@ -17,7 +17,7 @@ fn compaction_shrinks_cold_ref_vectors() {
     // F7: CompactCold and retention remove whole runs of state refs; the
     // vectors return the freed capacity.
     const SLICES: u64 = 512;
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: "hygiene".to_owned(),

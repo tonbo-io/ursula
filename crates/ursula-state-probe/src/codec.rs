@@ -11,12 +11,11 @@ use prost::Message;
 use serde::Serialize;
 use ursula_proto as proto;
 use ursula_runtime::GroupSnapshot;
-use ursula_runtime::StreamAppendCount;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
-use ursula_stream::StreamSnapshot;
+use ursula_stream::StreamStateMachine;
 
 pub fn placement0() -> ShardPlacement {
     ShardPlacement {
@@ -26,16 +25,14 @@ pub fn placement0() -> ShardPlacement {
     }
 }
 
-pub fn group_snapshot(
-    stream_snapshot: StreamSnapshot,
-    stream_append_counts: Vec<StreamAppendCount>,
-    group_commit_index: u64,
-) -> GroupSnapshot {
+/// The group snapshot of `machine` at `group_commit_index`, as the engines
+/// build it: its stream snapshot and its usage ledger.
+pub fn group_snapshot(machine: &StreamStateMachine, group_commit_index: u64) -> GroupSnapshot {
     GroupSnapshot {
         placement: placement0(),
         group_commit_index,
-        stream_snapshot,
-        stream_append_counts,
+        stream_snapshot: machine.snapshot(),
+        usage: machine.usage_snapshot(),
     }
 }
 
@@ -98,8 +95,11 @@ pub struct SnapStats {
     pub producer_bytes: u64,
     pub visible_snapshot_bytes: u64,
     pub stream_fixed_bytes: u64,
-    pub append_count_frames: u64,
-    pub append_count_bytes: u64,
+    /// The version usage each stream frame carries (F20, field 24).
+    pub stream_usage_bytes: u64,
+    /// End-record frames (F20, frame 8) and their bytes.
+    pub end_record_frames: u64,
+    pub end_record_bytes: u64,
     pub cold_gc_frames: u64,
     pub cold_gc_bytes: u64,
     pub encode_ms: f64,
@@ -156,6 +156,7 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     let hs = delta(&entry, full, |x| x.hot_segments.clear());
     let pr = delta(&entry, full, |x| x.producer_states.clear());
     let vs = delta(&entry, full, |x| x.visible_snapshot = None);
+    let us = delta(&entry, full, |x| x.usage = None);
     // One receipt per producer record (F3).
     let receipts = n(entry.producer_states.len());
     bump(&mut st.cold_chunks_bytes, cc);
@@ -172,7 +173,8 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     bump(&mut st.producer_count, n(entry.producer_states.len()));
     bump(&mut st.receipt_count, receipts);
     bump(&mut st.visible_snapshot_bytes, vs);
-    let attributed = [cc, es, hp, hs, pr, vs]
+    bump(&mut st.stream_usage_bytes, us);
+    let attributed = [cc, es, hp, hs, pr, vs, us]
         .into_iter()
         .fold(0u64, u64::saturating_add);
     bump(
@@ -229,9 +231,9 @@ pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
                 );
             }
             proto::snapshot_frame_v1::Frame::Stream(entry) => add_stream(&mut st, *entry, len),
-            proto::snapshot_frame_v1::Frame::AppendCount(_) => {
-                bump(&mut st.append_count_frames, 1);
-                bump(&mut st.append_count_bytes, len);
+            proto::snapshot_frame_v1::Frame::EndRecord(_) => {
+                bump(&mut st.end_record_frames, 1);
+                bump(&mut st.end_record_bytes, len);
             }
             proto::snapshot_frame_v1::Frame::ColdGc(_) => {
                 bump(&mut st.cold_gc_frames, 1);

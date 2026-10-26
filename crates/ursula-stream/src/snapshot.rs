@@ -192,6 +192,16 @@ pub enum StreamSnapshotError {
     UnattributedColdGc { seq: u64 },
     #[error("snapshot cold GC entry {seq} targets a stream without a cold generation")]
     ColdGcWithoutGeneration { seq: u64 },
+    #[error("snapshot holds two usage rows of bucket '{0}'")]
+    DuplicateBucketUsage(String),
+    /// The snapshot holds a stream but no history event, which no writer
+    /// since 0.8 produces: its versions would have no history to count in
+    /// (F20).
+    #[error("snapshot stream '{0}' has no history to count its usage in")]
+    StreamWithoutHistory(BucketStreamId),
+    /// A group snapshot's usage does not fit its stream snapshot (F20).
+    #[error(transparent)]
+    Usage(#[from] crate::usage::UsageSnapshotError),
 }
 
 fn snapshot_backup_format_message(found: &Option<u32>) -> String {

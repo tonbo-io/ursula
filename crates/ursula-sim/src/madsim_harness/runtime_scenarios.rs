@@ -347,9 +347,17 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         stream_count: snapshot_stream_count,
     });
     if corrupt_append_counts {
-        for count in &mut snapshot.stream_append_counts {
-            if count.stream_id == config.stream {
-                count.append_count = 0;
+        // The stream's applied appends ride in its usage, beside its entry
+        // (F9, F20). Appends are not part of the bucket totals an install
+        // checks, so only this invariant sees the loss.
+        for (entry, usage) in snapshot
+            .stream_snapshot
+            .streams
+            .iter()
+            .zip(&mut snapshot.usage.streams)
+        {
+            if entry.metadata.stream_id == config.stream {
+                usage.counters.appends = 0;
             }
         }
         trace.push(SimEvent::FaultApplied {
@@ -391,11 +399,23 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         ))
         .await
         .expect("append after runtime raft snapshot install");
+    // The version's applied appends live in its replicated usage (F9),
+    // which the group snapshot carries.
+    let restored_snapshot = restore_runtime
+        .snapshot_group(placement.raft_group_id)
+        .await
+        .expect("snapshot the restored runtime raft group");
+    let restore_append_count = restored_snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .zip(&restored_snapshot.usage.streams)
+        .find(|(entry, _)| entry.metadata.stream_id == config.stream)
+        .map_or(0, |(_, usage)| usage.counters.appends);
     let expected_restore_append_count = 3;
-    if restore_append.stream_append_count != expected_restore_append_count {
+    if restore_append_count != expected_restore_append_count {
         let message = format!(
-            "restore append count {}, expected {expected_restore_append_count}",
-            restore_append.stream_append_count
+            "restore append count {restore_append_count}, expected {expected_restore_append_count}"
         );
         SimTrace::record(SimEvent::InvariantFailed {
             invariant: "runtime_raft_snapshot_install_integrity".to_owned(),

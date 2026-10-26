@@ -1,8 +1,7 @@
-use serde::Deserialize;
-use serde::Serialize;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamSnapshot;
+use ursula_stream::UsageSnapshot;
 
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AppendExternalRequest;
@@ -14,14 +13,20 @@ use crate::request::CreateStreamRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
-use crate::request::StreamAppendCount;
+use crate::request::PurgeBucketRequest;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A group's state as its snapshot holds it. The snapshot codec writes it
+/// as protobuf frames, so it has no serde form, and a backup exports only
+/// its `stream_snapshot` (backup format 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupSnapshot {
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
     pub stream_snapshot: StreamSnapshot,
-    pub stream_append_counts: Vec<StreamAppendCount>,
+    /// The usage ledger beside the stream snapshot (F20): one version usage
+    /// per stream of `stream_snapshot`, in its order, the end records, the
+    /// retired rows, the seqs and the genesis.
+    pub usage: UsageSnapshot,
 }
 
 impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
@@ -167,6 +172,15 @@ impl From<DeleteStreamRequest> for StreamCommand {
             now_ms: request.now_ms,
         };
         if_incarnation(command, request.if_incarnation)
+    }
+}
+
+impl From<PurgeBucketRequest> for StreamCommand {
+    fn from(request: PurgeBucketRequest) -> Self {
+        Self::PurgeBucket {
+            bucket_id: request.bucket_id,
+            now_ms: request.now_ms,
+        }
     }
 }
 

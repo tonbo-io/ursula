@@ -75,6 +75,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
@@ -927,6 +928,7 @@ impl Background {
                             max_streams: 0,
                             max_expiry_sweeps: expiry_sweep::MAX_COMMANDS_PER_GROUP,
                             expiry_sweep_budget: expiry_sweep::GROUP_BUDGET,
+                            deleted_data_max_age: BOUND_DRIVERS.max_age,
                             now_ms,
                         },
                         group_placement(GROUP),
@@ -1023,7 +1025,13 @@ pub(super) async fn run_deleted_data_inner(
             let (remover, ()) = if plan.removal == Removal::BucketPurge {
                 on_leader!(cluster, &context, |engine| async {
                     engine
-                        .purge_bucket(BUCKET.to_owned(), placement)
+                        .purge_bucket(
+                            PurgeBucketRequest {
+                                bucket_id: BUCKET.to_owned(),
+                                now_ms: clock.now_ms(),
+                            },
+                            placement,
+                        )
                         .await
                         .map(drop)
                 })

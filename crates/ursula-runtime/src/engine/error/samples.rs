@@ -15,6 +15,8 @@ use ursula_stream::ProducerRefusal;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 use ursula_stream::StreamSnapshotError;
+use ursula_stream::UsageCounter;
+use ursula_stream::UsageSnapshotError;
 
 use super::AnswerProblem;
 use super::ApplyStopKind;
@@ -481,7 +483,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             TidyStream,
             DeferColdGc,
             OffloadColdRefs,
-            ExpireStreams,
+            Sweep,
             BucketCreated,
             BucketAlreadyExists,
             StreamError,
@@ -574,6 +576,57 @@ fn infra_errors() -> Vec<GroupInfraError> {
     errors
 }
 
+/// Every refusal of a group snapshot's usage (F20), and every counter one
+/// names.
+fn usage_errors() -> Vec<UsageSnapshotError> {
+    let mut errors = every!(UsageSnapshotError {
+        UsageSnapshotError::StreamCount { .. } => UsageSnapshotError::StreamCount {
+            streams: 3,
+            usages: 2,
+        },
+        UsageSnapshotError::InvalidSeq { .. } => UsageSnapshotError::InvalidSeq {
+            seq: 11,
+            usage_seq: 10,
+        },
+        UsageSnapshotError::RetiredEndRecord { .. } => UsageSnapshotError::RetiredEndRecord {
+            seq: 12,
+            retired_through: 13,
+        },
+        UsageSnapshotError::RetiredThroughAhead { .. } => {
+            UsageSnapshotError::RetiredThroughAhead {
+                retired_through: 15,
+                usage_seq: 14,
+            }
+        },
+        UsageSnapshotError::TooManyEndRecords { .. } => UsageSnapshotError::TooManyEndRecords {
+            count: 65_537,
+            max: 65_536,
+        },
+        UsageSnapshotError::DuplicateRetired { .. } => UsageSnapshotError::DuplicateRetired {
+            bucket_id: "bucket".to_owned(),
+        },
+        UsageSnapshotError::TotalsDisagree { .. } => UsageSnapshotError::TotalsDisagree {
+            bucket_id: "bucket".to_owned(),
+            counter: UsageCounter::AppendBytes,
+        },
+    });
+    errors.extend(
+        every_unit!(UsageCounter {
+            AppendBytes,
+            Records,
+            WriteUnits
+        })
+        .into_iter()
+        // The sample above names it.
+        .filter(|counter| *counter != UsageCounter::AppendBytes)
+        .map(|counter| UsageSnapshotError::TotalsDisagree {
+            bucket_id: "bucket".to_owned(),
+            counter,
+        }),
+    );
+    errors
+}
+
 fn snapshot_errors() -> Vec<GroupSnapshotError> {
     let contents = every!(StreamSnapshotError {
         StreamSnapshotError::DuplicateBucket(_) => {
@@ -612,6 +665,13 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
         StreamSnapshotError::ColdGcWithoutGeneration { .. } => {
             StreamSnapshotError::ColdGcWithoutGeneration { seq: 6 }
         },
+        StreamSnapshotError::DuplicateBucketUsage(_) => {
+            StreamSnapshotError::DuplicateBucketUsage("bucket".to_owned())
+        },
+        StreamSnapshotError::StreamWithoutHistory(_) => {
+            StreamSnapshotError::StreamWithoutHistory(stream())
+        },
+        StreamSnapshotError::Usage(_) => StreamSnapshotError::Usage(usage_errors().swap_remove(0)),
     });
     let key = || "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap".to_owned();
     let mut errors = every!(GroupSnapshotError {
@@ -643,6 +703,13 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
         },
     });
     errors.extend(contents.into_iter().map(GroupSnapshotError::InvalidContent));
+    // The sample above carries the first.
+    errors.extend(
+        usage_errors()
+            .into_iter()
+            .skip(1)
+            .map(|error| GroupSnapshotError::InvalidContent(StreamSnapshotError::Usage(error))),
+    );
     errors.push(GroupSnapshotError::ForeignKey {
         raft_group_id: GROUP,
         key: key(),

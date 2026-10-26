@@ -21,6 +21,7 @@ use super::StreamSlot;
 use super::StreamStateMachine;
 use crate::history::InheritedReport;
 use crate::history::incarnation_token;
+use crate::usage::VersionCounters;
 
 /// Whether a stream whose bytes last changed in history `stream_history`
 /// was written since its group's latest history event, `group_history`. A
@@ -68,6 +69,9 @@ impl StreamStateMachine {
                     self.history_id()
                 ),
             );
+        }
+        if previous == 0 {
+            self.usage.record_genesis(history);
         }
         self.history = Some(HistoryEvent {
             id: history,
@@ -129,15 +133,30 @@ impl StreamStateMachine {
 }
 
 impl StreamSlot {
-    /// The first write after a history event: no byte changed since the
-    /// event, so the tail now is the tail at the event.
+    /// The first write after a history event: no byte changed and nothing
+    /// counted since the event, so the tail and the usage counters now are
+    /// those at the event. The counters become the version's history
+    /// baseline before the write counts (F20).
     pub(super) fn inherit_history(&mut self, group: u64) {
         if !written_since_event(self.history, group) {
             self.inherited = Some(InheritedHistory {
                 history: self.history,
                 offset: self.metadata.tail_offset,
             });
+            self.usage.history_baseline = self.usage.counters;
             self.history = group;
+        }
+    }
+
+    /// The version's counters when the group's history `group` began for
+    /// it: its recorded baseline when it was created, restored or written
+    /// in `group`, else its counters, which nothing changed since `group`
+    /// began.
+    pub(super) fn history_baseline_in(&self, group: u64) -> VersionCounters {
+        if written_since_event(self.history, group) {
+            self.usage.history_baseline
+        } else {
+            self.usage.counters
         }
     }
 }

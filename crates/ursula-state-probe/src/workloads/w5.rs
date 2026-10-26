@@ -3,7 +3,7 @@
 //! - `delete`: create N streams per cycle (appends + drain flush), delete all,
 //!   drain cold GC; repeated cycles.
 //! - `ttl-expire`: N streams with sliding TTL, then let them expire and remove
-//!   them with `ExpireStreams` entries, as the leader's sweep does.
+//!   them with `Sweep` entries, as the leader's sweep does.
 //! - `ttl-heap`: one long-lived stream, A appends, TTL none / sliding /
 //!   absolute: TTL heap growth per append.
 //! - `purge`: B buckets with one stream each, `PurgeBucket` each.
@@ -17,6 +17,7 @@ use ursula_stream::StreamCommand;
 use ursula_stream::StreamStateMachine;
 
 use crate::alloc;
+use crate::codec;
 use crate::formula;
 use crate::out::Baseline;
 use crate::out::Outcome;
@@ -96,7 +97,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     )?;
     let mut rng = payload::Rng::new(21);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let keep = smx::sid("bkt1", "keep", "log");
     smx::create_stream(&mut m, &keep, None, None, smx::T0)?;
@@ -123,7 +124,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             }
         }
         while !smx::flush_pass(&mut m, 1, 8 * smx::MIB, &mut packs, &mut stats)?.is_empty() {}
-        let live = measure_sm(&m, &base, Vec::new(), false)?;
+        let live = measure_sm(&m, &base, false)?;
         for id in &ids {
             smx::ok(
                 m.apply(StreamCommand::DeleteStream {
@@ -136,7 +137,14 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         created_total = created_total.saturating_add(args.streams);
         let pending = m.pending_cold_gc_len();
         smx::ack_all_cold_gc(&mut m)?;
-        let after_gc = measure_sm(&m, &base, Vec::new(), false)?;
+        formula::end_records_held(
+            &mut outcome,
+            &codec::measure(codec::group_snapshot(&m, 0), false)?,
+        );
+        // The deleted streams' end records fold once their retention passed.
+        smx::retire_all(&mut m, now)?;
+        let after_gc = measure_sm(&m, &base, false)?;
+        formula::end_records_retired(&mut outcome, &after_gc);
         sink.row(&json!({
             "cycle": cycle, "streams_created_total": created_total,
             "flush": stats,
@@ -161,7 +169,7 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         "appends_per_stream": args.appends_per_stream, "ttl_seconds": ttl}))?;
     let mut rng = payload::Rng::new(22);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let keep = smx::sid("bkt1", "keep", "log");
     smx::create_stream(&mut m, &keep, None, None, smx::T0)?;
@@ -183,7 +191,7 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         }
     }
     while !smx::flush_pass(&mut m, 1, 8 * smx::MIB, &mut packs, &mut stats)?.is_empty() {}
-    let live = measure_sm(&m, &base, Vec::new(), false)?;
+    let live = measure_sm(&m, &base, false)?;
     formula::per_stream_checks(&mut outcome, &live, 0);
     outcome.metric_u64("ttl_heap_entries_live", live.gauges.ttl_heap_entries);
     sink.row(&json!({"phase": "all TTL streams live", "m": live.to_json()}))?;
@@ -200,14 +208,22 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         .unwrap_or(u64::MAX)
         .saturating_add(2);
     while commands <= limit && m.expiry_due(later) {
-        smx::ok(smx::expire_streams(&mut m, later), "expire streams")?;
+        // The expiry half only: no end record is due yet.
+        smx::ok(smx::sweep(&mut m, later, 0), "expire streams")?;
         commands = commands.saturating_add(1);
     }
     let left = ids.iter().filter(|id| m.head(id).is_some()).count();
     let pending = m.pending_cold_gc_len();
     smx::ack_all_cold_gc(&mut m)?;
-    let after = measure_sm(&m, &base, Vec::new(), false)?;
+    formula::end_records_held(
+        &mut outcome,
+        &codec::measure(codec::group_snapshot(&m, 0), false)?,
+    );
+    // The expired streams' end records fold once their retention passed.
+    smx::retire_all(&mut m, later)?;
+    let after = measure_sm(&m, &base, false)?;
     formula::per_stream_checks(&mut outcome, &after, 0);
+    formula::end_records_retired(&mut outcome, &after);
     sink.row(
         &json!({"phase": "after expiry sweeps and GC ack", "expire_commands_needed": commands,
         "streams_left": left, "pending_cold_gc_before_ack": pending, "m": after.to_json()}),
@@ -247,7 +263,7 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         // Allocated before the heap baseline, so it does not count as state.
         let mut starts = smx::RecordStarts::new(if args.retain_every > 0 { 1_002 } else { 0 });
         let base = Baseline::now();
-        let mut m = StreamStateMachine::new();
+        let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         smx::create_bucket(&mut m, "bkt1")?;
         let id = smx::sid("bkt1", "h0001", "log");
         let (ttl_seconds, expires_at) = match variant {
@@ -343,7 +359,7 @@ fn purge(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     sink.row(&json!({"mode": "purge", "buckets": buckets}))?;
     let mut rng = payload::Rng::new(24);
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     for b in 0..buckets {
         let bucket = format!("tenant-{b:08}");
         smx::create_bucket(&mut m, &bucket)?;
@@ -352,17 +368,27 @@ fn purge(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         let record = payload::json_record(&mut rng, 0, 200);
         smx::ok(smx::append(&mut m, &id, record, None, smx::T0), "append")?;
         smx::ok(
-            m.apply(StreamCommand::PurgeBucket { bucket_id: bucket }),
+            m.apply(StreamCommand::PurgeBucket {
+                bucket_id: bucket,
+                now_ms: smx::T0,
+            }),
             "purge",
         )?;
     }
-    let measured = measure_sm(&m, &base, Vec::new(), false)?;
+    let mut outcome = Outcome::default();
+    formula::end_records_held(
+        &mut outcome,
+        &codec::measure(codec::group_snapshot(&m, 0), false)?,
+    );
+    // The purged streams' end records fold once their retention passed.
+    smx::retire_all(&mut m, smx::T0)?;
+    let measured = measure_sm(&m, &base, false)?;
+    formula::end_records_retired(&mut outcome, &measured);
     let heap = u64::try_from(measured.heap.bytes.max(0))?;
     sink.row(&json!({"phase": "after purging every bucket", "buckets_purged": buckets,
         "heap_bytes_per_purged_bucket": round3(ratio(heap, buckets as u64)),
         "snapshot_bytes_per_purged_bucket": round3(ratio(measured.snap.total_bytes, buckets as u64)),
         "m": measured.to_json()}))?;
-    let mut outcome = Outcome::default();
     outcome.metric_i64("heap_bytes", measured.heap.bytes);
     outcome.metric_u64("snapshot_bytes", measured.snap.total_bytes);
     outcome.metric_u64("erased_buckets", measured.gauges.erased_buckets);

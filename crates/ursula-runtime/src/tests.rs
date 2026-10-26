@@ -83,6 +83,22 @@ async fn append_bytes(runtime: &ShardRuntime, stream: &BucketStreamId, payload: 
         .expect("append");
 }
 
+/// The applied appends of the stream's version (F9), as its group's
+/// snapshot carries them.
+async fn applied_appends(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64 {
+    let snapshot = runtime
+        .snapshot_group(runtime.locate(stream).raft_group_id)
+        .await
+        .expect("snapshot group");
+    snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .zip(&snapshot.usage.streams)
+        .find(|(entry, _)| &entry.metadata.stream_id == stream)
+        .map_or(0, |(_, usage)| usage.counters.appends)
+}
+
 fn memory_cold_store() -> ColdStore {
     ColdStore::memory().expect("memory cold store")
 }
@@ -366,7 +382,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             start_offset: 0,
             next_offset: 3,
-            stream_append_count: 1,
             group_commit_index: 3,
             closed: false,
             producer: None,
@@ -1283,8 +1298,8 @@ async fn repeated_appends_to_one_stream_are_ordered() {
             .expect("append");
         assert_eq!(response.start_offset, index * 7);
         assert_eq!(response.next_offset, (index + 1) * 7);
-        assert_eq!(response.stream_append_count, index + 1);
     }
+    assert_eq!(applied_appends(&runtime, &stream).await, 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1367,7 +1382,6 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let first = runtime.append(first).await.expect("first append");
     assert_eq!(first.start_offset, 0);
     assert_eq!(first.next_offset, 1);
-    assert_eq!(first.stream_append_count, 1);
     assert!(!first.deduplicated());
 
     let mut duplicate = AppendRequest::from_bytes(stream.clone(), b"ignored".to_vec());
@@ -1375,7 +1389,6 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let duplicate = runtime.append(duplicate).await.expect("duplicate append");
     assert_eq!(duplicate.start_offset, 0);
     assert_eq!(duplicate.next_offset, 1);
-    assert_eq!(duplicate.stream_append_count, 1);
     assert!(duplicate.deduplicated());
 
     let mut next = AppendRequest::from_bytes(stream.clone(), b"b".to_vec());
@@ -1383,11 +1396,10 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let next = runtime.append(next).await.expect("next append");
     assert_eq!(next.start_offset, 1);
     assert_eq!(next.next_offset, 2);
-    assert_eq!(next.stream_append_count, 2);
     assert!(!next.deduplicated());
 
     let read = runtime
-        .read_stream(read_req(stream, 0, 16))
+        .read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"ab");
@@ -1396,6 +1408,8 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert_eq!(metrics.accepted_appends, 2);
     assert_eq!(metrics.applied_mutations, 3);
     assert_eq!(metrics.routed_requests, 5);
+    // The repeat counted no append.
+    assert_eq!(applied_appends(&runtime, &stream).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1473,7 +1487,7 @@ async fn snapshot_group_rejects_out_of_range_group_before_routing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn install_group_snapshot_restores_group_state_and_append_counts() {
+async fn install_group_snapshot_restores_group_state_and_usage() {
     let source = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "install-snapshot");
     let placement = source.locate(&stream);
@@ -1488,16 +1502,24 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     // The genesis history event, the create and two appends.
     assert_eq!(snapshot.group_commit_index, 4);
     let snapshot_commit_index = snapshot.group_commit_index;
-    assert_eq!(snapshot.stream_append_counts, vec![StreamAppendCount {
-        stream_id: stream.clone(),
-        append_count: 2,
-    }]);
+    let usage = snapshot.usage.clone();
+    assert_eq!(usage.streams.len(), 1);
+    assert_eq!(usage.streams[0].counters.appends, 2);
 
     let target = runtime(2, 8);
     target
         .install_group_snapshot(snapshot)
         .await
         .expect("install snapshot");
+    // The installed replica holds the source's ledger exactly (F20).
+    assert_eq!(
+        target
+            .snapshot_group(placement.raft_group_id)
+            .await
+            .expect("snapshot installed group")
+            .usage,
+        usage
+    );
 
     let read = target
         .read_stream(read_req(stream.clone(), 0, 16))
@@ -1508,22 +1530,20 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     assert_eq!(read.next_offset, 4);
 
     let appended = target
-        .append(AppendRequest::from_bytes(stream, b"ef".to_vec()))
+        .append(AppendRequest::from_bytes(stream.clone(), b"ef".to_vec()))
         .await
         .expect("append after restore");
     assert_eq!(appended.start_offset, 4);
     assert_eq!(appended.next_offset, 6);
-    assert_eq!(appended.stream_append_count, 3);
     assert_eq!(appended.group_commit_index, snapshot_commit_index + 1);
+    assert_eq!(applied_appends(&target, &stream).await, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
-    // Regression: a deleted stream must not leave a stale entry in the runtime
-    // append-count map. Such an entry would make the snapshot fail every
-    // follower's install with "append count references missing snapshot stream",
-    // so a lagging node could never catch up and leadership transfer (which
-    // catches the target up via a snapshot) could never complete.
+async fn snapshot_after_stream_delete_installs_with_its_end_record() {
+    // A deleted stream's usage leaves with its slot into an end record, so
+    // no usage of a stream the snapshot does not hold can fail an install
+    // (F9, F20), and the installed replica keeps the end record.
     let source = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "churn-delete");
     let placement = source.locate(&stream);
@@ -1542,21 +1562,39 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
         .snapshot_group(placement.raft_group_id)
         .await
         .expect("snapshot group");
-    assert!(
-        snapshot
-            .stream_append_counts
-            .iter()
-            .all(|count| count.stream_id != stream),
-        "snapshot must not carry an append count for the deleted stream: {:?}",
-        snapshot.stream_append_counts
-    );
+    assert!(snapshot.usage.streams.is_empty(), "{:?}", snapshot.usage);
+    let ends = snapshot
+        .usage
+        .ends
+        .iter()
+        .map(|record| {
+            (
+                record.stream_id.clone(),
+                record.end,
+                record.counters.appends,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ends, [(
+        stream.clone(),
+        ursula_stream::StreamEnd::Deleted,
+        1
+    )]);
+    let usage = snapshot.usage.clone();
 
-    // Previously this failed the restore consistency check.
     let target = runtime(2, 8);
     target
         .install_group_snapshot(snapshot)
         .await
         .expect("install snapshot after delete");
+    assert_eq!(
+        target
+            .snapshot_group(placement.raft_group_id)
+            .await
+            .expect("snapshot installed group")
+            .usage,
+        usage
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1580,7 +1618,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             history: None,
             format_version: ursula_stream::BACKUP_FORMAT_VERSION,
         },
-        stream_append_counts: Vec::new(),
+        usage: ursula_stream::UsageSnapshot::default(),
     };
 
     let err = runtime
@@ -2105,7 +2143,10 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
     assert!(b_chunks[0].s3_path.starts_with("erasure-b/_packs/"));
 
     let purge = runtime
-        .purge_bucket_all_groups(bucket_a)
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: bucket_a.to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("purge first bucket");
     assert_eq!(purge.removed_streams, 2);
@@ -2115,7 +2156,10 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
         .await
         .expect("reclaim first bucket");
     let proof = runtime
-        .purge_bucket_all_groups(bucket_a)
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: bucket_a.to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("prove first bucket absence");
     assert_eq!(proof.pending_cold_gc_entries, 0);
@@ -2396,7 +2440,10 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("flush cold");
 
     let purge = runtime
-        .purge_bucket_all_groups("offboard-tenant")
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: "offboard-tenant".to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("purge bucket");
     assert_eq!(purge.removed_streams, 1);
@@ -2407,7 +2454,10 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .await
         .expect("reclaim cold payload");
     let proof = runtime
-        .purge_bucket_all_groups("offboard-tenant")
+        .purge_bucket_all_groups(&PurgeBucketRequest {
+            bucket_id: "offboard-tenant".to_owned(),
+            now_ms: 10_000,
+        })
         .await
         .expect("prove purge");
     assert_eq!(proof.removed_streams, 0);
@@ -4262,7 +4312,7 @@ impl GroupEngine for BlockingReadEngine {
                     history: None,
                     format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
-                stream_append_counts: Vec::new(),
+                usage: ursula_stream::UsageSnapshot::default(),
             })
         })
     }
@@ -4436,7 +4486,6 @@ impl GroupEngine for RecordingEngine {
                 placement,
                 start_offset,
                 next_offset,
-                stream_append_count: self.commit_index,
                 group_commit_index: self.commit_index,
                 closed: request.close_after,
                 producer: None,
@@ -4479,7 +4528,7 @@ impl GroupEngine for RecordingEngine {
                     history: None,
                     format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
-                stream_append_counts: Vec::new(),
+                usage: ursula_stream::UsageSnapshot::default(),
             })
         })
     }

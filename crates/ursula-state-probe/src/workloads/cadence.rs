@@ -88,7 +88,7 @@ impl Group {
 
 fn new_group(index: usize, streams_per_group: usize) -> Result<Group> {
     let mut group = Group {
-        machine: StreamStateMachine::new(),
+        machine: StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN),
         gauge: GroupLogGauge::default(),
         streams: Vec::new(),
         commit_index: 0,
@@ -152,7 +152,7 @@ fn maybe_flush(group: &mut Group, flush_bytes: usize) -> Result<()> {
 }
 
 fn snapshot_bytes(group: &Group) -> Result<u64> {
-    let snapshot = codec::group_snapshot(group.machine.snapshot(), Vec::new(), group.commit_index);
+    let snapshot = codec::group_snapshot(&group.machine, group.commit_index);
     Ok(codec::encode_bytes(snapshot)?.len() as u64)
 }
 

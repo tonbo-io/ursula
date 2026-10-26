@@ -86,6 +86,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketRequest;
 use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
@@ -274,8 +275,8 @@ pub enum GroupWriteResponse {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
-    /// An `ExpireStreams` entry of the leader's expiry sweep applied.
-    ExpireStreams(crate::request::ExpireStreamsResponse),
+    /// A `Sweep` entry of the leader's group sweep applied.
+    Sweep(crate::request::SweepResponse),
 }
 
 /// `GroupWriteResponse::kind` and one `TryFrom<GroupWriteResponse>` per
@@ -328,7 +329,7 @@ group_write_responses! {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
-    ExpireStreams(crate::request::ExpireStreamsResponse),
+    Sweep(crate::request::SweepResponse),
 }
 
 /// The error of a [`GroupEngine`] operation the engine leaves
@@ -514,11 +515,12 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(unsupported(EngineOperation::TidyStream)) })
     }
 
-    /// One leader-side tidy pass (bounded-state F0): first the expiry sweep
-    /// ([`crate::expiry_sweep`]), at most `request.max_expiry_sweeps`
-    /// `ExpireStreams` entries, then `TidyStream`
-    /// for up to `request.max_streams` streams with debt. A follower or an
-    /// engine without support proposes nothing.
+    /// One tidy pass (bounded-state F0, F20). Every replica first samples
+    /// its group's retirement clock ([`crate::expiry_sweep::RetirementClock`]).
+    /// A leader then runs the group sweep ([`crate::expiry_sweep`]), at most
+    /// `request.max_expiry_sweeps` `Sweep` entries, and `TidyStream` for up
+    /// to `request.max_streams` streams with debt. A follower or an engine
+    /// without support proposes nothing.
     fn tidy_streams<'a>(
         &'a mut self,
         _request: crate::request::TidyStreamsRequest,
@@ -599,11 +601,12 @@ pub trait GroupEngine: Send + 'static {
     }
 
     /// Replicated tenant offboarding: removes every stream in the bucket and
-    /// the bucket in this group. Monotonic aggregate usage remains
-    /// available to asynchronous accounting readers. Default unsupported.
+    /// the bucket in this group, each stream ending at the request's
+    /// `now_ms`. Monotonic aggregate usage remains available to
+    /// asynchronous accounting readers. Default unsupported.
     fn purge_bucket<'a>(
         &'a mut self,
-        _bucket_id: String,
+        _request: PurgeBucketRequest,
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async { Err(unsupported(EngineOperation::PurgeBucket)) })
@@ -874,6 +877,13 @@ impl GroupEngineMetrics {
     pub fn record_wal_storage(&self, placement: ShardPlacement, sample: WalStorageSample) {
         self.inner
             .record_wal_storage(placement.core_id, placement.raft_group_id, sample);
+    }
+
+    /// Records the end records one applied entry of the group's replica
+    /// folded (F20): `swept` by a `Sweep` entry, `early` at a removal that
+    /// found the group holding `ursula_stream::MAX_END_RECORDS`.
+    pub(crate) fn record_end_records_folded(&self, swept: u64, early: u64) {
+        self.inner.record_end_records_folded(swept, early);
     }
 
     /// Records what a core journal's writer did besides writing batches.

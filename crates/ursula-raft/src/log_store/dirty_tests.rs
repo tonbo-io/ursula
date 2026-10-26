@@ -974,7 +974,7 @@ async fn snapshot_record_after_a_journal_sync(publication: Publication) {
                 placement: placement(QUIET),
                 group_commit_index: 2,
                 stream_snapshot: Default::default(),
-                stream_append_counts: Vec::new(),
+                usage: Default::default(),
             };
             let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
                 .collect::<Result<Vec<_>, _>>()

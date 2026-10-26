@@ -95,7 +95,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
         0
     });
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
@@ -192,12 +192,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                     "us_per_retry": round3(started.elapsed().as_secs_f64() * 1e6 / f64::from(reps))}));
             }
         }
-        let measured = measure_sm(
-            &m,
-            &base,
-            smx::append_counts(std::slice::from_ref(&id), &[n]),
-            args.zstd,
-        )?;
+        let measured = measure_sm(&m, &base, args.zstd)?;
         formula::per_stream_checks(&mut outcome, &measured, 0);
         let heap = u64::try_from(measured.heap.bytes.max(0))?;
         sink.row(&json!({

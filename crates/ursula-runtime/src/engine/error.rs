@@ -225,7 +225,7 @@ pub enum ResponseKind {
     TidyStream,
     DeferColdGc,
     OffloadColdRefs,
-    ExpireStreams,
+    Sweep,
     /// A state-machine answer that no group write answers.
     BucketCreated,
     BucketAlreadyExists,
@@ -265,7 +265,7 @@ impl ResponseKind {
             StreamCommand::NewHistory { .. } => Self::NewHistory,
             StreamCommand::TidyStream { .. } => Self::TidyStream,
             StreamCommand::OffloadColdRefs { .. } => Self::OffloadColdRefs,
-            StreamCommand::ExpireStreams { .. } => Self::ExpireStreams,
+            StreamCommand::Sweep { .. } => Self::Sweep,
             StreamCommand::IfIncarnation { command, .. } => Self::answering(command),
         }
     }
@@ -294,7 +294,7 @@ impl From<&StreamResponse> for ResponseKind {
             StreamResponse::HistoryStarted { .. } => Self::NewHistory,
             StreamResponse::StreamTidied { .. } => Self::TidyStream,
             StreamResponse::ColdRefsOffloaded { .. } => Self::OffloadColdRefs,
-            StreamResponse::StreamsExpired { .. } => Self::ExpireStreams,
+            StreamResponse::Swept { .. } => Self::Sweep,
             StreamResponse::Error { .. } => Self::StreamError,
         }
     }

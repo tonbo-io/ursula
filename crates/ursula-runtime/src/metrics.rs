@@ -466,12 +466,17 @@ runtime_metrics! {
     // open back-off until their core opens them again (#687): 1 per group
     // while it waits.
     sum open_backoff_groups: group per_group_open_backoff;
-    // The leader's background expiry sweep (#669): the `ExpireStreams`
-    // entries its passes committed, the expired streams they removed, and
-    // the groups the latest pass left with expired streams for the next one.
+    // The leader's background group sweep (#669): the `Sweep` entries its
+    // passes committed, the expired streams they removed, and the groups
+    // the latest pass left due for the next one.
     counter ttl_expiry_sweeps;
     counter ttl_expiry_swept_streams;
     counter ttl_expiry_sweep_due_groups;
+    // Usage end records (F20): the end records the node's leaders' sweeps
+    // folded into their buckets' usage, and the ones the node's replicas
+    // folded early, at a removal that found the group holding 65,536.
+    counter usage_end_records_retired;
+    counter usage_end_records_folded_early;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -848,12 +853,23 @@ impl RuntimeMetricsInner {
             .fetch_add_relaxed(sample.failed);
     }
 
-    /// Records one expiry sweep pass over the node's groups (#669).
-    pub(crate) fn record_ttl_expiry_sweep(&self, sweeps: u64, swept_streams: u64, due_groups: u64) {
-        self.ttl_expiry_sweeps.fetch_add_relaxed(sweeps);
+    /// Records one sweep pass over the node's groups (#669, F20): its
+    /// `Sweep` entries and the expired streams they removed, and the groups
+    /// it left due.
+    pub(crate) fn record_ttl_expiry_sweep(&self, pass: &crate::request::TidyStreamsResponse) {
+        self.ttl_expiry_sweeps.fetch_add_relaxed(pass.expiry_sweeps);
         self.ttl_expiry_swept_streams
-            .fetch_add_relaxed(swept_streams);
-        self.ttl_expiry_sweep_due_groups.store_relaxed(due_groups);
+            .fetch_add_relaxed(pass.expiry_swept_streams);
+        self.ttl_expiry_sweep_due_groups
+            .store_relaxed(pass.expiry_due_groups);
+    }
+
+    /// End records one entry a replica applied folded (F20): `swept` by the
+    /// group sweep, `early` at a removal that found its group holding
+    /// `MAX_END_RECORDS`.
+    pub(crate) fn record_end_records_folded(&self, swept: u64, early: u64) {
+        self.usage_end_records_retired.fetch_add_relaxed(swept);
+        self.usage_end_records_folded_early.fetch_add_relaxed(early);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -1142,7 +1158,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 182] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 184] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1314,6 +1330,8 @@ mod metric_manifest_tests {
         "ttl_expiry_sweeps",
         "ttl_expiry_swept_streams",
         "ttl_expiry_sweep_due_groups",
+        "usage_end_records_retired",
+        "usage_end_records_folded_early",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",

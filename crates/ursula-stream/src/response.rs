@@ -110,13 +110,16 @@ pub enum StreamResponse {
     StreamTidied {
         debt_remaining: bool,
     },
-    /// Result of [`StreamCommand::ExpireStreams`]: how many expired streams
-    /// the entry removed, at most its `limit`. Fewer than `limit` means no
-    /// stream of the group had expired at its `now_ms` afterwards.
+    /// Result of [`StreamCommand::Sweep`]: how many expired streams the
+    /// entry removed and how many end records it folded, each at most its
+    /// `limit`. Fewer than `limit` removed means no stream of the group had
+    /// expired at its `now_ms` afterwards, and fewer than `limit` folded
+    /// that no end record it could fold was left.
     ///
-    /// [`StreamCommand::ExpireStreams`]: crate::StreamCommand::ExpireStreams
-    StreamsExpired {
-        removed: u64,
+    /// [`StreamCommand::Sweep`]: crate::StreamCommand::Sweep
+    Swept {
+        expired: u64,
+        retired: u64,
     },
     /// Result of [`StreamCommand::OffloadColdRefs`]: how many of the listed
     /// refs were still in state and removed, and how many state-held external

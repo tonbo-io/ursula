@@ -1016,6 +1016,8 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
                 max_streams: 16,
                 max_expiry_sweeps: 0,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                // The default bound: this pass sweeps nothing.
+                deleted_data_max_age: ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE,
                 now_ms: idle_now,
             })
             .await

@@ -35,9 +35,11 @@
 //! - [`read_index`]: the per-group ReadIndex barrier that linearizes reads
 //!   before they are queued to the group actor (D10).
 //! - [`tidy_worker`]: leader-side tidy driver (bounded-state F0): the
-//!   expiry sweep and `TidyStream`.
-//! - [`expiry_sweep`]: the leader's background sweep of expired streams
-//!   through the dedicated `ExpireStreams` command (F0, #669).
+//!   group sweep and `TidyStream`.
+//! - [`expiry_sweep`]: the leader's background group sweep through the
+//!   dedicated `Sweep` command, which removes expired streams (F0, #669)
+//!   and folds the end records each replica's retirement clock finds due
+//!   (F20).
 //! - [`key_holds`]: in-memory holds on object keys, which a deleter that
 //!   lists the store leaves alone, with a drop behaviour per set.
 //! - `wire_samples` (tests and `test-support` only): one sample of every
@@ -274,7 +276,6 @@ pub use request::DeferColdGcResponse;
 pub use request::DeleteStreamRequest;
 pub use request::DeleteStreamResponse;
 pub use request::EarlyAnswerQuery;
-pub use request::ExpireStreamsResponse;
 pub use request::FlushColdRequest;
 pub use request::FlushColdResponse;
 pub use request::FollowerRead;
@@ -291,6 +292,7 @@ pub use request::PlanGroupColdFlushRequest;
 pub use request::ProducerEarlyAnswerRequest;
 pub use request::PublishSnapshotRequest;
 pub use request::PublishSnapshotResponse;
+pub use request::PurgeBucketRequest;
 pub use request::PurgeBucketResponse;
 pub use request::ReadEnd;
 pub use request::ReadSnapshotRequest;
@@ -299,7 +301,7 @@ pub use request::ReadStreamRequest;
 pub use request::ReadStreamResponse;
 pub use request::RouteWriteRequest;
 pub use request::RoutedWrite;
-pub use request::StreamAppendCount;
+pub use request::SweepResponse;
 pub use request::TidyStreamResponse;
 pub use request::TidyStreamsPass;
 pub use request::TidyStreamsRequest;

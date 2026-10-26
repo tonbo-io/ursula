@@ -107,6 +107,7 @@ use ursula_runtime::Proposal;
 use ursula_runtime::ProposedUpload;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::PublishSnapshotResponse;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -1291,16 +1292,50 @@ impl RaftGroupEngine {
         Ok(Some(response))
     }
 
-    /// The leader's expiry sweep of one tidy pass (#669,
-    /// [`ursula_runtime::expiry_sweep`]): while the group's TTL front is due
-    /// at the pass's sweep clock, proposes `ExpireStreams`, at most
+    /// This replica's sample of its group's retirement clock in one tidy
+    /// pass (F20, [`ursula_runtime::expiry_sweep::RetirementClock`]), taken
+    /// on every replica from the applied state, so that a new leader
+    /// retires on time: the usage seq through which the group's end records
+    /// are due. 0, which folds nothing, when the applied state cannot be
+    /// read: a leader's sweep then reports that error itself, and a
+    /// follower logs it at debug.
+    async fn sample_retirement(&self, request: TidyStreamsRequest) -> u64 {
+        let now = crate::rt::time::Instant::now();
+        let sampled = self
+            .with_applied_state(move |state_machine| {
+                Box::pin(async move {
+                    state_machine.engine.sample_retirement(
+                        now,
+                        request.now_ms,
+                        request.deleted_data_max_age,
+                    )
+                })
+            })
+            .await;
+        match sampled {
+            Ok(retire_through) => retire_through,
+            Err(_reported_by_sweep) if self.leads() => 0,
+            Err(error) => {
+                tracing::debug!(
+                    raft_group_id = self.placement.raft_group_id.0,
+                    %error,
+                    "retirement clock: the applied state cannot be read"
+                );
+                0
+            }
+        }
+    }
+
+    /// The leader's group sweep of one tidy pass (#669, F20,
+    /// [`ursula_runtime::expiry_sweep`]): while the group is due at the
+    /// pass's sweep clock and `retire_through`, proposes `Sweep`, at most
     /// `request.max_expiry_sweeps` entries and for at most
-    /// `request.expiry_sweep_budget`. Each entry applies
-    /// through [`Self::write`], with its apply-health, history and
-    /// leadership checks. An error ends the sweep until the next pass,
-    /// keeps the entries committed so far in the report, and lets the pass
-    /// go on to `TidyStream`.
-    async fn sweep_expired_streams(&self, request: TidyStreamsRequest) -> TidyStreamsResponse {
+    /// `request.expiry_sweep_budget`. Each entry applies through
+    /// [`Self::write`], with its apply-health, history and leadership
+    /// checks. An error ends the sweep until the next pass, keeps the
+    /// entries committed so far in the report, and lets the pass go on to
+    /// `TidyStream`.
+    async fn sweep(&self, request: TidyStreamsRequest, retire_through: u64) -> TidyStreamsResponse {
         let mut report = TidyStreamsResponse::default();
         if request.max_expiry_sweeps == 0 || !expiry_sweep::enabled() {
             return report;
@@ -1311,7 +1346,7 @@ impl RaftGroupEngine {
         loop {
             let due = match self
                 .with_state_machine(move |state_machine| {
-                    Box::pin(async move { state_machine.engine.expiry_due(now_ms) })
+                    Box::pin(async move { state_machine.engine.sweep_due(now_ms, retire_through) })
                 })
                 .await
             {
@@ -1328,8 +1363,11 @@ impl RaftGroupEngine {
                 expiry_sweep::capped(&mut report);
                 break;
             }
-            match expiry_sweep::settle(self.write(expiry_sweep::command(now_ms)).await) {
-                Ok(removed) => expiry_sweep::applied(&mut report, removed),
+            match expiry_sweep::settle(
+                self.write(expiry_sweep::command(now_ms, retire_through))
+                    .await,
+            ) {
+                Ok(swept) => expiry_sweep::applied(&mut report, &swept),
                 Err(err) => {
                     expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
                     break;
@@ -2044,13 +2082,15 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move {
+            // Every replica keeps its clock, so a new leader retires on time.
+            let retire_through = self.sample_retirement(request).await;
             // Leader-side driver: followers propose nothing.
             if !self.leads() {
                 return TidyStreamsPass::empty();
             }
             // The sweep's report survives a failure of the `TidyStream`
             // step, so a capped sweep still runs again soon.
-            let mut report = self.sweep_expired_streams(request).await;
+            let mut report = self.sweep(request, retire_through).await;
             let candidates = match self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
@@ -2223,7 +2263,7 @@ impl GroupEngine for RaftGroupEngine {
 
     fn purge_bucket<'a>(
         &'a mut self,
-        bucket_id: String,
+        request: PurgeBucketRequest,
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
@@ -2239,10 +2279,10 @@ impl GroupEngine for RaftGroupEngine {
                         &leadership,
                     ));
                 };
-                return forward_purge_bucket_to_leader(&route, self.placement, bucket_id).await;
+                return forward_purge_bucket_to_leader(&route, self.placement, request).await;
             }
             ursula_runtime::PurgeBucketResponse::try_from(
-                self.write(StreamCommand::PurgeBucket { bucket_id }).await?,
+                self.write(StreamCommand::from(request)).await?,
             )
         })
     }

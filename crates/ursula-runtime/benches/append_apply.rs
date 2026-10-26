@@ -24,6 +24,10 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 const APPENDS_PER_ITER: usize = 1024;
 const PAYLOAD_BYTES: usize = 256;
 const STREAM_COUNT: usize = 1024;
+/// Live streams of the group in `live_streams_append`: each append updates
+/// its version's usage and takes a new usage seq (F20) in a group of this
+/// many versions.
+const LIVE_STREAM_COUNT: usize = 10_000;
 const CARDINALITY_APPEND_COUNT: usize = 256;
 
 fn append_apply_benches(c: &mut Criterion) {
@@ -36,6 +40,7 @@ fn append_apply_benches(c: &mut Criterion) {
     for scenario in [
         AppendScenario::SingleStream,
         AppendScenario::ManyStreams,
+        AppendScenario::LiveStreams,
         AppendScenario::ProducerDedup,
         AppendScenario::SnapshotCompaction,
     ] {
@@ -134,6 +139,7 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
 enum AppendScenario {
     SingleStream,
     ManyStreams,
+    LiveStreams,
     ProducerDedup,
     SnapshotCompaction,
 }
@@ -143,6 +149,7 @@ impl AppendScenario {
         match self {
             Self::SingleStream => "single_stream_append",
             Self::ManyStreams => "many_streams_append",
+            Self::LiveStreams => "live_streams_append",
             Self::ProducerDedup => "producer_dedup_retry",
             Self::SnapshotCompaction => "snapshot_compaction",
         }
@@ -152,11 +159,12 @@ impl AppendScenario {
 fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
     let stream_count = match scenario {
         AppendScenario::ManyStreams => STREAM_COUNT,
+        AppendScenario::LiveStreams => LIVE_STREAM_COUNT,
         AppendScenario::SingleStream
         | AppendScenario::ProducerDedup
         | AppendScenario::SnapshotCompaction => 1,
     };
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: "benchcmp".to_owned(),
@@ -185,7 +193,8 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
 fn run_appends(machine: &mut StreamStateMachine, scenario: &AppendScenario, payload: &[u8]) -> u64 {
     match scenario {
         AppendScenario::SingleStream => append_single_stream(machine, payload),
-        AppendScenario::ManyStreams => append_many_streams(machine, payload),
+        AppendScenario::ManyStreams => append_many_streams(machine, payload, STREAM_COUNT),
+        AppendScenario::LiveStreams => append_many_streams(machine, payload, LIVE_STREAM_COUNT),
         AppendScenario::ProducerDedup => producer_dedup(machine, payload),
         AppendScenario::SnapshotCompaction => snapshot_compaction(machine, payload),
     }
@@ -205,12 +214,20 @@ fn append_single_stream(machine: &mut StreamStateMachine, payload: &[u8]) -> u64
     tail
 }
 
-fn append_many_streams(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
+/// Appends round robin over the first `streams` streams, spread over all of
+/// them when the group holds more streams than one iteration appends.
+fn append_many_streams(machine: &mut StreamStateMachine, payload: &[u8], streams: usize) -> u64 {
+    let stride = (streams / APPENDS_PER_ITER).max(1);
     let mut tail = 0u64;
     for index in 0..APPENDS_PER_ITER {
         tail = append(
             machine,
-            stream_id(index % STREAM_COUNT),
+            stream_id(
+                index
+                    .saturating_mul(stride)
+                    .checked_rem(streams)
+                    .unwrap_or(0),
+            ),
             bytes::Bytes::copy_from_slice(payload),
             None,
         );

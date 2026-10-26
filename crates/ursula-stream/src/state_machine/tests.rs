@@ -283,14 +283,15 @@ fn snapshot_bytes_leave_with_expired_and_purged_streams() {
     );
 
     assert!(matches!(
-        machine.apply(expire_streams_cmd(10_000)),
-        StreamResponse::StreamsExpired { .. }
+        machine.apply(sweep_cmd(10_000)),
+        StreamResponse::Swept { .. }
     ));
     assert_eq!(snapshot_bytes(&machine)["benchcmp"], 4);
 
     assert!(matches!(
         machine.apply(StreamCommand::PurgeBucket {
             bucket_id: "benchcmp".to_owned(),
+            now_ms: 2_000,
         }),
         StreamResponse::BucketPurged { .. }
     ));
@@ -302,7 +303,7 @@ fn snapshot_bytes_leave_with_expired_and_purged_streams() {
 
 /// A fresh state machine with the shared `benchcmp` bucket created.
 fn machine() -> StreamStateMachine {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     create_bucket(&mut machine);
     machine
 }
@@ -409,10 +410,11 @@ fn delete_cmd(stream_id: BucketStreamId) -> StreamCommand {
     }
 }
 
-fn expire_streams_cmd(now_ms: u64) -> StreamCommand {
-    StreamCommand::ExpireStreams {
+fn sweep_cmd(now_ms: u64) -> StreamCommand {
+    StreamCommand::Sweep {
         now_ms,
         limit: std::num::NonZeroU32::new(256).expect("positive"),
+        retire_through: 0,
     }
 }
 
@@ -953,9 +955,27 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
     }
 }
 
+/// Before its genesis a group creates no stream, inline or external: a
+/// version needs a history to count its usage in (F20).
+#[test]
+fn a_create_before_the_genesis_is_refused() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    assert_error_code(
+        machine.apply(create_cmd(stream("s-1"), Create::default())),
+        StreamErrorCode::HistoryPending,
+    );
+    assert_error_code(
+        machine.apply(create_external_cmd(stream("s-2"), OCTET, 4, 0)),
+        StreamErrorCode::HistoryPending,
+    );
+    assert_eq!(machine.state_gauges().streams, 0);
+    assert_eq!(machine.usage_seq(), 0);
+}
+
 #[test]
 fn stream_create_requires_existing_bucket_and_valid_ids() {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
 
     assert_error_code(
         machine.apply(StreamCommand::CreateBucket {
@@ -981,7 +1001,7 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
 
 #[test]
 fn identical_stream_names_are_isolated_by_bucket_namespace() {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     for bucket_id in ["owner-a", "owner-b"] {
         assert_eq!(
             machine.apply(StreamCommand::CreateBucket {
@@ -1827,7 +1847,7 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
 }
 
 #[test]
-fn expire_streams_removes_in_bounded_batches() {
+fn sweep_removes_in_bounded_batches() {
     let mut machine = machine();
     create_stream(&mut machine, "active");
 
@@ -1855,11 +1875,11 @@ fn expire_streams_removes_in_bounded_batches() {
     ));
     assert_eq!(machine.snapshot().streams.len(), all);
 
-    let expire = expire_streams_cmd(2_000);
-    assert_eq!(
-        machine.apply(expire.clone()),
-        StreamResponse::StreamsExpired { removed: 256 }
-    );
+    let expire = sweep_cmd(2_000);
+    assert_eq!(machine.apply(expire.clone()), StreamResponse::Swept {
+        expired: 256,
+        retired: 0,
+    });
     let snapshot = machine.snapshot();
     let stream_ids = snapshot
         .streams
@@ -1872,8 +1892,9 @@ fn expire_streams_removes_in_bounded_batches() {
     assert!(!stream_ids.contains(&"old-0255"));
     assert!(stream_ids.contains(&"old-0256"));
     assert!(stream_ids.contains(&"old-0261"));
-    assert_eq!(machine.apply(expire), StreamResponse::StreamsExpired {
-        removed: 6
+    assert_eq!(machine.apply(expire), StreamResponse::Swept {
+        expired: 6,
+        retired: 0,
     });
     assert_eq!(machine.snapshot().streams.len(), 1);
 }
@@ -2549,7 +2570,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
 
 #[test]
 fn snapshot_order_is_deterministic() {
-    let mut machine = StreamStateMachine::new();
+    let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     for bucket_id in ["zzzz", "benchcmp", "aaaa"] {
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: bucket_id.to_owned(),
@@ -2658,7 +2679,7 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
     );
 
-    let restore_with = |entry: StreamSnapshotEntry| {
+    let restore_in = |history: Option<crate::HistoryEvent>, entry: StreamSnapshotEntry| {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
@@ -2667,10 +2688,36 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: vec![entry],
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
-            history: None,
+            history,
             format_version: crate::BACKUP_FORMAT_VERSION,
         })
     };
+    let restore_with = |entry: StreamSnapshotEntry| {
+        restore_in(
+            Some(crate::HistoryEvent {
+                id: std::num::NonZeroU64::MIN,
+                event_index: 1,
+                previous: 0,
+                kept: 0,
+                leader: crate::HistoryLeader {
+                    term: 1,
+                    node_id: 1,
+                },
+                imported: None,
+            }),
+            entry,
+        )
+    };
+
+    // A stream needs a history to count its usage in (F20).
+    assert_eq!(
+        restore_in(
+            None,
+            snapshot_entry(stream("orphan"), 0, Vec::new(), Vec::new())
+        )
+        .expect_err("a stream without a history"),
+        StreamSnapshotError::StreamWithoutHistory(stream("orphan"))
+    );
 
     assert!(matches!(
         restore_with(snapshot_entry(
@@ -3096,10 +3143,10 @@ fn renewed_ttl_ignores_stale_expiry_index_entry() {
             expired: false,
         }
     );
-    assert_eq!(
-        machine.apply(expire_streams_cmd(2_100)),
-        StreamResponse::StreamsExpired { removed: 0 }
-    );
+    assert_eq!(machine.apply(sweep_cmd(2_100)), StreamResponse::Swept {
+        expired: 0,
+        retired: 0,
+    });
 
     assert!(machine.head(&stream_id).is_some());
     assert!(machine.head_at(&stream_id, 2_500).is_none());
@@ -3120,10 +3167,10 @@ fn restore_rebuilds_ttl_index_from_stream_metadata() {
     ));
 
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
-    assert_eq!(
-        restored.apply(expire_streams_cmd(2_100)),
-        StreamResponse::StreamsExpired { removed: 1 }
-    );
+    assert_eq!(restored.apply(sweep_cmd(2_100)), StreamResponse::Swept {
+        expired: 1,
+        retired: 0,
+    });
     assert!(restored.head(&stream_id).is_none());
 }
 
@@ -4123,6 +4170,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     ));
     let response = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     });
     let StreamResponse::BucketPurged {
         bucket_id,
@@ -4182,6 +4230,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     // Idempotent re-run reports zero removals.
     let rerun = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     });
     assert!(matches!(rerun, StreamResponse::BucketPurged {
         removed_streams: 0,
@@ -4225,7 +4274,7 @@ fn purge_bucket_numbers_cold_gc_entries_alike_on_replicas_that_hash_differently(
     )
     .collect::<Vec<_>>();
     let replica = || {
-        let mut machine = StreamStateMachine::new();
+        let mut machine = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
         for command in &log {
             assert!(matches!(
                 machine.apply(command.clone()),
@@ -4250,6 +4299,7 @@ fn purge_bucket_numbers_cold_gc_entries_alike_on_replicas_that_hash_differently(
 
     let purge = StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
+        now_ms: 2_000,
     };
     let purged = first.apply(purge.clone());
     assert_eq!(second.apply(purge), purged);
@@ -4879,7 +4929,7 @@ enum Leaves {
     Stays,
     /// `DeleteStream`.
     Deleted,
-    /// Its TTL runs out and `ExpireStreams` removes it.
+    /// Its TTL runs out and `Sweep` removes it.
     Expires,
     /// Its TTL runs out and a read's `TouchStreamAccess` removes it.
     ReadExpired,
@@ -4947,7 +4997,7 @@ proptest! {
 
         // One second on, every stream with a TTL expired. A touch or a
         // create at that time removes the stream it names, and
-        // `ExpireStreams` removes the rest.
+        // `Sweep` removes the rest.
         let mut recreated = 0u64;
         let mut expires = 0u64;
         for (stream_id, bytes, leaves) in &held {
@@ -4977,14 +5027,18 @@ proptest! {
             expected.bytes = expected.bytes.saturating_add(*bytes);
         }
         prop_assert_eq!(
-            machine.apply(expire_streams_cmd(1_000)),
-            StreamResponse::StreamsExpired { removed: expires }
+            machine.apply(sweep_cmd(1_000)),
+            StreamResponse::Swept {
+            expired: expires,
+            retired: 0,
+        }
         );
         prop_assert_eq!(machine.removed_state(), expected);
 
         if purge {
             let purged = machine.apply(StreamCommand::PurgeBucket {
                 bucket_id: "benchcmp".to_owned(),
+                now_ms: 2_000,
             });
             prop_assert!(matches!(purged, StreamResponse::BucketPurged { .. }), "{:?}", purged);
             for (_, bytes, leaves) in &held {

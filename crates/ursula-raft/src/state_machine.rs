@@ -1685,6 +1685,9 @@ fn object_refusal(
         | SnapshotStoreError::ProducerDigestLength { .. }
         | SnapshotStoreError::HistoryIdZero
         | SnapshotStoreError::BackupDigestLength { .. }
+        | SnapshotStoreError::UsageFieldZero { .. }
+        | SnapshotStoreError::StreamEndUnknown { .. }
+        | SnapshotStoreError::UsageMismatch(_)
         | SnapshotStoreError::UnsupportedVersion { .. } => {
             GroupSnapshotError::PointerUnreadable { raft_group_id }
         }
@@ -2224,9 +2227,13 @@ impl RaftGroupStateMachine {
             #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault: None,
             placement,
-            engine: match cold_store {
-                Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
-                None => InMemoryGroupEngine::default(),
+            engine: {
+                let mut engine = match cold_store {
+                    Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
+                    None => InMemoryGroupEngine::default(),
+                };
+                engine.set_metrics(metrics.clone());
+                engine
             },
             metrics,
             last_applied_log_id: None,
@@ -2634,7 +2641,10 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                         }
                         Ok(result) => {
                             let removed = self.engine.removed_state().since(removed_before);
-                            if removed.streams > 0 {
+                            // A fold of end records counts as a removal
+                            // (F20): the ids they held leave the snapshot
+                            // and the log on the removal cadence.
+                            if removed.streams > 0 || removed.end_records > 0 {
                                 self.log_gauge.record_removal(removed.bytes);
                             }
                             RaftGroupResponse::Write(result)
@@ -3496,7 +3506,7 @@ mod tests {
             placement,
             group_commit_index: commit_index,
             stream_snapshot: Default::default(),
-            stream_append_counts: Vec::new(),
+            usage: Default::default(),
         }
     }
 

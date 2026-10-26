@@ -136,9 +136,12 @@ group_count = 16
 # snapshot_backstop_logs = 100000
 
 # How long a replica keeps a deleted, purged or expired stream in its current
-# Raft snapshot and its Raft log after it applies the removal.  Unset, the
-# larger of 1h and eight times install_snapshot_timeout.  A set value must be
-# at least eight times install_snapshot_timeout.
+# Raft snapshot and its Raft log after it applies the removal.  End records
+# fold into their buckets' usage half of it after the removal.  Unset, the
+# larger of 1h and the floor.  A set value must be at least the floor: eight
+# times install_snapshot_timeout, and long enough that an end record leaves
+# within it (964s inline and 980s with S3 snapshots at the default install
+# timeout).
 # deleted_data_max_age = "1h"
 
 # ------------------------------------------------------------------------------

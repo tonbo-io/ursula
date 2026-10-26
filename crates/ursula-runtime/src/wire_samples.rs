@@ -57,7 +57,6 @@ use crate::CompactColdResponse;
 use crate::CreateStreamResponse;
 use crate::DeferColdGcResponse;
 use crate::DeleteStreamResponse;
-use crate::ExpireStreamsResponse;
 use crate::FlushColdResponse;
 use crate::GroupWriteResponse;
 use crate::HeadStreamResponse;
@@ -67,6 +66,7 @@ use crate::OffloadStreamColdRefsResponse;
 use crate::PublishSnapshotResponse;
 use crate::PurgeBucketResponse;
 use crate::ReadStreamResponse;
+use crate::SweepResponse;
 use crate::TidyStreamResponse;
 use crate::TouchStreamAccessResponse;
 use crate::WriteHotBacklog;
@@ -264,6 +264,7 @@ pub fn stream_commands() -> Vec<StreamCommand> {
         },
         StreamCommand::PurgeBucket { .. } => StreamCommand::PurgeBucket {
             bucket_id: "tenant-c".to_owned(),
+            now_ms: 1_700_000_000_015,
         },
         StreamCommand::AckColdGc { .. } => StreamCommand::AckColdGc { up_to_seq: 21 },
         StreamCommand::DeferColdGc { .. } => StreamCommand::DeferColdGc {
@@ -287,9 +288,10 @@ pub fn stream_commands() -> Vec<StreamCommand> {
             stream_id: stream(),
             now_ms: 1_700_000_000_012,
         },
-        StreamCommand::ExpireStreams { .. } => StreamCommand::ExpireStreams {
+        StreamCommand::Sweep { .. } => StreamCommand::Sweep {
             now_ms: 1_700_000_000_013,
             limit: NonZeroU32::new(64).expect("non-zero"),
+            retire_through: 41,
         },
         StreamCommand::OffloadColdRefs { .. } => StreamCommand::OffloadColdRefs {
             stream_id: stream(),
@@ -328,7 +330,6 @@ pub fn group_write_responses() -> Vec<GroupWriteResponse> {
         placement: placement(),
         start_offset: 18,
         next_offset: 27,
-        stream_append_count: 3,
         group_commit_index: 42,
         closed: true,
         producer: Some(producer_ack(delivery)),
@@ -447,13 +448,12 @@ pub fn group_write_responses() -> Vec<GroupWriteResponse> {
                 group_commit_index: 56,
             })
         },
-        GroupWriteResponse::ExpireStreams(_) => {
-            GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
-                placement: placement(),
-                removed: 4,
-                group_commit_index: 57,
-            })
-        },
+        GroupWriteResponse::Sweep(_) => GroupWriteResponse::Sweep(SweepResponse {
+            placement: placement(),
+            expired: 4,
+            retired: 5,
+            group_commit_index: 57,
+        }),
     });
     responses.extend(
         every!(ProducerDelivery {
@@ -851,7 +851,9 @@ fn vary_command_by(command: StreamCommand, mask: &mut Mask) -> StreamCommand {
         StreamCommand::DeleteStream { stream_id, now_ms } => {
             StreamCommand::DeleteStream { stream_id, now_ms }
         }
-        StreamCommand::PurgeBucket { bucket_id } => StreamCommand::PurgeBucket { bucket_id },
+        StreamCommand::PurgeBucket { bucket_id, now_ms } => {
+            StreamCommand::PurgeBucket { bucket_id, now_ms }
+        }
         StreamCommand::AckColdGc { up_to_seq } => StreamCommand::AckColdGc { up_to_seq },
         StreamCommand::DeferColdGc { seq, not_before_ms } => {
             StreamCommand::DeferColdGc { seq, not_before_ms }
@@ -872,9 +874,15 @@ fn vary_command_by(command: StreamCommand, mask: &mut Mask) -> StreamCommand {
         StreamCommand::TidyStream { stream_id, now_ms } => {
             StreamCommand::TidyStream { stream_id, now_ms }
         }
-        StreamCommand::ExpireStreams { now_ms, limit } => {
-            StreamCommand::ExpireStreams { now_ms, limit }
-        }
+        StreamCommand::Sweep {
+            now_ms,
+            limit,
+            retire_through,
+        } => StreamCommand::Sweep {
+            now_ms,
+            limit,
+            retire_through,
+        },
         StreamCommand::OffloadColdRefs { stream_id, refs } => {
             StreamCommand::OffloadColdRefs { stream_id, refs }
         }
@@ -921,7 +929,6 @@ pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteRespo
             placement,
             start_offset,
             next_offset,
-            stream_append_count,
             group_commit_index,
             closed,
             producer,
@@ -932,7 +939,6 @@ pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteRespo
             placement,
             start_offset,
             next_offset,
-            stream_append_count,
             group_commit_index,
             closed,
             producer: vary_ack(producer, mask),
@@ -1098,13 +1104,15 @@ pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteRespo
             remaining,
             group_commit_index,
         }),
-        GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+        GroupWriteResponse::Sweep(SweepResponse {
             placement,
-            removed,
+            expired,
+            retired,
             group_commit_index,
-        }) => GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+        }) => GroupWriteResponse::Sweep(SweepResponse {
             placement,
-            removed,
+            expired,
+            retired,
             group_commit_index,
         }),
     }

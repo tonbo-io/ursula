@@ -104,7 +104,6 @@ use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
-use crate::request::ExpireStreamsResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::GroupReadStreamParts;
@@ -117,12 +116,13 @@ use crate::request::PlanGroupColdFlushRequest;
 use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketRequest;
 use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::RouteWriteRequest;
-use crate::request::StreamAppendCount;
+use crate::request::SweepResponse;
 use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
@@ -151,6 +151,14 @@ pub struct InMemoryGroupEngine {
     /// The applied history, published after every command and snapshot
     /// install (#581 section 4.7).
     pub(crate) history: super::HistoryPublisher,
+    /// When this replica's end records are due (F20): node-local, sampled
+    /// on every tidy pass, on every replica, and seeded again by a snapshot
+    /// install.
+    pub(crate) retirement: crate::expiry_sweep::RetirementClock,
+    /// Where this replica counts the end records the entries it applies
+    /// fold (F20). Both engines apply through this one, so a node counts
+    /// the folds of every replica it hosts.
+    pub(crate) metrics: Option<GroupEngineMetrics>,
 }
 
 impl InMemoryGroupEngine {
@@ -158,6 +166,11 @@ impl InMemoryGroupEngine {
         let mut engine = Self::default();
         engine.set_cold_store(Some(cold_store));
         engine
+    }
+
+    /// Counts the folds of the entries this engine applies in `metrics`.
+    pub fn set_metrics(&mut self, metrics: Option<GroupEngineMetrics>) {
+        self.metrics = metrics;
     }
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
@@ -213,9 +226,8 @@ impl InMemoryGroupEngine {
 
     /// Applies one canonical [`StreamCommand`] of an engine without a log
     /// to the deterministic state machine and lifts its [`StreamResponse`]
-    /// into the group-level response, maintaining the group commit index
-    /// and per-stream append counts. The entry's index is the next commit
-    /// index.
+    /// into the group-level response, maintaining the group commit index.
+    /// The entry's index is the next commit index.
     pub fn apply_stream_command(
         &mut self,
         command: StreamCommand,
@@ -276,9 +288,21 @@ impl InMemoryGroupEngine {
             command,
             StreamCommand::NewHistory { .. } | StreamCommand::ImportSnapshot { .. }
         );
+        let removed_before = self.state_machine.removed_state();
         let response = self.apply_unpublished(command, index, placement, check);
         if history_event {
             self.history.publish(self.state_machine.history());
+        }
+        if let Some(metrics) = &self.metrics {
+            let removed = self.state_machine.removed_state().since(removed_before);
+            if removed.end_records > 0 {
+                metrics.record_end_records_folded(
+                    removed
+                        .end_records
+                        .saturating_sub(removed.end_records_early),
+                    removed.end_records_early,
+                );
+            }
         }
         response
     }
@@ -430,14 +454,11 @@ impl InMemoryGroupEngine {
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
-                    self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
-                let stream_append_count = self.state_machine.stream_append_count(&stream_id);
                 Ok(GroupWriteResponse::Append(AppendResponse {
                     placement,
                     start_offset: offset,
                     next_offset,
-                    stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
                     producer,
@@ -583,13 +604,14 @@ impl InMemoryGroupEngine {
                     group_commit_index: self.commit_index,
                 }))
             }
-            StreamResponse::StreamsExpired { removed } => {
-                if removed > 0 {
+            StreamResponse::Swept { expired, retired } => {
+                if expired > 0 || retired > 0 {
                     self.advance_commit_index();
                 }
-                Ok(GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+                Ok(GroupWriteResponse::Sweep(SweepResponse {
                     placement,
-                    removed,
+                    expired,
+                    retired,
                     group_commit_index: self.commit_index,
                 }))
             }
@@ -865,11 +887,39 @@ impl InMemoryGroupEngine {
         self.state_machine.tidy_candidates(now_ms, limit)
     }
 
-    /// Whether a stream of the group may have expired at `now_ms`, so that
-    /// the leader's expiry sweep proposes `ExpireStreams`
-    /// ([`crate::expiry_sweep`]). `false` is exact.
-    pub fn expiry_due(&self, now_ms: u64) -> bool {
-        self.state_machine.expiry_due(now_ms)
+    /// Whether the leader's group sweep proposes `Sweep` at `now_ms` and
+    /// `retire_through` ([`crate::expiry_sweep`]): a stream may have
+    /// expired, or an end record is due. `false` is exact.
+    pub fn sweep_due(&self, now_ms: u64, retire_through: u64) -> bool {
+        self.state_machine.sweep_due(now_ms, retire_through)
+    }
+
+    /// Samples the group's usage seq on this replica's retirement clock at
+    /// `now`, and returns the usage seq through which its end records are
+    /// due under `deleted_data_max_age`, which the leader's sweep folds
+    /// through (F20, [`crate::expiry_sweep::RetirementClock`]). Every
+    /// replica samples, so a new leader retires on time. `now_ms` is the
+    /// pass's wall clock: it dates the end records this replica held at its
+    /// start, installed or held at a history change, which are due once
+    /// they ended at least the retention before it.
+    pub fn sample_retirement(
+        &mut self,
+        now: crate::rt::time::Instant,
+        now_ms: u64,
+        deleted_data_max_age: std::time::Duration,
+    ) -> u64 {
+        let sample = crate::expiry_sweep::RetirementSample {
+            history: self.state_machine.history_id(),
+            usage_seq: self.state_machine.usage_seq(),
+        };
+        let state_machine = &self.state_machine;
+        self.retirement.sample(
+            now,
+            now_ms,
+            sample,
+            deleted_data_max_age,
+            |at_ms, through| state_machine.end_records_ended_by(at_ms, through),
+        )
     }
 
     pub fn head_stream_after_access(
@@ -1138,39 +1188,18 @@ impl InMemoryGroupEngine {
     }
 
     pub(crate) fn build_snapshot(&self, placement: ShardPlacement) -> GroupSnapshot {
-        let stream_snapshot = self.state_machine.snapshot();
-        let stream_append_counts = self.stream_append_counts_snapshot();
         GroupSnapshot {
             placement,
             group_commit_index: self.commit_index,
-            stream_snapshot,
-            stream_append_counts,
+            stream_snapshot: self.state_machine.snapshot(),
+            usage: self.state_machine.usage_snapshot(),
         }
-    }
-
-    pub(crate) fn stream_append_counts_snapshot(&self) -> Vec<StreamAppendCount> {
-        // Counts live in the stream slots, so only live streams carry one.
-        let mut counts = self
-            .state_machine
-            .stream_append_counts()
-            .map(|(stream_id, append_count)| StreamAppendCount {
-                stream_id: stream_id.clone(),
-                append_count,
-            })
-            .collect::<Vec<_>>();
-        counts.sort_by(|left, right| compare_stream_ids(&left.stream_id, &right.stream_id));
-        counts
     }
 
     /// Cold-index generation of the live stream `stream_id` (F14g), which
     /// pre-proposal cold-index page writes use.
     pub fn cold_index_generation(&self, stream_id: &BucketStreamId) -> Option<u64> {
         self.state_machine.cold_index_generation(stream_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tracked_append_count_entries(&self) -> usize {
-        self.state_machine.stream_append_counts().count()
     }
 
     pub fn stream_tail_offset(&self, stream_id: &BucketStreamId) -> Option<u64> {
@@ -1405,27 +1434,29 @@ impl InMemoryGroupEngine {
             placement: _,
             group_commit_index,
             stream_snapshot,
-            stream_append_counts,
+            usage,
         } = snapshot;
-        self.install_snapshot_parts(group_commit_index, stream_snapshot, stream_append_counts)
+        self.install_snapshot_parts(group_commit_index, stream_snapshot, usage)
     }
 
+    /// The one install path of both engines, a start's restore included:
+    /// the group snapshot's state with its usage ledger, checked exactly
+    /// against its bucket totals (F20).
     pub(crate) fn install_snapshot_parts(
         &mut self,
         group_commit_index: u64,
         stream_snapshot: StreamSnapshot,
-        stream_append_counts: Vec<StreamAppendCount>,
+        usage: ursula_stream::UsageSnapshot,
     ) -> Result<(), GroupEngineError> {
-        let mut state_machine = StreamStateMachine::restore(stream_snapshot)
+        let state_machine = StreamStateMachine::restore_group(stream_snapshot, usage)
             .map_err(|err| GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(err)))?;
-        // A count for a stream the snapshot does not hold has nothing to
-        // attach to and is dropped (F9: counts die with their slot).
-        for count in stream_append_counts {
-            state_machine.set_stream_append_count(&count.stream_id, count.append_count);
-        }
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
+        // The install brings end records this replica never sampled: the
+        // clock dates them by their removal times. A history change it
+        // brings seeds the clock again at its next sample.
+        self.retirement.installed();
         // The installed state may follow page rewrites (clips, compaction)
         // this replica never applied; cached pages could predate them.
         if let Some(cache) = self.cold_index_cache.as_ref() {
@@ -1629,18 +1660,24 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move {
             let mut report = TidyStreamsResponse::default();
+            let retire_through = self.sample_retirement(
+                crate::rt::time::Instant::now(),
+                request.now_ms,
+                request.deleted_data_max_age,
+            );
             if request.max_expiry_sweeps > 0 && crate::expiry_sweep::enabled() {
                 let now_ms = crate::expiry_sweep::sweep_now_ms(request.now_ms);
                 let max = u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX);
-                while self.expiry_due(now_ms) {
+                while self.sweep_due(now_ms, retire_through) {
                     if report.expiry_sweeps >= max {
                         crate::expiry_sweep::capped(&mut report);
                         break;
                     }
-                    let removed = match crate::expiry_sweep::settle(
-                        self.apply_committed_write(crate::expiry_sweep::command(now_ms), placement),
-                    ) {
-                        Ok(removed) => removed,
+                    let swept = match crate::expiry_sweep::settle(self.apply_committed_write(
+                        crate::expiry_sweep::command(now_ms, retire_through),
+                        placement,
+                    )) {
+                        Ok(swept) => swept,
                         Err(err) => {
                             crate::expiry_sweep::interrupted(
                                 placement.raft_group_id,
@@ -1650,7 +1687,7 @@ impl GroupEngine for InMemoryGroupEngine {
                             break;
                         }
                     };
-                    crate::expiry_sweep::applied(&mut report, removed);
+                    crate::expiry_sweep::applied(&mut report, &swept);
                 }
             }
             let mut error = None;
@@ -1838,12 +1875,12 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn purge_bucket<'a>(
         &'a mut self,
-        bucket_id: String,
+        request: PurgeBucketRequest,
         placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
             PurgeBucketResponse::try_from(
-                self.apply_committed_write(StreamCommand::PurgeBucket { bucket_id }, placement)?,
+                self.apply_committed_write(StreamCommand::from(request), placement)?,
             )
         })
     }
@@ -2199,11 +2236,12 @@ impl GroupEngineFactory for InMemoryGroupEngineFactory {
     fn create<'a>(
         &'a self,
         placement: ShardPlacement,
-        _metrics: GroupEngineMetrics,
+        metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             let mut engine = InMemoryGroupEngine::default();
             engine.set_cold_store(self.cold_store.clone());
+            engine.set_metrics(Some(metrics));
             engine.start_genesis(placement, 0);
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
@@ -2211,14 +2249,6 @@ impl GroupEngineFactory for InMemoryGroupEngineFactory {
     }
 }
 
-pub(crate) fn compare_stream_ids(
-    left: &BucketStreamId,
-    right: &BucketStreamId,
-) -> std::cmp::Ordering {
-    left.bucket_id
-        .cmp(&right.bucket_id)
-        .then_with(|| left.stream_id.cmp(&right.stream_id))
-}
 pub(crate) fn ensure_bucket_exists(
     state_machine: &mut StreamStateMachine,
     stream_id: &BucketStreamId,
@@ -2260,7 +2290,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::NewHistory { .. }
-        | StreamCommand::ExpireStreams { .. } => None,
+        | StreamCommand::Sweep { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

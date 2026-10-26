@@ -151,7 +151,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         })
         .collect();
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     // Distinct names: deterministic planner order.
     let ids: Vec<BucketStreamId> = (0..args.streams)
@@ -280,7 +280,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
             first_starved_sec = Some(sec);
         }
         if sec.checked_rem(measure_every) == Some(0) || sec == total_secs {
-            let measured = measure_sm(&m, &base, smx::append_counts(&ids, &appends), args.zstd)?;
+            let measured = measure_sm(&m, &base, args.zstd)?;
             formula::per_stream_checks(&mut outcome, &measured, shared_refs_interval);
             let mut ref_counts: Vec<u64> = measured
                 .snap
@@ -366,7 +366,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
 
     if args.compact {
         compact_all(
-            &mut m, &ids, &mut refs, total_secs, &base, &appends, args.zstd, &name, sink,
+            &mut m, &ids, &mut refs, total_secs, &base, args.zstd, &name, sink,
         )?;
     }
     Ok(outcome)
@@ -378,7 +378,6 @@ fn compact_all(
     refs: &mut BTreeMap<usize, Vec<ColdChunkRef>>,
     total_secs: u64,
     base: &Baseline,
-    appends: &[u64],
     zstd: bool,
     name: &str,
     sink: &mut Sink,
@@ -426,7 +425,7 @@ fn compact_all(
             }
         }
     }
-    let measured = measure_sm(m, base, smx::append_counts(ids, appends), zstd)?;
+    let measured = measure_sm(m, base, zstd)?;
     sink.row(&json!({
         "workload": name,
         "phase": "after CompactCold(shared->exclusive) for every stream",
@@ -438,7 +437,7 @@ fn compact_all(
         "m": measured.to_json(),
     }))?;
     smx::ack_all_cold_gc(m)?;
-    let measured = measure_sm(m, base, smx::append_counts(ids, appends), zstd)?;
+    let measured = measure_sm(m, base, zstd)?;
     sink.row(&json!({
         "workload": name,
         "phase": "after AckColdGc (GC worker drained the queue)",

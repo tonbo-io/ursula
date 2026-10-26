@@ -44,9 +44,9 @@ openraft::declare_raft_types!(
 /// are shared, and the plane a request names admits only its own commands
 /// (`RaftTarget::admits`).
 ///
-/// A data entry encodes as the one-variant envelope of format epoch 5 did
-/// (`81 a6 "Stream" ...`): the variant keeps its name, so a data entry's
-/// bytes are unchanged.
+/// A data entry encodes as a one-variant map, `81 a6 "Stream"` followed by
+/// its [`StreamCommand`]: the variant is written by its name, so the bytes
+/// of a data entry are those of its command under that one key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftCommand {
     Stream(StreamCommand),

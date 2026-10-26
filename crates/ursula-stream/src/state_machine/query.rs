@@ -59,14 +59,23 @@ impl StreamStateMachine {
     }
 
     /// Whether a stream of the group may have expired at `now_ms`, so that
-    /// a leader's background sweep proposes
-    /// [`crate::StreamCommand::ExpireStreams`] (bounded-stream-state F0).
+    /// a leader's background sweep proposes [`crate::StreamCommand::Sweep`]
+    /// (bounded-stream-state F0).
     /// O(1): the front of the TTL index. `false` is exact. `true` may come
     /// from a stale front, of a stream removed or renewed since its entry
     /// was armed. The command still discards or re-arms that front, so each
     /// command makes progress.
     pub fn expiry_due(&self, now_ms: u64) -> bool {
         self.registry.ttl_front_due(now_ms)
+    }
+
+    /// Whether a leader's sweep proposes [`crate::StreamCommand::Sweep`] at
+    /// `now_ms` and `retire_through` (bounded-stream-state F0, F20): a
+    /// stream may have expired ([`Self::expiry_due`]), or an end record is
+    /// at or below `retire_through`. O(1), two front reads. `false` is
+    /// exact.
+    pub fn sweep_due(&self, now_ms: u64, retire_through: u64) -> bool {
+        self.expiry_due(now_ms) || self.end_record_due(retire_through)
     }
 
     /// Up to `max` stream ids strictly after `after`, in (bucket, stream)
@@ -132,43 +141,6 @@ impl StreamStateMachine {
     pub fn stream_is_live(&self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
         self.stream_metadata(stream_id)
             .is_some_and(|metadata| !super::stream_is_expired(metadata, now_ms))
-    }
-
-    /// Runtime append count of the stream's current incarnation (0 when the
-    /// stream does not exist).
-    pub fn stream_append_count(&self, stream_id: &BucketStreamId) -> u64 {
-        self.stream_slot(stream_id)
-            .map_or(0, |slot| slot.append_count)
-    }
-
-    /// Adds `appends` to the stream's runtime append count and returns the new
-    /// value, or `None` when the stream does not exist.
-    pub fn add_stream_append_count(
-        &mut self,
-        stream_id: &BucketStreamId,
-        appends: u64,
-    ) -> Option<u64> {
-        let slot = self.stream_slot_mut(stream_id)?;
-        slot.append_count = slot.append_count.saturating_add(appends);
-        Some(slot.append_count)
-    }
-
-    /// Overwrites the stream's runtime append count (snapshot install and
-    /// engine-level rollback). Returns `false` when the stream does not exist.
-    pub fn set_stream_append_count(&mut self, stream_id: &BucketStreamId, count: u64) -> bool {
-        let Some(slot) = self.stream_slot_mut(stream_id) else {
-            return false;
-        };
-        slot.append_count = count;
-        true
-    }
-
-    /// Non-zero runtime append counts of live streams, in arbitrary order.
-    pub fn stream_append_counts(&self) -> impl Iterator<Item = (&BucketStreamId, u64)> {
-        self.registry
-            .slots()
-            .filter(|slot| slot.append_count > 0)
-            .map(|slot| (&slot.metadata.stream_id, slot.append_count))
     }
 
     /// Hot payload bytes across the group: what admission and the flush

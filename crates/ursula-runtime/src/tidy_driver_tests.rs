@@ -10,6 +10,7 @@ use ursula_stream::ProducerRequest;
 use crate::AppendRequest;
 use crate::CloseStreamRequest;
 use crate::CreateStreamRequest;
+use crate::DeleteStreamRequest;
 use crate::RuntimeConfig;
 use crate::ShardRuntime;
 use crate::TidyStreamsRequest;
@@ -18,12 +19,17 @@ use crate::cold_store::DEFAULT_CONTENT_TYPE;
 /// F3: a producer idle this long expires at the next tidy.
 const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
+/// The default `raft.deleted_data_max_age`.
+const DELETED_DATA_MAX_AGE: std::time::Duration =
+    ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE;
+
 /// A tidy pass with the scheduled sweep's budget.
 fn tidy(max_streams: usize, max_expiry_sweeps: usize, now_ms: u64) -> TidyStreamsRequest {
     TidyStreamsRequest {
         max_streams,
         max_expiry_sweeps,
         expiry_sweep_budget: crate::expiry_sweep::GROUP_BUDGET,
+        deleted_data_max_age: DELETED_DATA_MAX_AGE,
         now_ms,
     }
 }
@@ -116,8 +122,8 @@ async fn stream_count(runtime: &ShardRuntime) -> u64 {
         .sum()
 }
 
-/// #669: the leader's expiry sweep removes expired streams a group never
-/// writes to again with `ExpireStreams` entries of 256 streams, at most its
+/// #669: the leader's sweep removes expired streams a group never writes
+/// to again with `Sweep` entries of 256 streams, at most its
 /// entry cap per group and pass, reports the groups it left capped, and
 /// sums its entries and removals over the groups. Writes never remove an
 /// expired stream they do not name: creates, appends and closes leave them
@@ -212,4 +218,107 @@ async fn expiry_sweep_removes_expired_streams_within_its_cap() {
         .into_result()
         .expect("an idle pass");
     assert_eq!(report.expiry_sweeps, 0);
+}
+
+/// The usage committed per bucket over every group, by bucket.
+async fn bucket_committed(runtime: &ShardRuntime) -> Vec<(String, u64, u64)> {
+    let mut buckets = std::collections::BTreeMap::<String, (u64, u64)>::new();
+    for (_, usage) in runtime
+        .bucket_usage_all_groups()
+        .await
+        .expect("bucket usage")
+    {
+        for row in usage.buckets {
+            let entry = buckets.entry(row.bucket_id).or_default();
+            entry.0 = entry.0.saturating_add(row.usage.committed_write_units);
+            entry.1 = entry.1.saturating_add(row.usage.stream_count);
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(bucket, (units, streams))| (bucket, units, streams))
+        .collect()
+}
+
+/// F20: a deleted stream's end record stays until the sweep folds it into
+/// its bucket's usage, once its retention passed. A group's first pass
+/// seeds its retirement clock, which dates the end records the group held
+/// then by their removal times: one removed half a retention before the
+/// seed folds half a retention later by the pass's wall clock, and one
+/// removed at least the retention before folds at once. An end record
+/// removed after the seed is due only once this replica's samples are the
+/// retention old, whatever the wall clock says. The bucket's totals never
+/// move.
+#[tokio::test]
+async fn the_sweep_folds_end_records_past_their_retention() {
+    // A retention of a minute.
+    let bound = std::time::Duration::from_secs(120);
+    let runtime = spawn();
+    let delete = |index: usize, now_ms: u64| {
+        let runtime = &runtime;
+        async move {
+            runtime
+                .delete_stream(DeleteStreamRequest {
+                    stream_id: BucketStreamId::new("retire", format!("s-{index:02}")),
+                    now_ms,
+                    if_incarnation: None,
+                })
+                .await
+                .expect("delete");
+        }
+    };
+    for index in 0..50 {
+        let stream_id = BucketStreamId::new("retire", format!("s-{index:02}"));
+        let mut request = CreateStreamRequest::new(stream_id.clone(), DEFAULT_CONTENT_TYPE);
+        request.now_ms = 1;
+        runtime.create_stream(request).await.expect("create");
+    }
+    // Twenty a whole retention before the first pass, twenty half a
+    // retention before it.
+    for index in 0..40 {
+        delete(index, if index < 20 { 2 } else { 30_002 }).await;
+    }
+    let before = bucket_committed(&runtime).await;
+    assert_eq!(before, vec![("retire".to_owned(), 50, 10)]);
+
+    let pass = |now_ms: u64| {
+        let runtime = &runtime;
+        async move {
+            let mut request = tidy(0, 16, now_ms);
+            request.deleted_data_max_age = bound;
+            runtime
+                .tidy_streams_all_groups_once(request)
+                .await
+                .into_result()
+                .expect("a sweep pass")
+        }
+    };
+    let report = pass(60_002).await;
+    assert_eq!(report.end_records_retired, 20, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 0, "{report:?}");
+    assert_eq!(report.expiry_due_groups, 0, "{report:?}");
+    assert_eq!(bucket_committed(&runtime).await, before);
+
+    // Ten removed after the seed, dated long before the pass's clock.
+    for index in 40..50 {
+        delete(index, 0).await;
+    }
+    // Half a retention before the next pass's clock is not yet a whole one.
+    let report = pass(90_001).await;
+    assert_eq!(report.end_records_retired, 0, "{report:?}");
+    assert_eq!(report.expiry_sweeps, 0, "{report:?}");
+    // Half a retention after the seed, the twenty held at the seed are
+    // due, and the ten removed after it are not.
+    let report = pass(90_002).await;
+    assert_eq!(report.end_records_retired, 20, "{report:?}");
+    let report = pass(10_000_000).await;
+    assert_eq!(report.end_records_retired, 0, "{report:?}");
+    assert_eq!(report.expiry_sweeps, 0, "{report:?}");
+    assert_eq!(bucket_committed(&runtime).await, vec![(
+        "retire".to_owned(),
+        50,
+        0
+    )]);
+    // `/__ursula/metrics` counts the folds this node's replicas applied.
+    assert_eq!(runtime.metrics().snapshot().usage_end_records_retired, 40);
 }

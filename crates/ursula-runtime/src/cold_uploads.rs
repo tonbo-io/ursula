@@ -167,7 +167,7 @@ pub fn uploaded_object(command: &StreamCommand) -> Option<&str> {
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::NewHistory { .. }
         | StreamCommand::TidyStream { .. }
-        | StreamCommand::ExpireStreams { .. }
+        | StreamCommand::Sweep { .. }
         | StreamCommand::OffloadColdRefs { .. } => None,
     }
 }

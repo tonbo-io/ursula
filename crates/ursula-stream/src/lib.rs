@@ -24,6 +24,9 @@
 //!   ([`SharedRefCandidate`], F2), orphan-sweep references (F14h) and
 //!   staged external-ref offload discovery ([`StagedExternalRefCandidate`],
 //!   F5).
+//! - [`usage`]: per-stream usage (F20): each version's committed counters
+//!   and applied appends, counted at the bucket counter's call sites, and
+//!   the end record a removal leaves.
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
@@ -36,6 +39,7 @@ mod response;
 pub mod sim_controls;
 mod snapshot;
 mod state_machine;
+mod usage;
 mod validate;
 
 pub use command::COMMAND_LOG_OVERHEAD_BYTES;
@@ -109,6 +113,7 @@ pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
+pub use state_machine::MAX_END_RECORDS;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
 pub use state_machine::RemovedState;
@@ -121,5 +126,15 @@ pub use state_machine::SharedRefIdleTracker;
 pub use state_machine::StagedExternalRefCandidate;
 pub use state_machine::StreamStateMachine;
 pub use state_machine::plan_shared_ref_run;
+pub use usage::BucketRetired;
+pub use usage::CommittedUsage;
+pub use usage::EndRecord;
+pub use usage::LastWrite;
+pub use usage::StreamEnd;
+pub use usage::UsageCounter;
+pub use usage::UsageSnapshot;
+pub use usage::UsageSnapshotError;
+pub use usage::VersionCounters;
+pub use usage::VersionUsage;
 pub use validate::validate_bucket_id;
 pub use validate::validate_stream_id;

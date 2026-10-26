@@ -152,7 +152,7 @@ Simulation seams:
 | `pipeline-smoke-runtime-raft-network-leader-failover-read-corruption` | 252-256 | runtime + Raft | post-failover read expectation | `runtime_raft_network_leader_failover_no_loss_or_dup` | nightly |
 | `runtime-raft-network-leader-failover-cold-live-read-failures` | 327-331 | runtime + Raft + cold | leader failover, truncated cold read | `runtime_raft_network_leader_failover_cold_live_read_integrity` | nightly |
 | `runtime-raft-network-randomized-cold-read-failures` | 322-326 | runtime + Raft + cold | truncated cold read | `runtime_raft_network_cold_live_read_integrity` | nightly |
-| `runtime-raft-snapshot-install-failures` | 232-236 | runtime + Raft | corrupted snapshot append counts | `runtime_raft_snapshot_install_integrity` | nightly |
+| `runtime-raft-snapshot-install-failures` | 232-236 | runtime + Raft | corrupted applied appends in a snapshot's stream usage | `runtime_raft_snapshot_install_integrity` | nightly |
 | `runtime-raft-network-cold-live-truncate-failures` | 222-226 | runtime + Raft + cold | partition, heal, truncated cold read | `runtime_raft_network_cold_live_read_integrity` | nightly |
 | `runtime-raft-network-cold-live-write-failures` | 312-316 | runtime + Raft + cold | partition, heal, failed cold write | `runtime_raft_network_cold_live_write_integrity` | nightly |
 | `runtime-raft-network-partition-failures` | 212-216 | runtime + Raft | partition without heal | `runtime_raft_network_follower_catchup` | manual |
@@ -306,7 +306,7 @@ Each invariant helper records `SimEvent::InvariantFailed { invariant, ... }` in 
 | `runtime_raft_network_close_state` | closed flag survives, append after close is rejected | randomized |
 | `runtime_raft_network_snapshot_publish_read` | latest and exact snapshot reads and bootstrap agree | randomized |
 | `runtime_raft_network_cold_live_read_integrity`, `runtime_raft_network_cold_live_write_integrity`, `runtime_raft_network_leader_failover_cold_live_read_integrity` | cold/live reads after cold faults, recovery or failover | cold-live families |
-| `runtime_raft_snapshot_install_integrity` | a restored runtime continues append counts and offsets from the snapshot | snapshot-install families |
+| `runtime_raft_snapshot_install_integrity` | a restored runtime continues each stream version's applied appends and offsets from the snapshot | snapshot-install families |
 | `http_producer_retry_idempotence`, `http_live_sse_delivery`, `http_live_waiter_backpressure`, `http_snapshot_protocol_surface_read` | producer retry, SSE delivery, waiter backpressure and snapshot read through the axum handlers | HTTP families |
 | `http_protocol_randomized_read_your_write`, `http_protocol_randomized_sse_delivery`, `http_protocol_randomized_live_waiter_backpressure` | the same properties under a seeded plan | `http-protocol-surface-randomized*` |
 

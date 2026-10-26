@@ -2105,12 +2105,18 @@ fn producer_refusal_message(answer: &ProducerAnswer) -> String {
 /// reclaimed before the report returns, and finally erases and proves empty
 /// `{bucket}/`. Idempotent — purging an absent bucket returns the same
 /// report shape with zero counts, and a crashed purge converges on re-run
-/// because cold reclamation is list-then-delete over object prefixes.
+/// because cold reclamation is list-then-delete over object prefixes. The
+/// handler stamps the purge's `now_ms` once, and every group ends the
+/// bucket's streams at it.
 pub(crate) async fn purge_bucket(
     State(state): State<HttpState>,
     Path(bucket): Path<String>,
 ) -> Response {
-    let report = match purge_every_group(&state, &bucket).await {
+    let request = ursula_runtime::PurgeBucketRequest {
+        bucket_id: bucket.clone(),
+        now_ms: state.unix_time_ms(),
+    };
+    let report = match purge_every_group(&state, &request).await {
         Ok(report) => report,
         Err(err) => return purge_error_response(err),
     };
@@ -2138,7 +2144,7 @@ pub(crate) async fn purge_bucket(
     // queue after reclamation. The number reclaimed by one pass is only
     // diagnostic: delayed entries, a partial failure, or another leader's
     // background worker can all make it zero without proving cold absence.
-    let proof = match purge_every_group(&state, &bucket).await {
+    let proof = match purge_every_group(&state, &request).await {
         Ok(report) => report,
         Err(err) => return purge_error_response(err),
     };
@@ -2176,14 +2182,15 @@ pub(crate) async fn purge_bucket(
     .into_response()
 }
 
-/// Purges `bucket` from every Raft group: in place in the groups this node
-/// hosts a replica of, and through its leader each group it hosts none of
+/// Purges the request's bucket from every Raft group: in place in the
+/// groups this node hosts a replica of, and through its leader each group
+/// it hosts none of
 /// ([`ursula_raft::RaftGroupHandleRegistry::purge_bucket_through_leader`]).
 async fn purge_every_group(
     state: &HttpState,
-    bucket: &str,
+    request: &ursula_runtime::PurgeBucketRequest,
 ) -> Result<ursula_runtime::PurgeBucketReport, RuntimeError> {
-    let mut report = state.runtime.purge_bucket_all_groups(bucket).await?;
+    let mut report = state.runtime.purge_bucket_all_groups(request).await?;
     for placement in std::mem::take(&mut report.not_hosted) {
         // Only a Raft node hosts some groups and not others.
         let Some(registry) = state.raft_registry() else {
@@ -2193,7 +2200,7 @@ async fn purge_every_group(
             });
         };
         let response = registry
-            .purge_bucket_through_leader(placement, bucket)
+            .purge_bucket_through_leader(placement, request)
             .await
             .map_err(|error| RuntimeError::GroupEngine {
                 core_id: placement.core_id,

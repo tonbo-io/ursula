@@ -198,7 +198,7 @@ impl StreamRegistry {
     /// `false` is exact: every live stream with an expiry has one armed
     /// entry at or before its true expiry, so a front past `now_ms` means
     /// no stream has expired. `true` may come from a stale entry, of a
-    /// stream that was removed or renewed since. An `ExpireStreams` at
+    /// stream that was removed or renewed since. A `Sweep` at
     /// `now_ms` still makes progress on it: [`Self::pop_expired`] discards
     /// or re-arms that front.
     pub(super) fn ttl_front_due(&self, now_ms: u64) -> bool {
@@ -267,6 +267,9 @@ mod tests {
     use crate::model::StreamStatus;
     use crate::state_machine::HotBuffer;
     use crate::state_machine::StreamColdState;
+    use crate::usage::LastWrite;
+    use crate::usage::VersionCounters;
+    use crate::usage::VersionUsage;
 
     fn slot(
         name: &str,
@@ -294,7 +297,13 @@ mod tests {
             retired_epoch_watermark: None,
             history: 0,
             inherited: None,
-            append_count: 0,
+            usage: VersionUsage {
+                seq: 1,
+                counters: VersionCounters::default(),
+                history_baseline: VersionCounters::default(),
+                last_write: LastWrite::At(now),
+                counted_since: std::num::NonZeroU64::MIN,
+            },
         }
     }
 

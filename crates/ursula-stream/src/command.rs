@@ -137,12 +137,16 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
     },
-    /// Administrator-triggered tenant offboarding: removes every stream in
-    /// the bucket and the bucket itself in this group. Monotonic
-    /// aggregate usage is retained for asynchronous accounting. Idempotent —
-    /// purging an absent bucket reports zero removals.
+    /// Administrator-triggered tenant offboarding: removes every stream the
+    /// bucket owns in this group, in stream-id order, each ending `Purged`
+    /// at `now_ms`, then the bucket, and installs its erasure fence.
+    /// Monotonic aggregate usage is retained for asynchronous accounting.
+    /// Idempotent: purging an absent bucket reports zero removals.
     PurgeBucket {
         bucket_id: String,
+        /// The admin request's clock, one value for every group of one
+        /// purge: the purged versions' `ended_at_ms`.
+        now_ms: u64,
     },
     /// Confirms the leader's background worker has physically reclaimed every
     /// queued cold-GC entry with `seq <= up_to_seq`; removes them from the
@@ -208,16 +212,23 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
     },
-    /// Removes up to `limit` streams that expired at `now_ms` (bounded-state
-    /// F0), earliest expiry first, then by bucket and stream id. A group's
-    /// leader proposes it in its background sweep at its clock less a grace.
-    /// The removed set is a function of replicated state, `now_ms` and
-    /// `limit`, so every replica, restored or replayed, removes the same
-    /// streams. Group-scoped: it names no stream and refuses nothing. No
-    /// other command removes a stream it does not name.
-    ExpireStreams {
+    /// The group's sweep (bounded-state F0, F20). Removes up to `limit`
+    /// streams expired at `now_ms`, earliest expiry first, then by bucket
+    /// and stream id, each ending `Expired`. Then folds into their buckets'
+    /// retired usage up to `limit` end records whose seqs are at or below
+    /// `retire_through`, lowest seq first. Only end records that the group
+    /// held before the entry fold, so the entry never folds its own
+    /// removals. A group's leader proposes it in its tidy pass: `now_ms` is
+    /// its wall clock less a grace, `retire_through` the usage seq its
+    /// monotonic clock saw half of its `raft.deleted_data_max_age` ago. The
+    /// effect is a function of replicated state and the three fields, so
+    /// every replica, replayed or restored, removes and folds the same.
+    /// Group-scoped: it names no stream and refuses nothing. No other
+    /// command removes a stream it does not name.
+    Sweep {
         now_ms: u64,
         limit: NonZeroU32,
+        retire_through: u64,
     },
     /// Bounded-state F5: removes `refs` from the stream's
     /// state-held external payload locators after the leader wrote their
@@ -384,7 +395,7 @@ impl fmt::Display for StreamCommand {
             ),
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
             Self::DeleteStream { stream_id, .. } => write!(f, "delete_stream:{stream_id}"),
-            Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
+            Self::PurgeBucket { bucket_id, .. } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
             Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
             Self::ImportSnapshot {
@@ -397,9 +408,14 @@ impl fmt::Display for StreamCommand {
             ),
             Self::NewHistory { history, .. } => write!(f, "new_history:{history:#x}"),
             Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
-            Self::ExpireStreams { now_ms, limit } => {
-                write!(f, "expire_streams:now_ms={now_ms}:limit={limit}")
-            }
+            Self::Sweep {
+                now_ms,
+                limit,
+                retire_through,
+            } => write!(
+                f,
+                "sweep:now_ms={now_ms}:limit={limit}:retire_through={retire_through}"
+            ),
             Self::OffloadColdRefs { stream_id, refs } => {
                 write!(f, "offload_cold_refs:{stream_id}:{} refs", refs.len())
             }

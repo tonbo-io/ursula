@@ -3070,7 +3070,7 @@ mod tests {
             },
             group_commit_index: 0,
             stream_snapshot: Default::default(),
-            stream_append_counts: Vec::new(),
+            usage: Default::default(),
         }))
         .collect::<Result<Vec<_>, _>>()
         .expect("encode test group snapshot")

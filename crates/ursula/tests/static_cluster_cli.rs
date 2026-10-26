@@ -2049,7 +2049,9 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     ));
     remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
-    let max_age = Duration::from_secs(16);
+    // The floor with a 2 s install timeout and inline snapshots:
+    // 8 * (1 s + 2 s).
+    let max_age = Duration::from_secs(24);
     let config = root.join("node.toml");
     let wal_dir = root.join("node-log");
     let admin_port = write_single_node_cluster_config(&config, port, 1, 1, &base_url, &wal_dir);
@@ -2059,7 +2061,7 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
         &config,
         text.replace(
             "[raft]\n",
-            "[raft]\ndeleted_data_max_age = \"16s\"\n\
+            "[raft]\ndeleted_data_max_age = \"24s\"\n\
              install_snapshot_timeout = \"2s\"\n",
         )
         .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n"),
@@ -2291,7 +2293,9 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     ));
     remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
-    let max_age = Duration::from_secs(160);
+    // The floor with a 20 s install timeout and S3 snapshots:
+    // 8 * (5 s + 20 s).
+    let max_age = Duration::from_secs(200);
     let mut configs = Vec::new();
     let mut admins = Vec::new();
     for (node_id, port) in (1_u64..).zip(ports) {
@@ -2315,7 +2319,7 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
             &config,
             text.replace(
                 "[raft]\n",
-                "[raft]\ndeleted_data_max_age = \"160s\"\n\
+                "[raft]\ndeleted_data_max_age = \"200s\"\n\
                  install_snapshot_timeout = \"20s\"\n",
             )
             .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n")
@@ -8074,14 +8078,15 @@ async fn cli_an_s3_backed_node_refuses_a_non_inline_meta_record() {
 const LIFECYCLE_WAIT: Duration = Duration::from_secs(300);
 
 /// How long the teardown test waits for a retired log's frames to leave
-/// its source's journal: its `raft.deleted_data_max_age` of 160 s, a quarter
+/// its source's journal: its `raft.deleted_data_max_age` of 200 s, a quarter
 /// of which is the age at which a segment holding dead frames is given back,
 /// and a margin.
 const JOURNAL_RECLAIM_WAIT: Duration = Duration::from_secs(220);
 
 /// Rewrites `node`'s config for the teardown test, as the S3 deleted-data
 /// test does: a journal segment that holds dead frames is given back once
-/// they are 40 s old (`raft.deleted_data_max_age` of 160 s), segments are
+/// they are 50 s old (`raft.deleted_data_max_age` of 200 s, the floor with a
+/// 20 s install timeout and S3 snapshots), segments are
 /// 64 KiB so that a few writes seal them, and a follower's install copy
 /// fits inside a 20 s `raft.install_snapshot_timeout`.
 ///
@@ -8096,7 +8101,7 @@ fn bound_dead_journal_data(node: &MetaNode) {
     let text = text
         .replace(
             "[raft]\n",
-            "[raft]\ndeleted_data_max_age = \"160s\"\ninstall_snapshot_timeout = \"20s\"\n",
+            "[raft]\ndeleted_data_max_age = \"200s\"\ninstall_snapshot_timeout = \"20s\"\n",
         )
         .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n")
         + "\n[storage.snapshot]\ns3_timeout = \"1500ms\"\ns3_max_retries = 1\n";

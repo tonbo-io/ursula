@@ -1,11 +1,12 @@
 //! Leader-side tidy driver (bounded-stream-state F0).
 //!
-//! Expired streams and idle streams with debt (receipts beyond the window,
-//! idle producers, producers over the cap) keep their state until something
-//! normalizes them. Every [`crate::expiry_sweep::interval`] of
-//! `raft.deleted_data_max_age`, each group this node leads removes the
-//! streams that expired in it with `ExpireStreams` entries, at most
-//! [`crate::expiry_sweep::MAX_COMMANDS_PER_GROUP`] of them, for at most
+//! Expired streams, end records and idle streams with debt (receipts beyond
+//! the window, idle producers, producers over the cap) keep their state
+//! until something normalizes them. Every [`crate::expiry_sweep::interval`]
+//! of `raft.deleted_data_max_age`, every group this node hosts samples its
+//! retirement clock, and each group this node leads removes the streams
+//! that expired in it and folds its due end records with `Sweep` entries,
+//! at most [`crate::expiry_sweep::MAX_COMMANDS_PER_GROUP`] of them, for at most
 //! [`crate::expiry_sweep::GROUP_BUDGET`]. A pass that stops a group at that
 //! cap or budget is followed by another [`crate::expiry_sweep::MIN_INTERVAL`]
 //! later, with the shorter [`crate::expiry_sweep::RERUN_BUDGET`], until the
@@ -27,7 +28,7 @@ pub const TIDY_INTERVAL: Duration = Duration::from_secs(60);
 /// `TidyStream` commands one pass proposes per group.
 pub const TIDY_MAX_STREAMS_PER_GROUP: usize = 64;
 
-/// Which expiry sweep a tick runs.
+/// Which group sweep a tick runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sweep {
     /// The sweep every interval.
@@ -122,8 +123,9 @@ fn later(now: Instant, pause: Duration) -> Instant {
     now.checked_add(pause).unwrap_or(now)
 }
 
-/// Start the periodic tidy driver, which sweeps expired streams every
-/// [`expiry_sweep::interval`] of `deleted_data_max_age`.
+/// Start the periodic tidy driver, which sweeps every
+/// [`expiry_sweep::interval`] of `deleted_data_max_age` and folds end
+/// records its `RaftConfig::end_record_retention` after their removal.
 pub fn spawn_tidy_worker(runtime: &ShardRuntime, deleted_data_max_age: Duration) {
     let runtime = runtime.clone();
     let mut schedule = Schedule::new(expiry_sweep::interval(deleted_data_max_age), Instant::now());
@@ -144,6 +146,7 @@ pub fn spawn_tidy_worker(runtime: &ShardRuntime, deleted_data_max_age: Duration)
                         0
                     },
                     expiry_sweep_budget: tick.sweep.map_or(Duration::ZERO, Sweep::budget),
+                    deleted_data_max_age,
                     now_ms: crate::runtime::unix_time_ms(),
                 })
                 .await;
@@ -166,9 +169,10 @@ pub fn spawn_tidy_worker(runtime: &ShardRuntime, deleted_data_max_age: Duration)
                 tracing::info!(
                     sweeps = report.expiry_sweeps,
                     swept_streams = report.expiry_swept_streams,
+                    retired_end_records = report.end_records_retired,
                     due_groups = report.expiry_due_groups,
                     capped_groups = report.expiry_capped_groups,
-                    "expiry sweep completed"
+                    "group sweep completed"
                 );
             }
             if let Some(err) = pass.error {

@@ -30,6 +30,7 @@ use ursula_runtime::KnownLeader;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::Proposal;
+use ursula_runtime::PurgeBucketRequest;
 use ursula_runtime::PurgeBucketResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
@@ -220,17 +221,19 @@ pub(crate) async fn forward_group_read_to_leader(
 /// Raft-group leader. Ordinary client writes intentionally do not use this
 /// path: their admission checks must run on the serving leader before
 /// replication. PurgeBucket has no per-stream admission step, and constraining
-/// this helper to that exact command keeps the exception narrow.
+/// this helper to that exact command keeps the exception narrow. The
+/// request's `now_ms` travels as it is, so every group of one purge ends
+/// its streams at the same time.
 pub(crate) async fn forward_purge_bucket_to_leader(
     route: &LeaderRoute,
     placement: ShardPlacement,
-    bucket_id: String,
+    purge: PurgeBucketRequest,
 ) -> Result<PurgeBucketResponse, GroupEngineError> {
     let mut request = raft_internal_proto::GroupWriteRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
         command_payloads: vec![encode_wire(&RaftCommand::Stream(
-            ursula_stream::StreamCommand::PurgeBucket { bucket_id },
+            ursula_stream::StreamCommand::from(purge),
         ))],
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
@@ -279,7 +282,7 @@ impl crate::RaftGroupHandleRegistry {
     pub async fn purge_bucket_through_leader(
         &self,
         placement: ShardPlacement,
-        bucket_id: &str,
+        request: &PurgeBucketRequest,
     ) -> Result<PurgeBucketResponse, GroupEngineError> {
         let candidates = {
             let peers = self.peer_cluster().directory();
@@ -314,8 +317,7 @@ impl crate::RaftGroupHandleRegistry {
                     leader_id: node,
                     address,
                 };
-                match forward_purge_bucket_to_leader(&route, placement, bucket_id.to_owned()).await
-                {
+                match forward_purge_bucket_to_leader(&route, placement, request.clone()).await {
                     Err(GroupEngineError::NotLeader(refusal)) => {
                         if refusal.proposal == Proposal::MayHaveCommitted {
                             proposal = Proposal::MayHaveCommitted;

@@ -107,7 +107,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         0
     });
     let base = Baseline::now();
-    let mut m = StreamStateMachine::new();
+    let mut m = StreamStateMachine::with_genesis(std::num::NonZeroU64::MIN);
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
@@ -161,12 +161,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         }
         let tail = m.head(&id).map_or(0, |h| h.tail_offset);
         let hot = m.hot_payload_len(&id).unwrap_or(0);
-        let measured = measure_sm(
-            &m,
-            &base,
-            smx::append_counts(std::slice::from_ref(&id), &[appends]),
-            args.zstd,
-        )?;
+        let measured = measure_sm(&m, &base, args.zstd)?;
         formula::per_stream_checks(&mut outcome, &measured, 0);
         if args.retain_every > 0 && retentions > 0 {
             formula::capacity_check(&mut outcome, &measured);
@@ -223,13 +218,13 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     }
 
     if args.restore {
-        let snapshot = codec::group_snapshot(m.snapshot(), Vec::new(), 0);
+        let snapshot = codec::group_snapshot(&m, 0);
         let bytes = codec::encode_bytes(snapshot)?;
         drop(m);
         let before = crate::alloc::heap();
         let started = Instant::now();
         let decoded = codec::decode(&bytes)?;
-        let restored = StreamStateMachine::restore(decoded.stream_snapshot)
+        let restored = StreamStateMachine::restore_group(decoded.stream_snapshot, decoded.usage)
             .map_err(|err| anyhow::anyhow!("restore: {err:?}"))?;
         let restore_ms = started.elapsed().as_secs_f64() * 1e3;
         let after = crate::alloc::heap();

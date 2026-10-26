@@ -5,8 +5,11 @@
 //! ratchet file records which targets are met, so a regression (a met target
 //! lost) fails and an improvement is reported for tightening.
 
+use crate::codec::SnapStats;
 use crate::out::Measured;
 use crate::out::Outcome;
+use crate::out::ratio;
+use crate::out::round3;
 
 /// Producer ids per stream (F3).
 pub const MAX_PRODUCERS: u64 = 4_096;
@@ -55,6 +58,36 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
         "TTL heap entries <= 2 x live TTL streams (F8)",
         g.ttl_heap_entries as f64,
         g.ttl_streams.saturating_mul(2) as f64,
+    );
+}
+
+/// The group snapshot bytes one end record holds (F20, bounded-state I2):
+/// the 122-byte id limit plus about 128 B of fields, rounded up.
+pub const MAX_END_RECORD_BYTES: u64 = 256;
+
+/// F20 before the sweep folds the removals' end records: how many the group
+/// holds and what each adds to its snapshot, at most
+/// [`MAX_END_RECORD_BYTES`].
+pub fn end_records_held(outcome: &mut Outcome, snap: &SnapStats) {
+    let per_removal = ratio(snap.end_record_bytes, snap.end_record_frames);
+    outcome.metric_u64("end_records_before_retire", snap.end_record_frames);
+    outcome.metric("end_record_bytes_per_removal", round3(per_removal));
+    outcome.check(
+        "f20_end_record_bytes_per_removal",
+        "an end record adds at most 256 B to a group snapshot (F20)",
+        per_removal,
+        MAX_END_RECORD_BYTES as f64,
+    );
+}
+
+/// F20 after the sweep folded through the latest usage seq: the group's
+/// snapshot holds no end record.
+pub fn end_records_retired(outcome: &mut Outcome, m: &Measured) {
+    outcome.check(
+        "f20_end_records_after_retire",
+        "no end record is left once the sweep folded through the latest seq (F20)",
+        m.snap.end_record_frames as f64,
+        0.0,
     );
 }
 

@@ -1385,7 +1385,6 @@ async fn single_node_openraft_group_applies_client_writes() {
     {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
-            assert_eq!(response.stream_append_count, 1);
         }
         other => panic!("unexpected append response: {other:?}"),
     }
@@ -4011,13 +4010,15 @@ async fn openraft_state_machine_applies_group_write_commands() {
 
     let snapshot = sm.group_snapshot().await.expect("snapshot");
     assert_eq!(snapshot.group_commit_index, 3);
-    assert_eq!(snapshot.stream_append_counts.len(), 1);
-    assert_eq!(snapshot.stream_append_counts[0].append_count, 1);
+    assert_eq!(snapshot.usage.streams.len(), 1);
+    assert_eq!(snapshot.usage.streams[0].counters.appends, 1);
 }
 
 /// #669: an applied entry that removes streams records what they held in a
 /// group snapshot, their hot bytes and the per-command overhead each, for a
-/// deletion and a bucket purge alike. Other entries record nothing.
+/// deletion and a bucket purge alike. A `Sweep` that only folds end records
+/// records what they held, their ids and a fixed 128 B each (F20). Other
+/// entries record nothing.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn applied_removals_record_what_the_snapshot_held() {
@@ -4028,6 +4029,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
     let deleted = bsid("removal-deleted");
     let purged = ursula_shard::BucketStreamId::new("removal-purged", "a");
     let empty = ursula_shard::BucketStreamId::new("removal-purged", "b");
+    let folded = [deleted.clone(), purged.clone(), empty.clone()];
     let mut sm = RaftGroupStateMachine::new(placement());
     apply_entries(&mut sm, vec![
         normal_entry(1, genesis_command()),
@@ -4059,6 +4061,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
         9,
         RaftCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
             bucket_id: "removal-purged".to_owned(),
+            now_ms: 9,
         }),
     )])
     .await;
@@ -4072,6 +4075,26 @@ async fn applied_removals_record_what_the_snapshot_held() {
     )])
     .await;
     assert_eq!(owed(&sm), purged_bytes);
+    // The sweep expires nothing and folds the three end records.
+    apply_entries(&mut sm, vec![normal_entry(
+        11,
+        RaftCommand::Stream(ursula_stream::StreamCommand::Sweep {
+            now_ms: 11,
+            limit: std::num::NonZeroU32::new(256).expect("not zero"),
+            retire_through: u64::MAX,
+        }),
+    )])
+    .await;
+    assert_eq!(sm.engine.state_gauges().end_records, 0);
+    let folded_bytes = folded
+        .iter()
+        .map(|id| {
+            u64::try_from(id.bucket_id.len().saturating_add(id.stream_id.len()))
+                .expect("fits")
+                .saturating_add(128)
+        })
+        .fold(0, u64::saturating_add);
+    assert_eq!(owed(&sm), purged_bytes.saturating_add(folded_bytes));
 }
 
 /// Applies `entries` to `sm` in one batch.
@@ -4122,10 +4145,21 @@ async fn openraft_snapshot_round_trips_group_state() {
     match appended {
         GroupWriteResponse::Append(response) => {
             assert_eq!(response.start_offset, 7);
-            assert_eq!(response.stream_append_count, 2);
         }
         other => panic!("unexpected append response: {other:?}"),
     }
+    // The installed version kept its usage, and counted this append on top
+    // of it, under the next seq (F20).
+    let source_usage = source.group_snapshot().await.expect("snapshot").usage;
+    let installed = target.group_snapshot().await.expect("snapshot").usage;
+    assert_eq!(installed.genesis, source_usage.genesis);
+    assert_eq!(installed.streams.len(), 1);
+    assert_eq!(installed.streams[0].counters.appends, 2);
+    assert_eq!(installed.streams[0].seq, source_usage.usage_seq + 1);
+    assert_eq!(
+        installed.streams[0].counted_since,
+        source_usage.streams[0].counted_since
+    );
 }
 
 /// A forwarded read carries `leader_only` (field 6) to the leader over gRPC,
@@ -5114,12 +5148,16 @@ fn expiring_create(stream_id: ursula_shard::BucketStreamId, expires_at_ms: u64) 
     RaftCommand::Stream(StreamCommand::from(request))
 }
 
+/// The default `raft.deleted_data_max_age`.
+const DELETED_DATA_MAX_AGE: Duration = ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE;
+
 /// #669: a group's leader sweeps the streams that expired in it in its
-/// tidy pass, and the only entries the sweep appends are `ExpireStreams` at
-/// its clock less the grace, each removing up to 256 streams.
+/// tidy pass, and the only entries the sweep appends are `Sweep` at its
+/// clock less the grace, each removing up to 256 streams. Their end
+/// records are not due yet, so the entries fold nothing.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
+async fn a_leader_sweeps_expired_streams_with_sweep_entries() {
     let (_wal_root, wal) = fresh_wal();
     let log_store = reopen_journal_store(&wal);
     let mut engine =
@@ -5159,6 +5197,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                deleted_data_max_age: DELETED_DATA_MAX_AGE,
                 now_ms: 20_000,
             },
             placement(),
@@ -5186,9 +5225,10 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
             matches!(
                 &entry.payload,
                 EntryPayload::Normal(RaftCommand::Stream(
-                    ursula_stream::StreamCommand::ExpireStreams {
+                    ursula_stream::StreamCommand::Sweep {
                         now_ms: 19_000,
                         limit,
+                        retire_through: 0,
                     }
                 )) if limit.get() == 256
             ),
@@ -5206,6 +5246,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
                 expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                deleted_data_max_age: DELETED_DATA_MAX_AGE,
                 now_ms: 20_000,
             },
             placement(),
@@ -5245,6 +5286,7 @@ async fn a_follower_proposes_no_expiry_sweep() {
         max_streams: 0,
         max_expiry_sweeps: 16,
         expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+        deleted_data_max_age: DELETED_DATA_MAX_AGE,
         now_ms: 20_000,
     };
     let report = engines[follower_index]
@@ -5283,6 +5325,140 @@ async fn a_follower_proposes_no_expiry_sweep() {
             "the replica still holds the expired stream: {read:?}"
         );
     }
+    shutdown_all(&engines).await;
+}
+
+/// Waits until every engine applied the entry at `index`.
+#[cfg(not(madsim))]
+async fn applied_everywhere(engines: &[RaftGroupEngine], index: u64) {
+    for engine in engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(index), "replicated")
+            .await
+            .expect("wait for the entry");
+    }
+}
+
+/// F20: the leader's sweep folds the end records its replica's retirement
+/// clock finds due, with the watermark in the entry, and every replica
+/// folds the same ones. The clock seeds at its first sample and dates the
+/// end records held then by their removal times, so records removed the
+/// retention before the pass fold in that pass, and later ones once the
+/// pass's wall clock is the retention past them. A record removed after the
+/// seed waits for the samples, whatever the wall clock says.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_leader_retires_due_end_records_on_every_replica() {
+    let (_registry, mut engines, leader_id, _wal_roots) =
+        build_three_node_cluster("ursula-end-record-retirement-test", None).await;
+    let leader_index = usize::try_from(leader_id.saturating_sub(1)).expect("leader id fits usize");
+    let follower_index = if leader_index == 0 { 1 } else { 0 };
+    wait_history(&engines[leader_index]).await;
+    let delete = |stream_id: ursula_shard::BucketStreamId, now_ms: u64| {
+        RaftCommand::Stream(ursula_stream::StreamCommand::DeleteStream { stream_id, now_ms })
+    };
+    let mut last_index = 0;
+    for index in 0..4 {
+        last_index = engines[leader_index]
+            .raft
+            .client_write(create_command(bsid(&format!("deleted-{index}"))))
+            .await
+            .expect("create a stream")
+            .log_id
+            .index();
+    }
+    for (index, deleted_at_ms) in [(0, 10_000), (1, 10_000), (2, 90_000)] {
+        last_index = engines[leader_index]
+            .raft
+            .client_write(delete(bsid(&format!("deleted-{index}")), deleted_at_ms))
+            .await
+            .expect("delete the stream")
+            .log_id
+            .index();
+    }
+    applied_everywhere(&engines, last_index).await;
+    // A minute's retention at a clock of 70 s: the two records removed at
+    // 10 s are due, the one removed at 90 s is not.
+    let request = ursula_runtime::TidyStreamsRequest {
+        max_streams: 0,
+        max_expiry_sweeps: 16,
+        expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+        deleted_data_max_age: Duration::from_secs(120),
+        now_ms: 70_000,
+    };
+    let report = engines[follower_index]
+        .tidy_streams(request, placement())
+        .await
+        .into_result()
+        .expect("a follower's pass");
+    assert_eq!(report, ursula_runtime::TidyStreamsResponse::default());
+    let report = engines[leader_index]
+        .tidy_streams(request, placement())
+        .await
+        .into_result()
+        .expect("the leader's pass");
+    assert_eq!(report.expiry_sweeps, 1, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 0, "{report:?}");
+    assert_eq!(report.end_records_retired, 2, "{report:?}");
+    assert_eq!(report.expiry_due_groups, 0, "{report:?}");
+    let swept = last_index.saturating_add(1);
+    applied_everywhere(&engines, swept).await;
+    for engine in &engines {
+        let removed = engine
+            .with_applied_state(|state_machine| {
+                Box::pin(async move { state_machine.engine.removed_state() })
+            })
+            .await
+            .expect("access the state machine");
+        assert_eq!(removed.end_records, 2, "{removed:?}");
+        assert_eq!(removed.end_records_early, 0, "{removed:?}");
+    }
+    // A removal after the seed, dated long before any pass's clock.
+    let deleted = engines[leader_index]
+        .raft
+        .client_write(delete(bsid("deleted-3"), 0))
+        .await
+        .expect("delete the stream")
+        .log_id
+        .index();
+    applied_everywhere(&engines, deleted).await;
+    // The record removed at 90 s was held at the seed: it is due once the
+    // wall clock is the retention past it. The one removed after the seed
+    // is not due on the leader's samples: no later pass folds it, whatever
+    // its wall clock.
+    let report = engines[leader_index]
+        .tidy_streams(
+            ursula_runtime::TidyStreamsRequest {
+                now_ms: 150_000,
+                ..request
+            },
+            placement(),
+        )
+        .await
+        .into_result()
+        .expect("a pass past the held record's retention");
+    assert_eq!(report.end_records_retired, 1, "{report:?}");
+    let report = engines[leader_index]
+        .tidy_streams(
+            ursula_runtime::TidyStreamsRequest {
+                now_ms: 1_000_000,
+                ..request
+            },
+            placement(),
+        )
+        .await
+        .into_result()
+        .expect("an idle pass");
+    assert_eq!(report.expiry_sweeps, 0, "{report:?}");
+    let ends = engines[leader_index]
+        .with_applied_state(|state_machine| {
+            Box::pin(async move { state_machine.engine.state_gauges().end_records })
+        })
+        .await
+        .expect("access the state machine");
+    assert_eq!(ends, 1);
     shutdown_all(&engines).await;
 }
 
@@ -5413,7 +5589,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
             placement: placement(),
             group_commit_index: snapshot_log_id.index,
             stream_snapshot: Default::default(),
-            stream_append_counts: Vec::new(),
+            usage: Default::default(),
         };
         let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
             .collect::<Result<Vec<_>, _>>()
@@ -5794,7 +5970,7 @@ async fn queue_state_machine_work(
         placement: placement(),
         group_commit_index: installed_index,
         stream_snapshot: Default::default(),
-        stream_append_counts: Vec::new(),
+        usage: Default::default(),
     };
     let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(group))
         .collect::<Result<Vec<_>, _>>()

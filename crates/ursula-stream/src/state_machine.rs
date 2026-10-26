@@ -12,6 +12,8 @@
 //!   restores a backup as a history event.
 //! - [`history`]: history events (`NewHistory`), the token every response
 //!   renders, and what a stream inherited from the history before (W5).
+//! - [`usage_ledger`]: per-version usage, counted at the bucket counter's
+//!   call sites, and the bucket totals derived from it (F20).
 //! - [`producer_record`]: the producer record and the evaluation of a producer
 //!   write (#581 section 2.3).
 //! - [`producers`]: F3 producer bounds (idle expiry, the producer cap, the
@@ -52,8 +54,6 @@ use crate::json_records::message_count_valid;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
-use crate::model::BucketUsage;
-use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
 use crate::model::ClosedEpoch;
 use crate::model::ColdChunkRef;
@@ -95,6 +95,7 @@ use crate::response::StreamResponse;
 use crate::snapshot::StreamSnapshot;
 use crate::snapshot::StreamSnapshotEntry;
 use crate::snapshot::StreamSnapshotError;
+use crate::usage::VersionUsage;
 use crate::validate::validate_bucket_id;
 use crate::validate::validate_stream_id;
 
@@ -131,6 +132,7 @@ mod producers;
 mod query;
 mod registry;
 mod ttl;
+mod usage_ledger;
 
 /// Size of the self-described derived write unit exported by Ursula.
 ///
@@ -160,10 +162,10 @@ pub struct StreamStateMachine {
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
     shared_cold_object_refs: HashMap<String, u64>,
-    /// Per-bucket committed usage for this group; see [`BucketUsage`] for the
-    /// monotonic-versus-gauge split. Mutated only by the accounting helpers
-    /// below so every counter change stays deterministic and auditable.
-    bucket_usage: HashMap<String, BucketUsage>,
+    /// The usage ledger (F15, F20): the group's genesis, its usage seq, its
+    /// end records and each bucket's retired usage. Bucket totals derive
+    /// from it and the slots ([`Self::bucket_usage_report`]).
+    usage: usage_ledger::UsageLedger,
     /// Derived flush-planner state (bounded-stream-state F10): the streams
     /// that hold hot bytes and the leader-local rotation cursor. Neither is
     /// replicated nor part of snapshots; restore rebuilds the index.
@@ -184,16 +186,23 @@ pub struct StreamStateMachine {
     removed: RemovedState,
 }
 
-/// Streams a group's state machine removed and the bytes they held in a
-/// group snapshot (#669): cumulative since the state machine was built or
-/// restored. A deletion, a bucket purge, a TTL expiry and a create over an
-/// expired stream all remove a stream through one path.
+/// Streams and end records a group's state machine removed and the bytes
+/// they held in a group snapshot (#669): cumulative since the state machine
+/// was built or restored. A deletion, a bucket purge, a TTL expiry and a
+/// create over an expired stream all remove a stream through one path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RemovedState {
     /// Streams removed.
     pub streams: u64,
-    /// What those streams added to a group snapshot: their hot bytes, any
-    /// inline snapshot body, and [`crate::COMMAND_LOG_OVERHEAD_BYTES`] each.
+    /// End records folded into their buckets' retired usage (F20).
+    pub end_records: u64,
+    /// Of those, end records folded early, because a removal found the
+    /// group holding [`MAX_END_RECORDS`].
+    pub end_records_early: u64,
+    /// What those streams and end records added to a group snapshot: a
+    /// stream's hot bytes, any inline snapshot body, and
+    /// [`crate::COMMAND_LOG_OVERHEAD_BYTES`] each, and an end record's
+    /// encoded size.
     pub bytes: u64,
 }
 
@@ -202,10 +211,19 @@ impl RemovedState {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             streams: self.streams.saturating_sub(earlier.streams),
+            end_records: self.end_records.saturating_sub(earlier.end_records),
+            end_records_early: self
+                .end_records_early
+                .saturating_sub(earlier.end_records_early),
             bytes: self.bytes.saturating_sub(earlier.bytes),
         }
     }
 }
+
+/// The most end records a group holds (F20, bounded-state I2). A removal
+/// that would hold more first folds the lowest-seq end record into its
+/// bucket's retired usage. Part of the apply semantics of format epoch 7.
+pub const MAX_END_RECORDS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 struct StreamSlot {
@@ -225,15 +243,39 @@ struct StreamSlot {
     /// What the stream's current history began from: set by the first
     /// write after a history event (W5).
     inherited: Option<InheritedHistory>,
-    /// Runtime append count for this incarnation (F9). Kept by the group
-    /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
-    /// the stream on every removal path (delete, TTL expiry, bucket purge).
-    append_count: u64,
+    /// The version's usage and its seq (F20), its applied appends (F9)
+    /// included.
+    usage: VersionUsage,
 }
 
 impl StreamStateMachine {
+    /// A group before its genesis: it applies nothing but the genesis
+    /// history event, and creates no stream before it.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A group whose genesis history event `history` applied as its first
+    /// entry, the state both engines start a group in (#581 section 4.3).
+    /// For callers that drive the machine without an engine: tests,
+    /// benchmarks and the state probe.
+    pub fn with_genesis(history: std::num::NonZeroU64) -> Self {
+        let mut machine = Self::new();
+        let started = machine.apply_entry(1, StreamCommand::NewHistory {
+            history,
+            now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: crate::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
+        });
+        debug_assert!(
+            matches!(started, StreamResponse::HistoryStarted { .. }),
+            "a genesis event always applies: {started:?}"
+        );
+        machine
     }
 
     /// What this state machine removed since it was built or restored
@@ -343,49 +385,6 @@ impl StreamStateMachine {
         }
     }
 
-    fn usage_mut(&mut self, bucket_id: &str) -> &mut BucketUsage {
-        self.bucket_usage.entry(bucket_id.to_owned()).or_default()
-    }
-
-    /// One accepted (non-deduplicated) append: monotonic counters grow and
-    /// the retained gauge grows by the same bytes.
-    fn usage_on_append(&mut self, bucket_id: &str, payload_bytes: u64, records: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(payload_bytes);
-        usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units = usage
-            .committed_write_units
-            .saturating_add(payload_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
-        usage.retained_bytes = usage.retained_bytes.saturating_add(payload_bytes);
-    }
-
-    /// A newly created stream, including any initial payload it was created
-    /// with.
-    fn usage_on_stream_created(&mut self, bucket_id: &str, initial_bytes: u64, records: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.stream_count = usage.stream_count.saturating_add(1);
-        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(initial_bytes);
-        usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units = usage
-            .committed_write_units
-            .saturating_add(initial_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
-        usage.retained_bytes = usage.retained_bytes.saturating_add(initial_bytes);
-    }
-
-    /// Destructive retention reclaimed `reclaimed_bytes` of logical prefix.
-    fn usage_on_retention(&mut self, bucket_id: &str, reclaimed_bytes: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.retained_bytes = usage.retained_bytes.saturating_sub(reclaimed_bytes);
-    }
-
-    /// A stream left the registry (delete or TTL expiry); its remaining
-    /// retained bytes leave the gauge with it.
-    fn usage_on_stream_removed(&mut self, bucket_id: &str, retained_bytes: u64) {
-        let usage = self.usage_mut(bucket_id);
-        usage.stream_count = usage.stream_count.saturating_sub(1);
-        usage.retained_bytes = usage.retained_bytes.saturating_sub(retained_bytes);
-    }
-
     /// Largest `created_at_ms` assigned by this group (C7).
     pub fn last_created_at_ms(&self) -> u64 {
         self.last_created_at_ms
@@ -420,21 +419,6 @@ impl StreamStateMachine {
 
     fn record_created_at_ms(&mut self, created_at_ms: u64) {
         self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
-    }
-
-    /// Current per-bucket usage for this group, sorted for deterministic
-    /// output.
-    pub fn bucket_usage_report(&self) -> Vec<BucketUsageSnapshot> {
-        let mut report = self
-            .bucket_usage
-            .iter()
-            .map(|(bucket_id, usage)| BucketUsageSnapshot {
-                bucket_id: bucket_id.clone(),
-                usage: *usage,
-            })
-            .collect::<Vec<_>>();
-        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
-        report
     }
 
     /// Per bucket, the summed body length of each live stream's latest
@@ -644,7 +628,9 @@ impl StreamStateMachine {
             StreamCommand::DeleteStream { stream_id, now_ms } => {
                 self.delete_stream(&stream_id, now_ms)
             }
-            StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
+            StreamCommand::PurgeBucket { bucket_id, now_ms } => {
+                self.purge_bucket(&bucket_id, now_ms)
+            }
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
             StreamCommand::DeferColdGc { seq, not_before_ms } => {
                 self.defer_cold_gc(seq, not_before_ms)
@@ -663,7 +649,11 @@ impl StreamStateMachine {
                 leader,
             } => self.new_history(index, history, previous, kept, leader, now_ms),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
-            StreamCommand::ExpireStreams { now_ms, limit } => self.expire_streams(now_ms, limit),
+            StreamCommand::Sweep {
+                now_ms,
+                limit,
+                retire_through,
+            } => self.sweep(now_ms, limit, retire_through),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
             }
@@ -897,8 +887,6 @@ mod derived_boundaries_tests;
 #[cfg(test)]
 mod derived_cold_tests;
 #[cfg(test)]
-mod expire_streams_tests;
-#[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]
 mod history_tests;
@@ -907,4 +895,12 @@ mod hygiene_tests;
 #[cfg(test)]
 mod producer_record_tests;
 #[cfg(test)]
+mod sweep_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_ledger_tests;
+#[cfg(test)]
+mod usage_oracle_tests;
+#[cfg(test)]
+mod usage_snapshot_tests;

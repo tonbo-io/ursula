@@ -130,6 +130,44 @@
 //! - a bucket purge removes its streams in stream-id order
 //!   (`compare_stream_ids`), so every replica numbers the purge's cold-GC
 //!   entries alike.
+//! - per-version usage (bounded-state F20): each live stream version's
+//!   committed counters, applied appends (F9), newest write time, usage
+//!   sequence number, counters when its current history began and the
+//!   history its counters began in, counted at the bucket counter's call
+//!   sites by its rule. Bucket totals derive from each bucket's retired
+//!   usage, its live versions and its end records. The group keeps its
+//!   genesis history id.
+//! - every removal leaves an end record with the version's final usage,
+//!   its end (`Deleted`, `Expired`, `Purged`), the removing entry's
+//!   `now_ms` and the history it ended in, under a new usage seq. A group
+//!   holds at most `MAX_END_RECORDS`: a removal past that first folds the
+//!   lowest-seq end record into its bucket's retired usage.
+//! - `PurgeBucket` carries the purge request's `now_ms`.
+//! - `Sweep { now_ms, limit, retire_through }` in place of `ExpireStreams`:
+//!   it removes up to `limit` expired streams, then folds up to `limit` end
+//!   records at or below `retire_through` that the group held before the
+//!   entry. It answers `Swept { expired, retired }`, and the group write
+//!   answer and `ResponseKind` follow.
+//! - an import gives every restored version zero counters, counted since
+//!   the import's history, and retires the backup's bucket totals. A
+//!   restore refuses a backup with two usage rows of one bucket
+//!   (`StreamSnapshotError::DuplicateBucketUsage`) and a snapshot that
+//!   holds a stream but no history event
+//!   (`StreamSnapshotError::StreamWithoutHistory`), both in the group
+//!   engine error. A create before the genesis is refused with
+//!   `HistoryPending`, as both engines already refused every command but
+//!   the genesis then.
+//! - `AppendResponse` without `stream_append_count`.
+//! - group snapshots carry the ledger: each stream frame its version's
+//!   usage (field 24), each end record a frame (`end_record`, frame 8,
+//!   after the cold-GC frames), and the header the group's `usage_seq`,
+//!   `retired_through`, retired rows and genesis history id (fields 13 to
+//!   16), the scalars required. Frame field 3, the per-stream append
+//!   counts, is reserved. An install restores through `restore_group`,
+//!   which requires each bucket's totals (header field 5) to equal its
+//!   retired usage plus its live versions plus its end records, and
+//!   refuses what does not fit with `StreamSnapshotError::Usage`
+//!   (`UsageSnapshotError`, `UsageCounter`), in the group engine error.
 //!
 //! A binary reads exactly one epoch: it refuses data and peers from any
 //! other epoch loudly, before it writes anything, and it does not convert
