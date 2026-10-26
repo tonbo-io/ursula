@@ -314,7 +314,7 @@ impl PurgeBucketReport {
             .saturating_add(response.pending_cold_gc_entries);
         let purged = GroupPurge {
             raft_group_id: group,
-            commit_index: response.group_commit_index,
+            commit_index: response.entry_index,
             history: response.history,
         };
         match self

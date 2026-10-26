@@ -823,7 +823,9 @@ pub struct PurgeBucketResponse {
     pub removed_streams: u64,
     /// Cold-GC entries this group still holds for the bucket.
     pub pending_cold_gc_entries: u64,
-    pub group_commit_index: u64,
+    /// The index of the log entry that purged the bucket in this group: the
+    /// index the usage export reports as `applied.index` once it applied.
+    pub entry_index: u64,
     /// The group's history the purge applied in.
     pub history: std::num::NonZeroU64,
 }

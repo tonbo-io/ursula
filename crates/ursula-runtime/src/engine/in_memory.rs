@@ -331,6 +331,7 @@ impl InMemoryGroupEngine {
                         refusal,
                         ResponseKind::answering(&command),
                         None,
+                        index,
                         placement,
                     );
                 }
@@ -373,8 +374,8 @@ impl InMemoryGroupEngine {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
                 let response = self.state_machine.apply_checked(index, command, check);
-                let response =
-                    self.group_response_from_stream(response, expected, stream_id, placement);
+                let response = self
+                    .group_response_from_stream(response, expected, stream_id, index, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
                         (self.cold_index_cache.as_ref(), compacted_stream_id.as_ref())
@@ -406,11 +407,14 @@ impl InMemoryGroupEngine {
 
     /// Lifts a [`StreamResponse`] into the matching [`GroupWriteResponse`],
     /// advancing the group commit index for every mutating outcome.
+    /// Lifts the state machine's answer to the entry at `index` into the
+    /// group-level response.
     fn group_response_from_stream(
         &mut self,
         response: StreamResponse,
         expected: ResponseKind,
         stream_id: Option<BucketStreamId>,
+        index: u64,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match response {
@@ -643,11 +647,14 @@ impl InMemoryGroupEngine {
                 history,
             } => {
                 self.advance_commit_index();
+                // The purge's own log index, which the usage export counts
+                // as `applied.index`: the count of applied writes runs
+                // behind it by every entry that never reaches the engine.
                 Ok(GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
                     placement,
                     removed_streams,
                     pending_cold_gc_entries,
-                    group_commit_index: self.commit_index,
+                    entry_index: index,
                     history,
                 }))
             }

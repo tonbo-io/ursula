@@ -1461,7 +1461,7 @@ impl Run {
             removed.insert(group, (response.removed_streams, interrupted));
             indexes.push(GroupPurgeIndex {
                 raft_group_id: group,
-                commit_index: response.group_commit_index,
+                commit_index: response.entry_index,
                 history: HistoryId::new(response.history),
             });
         }
