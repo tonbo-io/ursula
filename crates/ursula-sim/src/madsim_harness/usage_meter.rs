@@ -201,8 +201,10 @@ pub(super) struct MeteredGroup {
     /// What was accounted to each bucket rather than to a version: the
     /// usage of versions whose end record folded before a read listed it.
     pub(super) to_buckets: BTreeMap<String, CommittedUsageReport>,
-    /// Versions a relisting of the same history closed without listing
-    /// them: their end record folded before the consumer read it.
+    /// Versions held live that a relisting of the same history closed
+    /// without listing them: their end record folded before the consumer
+    /// read it. A version held as ended that such a relisting leaves out
+    /// had its end record listed, and folds instead (rule 7).
     pub(super) closed_unlisted: BTreeSet<VersionKey>,
     /// Versions a relisting of another history closed: a restore replaced
     /// them, or an accepted loss removed them.
@@ -332,7 +334,7 @@ impl MeteredGroup {
         }
         if complete && !self.relisting.is_empty() {
             let pages = std::mem::take(&mut self.relisting);
-            self.apply_relisting(&pages);
+            self.apply_relisting(&pages, now);
             self.retire_held(page.retired_through, now);
         }
         if complete && self.relisting.is_empty() {
@@ -400,7 +402,7 @@ impl MeteredGroup {
 
     /// Rule 7: applies a relisting once it completed, by its history
     /// compared with that of the last listing applied.
-    fn apply_relisting(&mut self, pages: &[GroupUsagePage]) {
+    fn apply_relisting(&mut self, pages: &[GroupUsagePage], now: madsim::time::Instant) {
         let Some(first) = pages.first() else {
             return;
         };
@@ -444,7 +446,7 @@ impl MeteredGroup {
                         .unwrap_or_default();
                     self.account(group, entry, level);
                 }
-                let closed = self.close_unlisted(&listed, false);
+                let closed = self.close_unlisted(&listed, false, now);
                 // Rows are never removed within one history: a bucket that
                 // closed a version and lists no row has retired nothing.
                 let buckets: BTreeSet<String> = rows.keys().chain(closed.keys()).cloned().collect();
@@ -505,7 +507,7 @@ impl MeteredGroup {
                     );
                     self.account(group, entry, level);
                 }
-                let closed = self.close_unlisted(&listed, true);
+                let closed = self.close_unlisted(&listed, true, now);
                 for (bucket_id, row) in &rows {
                     let view = self
                         .retired_view
@@ -570,11 +572,15 @@ impl MeteredGroup {
     }
 
     /// Closes each held version `listed` does not list, and returns their
-    /// billed levels per bucket.
+    /// billed levels per bucket. Of the same history, a version held as
+    /// ended folds instead (rule 6): its end record was listed, and folded
+    /// before a kept page's `retired_through` reached it, so its final
+    /// counters are in its bucket's `retired`.
     fn close_unlisted(
         &mut self,
         listed: &BTreeMap<VersionKey, StreamUsageEntry>,
         other_history: bool,
+        now: madsim::time::Instant,
     ) -> BTreeMap<String, CommittedUsageReport> {
         let closed: Vec<VersionKey> = self
             .billed
@@ -587,7 +593,11 @@ impl MeteredGroup {
             let Some(level) = self.billed.remove(&key) else {
                 continue;
             };
-            self.ended.remove(&key);
+            let held_ended = self.ended.remove(&key).is_some();
+            if held_ended && !other_history {
+                self.fold(key, level, now);
+                continue;
+            }
             add_committed(
                 levels.entry(key.bucket_id.clone()).or_default(),
                 committed(&level),
@@ -631,13 +641,20 @@ impl MeteredGroup {
             let Some(level) = self.billed.remove(&key) else {
                 continue;
             };
-            add_committed(
-                self.retired_view.entry(key.bucket_id.clone()).or_default(),
-                committed(&level),
-            );
-            self.folded.insert(key, (level, now));
-            self.folds = self.folds.saturating_add(1);
+            self.fold(key, level, now);
         }
+    }
+
+    /// Folds a held ended version at its final counters `level`: they join
+    /// its bucket's retired view, and it is kept as folded for one more
+    /// retention (rule 6).
+    fn fold(&mut self, key: VersionKey, level: Counters, now: madsim::time::Instant) {
+        add_committed(
+            self.retired_view.entry(key.bucket_id.clone()).or_default(),
+            committed(&level),
+        );
+        self.folded.insert(key, (level, now));
+        self.folds = self.folds.saturating_add(1);
     }
 
     /// What was accounted to the versions of `bucket_id`'s stream
@@ -741,5 +758,183 @@ impl UsageMeter {
             .filter(|applied| **applied == reason)
             .count();
         u64::try_from(count).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    use ursula_proto::admin::BucketUsageReport;
+    use ursula_proto::admin::BucketUsageRow;
+    use ursula_proto::admin::CommittedUsageReport;
+    use ursula_proto::admin::GroupStreamUsage;
+    use ursula_proto::admin::GroupUsagePage;
+    use ursula_proto::admin::HistoryId;
+    use ursula_proto::admin::RelistReason;
+    use ursula_proto::admin::StreamUsageEnd;
+    use ursula_proto::admin::StreamUsageEntry;
+    use ursula_proto::admin::UsageHistory;
+    use ursula_proto::admin::UsageLogId;
+    use ursula_proto::admin::UsagePage;
+    use ursula_proto::admin::VersionLifecycle;
+
+    use super::Counters;
+    use super::MeteredGroup;
+    use super::VersionKey;
+    use crate::madsim_harness::run_with_madsim;
+
+    const BUCKET: &str = "tenant-a";
+
+    fn history() -> HistoryId {
+        HistoryId::new(NonZeroU64::new(0x5d0e_9f3a_71c2_b864).expect("a history id"))
+    }
+
+    fn counters(bytes: u64) -> Counters {
+        Counters {
+            committed_append_bytes: bytes,
+            committed_records: bytes / 10,
+            committed_write_units: bytes / 100,
+            appends: bytes / 1000,
+        }
+    }
+
+    fn entry(seq: u64, stream_id: &str, bytes: u64, ended: bool) -> StreamUsageEntry {
+        StreamUsageEntry {
+            seq,
+            bucket_id: BUCKET.to_owned(),
+            stream_id: stream_id.to_owned(),
+            created_at_ms: 1_000,
+            counted_since: history(),
+            incarnation: seq,
+            counters: counters(bytes),
+            history_baseline: Counters::default(),
+            last_write_at_ms: Some(1_000),
+            lifecycle: if ended {
+                VersionLifecycle::Ended {
+                    end: StreamUsageEnd::Deleted,
+                    ended_at_ms: 2_000,
+                }
+            } else {
+                VersionLifecycle::Live {
+                    retained_bytes: 0,
+                    snapshot_bytes: 0,
+                }
+            },
+        }
+    }
+
+    /// A complete page read at log index `index`.
+    fn page(
+        index: u64,
+        relist: Option<RelistReason>,
+        (usage_seq, retired_through): (u64, u64),
+        (live_versions, end_records): (u64, u64),
+        rows: Vec<BucketUsageRow>,
+        entries: Vec<StreamUsageEntry>,
+    ) -> GroupStreamUsage {
+        GroupStreamUsage::Listed(GroupUsagePage {
+            raft_group_id: 0,
+            genesis: history(),
+            history: UsageHistory {
+                id: history(),
+                event_index: 1,
+                previous: None,
+            },
+            applied: UsageLogId { term: 2, index },
+            usage_seq,
+            retired_through,
+            live_versions,
+            end_records,
+            relist,
+            rows,
+            entries,
+            page: UsagePage::Complete,
+        })
+    }
+
+    fn key(stream_id: &str) -> VersionKey {
+        VersionKey::of(&entry(0, stream_id, 0, false))
+    }
+
+    /// A `retired` relisting that leaves out a version held as ended folds
+    /// it (rule 6), with its end record already listed, and closes as
+    /// unlisted only a version held live: the seed-1173 shape of
+    /// `skip_past_retention`, where a version read as ended was reported as
+    /// one whose end record folded before the consumer read it.
+    #[test]
+    fn a_retired_relisting_folds_a_version_held_as_ended() {
+        run_with_madsim(1173, async {
+            let retention = Duration::from_secs(8);
+            let mut group = MeteredGroup::default();
+            let mut behind = 0;
+            let mut read = |group: &mut MeteredGroup, answer| {
+                assert!(group.take_answers(
+                    vec![answer],
+                    madsim::time::Instant::now(),
+                    retention,
+                    &mut behind,
+                ));
+            };
+            read(
+                &mut group,
+                page(
+                    10,
+                    Some(RelistReason::Start),
+                    (0, 0),
+                    (0, 0),
+                    vec![],
+                    vec![],
+                ),
+            );
+            // `live` is read live and `ended` as ended.
+            read(
+                &mut group,
+                page(12, None, (2, 0), (1, 1), vec![], vec![
+                    entry(1, "live", 1_000, false),
+                    entry(2, "ended", 2_000, true),
+                ]),
+            );
+            // `live` writes and ends unread, `unseen` lives and ends
+            // unread, and all three end records fold.
+            let retired = CommittedUsageReport {
+                committed_append_bytes: 2_000 + 3_000 + 4_000,
+                committed_records: 200 + 300 + 400,
+                committed_write_units: 20 + 30 + 40,
+            };
+            let row = BucketUsageRow {
+                bucket_id: BUCKET.to_owned(),
+                retired,
+                totals: BucketUsageReport {
+                    committed_append_bytes: retired.committed_append_bytes,
+                    committed_records: retired.committed_records,
+                    committed_write_units: retired.committed_write_units,
+                    retained_bytes: 0,
+                    stream_count: 0,
+                    snapshot_bytes: Some(0),
+                },
+            };
+            read(
+                &mut group,
+                page(
+                    20,
+                    Some(RelistReason::Retired),
+                    (5, 5),
+                    (0, 0),
+                    vec![row],
+                    vec![],
+                ),
+            );
+
+            assert_eq!(group.alarms, Vec::<String>::new());
+            assert_eq!(group.closed_unlisted, BTreeSet::from([key("live")]));
+            assert_eq!(group.folds, 1);
+            assert!(group.folded.contains_key(&key("ended")));
+            assert_eq!(group.accounted_to(BUCKET, "ended"), counters(2_000));
+            assert_eq!(group.accounted_to(BUCKET, "live"), counters(1_000));
+            assert_eq!(group.accounted_to_bucket(BUCKET), retired);
+        });
     }
 }

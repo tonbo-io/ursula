@@ -248,11 +248,12 @@ jobs:
 
       # Outcome-level replays: every scenario test named `*_replays` runs its
       # scenario twice per fixed seed and asserts the same report. The
-      # `ci-shape` audit requires this filter to match each of them.
+      # `ci-shape` audit requires this filter to match each of them. The
+      # usage meter's tests pin the metering consumer's rules on fixed pages.
       - name: Run scenario replays
         run: |
           RUSTFLAGS="--cfg madsim" cargo nextest run -p ursula-sim --lib --no-fail-fast -- \
-            _replays
+            _replays usage_meter::tests
 
       # The report job merges every job's target/ursula-sim-* outputs.
       - name: Upload simulation outputs
