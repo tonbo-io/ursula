@@ -1,6 +1,7 @@
 //! Engine bookkeeping (F9): per-stream append counts, which apply keeps in
 //! each version's usage, die with the stream on every removal path, and the
-//! admission preview does not copy group state.
+//! admission preview does not copy group state. A bucket purge answers with
+//! its own log index, not the engine's count of applied writes.
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;

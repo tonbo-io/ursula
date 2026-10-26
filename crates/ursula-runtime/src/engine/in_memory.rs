@@ -405,10 +405,9 @@ impl InMemoryGroupEngine {
         }
     }
 
-    /// Lifts a [`StreamResponse`] into the matching [`GroupWriteResponse`],
-    /// advancing the group commit index for every mutating outcome.
     /// Lifts the state machine's answer to the entry at `index` into the
-    /// group-level response.
+    /// matching [`GroupWriteResponse`], advancing the group commit index for
+    /// every mutating outcome.
     fn group_response_from_stream(
         &mut self,
         response: StreamResponse,
@@ -647,8 +646,9 @@ impl InMemoryGroupEngine {
                 history,
             } => {
                 self.advance_commit_index();
-                // The purge's own log index, which the usage export counts
-                // as `applied.index`: the count of applied writes runs
+                // The purge's own log index: a replica's `applied.index` in
+                // the usage export is at or above it once the replica applied
+                // the purge (rule 12). The count of applied writes runs
                 // behind it by every entry that never reaches the engine.
                 Ok(GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
                     placement,
