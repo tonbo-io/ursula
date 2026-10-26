@@ -2,8 +2,9 @@
 //! contract in operations, "Per-stream usage"), on journal-backed replicas
 //! with the production snapshot driver and real OpenRaft
 //! ([`JournalCluster`] with [`DriverPlan`]). The accepted loss runs without
-//! the driver and with segments larger than its writes, so nothing syncs
-//! the journals of the nodes that lose power until the power cut.
+//! the driver and with segments larger than its writes, so only the
+//! script's own write-backs make durable what the nodes that lose power
+//! wrote before the power cut.
 //!
 //! Scenario `stream-usage-bills-exactly`: writers create streams in two
 //! buckets of both groups, write them with producer keys, so every
@@ -274,7 +275,11 @@ pub(super) enum Script {
     /// the consumer reads and lose them in a power cut, and a recovery
     /// plan accepts the loss: a new history. It runs without the snapshot
     /// driver and with segments no run fills, so no snapshot, rotation or
-    /// reclaim syncs the window before the power cut.
+    /// reclaim syncs the window before the power cut. On half of the seeds
+    /// the others write back the window's creates and first appends before
+    /// its last appends, so the plan keeps their longest log without a cut
+    /// and versions created in the window live on into the new history. On
+    /// the other half they lose the whole window, and the plan cuts.
     AcceptedLoss,
     /// Both groups backed up, every node wiped, and the backups imported
     /// into the new groups, whose genesis the consumer's cursors do not
@@ -1390,21 +1395,25 @@ impl Run {
             self.pause(Duration::from_millis(500)).await;
         }
         self.poll_until_complete(false, "streams_expired").await;
-        let expired = self
-            .meter
-            .groups
-            .values()
-            .flat_map(|group| group.ends.values())
-            .filter(|end| **end == StreamUsageEnd::Expired)
-            .count();
-        if expired == 0 {
-            let context = self.context.clone();
-            fail(
-                &mut self.trace,
-                ACCOUNTING_INVARIANT,
-                "streams_expired",
-                format!("{context}: the consumer listed no expired version"),
-            );
+        // Each group's leader swept its own expiring stream, which no
+        // writer deletes, and the consumer listed it expired.
+        for group in JOURNAL_GROUPS {
+            let expired = self
+                .meter
+                .group(group)
+                .ends
+                .values()
+                .filter(|end| **end == StreamUsageEnd::Expired)
+                .count();
+            if expired == 0 {
+                let context = self.context.clone();
+                fail(
+                    &mut self.trace,
+                    ACCOUNTING_INVARIANT,
+                    "streams_expired",
+                    format!("{context}: group {group}: the consumer listed no expired version"),
+                );
+            }
         }
         // The purge, stamped once for every group.
         let now_ms = self.wall_ms();
@@ -1412,8 +1421,10 @@ impl Run {
         let mut removed = BTreeMap::new();
         for group in JOURNAL_GROUPS {
             let deadline = madsim::time::Instant::now() + WRITE_WAIT;
-            // Whether a purge sent before the answered one failed: it may
-            // have removed the streams, so the answer counts none of them.
+            // Whether a purge sent before the answered one failed with an
+            // outcome unknown (a lost answer or a `503`): it may have
+            // removed the streams, so the answer counts none of them. A
+            // refusal that applied nothing excuses no undercount.
             let mut interrupted = false;
             let response = loop {
                 if let Some(leader) = self.leader(group)
@@ -1430,7 +1441,7 @@ impl Run {
                         .await
                     {
                         Ok(response) => break response,
-                        Err(_retry) => interrupted = true,
+                        Err(error) => interrupted |= !error.applied_nothing(),
                     }
                 }
                 self.retry(deadline, "the purge").await;
@@ -1488,8 +1499,8 @@ impl Run {
         }
         // Each group's purge removed its kept stream, and the consumer
         // listed it purged. `removed_streams` counts only what the answered
-        // request removed, so after an interrupted try only the listing
-        // shows the removal.
+        // request removed, so after a try whose outcome is unknown only the
+        // listing shows the removal.
         for group in JOURNAL_GROUPS {
             let (removed, interrupted) = removed.get(&group).copied().unwrap_or_default();
             let purged = self
@@ -1577,12 +1588,28 @@ impl Run {
                 madsim::time::sleep(STEP).await;
             }
         }
+        let others: Vec<u64> = NODES
+            .into_iter()
+            .filter(|node_id| *node_id != cut)
+            .collect();
         // The window: writes the others acknowledge and the consumer reads.
         self.window = true;
         for group in JOURNAL_GROUPS {
             let stream = self.create(group, BUCKETS[0], false).await;
             self.append(&stream).await;
             self.append(&stream).await;
+        }
+        // On half of the seeds the others write the window's creates and
+        // first appends back, so those survive the power cut, their logs
+        // end in the window's term, and the plan keeps the longest log
+        // without a cut. Otherwise they lose the whole window, and the plan
+        // cuts to the committed markers. The drawn appends are lost either
+        // way.
+        if self.draw(2) == 0 {
+            for node_id in &others {
+                self.cluster.wals[node_id].write_back();
+            }
+            self.fault("window_prefix_written_back");
         }
         for _ in 0..3 {
             if let Some(stream) = self.draw_writable() {
@@ -1593,13 +1620,9 @@ impl Run {
         // The consumer reads the window from the others, which applied it.
         self.poll_until_complete_via(false, "window_read", Route::Avoid(cut))
             .await;
-        // The others lose power and every page written since the window
-        // began: no snapshot driver runs and no segment fills, so nothing
-        // synced their journals since the write-back.
-        let others: Vec<u64> = NODES
-            .into_iter()
-            .filter(|node_id| *node_id != cut)
-            .collect();
+        // The others lose power and every page written since the last
+        // write-back: no snapshot driver runs and no segment fills, so
+        // nothing synced their journals since.
         for node_id in &others {
             self.stop(*node_id).await;
         }
