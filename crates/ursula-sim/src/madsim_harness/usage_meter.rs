@@ -215,7 +215,9 @@ pub(super) struct MeteredGroup {
     pub(super) relists: Vec<RelistReason>,
     /// What the contract tells a consumer to alarm on.
     pub(super) alarms: Vec<String>,
-    /// Held versions whose end record the consumer saw fold (rule 6).
+    /// Held versions whose end record the consumer saw fold through a kept
+    /// page's `retired_through` (rule 6). A fold a relisting reveals by
+    /// leaving the version out (rule 7) is not counted.
     pub(super) folds: u64,
     /// Relistings applied across a history change (rule 7).
     pub(super) history_changes: u64,
@@ -575,7 +577,9 @@ impl MeteredGroup {
     /// billed levels per bucket. Of the same history, a version held as
     /// ended folds instead (rule 6): its end record was listed, and folded
     /// before a kept page's `retired_through` reached it, so its final
-    /// counters are in its bucket's `retired`.
+    /// counters are in its bucket's `retired`. Its bucket is returned too,
+    /// with no level, so the share is checked against the view that
+    /// already holds the fold even when the relisting lists no row for it.
     fn close_unlisted(
         &mut self,
         listed: &BTreeMap<VersionKey, StreamUsageEntry>,
@@ -595,6 +599,7 @@ impl MeteredGroup {
             };
             let held_ended = self.ended.remove(&key).is_some();
             if held_ended && !other_history {
+                levels.entry(key.bucket_id.clone()).or_default();
                 self.fold(key, level, now);
                 continue;
             }
@@ -642,6 +647,7 @@ impl MeteredGroup {
                 continue;
             };
             self.fold(key, level, now);
+            self.folds = self.folds.saturating_add(1);
         }
     }
 
@@ -654,7 +660,6 @@ impl MeteredGroup {
             committed(&level),
         );
         self.folded.insert(key, (level, now));
-        self.folds = self.folds.saturating_add(1);
     }
 
     /// What was accounted to the versions of `bucket_id`'s stream
@@ -921,7 +926,7 @@ mod tests {
                 page(
                     20,
                     Some(RelistReason::Retired),
-                    (5, 5),
+                    (7, 7),
                     (0, 0),
                     vec![row],
                     vec![],
@@ -930,11 +935,72 @@ mod tests {
 
             assert_eq!(group.alarms, Vec::<String>::new());
             assert_eq!(group.closed_unlisted, BTreeSet::from([key("live")]));
-            assert_eq!(group.folds, 1);
+            // Revealed by the relisting, not seen through `retired_through`.
+            assert_eq!(group.folds, 0);
             assert!(group.folded.contains_key(&key("ended")));
             assert_eq!(group.accounted_to(BUCKET, "ended"), counters(2_000));
             assert_eq!(group.accounted_to(BUCKET, "live"), counters(1_000));
             assert_eq!(group.accounted_to_bucket(BUCKET), retired);
+        });
+    }
+
+    /// A `retired` relisting that leaves out a version held as ended, and
+    /// lists no row for its bucket, lost the fold's final counters: the
+    /// bucket's share is checked against the view that holds the fold, and
+    /// alarms.
+    #[test]
+    fn a_retired_relisting_without_the_folded_bucket_alarms() {
+        run_with_madsim(1173, async {
+            let retention = Duration::from_secs(8);
+            let mut group = MeteredGroup::default();
+            let mut behind = 0;
+            let mut read = |group: &mut MeteredGroup, answer| {
+                assert!(group.take_answers(
+                    vec![answer],
+                    madsim::time::Instant::now(),
+                    retention,
+                    &mut behind,
+                ));
+            };
+            read(
+                &mut group,
+                page(
+                    10,
+                    Some(RelistReason::Start),
+                    (0, 0),
+                    (0, 0),
+                    vec![],
+                    vec![],
+                ),
+            );
+            read(
+                &mut group,
+                page(12, None, (2, 0), (0, 1), vec![], vec![entry(
+                    2, "ended", 2_000, true,
+                )]),
+            );
+            read(
+                &mut group,
+                page(
+                    20,
+                    Some(RelistReason::Retired),
+                    (2, 2),
+                    (0, 0),
+                    vec![],
+                    vec![],
+                ),
+            );
+
+            assert_eq!(group.alarms.len(), 1, "{:?}", group.alarms);
+            assert!(
+                group
+                    .alarms
+                    .iter()
+                    .all(|alarm| alarm.contains("share is negative")),
+                "{:?}",
+                group.alarms
+            );
+            assert_eq!(group.closed_unlisted, BTreeSet::new());
         });
     }
 }

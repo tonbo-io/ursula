@@ -6348,11 +6348,16 @@ impl MeteredGroup {
             let mut closed_levels = BTreeMap::<String, CommittedUsageReport>::new();
             for key in closed {
                 let level = self.billed.remove(&key).expect("a held version");
-                self.ended.remove(&key);
-                add_committed(
-                    closed_levels.entry(key.0.clone()).or_default(),
-                    committed_part(&level),
-                );
+                // A version held as ended that the relisting leaves out
+                // folded after its end record was listed: its final
+                // counters join the retired view, as in item 6. Only a
+                // version held live closes.
+                let levels = if self.ended.remove(&key).is_some() {
+                    self.retired_view.entry(key.0.clone()).or_default()
+                } else {
+                    closed_levels.entry(key.0.clone()).or_default()
+                };
+                add_committed(levels, committed_part(&level));
             }
             for (bucket, row) in &rows {
                 let view = self.retired_view.get(bucket).copied().unwrap_or_default();
