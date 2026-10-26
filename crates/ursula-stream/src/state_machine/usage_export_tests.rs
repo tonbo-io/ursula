@@ -29,7 +29,7 @@ use crate::usage::UsagePage;
 use crate::usage::UsagePosition;
 
 const OCTET: &str = "application/octet-stream";
-const BUCKETS: [&str; 2] = ["a", "b"];
+const BUCKETS: [&str; 2] = ["alfa", "bravo"];
 const GENESIS: u64 = 0x11;
 
 fn id(value: u64) -> NonZeroU64 {
@@ -61,7 +61,7 @@ fn new_history(machine: &mut StreamStateMachine, index: u64, history: u64) {
     ));
 }
 
-/// A group whose genesis applied, with the buckets `a` and `b`. A bucket
+/// A group whose genesis applied, with the buckets `alfa` and `bravo`. A bucket
 /// has a row once a stream was created in it (F15).
 fn group() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
@@ -219,10 +219,10 @@ fn a_group_before_its_genesis_answers_no_history() {
 #[test]
 fn a_start_relists_every_row_and_then_every_entry() {
     let mut machine = group();
-    create(&mut machine, &sid("b", "y"), b"yy");
-    create(&mut machine, &sid("a", "x"), b"xxx");
-    create(&mut machine, &sid("a", "gone"), b"g");
-    delete(&mut machine, &sid("a", "gone"));
+    create(&mut machine, &sid("bravo", "y"), b"yy");
+    create(&mut machine, &sid("alfa", "x"), b"xxx");
+    create(&mut machine, &sid("alfa", "gone"), b"g");
+    delete(&mut machine, &sid("alfa", "gone"));
     let applied = log_id(2, 9);
     let listing = page(&machine, UsageCursor::Start, 100, applied);
 
@@ -244,7 +244,7 @@ fn a_start_relists_every_row_and_then_every_entry() {
         assert_eq!(row.retired, CommittedUsage::default());
         assert_eq!(row.snapshot_bytes, 0);
     }
-    assert_eq!(listing.rows[0].bucket_id, "a");
+    assert_eq!(listing.rows[0].bucket_id, "alfa");
     assert_eq!(listing.rows[0].totals.stream_count, 1);
     assert_eq!(listing.rows[0].totals.retained_bytes, 3);
 
@@ -262,7 +262,7 @@ fn a_start_relists_every_row_and_then_every_entry() {
     });
     assert_eq!(
         Some(x.incarnation),
-        machine.stream_incarnation(&sid("a", "x"))
+        machine.stream_incarnation(&sid("alfa", "x"))
     );
 }
 
@@ -272,7 +272,7 @@ fn a_start_relists_every_row_and_then_every_entry() {
 #[test]
 fn genesis_decides_before_log_order_and_log_order_before_history() {
     let mut machine = group();
-    create(&mut machine, &sid("a", "x"), b"x");
+    create(&mut machine, &sid("alfa", "x"), b"x");
     let applied = log_id(3, 20);
     let kept = page(&machine, UsageCursor::Start, 100, applied);
     let ahead = log_id(3, 21);
@@ -354,11 +354,11 @@ fn genesis_decides_before_log_order_and_log_order_before_history() {
 fn a_fold_the_caller_had_not_listed_relists_as_retired() {
     let mut machine = group();
     let applied = log_id(1, 50);
-    create(&mut machine, &sid("b", "z"), b"z");
-    create(&mut machine, &sid("a", "x"), b"x");
-    create(&mut machine, &sid("a", "y"), b"y");
+    create(&mut machine, &sid("bravo", "z"), b"z");
+    create(&mut machine, &sid("alfa", "x"), b"x");
+    create(&mut machine, &sid("alfa", "y"), b"y");
     let before = page(&machine, UsageCursor::Start, 100, applied);
-    delete(&mut machine, &sid("a", "x"));
+    delete(&mut machine, &sid("alfa", "x"));
     let listed_end = page(&machine, next_changes(&before), 100, applied);
     assert_eq!(listed_end.relist, None);
     assert_eq!(names(&listed_end.entries), ["x"]);
@@ -387,16 +387,16 @@ fn a_fold_the_caller_had_not_listed_relists_as_retired() {
         panic!("a cut relisting: {first:?}");
     };
     assert_eq!(next, UsagePosition::Rows {
-        after_bucket: Some("a".to_owned()),
+        after_bucket: Some("alfa".to_owned()),
     });
     let unchanged = page(&machine, after(&first, next.clone()), 1, applied);
     assert_eq!(unchanged.relist, None);
-    delete(&mut machine, &sid("a", "y"));
+    delete(&mut machine, &sid("alfa", "y"));
     let through = machine.usage_seq();
     fold_through(&mut machine, through);
     let restarted = page(&machine, after(&first, next), 1, applied);
     assert_eq!(restarted.relist, Some(RelistReason::Retired));
-    assert_eq!(restarted.rows[0].bucket_id, "a");
+    assert_eq!(restarted.rows[0].bucket_id, "alfa");
 }
 
 /// Rule 6 at the cap: a removal that folds the oldest end record early
@@ -406,11 +406,11 @@ fn a_fold_at_the_cap_relists_a_listing_that_missed_the_end_record() {
     test_cap::with(1, || {
         let mut machine = group();
         let applied = log_id(1, 50);
-        create(&mut machine, &sid("a", "x"), b"x");
-        create(&mut machine, &sid("a", "y"), b"y");
+        create(&mut machine, &sid("alfa", "x"), b"x");
+        create(&mut machine, &sid("alfa", "y"), b"y");
         let before = page(&machine, UsageCursor::Start, 100, applied);
-        delete(&mut machine, &sid("a", "x"));
-        delete(&mut machine, &sid("a", "y"));
+        delete(&mut machine, &sid("alfa", "x"));
+        delete(&mut machine, &sid("alfa", "y"));
         assert_eq!(machine.end_records().len(), 1);
         assert_eq!(machine.usage_retired_through(), 3);
         let missed = page(&machine, next_changes(&before), 100, applied);
@@ -427,8 +427,8 @@ fn a_fold_at_the_cap_relists_a_listing_that_missed_the_end_record() {
 fn rows_relist_on_request_and_continue_after_their_bucket() {
     let mut machine = group();
     let applied = log_id(1, 50);
-    create(&mut machine, &sid("a", "x"), b"x");
-    create(&mut machine, &sid("b", "y"), b"y");
+    create(&mut machine, &sid("alfa", "x"), b"x");
+    create(&mut machine, &sid("bravo", "y"), b"y");
     let kept = page(&machine, UsageCursor::Start, 100, applied);
 
     let requested = page(
@@ -444,14 +444,14 @@ fn rows_relist_on_request_and_continue_after_their_bucket() {
     let continued = page(
         &machine,
         after(&kept, UsagePosition::Rows {
-            after_bucket: Some("a".to_owned()),
+            after_bucket: Some("alfa".to_owned()),
         }),
         100,
         applied,
     );
     assert_eq!(continued.relist, None);
     assert_eq!(continued.rows.len(), 1);
-    assert_eq!(continued.rows[0].bucket_id, "b");
+    assert_eq!(continued.rows[0].bucket_id, "bravo");
     assert_eq!(names(&continued.entries), ["x", "y"]);
     assert_eq!(continued.page, UsagePage::Complete);
 
@@ -459,7 +459,7 @@ fn rows_relist_on_request_and_continue_after_their_bucket() {
     let past = page(
         &machine,
         after(&kept, UsagePosition::Rows {
-            after_bucket: Some("z".to_owned()),
+            after_bucket: Some("zulu".to_owned()),
         }),
         100,
         applied,
@@ -474,11 +474,11 @@ fn rows_relist_on_request_and_continue_after_their_bucket() {
 fn entries_continue_above_their_position_each_version_once() {
     let mut machine = group();
     let applied = log_id(1, 50);
-    create(&mut machine, &sid("a", "x"), b"x");
-    create(&mut machine, &sid("a", "y"), b"y");
+    create(&mut machine, &sid("alfa", "x"), b"x");
+    create(&mut machine, &sid("alfa", "y"), b"y");
     let kept = page(&machine, UsageCursor::Start, 100, applied);
-    append(&mut machine, &sid("a", "x"), b"more");
-    append(&mut machine, &sid("a", "x"), b"again");
+    append(&mut machine, &sid("alfa", "x"), b"more");
+    append(&mut machine, &sid("alfa", "x"), b"again");
     let changes = page(&machine, next_changes(&kept), 100, applied);
     assert_eq!(changes.relist, None);
     assert!(changes.rows.is_empty());
@@ -510,8 +510,8 @@ fn a_page_holds_at_most_its_limit_and_names_what_follows() {
 
     // One row and no entry: a limit of one completes.
     let mut machine = group();
-    create(&mut machine, &sid("a", "gone"), b"g");
-    delete(&mut machine, &sid("a", "gone"));
+    create(&mut machine, &sid("alfa", "gone"), b"g");
+    delete(&mut machine, &sid("alfa", "gone"));
     let through = machine.usage_seq();
     fold_through(&mut machine, through);
     let rows_only = page(&machine, UsageCursor::Start, 1, applied);
@@ -520,14 +520,14 @@ fn a_page_holds_at_most_its_limit_and_names_what_follows() {
     assert_eq!(rows_only.page, UsagePage::Complete);
 
     let mut machine = group();
-    create(&mut machine, &sid("a", "x"), b"x");
-    create(&mut machine, &sid("a", "y"), b"y");
-    create(&mut machine, &sid("a", "z"), b"z");
-    create(&mut machine, &sid("b", "w"), b"w");
+    create(&mut machine, &sid("alfa", "x"), b"x");
+    create(&mut machine, &sid("alfa", "y"), b"y");
+    create(&mut machine, &sid("alfa", "z"), b"z");
+    create(&mut machine, &sid("bravo", "w"), b"w");
     let cut_rows = page(&machine, UsageCursor::Start, 1, applied);
     assert_eq!(cut_rows.page, UsagePage::More {
         next: UsagePosition::Rows {
-            after_bucket: Some("a".to_owned()),
+            after_bucket: Some("alfa".to_owned()),
         },
     });
     let end_of_rows = page(&machine, UsageCursor::Start, 2, applied);
@@ -561,9 +561,9 @@ fn a_page_holds_at_most_its_limit_and_names_what_follows() {
 fn an_entrys_token_and_baseline_follow_the_current_history() {
     let mut machine = group();
     let applied = log_id(1, 50);
-    let x = sid("a", "x");
-    let early = sid("a", "early");
-    let late = sid("a", "late");
+    let x = sid("alfa", "x");
+    let early = sid("alfa", "early");
+    let late = sid("alfa", "late");
     create(&mut machine, &x, b"x");
     append(&mut machine, &x, b"xx");
     create(&mut machine, &early, b"e");
@@ -612,7 +612,7 @@ fn an_entrys_token_and_baseline_follow_the_current_history() {
 fn a_live_entry_reads_its_gauges_with_the_page() {
     let mut machine = group();
     let applied = log_id(1, 50);
-    let x = sid("b", "x");
+    let x = sid("bravo", "x");
     create(&mut machine, &x, b"abcdef");
     let published = machine.apply(StreamCommand::PublishSnapshot {
         stream_id: x.clone(),
@@ -642,7 +642,7 @@ fn a_live_entry_reads_its_gauges_with_the_page() {
     });
     assert_eq!(listing.entries[0].seq, 3);
     assert_eq!(listing.rows.len(), 1);
-    assert_eq!(listing.rows[0].bucket_id, "b");
+    assert_eq!(listing.rows[0].bucket_id, "bravo");
     assert_eq!(listing.rows[0].snapshot_bytes, 5);
     assert_eq!(listing.rows[0].totals.retained_bytes, 2);
 }

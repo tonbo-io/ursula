@@ -219,10 +219,12 @@ impl UsageLedger {
     }
 
     /// Indexes the live version `key` at its seq `seq`: its slot was just
-    /// inserted.
+    /// inserted. Apply stamps every new version with a fresh seq. A group
+    /// snapshot can repeat one, and its restore refuses it once every slot
+    /// is in ([`StreamStateMachine::check_restored_usage`]), so the index of
+    /// a refused restore is never read.
     pub(super) fn index_live(&mut self, seq: u64, key: StreamKey) {
-        let earlier = self.live_by_seq.insert(seq, key);
-        debug_assert!(earlier.is_none(), "two live versions at seq {seq}");
+        self.live_by_seq.insert(seq, key);
     }
 
     /// Drops the live version at `seq` from the index: its slot was just
