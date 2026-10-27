@@ -400,6 +400,8 @@ pub(crate) enum Failure {
 pub(crate) struct Retry {
     policy: Policy,
     condition: Option<Unavailable>,
+    /// The token changes the open was told of ([`Retry::token_changed`]).
+    token_changes: u64,
 }
 
 impl Retry {
@@ -417,6 +419,17 @@ impl Retry {
         self.policy = Policy::default();
     }
 
+    /// The token requests carry changed.
+    pub(crate) fn token_changed(&mut self) {
+        self.token_changes = self.token_changes.wrapping_add(1);
+    }
+
+    /// While no request is out: whether the request a `401` blocked goes again at once, under a
+    /// token changed since ([`Policy::wakes`]).
+    pub(crate) fn wakes(&mut self) -> bool {
+        self.policy.wakes(self.token_changes)
+    }
+
     /// What to do after `exchange`, which decided nothing about the request itself.
     pub(crate) fn failed(&mut self, exchange: &Exchange, now_ms: u64) -> Failure {
         let no_answer = Common::Resend {
@@ -428,7 +441,10 @@ impl Retry {
             Exchange::Answered(answer) => (decide_status(answer), Some(answer)),
         };
         let retry_after = answer.and_then(|a| a.retry_after);
-        match self.policy.decide(common, retry_after, now_ms) {
+        match self
+            .policy
+            .decide(common, retry_after, now_ms, self.token_changes)
+        {
             Next::Wait {
                 at_ms,
                 jitter_ms,
@@ -804,6 +820,13 @@ impl Build {
     /// The last condition met, if any.
     pub(crate) fn seen(&self) -> Option<Unavailable> {
         self.retry.seen()
+    }
+
+    /// The token requests carry changed. `waiting`: no read is out. Whether the read a `401`
+    /// blocked goes again at once.
+    pub(crate) fn token_changed(&mut self, waiting: bool) -> bool {
+        self.retry.token_changed();
+        waiting && self.retry.wakes()
     }
 
     /// The answer to the last request.
@@ -1600,13 +1623,7 @@ impl Opening {
     /// The error of an open given up (`ursula_cancel`): the last condition it met, `cancelled`
     /// when it met none.
     pub(crate) fn given_up(&self) -> OpenError {
-        self.seen()
-            .map_or(OpenError::Cancelled, OpenError::Unavailable)
-    }
-
-    /// The last condition the open met, if any.
-    pub(crate) fn seen(&self) -> Option<Unavailable> {
-        match &self.phase {
+        let seen = match &self.phase {
             Phase::Reading { build, .. } => build.seen(),
             Phase::Preparing
             | Phase::Head
@@ -1614,6 +1631,23 @@ impl Opening {
             | Phase::Building { .. }
             | Phase::CatchingUp { .. }
             | Phase::CatchUpApplying(_) => self.retry.seen(),
+        };
+        seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
+    }
+
+    /// The token requests carry changed. `waiting`: no request or disk job of the open is out.
+    /// Whether the request a `401` blocked, the open's own or its build's, goes again at once.
+    pub(crate) fn token_changed(&mut self, waiting: bool) -> bool {
+        self.retry.token_changed();
+        match &mut self.phase {
+            // The build's reads are the open's requests while it reads.
+            Phase::Reading { build, .. } => build.token_changed(waiting),
+            Phase::Preparing
+            | Phase::Head
+            | Phase::Create
+            | Phase::Building { .. }
+            | Phase::CatchingUp { .. }
+            | Phase::CatchUpApplying(_) => waiting && self.retry.wakes(),
         }
     }
 

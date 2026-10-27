@@ -13,7 +13,7 @@
 // real server too (test/stack.ts puts a gate in front of it). Only `delay <ms>` is scripted: the
 // request is forwarded at once and its answer held back for `ms`.
 //
-// For test/token.e2e.ts it also stands in for an authorizer: once told a token, it answers `401`
+// For test/token-change.e2e.ts it also stands in for an authorizer: once told a token, it answers `401`
 // to every request that does not carry it as `Authorization: Bearer <token>`, and forwards nothing
 // of it.
 //
@@ -55,8 +55,10 @@ const proxy = createServer((req, res) => {
 	}
 	if (state.token !== null && req.headers.authorization !== `Bearer ${state.token}`) {
 		state.unauthorized++;
+		// Answered once the body is read: an answer before it can close the connection under a
+		// writer still sending, which then sees no answer instead of the `401`.
+		req.on("end", () => res.writeHead(401, { "content-length": "0" }).end());
 		req.resume();
-		res.writeHead(401).end();
 		return;
 	}
 	state.forwarded++;

@@ -621,12 +621,13 @@ Tests:
   the last addresses for up to 10 minutes.
 - One bearer token per process: the last open's `token`, `ursula_set_token`, or the file
   `URSULA_VFS_TOKEN_FILE` names, re-read when it changes and after a `401`. A token change sends
-  every request a `401` blocked again at once, with no wait for the 30 s retry: the core takes it
-  as `Event::TokenChanged`. A token set takes effect at once, and a changed file within 1 s, since
-  the driver thread checks the file every second while a request waits blocked `unauthorized`. A
-  `401` to an attempt sent before the change sends the request again under the new token instead
-  of blocking it. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent over `http://` to a host that is not a loopback
-  address logs `token_in_clear` once.
+  every request a `401` blocked again at once, with no wait for the 30 s retry: the replicators',
+  the opens' and the rebuilds' alike, through the retry policy they share (`Core::token_changed`).
+  A `401` to an attempt sent before the change sends the request again under the new token instead
+  of blocking it. A token set changes at once. A token in the file changes when a read finds it:
+  any request's, or the driver thread's check of the file every second while an open or a writer
+  may send requests. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent over `http://`
+  to a host that is not a loopback address logs `token_in_clear` once.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `every_body_carries_content_length`, `time_limits_scale_with_the_body_and_the_answer`,
@@ -636,10 +637,14 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `a_failed_lookup_uses_the_last_addresses_until_the_retry`,
 `a_failed_lookup_past_the_stale_limit_fails_as_never_sent`. Tokens: `auth.rs`
 `tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`,
+`the_read_that_finds_a_new_token_signals_the_change`,
 `a_lent_token_goes_back_unless_another_was_set_since`, `replicator/tests/machine.rs`
 `a_token_change_resends_a_request_blocked_unauthorized_at_once`,
 `a_token_changed_while_the_refused_attempt_was_out_goes_at_once`, `driver/tests.rs`
-`a_token_change_resends_what_a_401_blocked_at_once`, and `test/token.e2e.ts`.
+`a_token_change_resends_what_a_401_blocked_at_once`,
+`a_token_changed_while_an_opens_reread_is_out_goes_at_once`,
+`a_token_change_resends_a_rebuilds_read_a_401_blocked`, the replicator proptest's token changes,
+and `test/token-change.e2e.ts`.
 
 ## Local state
 

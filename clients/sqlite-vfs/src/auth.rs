@@ -1,8 +1,9 @@
 //! The bearer token every request carries: the one the application set (`ursula_set_token`), else
 //! the content of `URSULA_VFS_TOKEN_FILE`, read again whenever the file changes and after the
 //! endpoint refused a token. One token per process. A change of it sends again at once every
-//! request a `401` blocked ([`crate::driver::runtime::token_changed`]): a token set at once, a
-//! changed file within [`FILE_CHECK_MS`].
+//! request a `401` blocked ([`crate::driver::runtime::token_changed`]): a token set at once, and a
+//! file whose token changed when a read finds the new one, by a request or by the driver's check
+//! every [`FILE_CHECK_MS`] ([`check_file`]).
 
 use std::fs;
 use std::sync::Mutex;
@@ -14,8 +15,8 @@ use crate::config::token_file;
 use crate::log;
 use crate::log::Level;
 
-/// How often the driver checks the token file for a change ([`file_changed`]) while a request
-/// waits blocked `unauthorized`.
+/// How often the driver checks the token file for a change ([`check_file`]) while an open or a
+/// writer may send requests.
 pub(crate) const FILE_CHECK_MS: u64 = 1_000;
 
 /// The token the application set, if any.
@@ -108,7 +109,25 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
     if let Some(token) = lock(&SET).clone() {
         return Some(token);
     }
-    file_token(token_file()?, refresh, &FILE)
+    let read = file_token(token_file()?, refresh, &FILE);
+    if read.changed {
+        changed();
+    }
+    read.token
+}
+
+/// Reads the token file again if it changed since the last read, while no token is set: a new
+/// token in it is a change ([`token`]). A stat, and a read only after a change.
+pub(crate) fn check_file() {
+    drop(token(false));
+}
+
+/// What a look at the token file found.
+struct FileToken {
+    token: Option<String>,
+    /// A read found a token other than the one the file held before: the token requests carry
+    /// changed.
+    changed: bool,
 }
 
 /// The token in the file at `path`, read again when it changed (or on `refresh`), outside the
@@ -117,19 +136,23 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
 /// request sent without one is refused as if the stream did not exist (an authorizer conceals it
 /// with a 404, which an open takes for a missing stream), whereas a stale token is refused with a
 /// 401, which is retried with the file read again.
-fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> Option<String> {
+fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> FileToken {
     let (modified, len) = stat(path);
     if !refresh
         && let Some(c) = lock(cache)
             .as_ref()
             .filter(|c| c.modified == modified && c.len == len)
     {
-        return c.token.clone();
+        return FileToken {
+            token: c.token.clone(),
+            changed: false,
+        };
     }
     let read = fs::read_to_string(path)
         .map_err(Unusable::Read)
         .and_then(|text| usable(&text).ok_or(Unusable::NoToken));
     let mut cached = lock(cache);
+    let read_before = cached.is_some();
     let last = cached.as_ref().and_then(|c| c.token.clone());
     let (token, unusable) = match read {
         Ok(token) => (Some(token), false),
@@ -150,23 +173,10 @@ fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> Optio
         token: token.clone(),
         unusable,
     });
-    token
-}
-
-/// Whether the token file changed since a request last read it, while no token is set and the
-/// file is in use: the next request reads it again ([`token`]). A stat, no read.
-pub(crate) fn file_changed() -> bool {
-    if lock(&SET).is_some() {
-        return false;
+    FileToken {
+        changed: read_before && token != last,
+        token,
     }
-    token_file().is_some_and(|path| file_changed_at(path, &FILE))
-}
-
-fn file_changed_at(path: &str, cache: &Mutex<Option<Cached>>) -> bool {
-    let (modified, len) = stat(path);
-    lock(cache)
-        .as_ref()
-        .is_some_and(|c| c.modified != modified || c.len != len)
 }
 
 /// The file's modification time and length, `None` when it cannot be read.
@@ -190,7 +200,6 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    use super::file_changed_at;
     use super::file_token;
     use super::lend;
     use super::put_back;
@@ -239,25 +248,57 @@ mod tests {
         let file = path.to_str().unwrap();
         let cache = Mutex::new(None);
         fs::write(&path, "").unwrap();
-        assert_eq!(file_token(file, true, &cache), None);
+        assert_eq!(file_token(file, true, &cache).token, None);
         fs::write(&path, "t1\n").unwrap();
-        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        assert_eq!(file_token(file, true, &cache).token.as_deref(), Some("t1"));
         fs::write(&path, "").unwrap();
-        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        assert_eq!(file_token(file, true, &cache).token.as_deref(), Some("t1"));
         fs::write(&path, "half written").unwrap();
-        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        assert_eq!(file_token(file, true, &cache).token.as_deref(), Some("t1"));
         fs::remove_file(&path).unwrap();
-        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        assert_eq!(file_token(file, true, &cache).token.as_deref(), Some("t1"));
         fs::write(&path, "t2").unwrap();
-        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t2"));
+        assert_eq!(file_token(file, true, &cache).token.as_deref(), Some("t2"));
         // Unchanged since the last read: the cached token, without reading the file.
-        assert_eq!(file_token(file, false, &cache).as_deref(), Some("t2"));
-        assert!(!file_changed_at(file, &cache));
-        // A change shows until a request reads the file again.
+        assert_eq!(file_token(file, false, &cache).token.as_deref(), Some("t2"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Whichever read first finds a new token in the file signals the change, once: a request's
+    // read or the driver's check alike. A first read, a file read again unchanged, and a file
+    // without a token (which keeps the last one) signal none.
+    #[test]
+    fn the_read_that_finds_a_new_token_signals_the_change() {
+        let dir = std::env::temp_dir().join(format!("ursula-token-change-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        let file = path.to_str().unwrap();
+        let cache = Mutex::new(None);
+        fs::write(&path, "t1").unwrap();
+        let first = file_token(file, false, &cache);
+        assert_eq!(first.token.as_deref(), Some("t1"));
+        assert!(!first.changed, "the first read");
+        assert!(
+            !file_token(file, true, &cache).changed,
+            "read again, the same token"
+        );
+
+        fs::write(&path, "token-2").unwrap();
+        let read = file_token(file, false, &cache);
+        assert_eq!(read.token.as_deref(), Some("token-2"));
+        assert!(read.changed);
+        assert!(
+            !file_token(file, false, &cache).changed,
+            "seen by the read before"
+        );
+        assert!(!file_token(file, true, &cache).changed);
+
+        fs::write(&path, "").unwrap();
+        let read = file_token(file, false, &cache);
+        assert_eq!(read.token.as_deref(), Some("token-2"));
+        assert!(!read.changed, "no token: the last one kept");
         fs::write(&path, "token-3").unwrap();
-        assert!(file_changed_at(file, &cache));
-        assert_eq!(file_token(file, false, &cache).as_deref(), Some("token-3"));
-        assert!(!file_changed_at(file, &cache));
+        assert!(file_token(file, false, &cache).changed);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

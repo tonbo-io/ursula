@@ -278,9 +278,9 @@ fn attempt_of(actions: &[Action]) -> crate::transport::Attempt {
         .unwrap_or_else(|| panic!("no send: {actions:?}"))
 }
 
-// A token change sends a request a `401` blocked again at once, the token file read again, with
-// no wait for the 30 s retry. The new token refused too blocks again at once, until the next
-// change. A change that finds nothing blocked sends nothing.
+// A token change sends a request a `401` blocked again at once, with no wait for the 30 s retry.
+// The new token refused too blocks again at once, until the next change. A change that finds
+// nothing blocked sends nothing.
 #[test]
 fn a_token_change_resends_a_request_blocked_unauthorized_at_once() {
     let mut h = streaming(1);
@@ -292,9 +292,7 @@ fn a_token_change_resends_a_request_blocked_unauthorized_at_once() {
         condition(&actions),
         Some(Some(Condition::Blocked(BlockedReason::Unauthorized)))
     );
-    let actions = h.on(Event::TokenChanged);
-    assert_eq!(sends(&actions), vec![&first]);
-    assert!(attempt_of(&actions).refresh_token);
+    assert_eq!(sends(&h.on(Event::TokenChanged)), vec![&first]);
     let actions = h.answer(&RawAnswer::new(401));
     assert!(sends(&actions).is_empty());
     assert_eq!(timer_of(&actions).unwrap().0, h.now_ms + BLOCKED_RETRY_MS);
@@ -312,7 +310,8 @@ fn a_token_change_resends_a_request_blocked_unauthorized_at_once() {
 }
 
 // A token that changes while the token reread after a `401` is out: that attempt carried the old
-// token, so its `401` sends the request again at once instead of blocking it.
+// token, so its `401` sends the request again at once, the token read again, instead of blocking
+// it.
 #[test]
 fn a_token_changed_while_the_refused_attempt_was_out_goes_at_once() {
     let mut h = streaming(1);

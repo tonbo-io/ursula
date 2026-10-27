@@ -2,7 +2,8 @@
 // server (test/stack.ts) behind test/gate.mjs, which answers `401` to every request without the
 // token it requires. A bound database's replication blocks `unauthorized` once the gate requires
 // another token, and resumes far within the 30 s retry of a blocked condition once the process has
-// that token: set with `ursula_set_token`, or written to the file `URSULA_VFS_TOKEN_FILE` names.
+// that token: set with `ursula_set_token`, or written to the file `URSULA_VFS_TOKEN_FILE` names,
+// even when another database's requests read the changed file first.
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -71,20 +72,24 @@ describe("a token change after a 401", () => {
 		}
 	});
 
-	it("resends at once with the token a changed token file holds", async () => {
+	it("resends at once with the token a changed token file holds, whoever reads it first", async () => {
 		const control = loadUrsulaVfs(ext());
 		// Back to the token file.
 		control.prepare("SELECT ursula_set_token('', '')").get();
 		writeFileSync(TOKEN_FILE, "file-token-1\n");
 		await requireToken("file-token-1");
 		const db = await blockedDatabase("token-file", undefined, "file-token-22");
+		let other: UrsulaDatabase | undefined;
 		try {
 			const started = Date.now();
 			writeFileSync(TOKEN_FILE, "file-token-22\n");
+			// Another database's open reads the changed file before the driver's own check does.
+			other = await open(`${g.url}${stream("token-file-other").path}`, { dir: freshDir() });
 			await db.synced();
 			expect(Date.now() - started).toBeLessThan(RESUME_MS);
 			expect(db.status().replication.condition).toBeNull();
 		} finally {
+			other?.close();
 			db.close();
 			await requireToken(null);
 		}

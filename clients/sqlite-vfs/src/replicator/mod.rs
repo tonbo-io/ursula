@@ -276,7 +276,7 @@ pub(crate) enum Event {
     /// The time moved; timers that are due fire.
     Tick,
     /// The token requests carry changed (`ursula_set_token`, the token file): a request a `401`
-    /// blocked goes again at once under the new one ([`backoff::Link`]). The rest is a
+    /// blocked goes again at once under the new one ([`backoff::Policy`]). The rest is a
     /// [`Event::Tick`].
     TokenChanged,
     /// A batch must end exactly at `position` (a snapshot's `k`, design: Snapshots): once it is
@@ -531,8 +531,9 @@ pub(crate) struct Ctx {
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
     next_id: u64,
-    /// How many times the token requests carry changed ([`Event::TokenChanged`]).
-    pub(crate) tokens: u64,
+    /// The token changes the replicator was told of ([`Event::TokenChanged`]), compared with `!=`
+    /// only ([`backoff::Policy`]).
+    pub(crate) token_changes: u64,
     /// The negative controls the proptest checks its properties against.
     #[cfg(test)]
     pub(crate) knobs: Knobs,
@@ -610,7 +611,7 @@ impl Ctx {
             pre_checked: None,
             producer,
             next_id: 0,
-            tokens: 0,
+            token_changes: 0,
             #[cfg(test)]
             knobs: Knobs::default(),
         })
@@ -1278,7 +1279,7 @@ fn common_event(
         }
         Event::Stop => Err(Terminal::Stopped),
         Event::TokenChanged => {
-            ctx.tokens = ctx.tokens.saturating_add(1);
+            ctx.token_changes = ctx.token_changes.wrapping_add(1);
             Ok(Some(Event::Tick))
         }
         Event::Answer { .. } | Event::Tick | Event::CaughtUp { .. } => Ok(Some(event)),
