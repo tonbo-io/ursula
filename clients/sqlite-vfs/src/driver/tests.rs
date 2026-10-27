@@ -5,11 +5,13 @@
 //! Tests of the driver: [`Core`]s against the model server in a virtual-time world with real log
 //! and generation files in a temp dir, and the runtime over the model in process.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -66,6 +68,8 @@ use crate::open::StreamFormat;
 use crate::open::StreamState;
 use crate::open::Unavailable;
 use crate::options::Access;
+use crate::replicator::BlockedReason;
+use crate::replicator::Condition;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
 use crate::salvage::Reason;
@@ -135,6 +139,9 @@ type EveryHead = Box<dyn FnMut(&mut ModelServer)>;
 /// Rewrites the server's answer to a request before the client reads it.
 type AnswerHook = Box<dyn FnMut(&Request, &mut RawAnswer)>;
 
+/// Picks the requests that wait in `held_sends`, out but unanswered.
+type SendHook = Box<dyn FnMut(&Request) -> bool>;
+
 /// Cores, the model server, a network each core can lose, and a virtual clock.
 struct World {
     server: ModelServer,
@@ -150,6 +157,9 @@ struct World {
     /// Disk jobs it matches wait in `held` instead of running.
     hold: Option<fn(&DiskJob) -> bool>,
     held: Vec<(usize, DiskIo)>,
+    /// Requests it matches wait in `held_sends` instead of reaching the server.
+    hold_sends: Option<SendHook>,
+    held_sends: Vec<(usize, super::Io)>,
     /// Runs on the server after the next HEAD it answers, once `skip_heads` more went by.
     after_head: Option<ServerHook>,
     skip_heads: u32,
@@ -195,6 +205,8 @@ impl World {
             misroute_reads: false,
             hold: None,
             held: Vec::new(),
+            hold_sends: None,
+            held_sends: Vec::new(),
             next_id: 1,
             tickets: HashMap::new(),
             connect_ms: 0,
@@ -296,6 +308,15 @@ impl World {
             let ios = match io {
                 Io::Http(io) if self.down[core] && self.connect_ms > 0 => {
                     self.connecting.push((now + self.connect_ms, core, io.id));
+                    Vec::new()
+                }
+                Io::Http(io)
+                    if self
+                        .hold_sends
+                        .as_mut()
+                        .is_some_and(|hold| hold(&io.request)) =>
+                {
+                    self.held_sends.push((core, Io::Http(io)));
                     Vec::new()
                 }
                 Io::Http(io) => {
@@ -456,6 +477,22 @@ impl World {
         self.queue_ios(core, ios);
         self.deliver();
     }
+    /// The requests `hold_sends` held reach the server now, and no more are held.
+    fn release_sends(&mut self) {
+        self.hold_sends = None;
+        let held = std::mem::take(&mut self.held_sends);
+        self.queue.extend(held);
+        self.deliver();
+    }
+
+    /// The token requests carry changed: the core is told, and runs for 100 ms.
+    fn token_changed(&mut self, core: usize) {
+        let now = self.now;
+        let ios = self.c(core).token_changed(now);
+        self.queue_ios(core, ios);
+        self.run_for(100);
+    }
+
     /// Runs the held disk jobs, and what they lead to.
     fn release_held(&mut self) {
         self.hold = None;
@@ -718,6 +755,158 @@ fn an_open_creates_the_stream_commits_replicate_and_synced_resolves() {
         DriverEvent::Opened { result: Ok(binding), .. } if *binding == bound.binding
     )));
     assert!(w.resets(c).is_empty());
+}
+
+// A token change sends again at once what a `401` blocked, an open's HEAD and then a bound
+// database's append, with no wait for the 30 s retry.
+#[test]
+fn a_token_change_resends_what_a_401_blocked_at_once() {
+    let dir = TempDir::new("driver-token");
+    let mut w = World::new();
+    let c = w.core();
+    let refusing = Rc::new(Cell::new(true));
+    let refuse = Rc::clone(&refusing);
+    w.rewrite = Some(Box::new(move |_, answer| {
+        if refuse.get() {
+            *answer = RawAnswer::new(401);
+        }
+    }));
+
+    let open = OpenId(w.id());
+    let now = w.now;
+    let ios = w.c(c).open(open, spec(dir.path(), 1), now);
+    w.queue_ios(c, ios);
+    w.run_for(5_000);
+    assert!(w.c(c).take_opened(open).is_none(), "blocked unauthorized");
+    refusing.set(false);
+    w.token_changed(c);
+    let bound = w.c(c).take_opened(open).expect("resolved").unwrap();
+    assert!(bound.handle.connect(Holder::Host).is_some());
+
+    refusing.set(true);
+    let frame = w.commit(c, &bound, 1).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c, ticket), None);
+    assert!(
+        w.events(c)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Condition {
+                condition: Some(Condition::Blocked(BlockedReason::Unauthorized)),
+                ..
+            }))
+    );
+    // The new token refused too: blocked again.
+    w.token_changed(c);
+    w.run_for(5_000);
+    assert_eq!(w.outcome(c, ticket), None);
+    refusing.set(false);
+    w.token_changed(c);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits(), vec![frame]);
+    assert!(w.resets(c).is_empty());
+}
+
+// A token that changes while an open's token reread after a `401` is out: that reread carried the
+// old token, so its `401` sends the HEAD again at once under the new one instead of blocking it.
+#[test]
+fn a_token_changed_while_an_opens_reread_is_out_goes_at_once() {
+    let dir = TempDir::new("driver-token-reread");
+    let mut w = World::new();
+    let c = w.core();
+    // The first HEAD and its reread are refused, the token the change brings is taken.
+    let refusals = Rc::new(Cell::new(2u32));
+    let refuse = Rc::clone(&refusals);
+    w.rewrite = Some(Box::new(move |_, answer| {
+        if refuse.get() > 0 {
+            refuse.set(refuse.get() - 1);
+            *answer = RawAnswer::new(401);
+        }
+    }));
+    let heads = Rc::new(Cell::new(0u32));
+    let counted = Rc::clone(&heads);
+    w.hold_sends = Some(Box::new(move |request| {
+        if request.method != Method::Head {
+            return false;
+        }
+        counted.set(counted.get() + 1);
+        counted.get() == 2
+    }));
+
+    let open = OpenId(w.id());
+    let now = w.now;
+    let ios = w.c(c).open(open, spec(dir.path(), 1), now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    assert_eq!(w.held_sends.len(), 1, "the reread is out");
+    w.token_changed(c);
+    assert!(w.c(c).take_opened(open).is_none());
+    w.release_sends();
+    w.run_for(1_000);
+    let bound = w.c(c).take_opened(open).expect("resolved").unwrap();
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert_eq!(refusals.get(), 0, "the reread was refused");
+}
+
+// A rebuild's read a `401` blocked goes again at once when the token changes.
+#[test]
+fn a_token_change_resends_a_rebuilds_read_a_401_blocked() {
+    let dir_a = TempDir::new("driver-token-rebuild-a");
+    let dir_b = TempDir::new("driver-token-rebuild-b");
+    let mut w = World::new();
+    let a = w.core();
+    let bound = w.open(a, spec(dir_a.path(), 1));
+    w.commit(a, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(a, &bound);
+    let old = bound.handle.generation.clone();
+    drop(bound);
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    // Pages that do not compress: the frames outgrow A's one-page database, which rebuilds.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..3 {
+        let mut page = Box::new([0u8; 4096]);
+        for byte in page.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = x as u8;
+        }
+        w.commit_page(b, &bound_b, page).unwrap();
+    }
+    w.run_for(1_000);
+
+    let refusing = Rc::new(Cell::new(false));
+    let refuse = Rc::clone(&refusing);
+    w.rewrite = Some(Box::new(move |_, answer| {
+        if refuse.get() {
+            *answer = RawAnswer::new(401);
+        }
+    }));
+    w.hold = Some(|job| matches!(job, DiskJob::NewBuild(_)));
+    let a2 = w.core();
+    let open = OpenId(w.id());
+    let now = w.now;
+    let ios = w.c(a2).open(open, spec(dir_a.path(), 3), now);
+    w.queue_ios(a2, ios);
+    for _ in 0..100 {
+        if !w.held.is_empty() {
+            break;
+        }
+        w.run_for(100);
+    }
+    assert_eq!(w.held.len(), 1, "the rebuild starts");
+    // From the rebuild's first request on, the token is refused.
+    refusing.set(true);
+    w.release_held();
+    w.run_for(5_000);
+    assert!(w.c(a2).take_opened(open).is_none(), "blocked unauthorized");
+    refusing.set(false);
+    w.token_changed(a2);
+    w.run_for(1_000);
+    let bound = w.c(a2).take_opened(open).expect("resolved").unwrap();
+    assert_ne!(bound.handle.generation, old, "rebuilt");
 }
 
 #[test]

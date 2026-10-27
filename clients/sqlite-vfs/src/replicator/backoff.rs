@@ -1,13 +1,14 @@
 //! The outstanding request ([`Link`]): what to do with an answer that decides nothing about the
 //! request itself (design: Appends, Answers). It resends the identical request after backoff,
 //! doubling from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped
-//! at 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
-//! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
-//! the re-key to the replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight
-//! hands it the re-cut ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a
-//! body above [`LOST_HEAD_BYTES`] send a HEAD before the next resend: a layer in front of the
-//! server may answer a body above its limit without reading it and close, which looks like a lost
-//! answer, while a HEAD through it learns its limit.
+//! at 60 s); retries a blocked request every 30 s, and one a `401` blocked at once when the token
+//! changes ([`Link::token_changed`]); and parks the request while a HEAD checks the stream's token,
+//! cluster and limit. A HEAD naming a history that inherits the generation hands the re-key to the
+//! replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight hands it the re-cut
+//! ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a body above
+//! [`LOST_HEAD_BYTES`] send a HEAD before the next resend: a layer in front of the server may
+//! answer a body above its limit without reading it and close, which looks like a lost answer,
+//! while a HEAD through it learns its limit.
 
 use std::time::Duration;
 
@@ -123,11 +124,20 @@ impl Halt {
 /// condition every 30 s, one token reread after a `401`, a few resends of a redirect. [`Link`]
 /// carries them out for the replicator, and the driver's open uses them for its own requests:
 /// one policy.
+///
+/// A token change (`ursula_set_token`, the token file) sends a request a `401` blocked again at
+/// once. The owner counts the changes it was told of (`token_changes`, compared with `!=` only),
+/// and the policy keeps the count its refused request last went out under: a `401` to an attempt
+/// sent before a change sends the request again instead of blocking it, and a change while it
+/// waits blocked wakes it ([`Policy::wakes`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Policy {
     failures: u32,
     token_refused: bool,
     redirects: u8,
+    /// The token changes when the request a `401` refused last went out: meaningful while
+    /// `token_refused`.
+    refused_under: u64,
 }
 
 /// What [`Policy`] decided.
@@ -179,13 +189,15 @@ impl Policy {
         }
     }
 
-    /// What an answer without a producer outcome leads to. A typed `413` blocks
-    /// `request_too_large`: lowering the limit, and the re-cut it may lead to, are the caller's.
+    /// What an answer without a producer outcome leads to, under `token_changes` token changes so
+    /// far. A typed `413` blocks `request_too_large`: lowering the limit, and the re-cut it may
+    /// lead to, are the caller's.
     pub(crate) fn decide(
         &mut self,
         common: Common,
         retry_after: Option<Duration>,
         now_ms: u64,
+        token_changes: u64,
     ) -> Next {
         if !matches!(common, Common::Reauthorize) {
             self.token_refused = false;
@@ -200,11 +212,15 @@ impl Policy {
                 self.backoff(retry_after, attempt, now_ms)
             }
             Common::Head(reason) => Next::Head(reason),
-            Common::Reauthorize if self.token_refused => {
+            // Refused again under the token the reread found.
+            Common::Reauthorize if self.token_refused && self.refused_under == token_changes => {
                 Self::block(BlockedReason::Unauthorized, now_ms)
             }
+            // The first `401`, or one to an attempt sent before the token changed: the token
+            // read again, sent again at once.
             Common::Reauthorize => {
                 self.token_refused = true;
+                self.refused_under = token_changes;
                 Next::Resend(Attempt {
                     fresh_connection: false,
                     refresh_token: true,
@@ -222,6 +238,17 @@ impl Policy {
             Common::Blocked(reason) => Self::block(reason, now_ms),
         }
     }
+
+    /// While the request waits (no attempt of it out), `token_changes` token changes so far:
+    /// whether it goes again at once, blocked `unauthorized` under an older token. It then counts
+    /// as sent under this one.
+    pub(crate) fn wakes(&mut self, token_changes: u64) -> bool {
+        let wake = self.token_refused && self.refused_under != token_changes;
+        if wake {
+            self.refused_under = token_changes;
+        }
+        wake
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +261,8 @@ enum LinkState {
 /// One request, from its first attempt to a definite answer.
 #[derive(Debug, Clone)]
 pub(crate) struct Link {
-    request: Request,
+    /// Boxed: every replicator state holds a link, and the request is most of its size.
+    request: Box<Request>,
     state: LinkState,
     policy: Policy,
     /// Lost answers in a row.
@@ -251,7 +279,7 @@ impl Link {
             attempt: Attempt::default(),
         });
         Self {
-            request,
+            request: Box::new(request),
             state: LinkState::InFlight(id),
             policy: Policy::default(),
             lost: 0,
@@ -282,14 +310,14 @@ impl Link {
     /// Replaces the request the next attempt sends (the renumbering negative control).
     #[cfg(test)]
     pub(crate) fn replace(&mut self, request: Request) {
-        self.request = request;
+        *self.request = request;
     }
 
     fn resend(&mut self, attempt: Attempt, ctx: &mut Ctx, actions: &mut Vec<Action>) {
         let id = ctx.next_id();
         actions.push(Action::Send {
             id,
-            request: self.request.clone(),
+            request: (*self.request).clone(),
             attempt,
         });
         self.state = LinkState::InFlight(id);
@@ -355,7 +383,8 @@ impl Link {
             self.lost = 0;
             Next::Head(HeadReason::Unanswered)
         } else {
-            self.policy.decide(common, retry_after, now_ms)
+            self.policy
+                .decide(common, retry_after, now_ms, ctx.token_changes)
         };
         self.carry(next, ctx, actions).map_err(Halt::Reset)
     }
@@ -462,6 +491,22 @@ impl Link {
                 }
             }
             LinkState::Checking { head, .. } => head.tick(now_ms, ctx, actions),
+        }
+    }
+
+    /// The token requests carry changed (`ctx.token_changes` counts it already): the request, or
+    /// the HEAD it waits on, goes again at once if a `401` blocked it under an older token
+    /// ([`Policy::wakes`]). Any other wait, and the timer it asked for, stay as they were.
+    pub(crate) fn token_changed(&mut self, ctx: &mut Ctx, actions: &mut Vec<Action>) {
+        match &mut self.state {
+            LinkState::InFlight(_) => {}
+            LinkState::Waiting { attempt, .. } => {
+                if self.policy.wakes(ctx.token_changes) {
+                    let attempt = *attempt;
+                    self.resend(attempt, ctx, actions);
+                }
+            }
+            LinkState::Checking { head, .. } => head.token_changed(ctx, actions),
         }
     }
 }

@@ -13,18 +13,24 @@
 // real server too (test/stack.ts puts a gate in front of it). Only `delay <ms>` is scripted: the
 // request is forwarded at once and its answer held back for `ms`.
 //
+// For test/token-change.e2e.ts it also stands in for an authorizer: once told a token, it answers `401`
+// to every request that does not carry it as `Authorization: Bearer <token>`, and forwards nothing
+// of it.
+//
 // argv: the server's URL. Prints {"port": n, "control": n} once it listens: the proxy's port and a
 // control port of its own, which no mode affects. Control requests:
 //   PUT /mode {"mode": "forward" | "blackhole" | "refuse"} -> 204
 //   PUT /target {"url": "<server URL>"} -> 204: later requests go to that server
-//   GET /stats -> {"mode", "forwarded", "held", "refused"}
+//   PUT /auth {"token": "<token>" | null} -> 204: later requests without that token get `401`
+//     (null: none required)
+//   GET /stats -> {"mode", "forwarded", "held", "refused", "unauthorized", "token"}
 //   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` -> 204: the fault for the next
 //     `times` (1) forwarded requests with that method (any method when absent)
 // It exits when its stdin closes, so it never outlives the test process that started it.
 import { createServer, request } from "node:http";
 
 let target = new URL(process.argv[2]);
-const state = { mode: "forward", forwarded: 0, held: 0, refused: 0 };
+const state = { mode: "forward", forwarded: 0, held: 0, refused: 0, unauthorized: 0, token: null };
 const sockets = new Set();
 let port = 0;
 /** Scripted faults, in order: `{ method, delayMs, times }`. */
@@ -44,6 +50,14 @@ const proxy = createServer((req, res) => {
 	if (state.mode === "blackhole") {
 		state.held++;
 		// Read the body and never answer.
+		req.resume();
+		return;
+	}
+	if (state.token !== null && req.headers.authorization !== `Bearer ${state.token}`) {
+		state.unauthorized++;
+		// Answered once the body is read: an answer before it can close the connection under a
+		// writer still sending, which then sees no answer instead of the `401`.
+		req.on("end", () => res.writeHead(401, { "content-length": "0" }).end());
 		req.resume();
 		return;
 	}
@@ -124,6 +138,21 @@ const control = createServer((req, res) => {
 				return;
 			}
 			if (times > 0) faults.push({ method: url.searchParams.get("method") ?? undefined, delayMs: Number(delay[1]), times });
+			res.writeHead(204).end();
+			return;
+		}
+		if (req.method === "PUT" && url.pathname === "/auth") {
+			let token;
+			try {
+				({ token } = JSON.parse(body));
+			} catch {
+				token = undefined;
+			}
+			if (token !== null && typeof token !== "string") {
+				res.writeHead(400).end(`not a JSON body with a token or null: ${body}`);
+				return;
+			}
+			state.token = token;
 			res.writeHead(204).end();
 			return;
 		}

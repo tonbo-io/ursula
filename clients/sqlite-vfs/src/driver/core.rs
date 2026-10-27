@@ -1648,6 +1648,48 @@ impl Core {
         ios
     }
 
+    /// The token requests carry changed (design: Transport): every request a `401` blocked goes
+    /// again at once under the new one, and one out under the old token goes again on its `401`
+    /// ([`crate::replicator::backoff::Policy`]). The opens and the rebuilds count the change
+    /// themselves, the replicators through [`Event::TokenChanged`], and a snapshot attempt a `401`
+    /// failed starts again at once ([`crate::snapshotter::Snapshots::token_changed`]). Timers
+    /// that are not a `401`'s stay as they were.
+    pub(crate) fn token_changed(&mut self, now_ms: u64) -> Vec<Io> {
+        for slot in self.opens.values_mut() {
+            let waiting = slot.wake_at.is_some();
+            if slot.opening.token_changed(waiting) {
+                slot.wake_at = Some(now_ms);
+            }
+        }
+        for b in self.bindings.values_mut() {
+            if let Stage::Opening {
+                local: Local::Rebuilding { build, wake_at },
+                ..
+            } = &mut b.stage
+                && build.token_changed(wake_at.is_some())
+            {
+                *wake_at = Some(now_ms);
+            }
+        }
+        for handle in self.bindings.values().filter_map(Binding::handle) {
+            handle.snapshots.token_changed();
+        }
+        let mut ios = Vec::new();
+        let bindings: Vec<BindingId> = self.bindings.keys().copied().collect();
+        for binding in bindings {
+            self.drive(binding, Event::TokenChanged, now_ms, &mut ios);
+        }
+        ios.extend(self.tick(now_ms));
+        ios
+    }
+
+    /// Whether an open or a writer binding may send requests, which a token change concerns: the
+    /// driver then checks the token file for a change while requests carry its token
+    /// ([`crate::auth::watching`], [`crate::auth::check_file`]).
+    pub(crate) fn requesting(&self) -> bool {
+        !self.opens.is_empty() || !self.bindings.is_empty()
+    }
+
     fn tick_binding(&mut self, binding: BindingId, now_ms: u64, ios: &mut Vec<Io>) {
         let Some(b) = self
             .bindings

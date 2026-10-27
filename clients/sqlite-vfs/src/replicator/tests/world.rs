@@ -201,6 +201,9 @@ enum Op {
     Advance(u32),
     ExpireIdle,
     Tick(u8),
+    /// The token the owner's requests carry changed: one a `401` blocked, or one whose `401`
+    /// answers an attempt sent before, goes again at once.
+    TokenChanged(u8),
     /// A history event that loses nothing: every token changes, every byte stays.
     NewHistory,
     /// A history event restoring the `n`-th latest checkpoint.
@@ -265,6 +268,7 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (0u32..40_000).prop_map(Op::Advance),
         1 => Just(Op::ExpireIdle),
         6 => (0u8..8).prop_map(Op::Tick),
+        2 => (0u8..8).prop_map(Op::TokenChanged),
         1 => Just(Op::NewHistory),
         1 => (0u8..4).prop_map(Op::Restore),
         1 => Just(Op::Checkpoint),
@@ -2558,6 +2562,10 @@ impl World {
             Op::Tick(o) => {
                 let i = self.owner(o);
                 self.tick(i);
+            }
+            Op::TokenChanged(o) => {
+                let i = self.owner(o);
+                self.event(i, Event::TokenChanged);
             }
             Op::NewHistory => self.server.history_event(HistoryEvent::NewHistory).unwrap(),
             Op::Restore(n) => {

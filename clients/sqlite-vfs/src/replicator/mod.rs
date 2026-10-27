@@ -275,6 +275,10 @@ pub(crate) enum Event {
     Answer { id: RequestId, exchange: Exchange },
     /// The time moved; timers that are due fire.
     Tick,
+    /// The token requests carry changed (`ursula_set_token`, the token file): a request a `401`
+    /// blocked goes again at once under the new one ([`Link::token_changed`]). Timers stay as
+    /// they were.
+    TokenChanged,
     /// A batch must end exactly at `position` (a snapshot's `k`, design: Snapshots): once it is
     /// acknowledged, [`Action::Boundary`] reports it.
     Boundary(Position),
@@ -527,6 +531,9 @@ pub(crate) struct Ctx {
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
     next_id: u64,
+    /// The token changes the replicator was told of ([`Event::TokenChanged`]), compared with `!=`
+    /// only ([`backoff::Policy`]).
+    pub(crate) token_changes: u64,
     /// The negative controls the proptest checks its properties against.
     #[cfg(test)]
     pub(crate) knobs: Knobs,
@@ -604,6 +611,7 @@ impl Ctx {
             pre_checked: None,
             producer,
             next_id: 0,
+            token_changes: 0,
             #[cfg(test)]
             knobs: Knobs::default(),
         })
@@ -1270,6 +1278,10 @@ fn common_event(
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
+        Event::TokenChanged => {
+            ctx.token_changes = ctx.token_changes.wrapping_add(1);
+            Ok(Some(event))
+        }
         Event::Answer { .. } | Event::Tick | Event::CaughtUp { .. } => Ok(Some(event)),
     }
 }
@@ -1297,6 +1309,14 @@ fn activating(
         Step::Claim { epoch, mut link } => match event {
             Event::Tick => {
                 link.tick(now_ms, &mut ctx, actions);
+                Replicator::Activating {
+                    kind,
+                    step: Step::Claim { epoch, link },
+                    ctx,
+                }
+            }
+            Event::TokenChanged => {
+                link.token_changed(&mut ctx, actions);
                 Replicator::Activating {
                     kind,
                     step: Step::Claim { epoch, link },
@@ -1333,6 +1353,14 @@ fn activating(
         } => match event {
             Event::Tick => {
                 link.tick(now_ms, &mut ctx, actions);
+                Replicator::Activating {
+                    kind,
+                    step: Step::Reconcile { reconcile, link },
+                    ctx,
+                }
+            }
+            Event::TokenChanged => {
+                link.token_changed(&mut ctx, actions);
                 Replicator::Activating {
                     kind,
                     step: Step::Reconcile { reconcile, link },
@@ -1430,7 +1458,8 @@ fn activating(
             | Event::Boundary(_)
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::Applying { reconcile, end },
                 ctx,
@@ -1467,7 +1496,8 @@ fn activating(
             | Event::Boundary(_)
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::CatchingUp(done),
                 ctx,
@@ -1484,6 +1514,7 @@ fn activating(
             };
             match (event, hit) {
                 (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
+                (Event::TokenChanged, _) => link.token_changed(&mut ctx, actions),
                 (Event::Answer { exchange, .. }, Hit::Head) => {
                     return match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
                         HeadOutcome::Waiting => Replicator::Activating {
@@ -1522,6 +1553,7 @@ fn activating(
             };
             match (event, hit) {
                 (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
+                (Event::TokenChanged, _) => link.token_changed(&mut ctx, actions),
                 (Event::Answer { exchange, .. }, Hit::Head) => {
                     let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
                     let holding = Holding::Reconciling(reconcile.epoch());
@@ -2542,6 +2574,15 @@ impl Stream {
                 }
                 if let Some(probe) = &mut self.probe {
                     probe.link.tick(now_ms, &mut self.ctx, actions);
+                }
+                self.kick(actions)
+            }
+            Event::TokenChanged => {
+                if let Work::Append { link, .. } = &mut self.work {
+                    link.token_changed(&mut self.ctx, actions);
+                }
+                if let Some(probe) = &mut self.probe {
+                    probe.link.token_changed(&mut self.ctx, actions);
                 }
                 self.kick(actions)
             }
