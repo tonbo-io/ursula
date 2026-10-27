@@ -3,20 +3,35 @@
     reason = "tests compute cuts and positions from small generated sizes"
 )]
 
-use std::fs;
+mod oracle;
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+use proptest::prelude::Just;
+use proptest::prelude::ProptestConfig;
 use proptest::prelude::Strategy;
+use proptest::prelude::any;
+use proptest::prop_assert_eq;
 use proptest::prop_oneof;
 use proptest::proptest;
+use proptest::test_runner::TestCaseError;
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
+use super::Fold;
 use super::Log;
 use super::LogError;
+use super::Logged;
+use crate::codec::frame::Frame;
+use crate::codec::segment::BUFFER;
+use crate::codec::segment::Keep;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
 use crate::ids::Activation;
+use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::testdir::TempDir;
@@ -881,4 +896,403 @@ fn every_segment_names_what_its_generation_supersedes() {
     let (_, original) = Log::open(&log_dir).unwrap();
     let (_, recopied) = Log::open(&copy_dir).unwrap();
     assert_eq!(records(&original), records(&recopied));
+}
+
+/// Keeps a frame's length.
+#[derive(Debug, Default)]
+struct Length(u32);
+
+impl Keep for Length {
+    type Kept = u32;
+
+    fn start(&mut self, len: u32) {
+        self.0 = len;
+    }
+
+    fn piece(&mut self, _bytes: &[u8]) {}
+
+    fn finish(&mut self) -> u32 {
+        self.0
+    }
+}
+
+/// A host's fold over [`Log::read`]: the position and frame length of each of the generation's own
+/// COMMIT records above the latest ACK, dropped as later ACKs come, so it keeps no frame and 16
+/// bytes per pending commit.
+#[derive(Debug, Default)]
+struct Unacknowledged {
+    commits: Vec<(Position, u64)>,
+    /// The highest position an ACK dropped.
+    dropped: Option<Position>,
+}
+
+impl Fold for Unacknowledged {
+    type Frames = Length;
+
+    fn record(&mut self, position: Position, body: RecordBody<Logged<u32>>, state: &SegmentHeader) {
+        if let RecordBody::Commit { frame } = &body
+            && !super::foreign(frame.id, state.lineage)
+        {
+            self.commits.push((position, u64::from(frame.kept)));
+        }
+        self.drop_through(state.acked);
+    }
+
+    fn cut(&mut self, from: Position) {
+        self.commits.retain(|(p, _)| *p < from);
+    }
+}
+
+impl Unacknowledged {
+    fn drop_through(&mut self, acked: Position) {
+        for (p, _) in self.commits.iter().filter(|(p, _)| *p <= acked) {
+            self.dropped = self.dropped.max(Some(*p));
+        }
+        self.commits.retain(|(p, _)| *p > acked);
+    }
+
+    /// The pending commits, `end` the state at the end of the log; `None` when a lower ACK
+    /// brought back a commit an earlier one dropped.
+    fn finish(mut self, end: &SegmentHeader) -> Option<Vec<(Position, u64)>> {
+        self.drop_through(end.acked);
+        if self.dropped.is_some_and(|d| d > end.acked) {
+            return None;
+        }
+        Some(self.commits)
+    }
+}
+
+/// What a test writes to a log.
+#[derive(Debug, Clone)]
+enum Op {
+    /// A commit of the generation's own: a COMMIT frame of its lineage, or bytes no frame starts
+    /// with.
+    Own {
+        frame: bool,
+        fill: u8,
+        len: usize,
+    },
+    /// A stream frame a catch-up logged.
+    CaughtUp {
+        fill: u8,
+        len: usize,
+    },
+    Claim(u64),
+    /// An ACK of the record `back` before the last one, never below an earlier one.
+    Ack {
+        back: u64,
+    },
+    /// An ACK of any position.
+    AnyAck(u64),
+    /// A BASE at the record `back` before the last one.
+    Base {
+        back: u64,
+    },
+    Rekey(u64),
+    Trim,
+}
+
+fn op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        6 => (any::<bool>(), any::<u8>(), 1usize..300)
+            .prop_map(|(frame, fill, len)| Op::Own { frame, fill, len }),
+        // Larger than the reader's buffer.
+        1 => (any::<bool>(), any::<u8>(), BUFFER..BUFFER + 4000)
+            .prop_map(|(frame, fill, len)| Op::Own { frame, fill, len }),
+        3 => (any::<u8>(), 1usize..300).prop_map(|(fill, len)| Op::CaughtUp { fill, len }),
+        1 => (0u64..10).prop_map(Op::Claim),
+        3 => (0u64..3).prop_map(|back| Op::Ack { back }),
+        1 => (0u64..24).prop_map(Op::AnyAck),
+        2 => (0u64..3).prop_map(|back| Op::Base { back }),
+        1 => (2u64..6).prop_map(Op::Rekey),
+        1 => Just(Op::Trim),
+    ]
+}
+
+/// A COMMIT frame of `lineage`.
+fn commit_frame(lineage: Lineage, position: u64, fill: u8, len: usize) -> Vec<u8> {
+    crate::codec::frame::encode(&Frame::Commit {
+        id: CommitId {
+            lineage,
+            position: Position(position),
+        },
+        compressed: vec![fill; len],
+    })
+    .unwrap()
+}
+
+/// Writes `ops` to a new log in `dir`, rolled past `roll` bytes.
+fn write_log(dir: &Path, roll: u64, ops: &[Op]) {
+    let mut log = Log::create(dir, header()).unwrap();
+    log.set_roll_bytes(roll);
+    let mut acked = 0;
+    for op in ops {
+        let last = log.next_position().0 - 1;
+        let body = match op {
+            Op::Own {
+                frame: true,
+                fill,
+                len,
+            } => RecordBody::Commit {
+                frame: commit_frame(header().lineage, last + 1, *fill, *len),
+            },
+            Op::Own {
+                frame: false,
+                fill,
+                len,
+            } => commit(*fill, *len),
+            Op::CaughtUp { fill, len } => RecordBody::Commit {
+                frame: commit_frame(Lineage([9; 16]), last + 1, *fill, *len),
+            },
+            Op::Claim(e) => RecordBody::Claim {
+                epoch: epoch(*e),
+                activation: Activation([*e as u8; 16]),
+            },
+            Op::Ack { back } => {
+                acked = last.saturating_sub(*back).max(acked);
+                RecordBody::Ack {
+                    acked: Position(acked),
+                    acked_offset: Offset::from_u64(acked * 10),
+                    log_bytes: 0,
+                }
+            }
+            Op::AnyAck(n) => RecordBody::Ack {
+                acked: Position(*n),
+                acked_offset: Offset::from_u64(*n),
+                log_bytes: 1,
+            },
+            Op::Base { back } => RecordBody::Base {
+                position: Position(last.saturating_sub(*back)),
+            },
+            Op::Rekey(n) => {
+                log.rekey(token(*n), epoch(*n), Activation([*n as u8; 16]))
+                    .unwrap();
+                continue;
+            }
+            Op::Trim => {
+                log.trim().unwrap();
+                continue;
+            }
+        };
+        log.append(&body).unwrap();
+    }
+    log.sync().unwrap();
+}
+
+/// What a crash or a damage may leave of the log's segment files.
+#[derive(Debug, Clone)]
+enum Damage {
+    None,
+    /// A segment cut short.
+    Cut {
+        segment: usize,
+        at: usize,
+    },
+    /// A damaged bit in a segment.
+    Flip {
+        segment: usize,
+        bit: usize,
+    },
+    /// The first segment gone.
+    DropFirst,
+    /// A later segment zero-filled: a roll whose header never reached the disk.
+    ZeroLater {
+        segment: usize,
+    },
+    /// Bytes after the last segment's records.
+    Garbage(Vec<u8>),
+}
+
+fn damage() -> impl Strategy<Value = Damage> {
+    prop_oneof![
+        2 => Just(Damage::None),
+        3 => (any::<usize>(), any::<usize>()).prop_map(|(segment, at)| Damage::Cut { segment, at }),
+        2 => (any::<usize>(), any::<usize>()).prop_map(|(segment, bit)| Damage::Flip { segment, bit }),
+        1 => Just(Damage::DropFirst),
+        1 => any::<usize>().prop_map(|segment| Damage::ZeroLater { segment }),
+        1 => proptest::collection::vec(any::<u8>(), 1..40).prop_map(Damage::Garbage),
+    ]
+}
+
+/// The segment files of the log in `dir`, by name.
+fn segment_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+fn apply(dir: &Path, damage: &Damage) {
+    let files = segment_files(dir);
+    let n = files.len();
+    match damage {
+        Damage::None => {}
+        Damage::Cut { segment, at } => {
+            let path = &files[segment % n];
+            let bytes = fs::read(path).unwrap();
+            fs::write(path, &bytes[..at % (bytes.len() + 1)]).unwrap();
+        }
+        Damage::Flip { segment, bit } => {
+            let path = &files[segment % n];
+            let mut bytes = fs::read(path).unwrap();
+            let bit = bit % (bytes.len() * 8);
+            bytes[bit / 8] ^= 1 << (bit % 8);
+            fs::write(path, bytes).unwrap();
+        }
+        Damage::DropFirst if n > 1 => fs::remove_file(&files[0]).unwrap(),
+        Damage::DropFirst => {}
+        Damage::ZeroLater { segment } if n > 1 => {
+            let path = &files[1 + segment % (n - 1)];
+            let len = fs::metadata(path).unwrap().len() as usize;
+            fs::write(path, vec![0u8; len]).unwrap();
+        }
+        Damage::ZeroLater { .. } => {}
+        Damage::Garbage(bytes) => {
+            let path = &files[n - 1];
+            let mut all = fs::read(path).unwrap();
+            all.extend_from_slice(bytes);
+            fs::write(path, all).unwrap();
+        }
+    }
+}
+
+/// Every file in `dir`, by name, with its bytes.
+fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().into_string().unwrap(),
+                fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn restore(dir: &Path, files: &BTreeMap<String, Vec<u8>>) {
+    fs::remove_dir_all(dir).unwrap();
+    fs::create_dir(dir).unwrap();
+    for (name, bytes) in files {
+        fs::write(dir.join(name), bytes).unwrap();
+    }
+}
+
+/// Checks that the open built on [`Log::read`] opens the log in `dir` as the open before it did:
+/// the same log and the same records, or the same error, and the same files after; that the read
+/// changes nothing; and that a host's fold over the read keeps the open's pending commits.
+fn opens_as_before(dir: &Path) -> Result<(), TestCaseError> {
+    let files = snapshot(dir);
+    let before = oracle::open(dir);
+    let files_before = snapshot(dir);
+    restore(dir, &files);
+    let now = Log::open(dir);
+    prop_assert_eq!(snapshot(dir), files_before);
+    match (&before, &now) {
+        (Ok((old, old_recovered)), Ok((new, new_recovered))) => {
+            prop_assert_eq!(old_recovered, new_recovered);
+            prop_assert_eq!(&old.segments, &new.segments);
+            prop_assert_eq!(&old.state, &new.state);
+            prop_assert_eq!(
+                (old.len, old.header_len, old.chain, old.next),
+                (new.len, new.header_len, new.chain, new.next)
+            );
+        }
+        (Err(old), Err(new)) => prop_assert_eq!(format!("{old:?}"), format!("{new:?}")),
+        (old, new) => {
+            return Err(TestCaseError::fail(format!(
+                "before: {:?}, now: {:?}",
+                old.as_ref().err(),
+                new.as_ref().err()
+            )));
+        }
+    }
+    drop(now);
+    restore(dir, &files);
+    let mut unacknowledged = Unacknowledged::default();
+    let read = Log::read(dir, &mut unacknowledged);
+    prop_assert_eq!(snapshot(dir), files);
+    match (read, &before) {
+        (Ok(valid), Ok((_, recovered))) => {
+            prop_assert_eq!(&valid.cut, &recovered.cut);
+            let pending: Vec<(Position, u64)> = recovered
+                .pending()
+                .iter()
+                .map(|(p, frame)| (*p, frame.len() as u64))
+                .collect();
+            if let Some(kept) = unacknowledged.finish(&valid.state) {
+                prop_assert_eq!(kept, pending);
+            }
+        }
+        (Err(read), Err(open)) => prop_assert_eq!(format!("{read:?}"), format!("{open:?}")),
+        (read, open) => {
+            return Err(TestCaseError::fail(format!(
+                "read: {:?}, open: {:?}",
+                read.err(),
+                open.as_ref().err()
+            )));
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // Over own and caught-up commits, records larger than the reader's buffer, ACKs, BASEs,
+    // CLAIMs, rolls, re-keys and trims, then a cut, a damaged bit, a lost or zero-filled segment
+    // or bytes after the end: the open built on the streaming read opens the log exactly as the
+    // whole-segment open did, the read changes nothing, and a fold that keeps only positions and
+    // lengths keeps the open's pending commits.
+    #[test]
+    fn the_read_opens_logs_as_the_whole_segment_open_did(
+        ops in proptest::collection::vec(op(), 0..14),
+        roll in 200u64..3000,
+        harm in damage(),
+    ) {
+        let dir = TempDir::new("log-read-equivalence");
+        let log_dir = dir.path().join("log");
+        write_log(&log_dir, roll, &ops);
+        apply(&log_dir, &harm);
+        opens_as_before(&log_dir)?;
+    }
+}
+
+// The fold keeps what the open's pending commits are, and reads a frame larger than the reader's
+// buffer without keeping it: own commits after the latest ACK, not the caught-up frames an ACK
+// follows or the trailing ones the read cuts.
+#[test]
+fn a_hosts_fold_keeps_the_pending_commits_without_their_frames() {
+    let dir = TempDir::new("log-read-fold");
+    let log_dir = dir.path().join("log");
+    write_log(&log_dir, 1000, &[
+        Op::Own {
+            frame: true,
+            fill: 1,
+            len: 10,
+        },
+        Op::Ack { back: 0 },
+        Op::CaughtUp { fill: 2, len: 10 },
+        Op::Ack { back: 0 },
+        Op::Own {
+            frame: true,
+            fill: 3,
+            len: BUFFER * 2,
+        },
+        Op::Own {
+            frame: false,
+            fill: 4,
+            len: 10,
+        },
+        Op::CaughtUp { fill: 5, len: 10 },
+    ]);
+    let mut fold = Unacknowledged::default();
+    let valid = Log::read(&log_dir, &mut fold).unwrap();
+    assert_eq!(valid.cut.as_ref().map(|c| c.at > 0), Some(true));
+    let kept = fold.finish(&valid.state).unwrap();
+    let frame = commit_frame(header().lineage, 5, 3, BUFFER * 2).len() as u64;
+    assert_eq!(kept, vec![(Position(5), frame), (Position(6), 10)]);
+    opens_as_before(&log_dir).unwrap();
 }

@@ -27,9 +27,18 @@
 //!
 //! Positions start at 1, so a `base` or `acked` of 0 means nothing yet. The valid log is the
 //! longest prefix whose chain verifies and whose positions grow by one from the header's
-//! `first_position`. [`scan`] returns that prefix and says how the rest ends. A record that is cut
-//! short or does not verify ends it as [`Tail::Torn`], whatever follows: bytes after a broken
-//! record that look like a record prove nothing, since a database user can store them in a commit.
+//! `first_position`. [`Reader`] reads that prefix record by record and says how the rest ends, and
+//! [`scan`] collects it from a segment held whole. A record that is cut short or does not verify
+//! ends it as [`Tail::Torn`], whatever follows: bytes after a broken record that look like a
+//! record prove nothing, since a database user can store them in a commit.
+//!
+//! A [`Reader`] passes every record's payload through one buffer of [`BUFFER`] bytes and keeps of
+//! a COMMIT record's frame only what its [`Keep`] keeps, so reading a segment takes that buffer
+//! whatever the size of a record or of the segment. Only the header is read whole: at most 131 KiB
+//! by its format.
+
+use std::convert::Infallible;
+use std::fs::File;
 
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
@@ -53,6 +62,16 @@ const BASE: u8 = 4;
 const RECORD_HEAD: usize = 13;
 /// A record's chain.
 const RECORD_TAIL: usize = 4;
+/// The longest payload of a record of a fixed shape: a CLAIM's or an ACK's.
+const FIXED_PAYLOAD: usize = 24;
+
+/// The header up to the tag of `supersedes`: the magic, version, lineage and first position.
+const HEADER_START: usize = 4 + 4 + 16 + 8 + 1;
+/// The header from the incarnation up to the tag of `claim`: five `u64` fields.
+const HEADER_COUNTERS: usize = 5 * 8 + 1;
+
+/// The buffer a [`Reader`] reads a segment through: 64 KiB.
+pub const BUFFER: usize = 64 << 10;
 
 /// A segment's header: where its records start, the identity of the stream and generation, and
 /// the state carried over from the segment before it.
@@ -78,10 +97,12 @@ pub struct SegmentHeader {
     pub claim: Option<(Epoch, Activation)>,
 }
 
+/// A record's body. A COMMIT record's frame is `F`: the frame's bytes, or what a [`Reader`]'s
+/// [`Keep`] kept of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecordBody {
+pub enum RecordBody<F = Vec<u8>> {
     /// A `USQ2` frame: our commit, or a stream frame caught up at open.
-    Commit { frame: Vec<u8> },
+    Commit { frame: F },
     /// A claim about to be sent.
     Claim {
         epoch: Epoch,
@@ -97,11 +118,31 @@ pub enum RecordBody {
     Base { position: Position },
 }
 
+impl<F> RecordBody<F> {
+    /// The body with a COMMIT record's frame mapped by `f`.
+    pub fn map_frame<G>(self, f: impl FnOnce(F) -> G) -> RecordBody<G> {
+        match self {
+            RecordBody::Commit { frame } => RecordBody::Commit { frame: f(frame) },
+            RecordBody::Claim { epoch, activation } => RecordBody::Claim { epoch, activation },
+            RecordBody::Ack {
+                acked,
+                acked_offset,
+                log_bytes,
+            } => RecordBody::Ack {
+                acked,
+                acked_offset,
+                log_bytes,
+            },
+            RecordBody::Base { position } => RecordBody::Base { position },
+        }
+    }
+}
+
 /// A valid record and where it ends in the segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
+pub struct Record<F = Vec<u8>> {
     pub position: Position,
-    pub body: RecordBody,
+    pub body: RecordBody<F>,
     /// The record's chain, which seeds the next record's.
     pub chain: u32,
     /// The byte offset just after the record.
@@ -362,14 +403,11 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
     Ok((header, found, header_end.saturating_add(4)))
 }
 
-fn body_of(kind: u8, payload: &[u8]) -> Option<RecordBody> {
+/// The body of a record of a fixed shape (CLAIM, ACK, BASE) from its whole payload, `None` for
+/// any other kind or a payload of another size.
+fn fixed_body<F>(kind: u8, payload: &[u8]) -> Option<RecordBody<F>> {
     let mut t = Take(payload);
     let body = match kind {
-        COMMIT if !payload.is_empty() => {
-            return Some(RecordBody::Commit {
-                frame: payload.to_vec(),
-            });
-        }
         CLAIM => RecordBody::Claim {
             epoch: Epoch::try_from(t.u64()?).ok()?,
             activation: Activation(t.array()?),
@@ -387,78 +425,417 @@ fn body_of(kind: u8, payload: &[u8]) -> Option<RecordBody> {
     t.rest().is_empty().then_some(body)
 }
 
-/// The record at the start of `bytes`, if it is whole: its kind, position, payload, stored chain
-/// and length.
-fn record_at(bytes: &[u8]) -> Option<(u8, Position, &[u8], u32, usize)> {
-    let mut t = Take(bytes);
-    let len = t.u32()?;
-    let kind = t.u8()?;
-    let position = Position(t.u64()?);
-    let payload = t.bytes(len as usize)?;
-    let chain = t.u32()?;
-    Some((
-        kind,
-        position,
-        payload,
-        chain,
-        bytes.len().saturating_sub(t.rest_len()),
-    ))
+/// What a [`Reader`] keeps of a COMMIT record's payload, the frame, which reaches it piece by
+/// piece as it passes through the reader's buffer.
+pub trait Keep {
+    /// What is kept of one frame.
+    type Kept;
+    /// A COMMIT record's payload of `len` bytes starts. What was kept of an earlier one goes: its
+    /// record did not verify.
+    fn start(&mut self, len: u32);
+    /// The payload's next piece.
+    fn piece(&mut self, bytes: &[u8]);
+    /// The record verified: what was kept of its frame.
+    fn finish(&mut self) -> Self::Kept;
 }
 
-/// The segment's header and its longest valid prefix of records. A header that is cut short,
-/// damaged or of another format is an error: the records cannot be trusted without it.
-pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
-    let (header, seed, header_len) = header(bytes)?;
-    let mut records = Vec::new();
-    let mut previous = seed;
-    let mut expected = Some(header.first_position);
-    let mut t = Take(bytes.get(header_len..).unwrap_or_default());
-    let tail = loop {
-        let at = bytes.len().saturating_sub(t.rest_len());
-        if t.rest_len() == 0 {
-            break Tail::Clean;
+/// Keeps a frame whole.
+#[derive(Debug, Default)]
+pub struct Whole(Vec<u8>);
+
+impl Keep for Whole {
+    type Kept = Vec<u8>;
+
+    fn start(&mut self, _len: u32) {
+        self.0.clear();
+    }
+
+    fn piece(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// Keeps nothing of a frame.
+#[derive(Debug, Default)]
+pub struct Skip;
+
+impl Keep for Skip {
+    type Kept = ();
+
+    fn start(&mut self, _len: u32) {}
+
+    fn piece(&mut self, _bytes: &[u8]) {}
+
+    fn finish(&mut self) -> Self::Kept {}
+}
+
+/// Where a [`Reader`] reads a segment's bytes from: a segment file, or a segment held whole.
+pub trait Source {
+    type Error;
+    /// Reads the next bytes into `out`: how many, 0 at the end.
+    fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Self::Error>;
+}
+
+impl Source for File {
+    type Error = std::io::Error;
+
+    fn read_some(&mut self, out: &mut [u8]) -> Result<usize, std::io::Error> {
+        loop {
+            match std::io::Read::read(self, out) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                read => return read,
+            }
         }
-        let rest = t.rest_slice();
-        let Some((kind, position, payload, found, size)) = record_at(rest) else {
-            break Tail::Torn { at };
+    }
+}
+
+impl Source for &[u8] {
+    type Error = Infallible;
+
+    fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Infallible> {
+        let bytes = std::mem::take(self);
+        let n = out.len().min(bytes.len());
+        let (Some((head, rest)), Some(to)) = (bytes.split_at_checked(n), out.get_mut(..n)) else {
+            *self = bytes;
+            return Ok(0);
         };
-        let chain = chain(previous, kind, position, payload);
-        if chain != found {
-            break Tail::Torn { at };
+        to.copy_from_slice(head);
+        *self = rest;
+        Ok(n)
+    }
+}
+
+/// A [`Reader`] failed: its source, or a header or record no segment has.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError<E> {
+    #[error("reading the segment: {0}")]
+    Source(#[source] E),
+    #[error(transparent)]
+    Segment(#[from] SegmentError),
+}
+
+/// A [`Source`] read through a buffer of [`BUFFER`] bytes, and how far.
+struct Buffered<S> {
+    source: S,
+    buf: Box<[u8]>,
+    /// The unread bytes of the buffer: `pos..filled`.
+    pos: usize,
+    filled: usize,
+    /// The bytes read so far.
+    offset: usize,
+}
+
+impl<S: Source> Buffered<S> {
+    fn new(source: S) -> Self {
+        Self {
+            source,
+            buf: vec![0; BUFFER].into_boxed_slice(),
+            pos: 0,
+            filled: 0,
+            offset: 0,
         }
-        t = Take(rest.get(size..).unwrap_or_default());
-        let Some(want) = expected else {
-            let after = records
-                .last()
-                .map_or(header.first_position, |r: &Record| r.position);
-            return Err(SegmentError::PositionOverflow { after });
+    }
+
+    /// Whether any byte is left, the buffer refilled once it is used up.
+    fn more(&mut self) -> Result<bool, S::Error> {
+        if self.pos < self.filled {
+            return Ok(true);
+        }
+        let n = self.source.read_some(&mut self.buf)?;
+        self.pos = 0;
+        self.filled = n.min(self.buf.len());
+        Ok(self.filled > 0)
+    }
+
+    /// Passes the next `len` bytes to `f`, piece by piece. False when the source ends first.
+    fn stream(&mut self, len: usize, mut f: impl FnMut(&[u8])) -> Result<bool, S::Error> {
+        let mut left = len;
+        while left > 0 {
+            if !self.more()? {
+                return Ok(false);
+            }
+            let unread = self.buf.get(self.pos..self.filled).unwrap_or_default();
+            let piece = unread.get(..left).unwrap_or(unread);
+            f(piece);
+            let n = piece.len();
+            self.pos = self.pos.saturating_add(n);
+            self.offset = self.offset.saturating_add(n);
+            left = left.saturating_sub(n);
+        }
+        Ok(true)
+    }
+
+    /// Appends the next `len` bytes to `out`. False when the source ends first, what there was
+    /// appended.
+    fn take(&mut self, out: &mut Vec<u8>, len: usize) -> Result<bool, S::Error> {
+        self.stream(len, |piece| out.extend_from_slice(piece))
+    }
+
+    /// The next `N` bytes, `None` when the source ends first.
+    fn array<const N: usize>(&mut self) -> Result<Option<[u8; N]>, S::Error> {
+        let mut out = [0u8; N];
+        let mut at = 0usize;
+        let whole = self.stream(N, |piece| {
+            let end = at.saturating_add(piece.len());
+            if let Some(to) = out.get_mut(at..end) {
+                to.copy_from_slice(piece);
+            }
+            at = end;
+        })?;
+        Ok(whole.then_some(out))
+    }
+}
+
+/// The bytes of a segment's header, read field by field as far as its lengths and tags say and no
+/// further, so the records follow. It stops early at the end of the source or at a tag no header
+/// has, and [`header`] then says what is wrong, as it does for the header of a segment held whole.
+fn header_bytes<S: Source>(b: &mut Buffered<S>) -> Result<Vec<u8>, S::Error> {
+    let mut head = Vec::new();
+    if !b.take(&mut head, HEADER_START)? {
+        return Ok(head);
+    }
+    let supersedes = match head.last().copied() {
+        Some(0) => 0,
+        Some(1) => 16,
+        _ => return Ok(head),
+    };
+    if !b.take(&mut head, supersedes)? {
+        return Ok(head);
+    }
+    // The cluster id and the stream path.
+    for _ in 0..2 {
+        if !b.take(&mut head, 2)? {
+            return Ok(head);
+        }
+        let len = head.last_chunk::<2>().map_or(0, |n| u16::from_le_bytes(*n));
+        if !b.take(&mut head, usize::from(len))? {
+            return Ok(head);
+        }
+    }
+    if !b.take(&mut head, HEADER_COUNTERS)? {
+        return Ok(head);
+    }
+    let claim = match head.last().copied() {
+        Some(0) => 0,
+        // An epoch and an activation.
+        Some(1) => 24,
+        _ => return Ok(head),
+    };
+    if !b.take(&mut head, claim)? {
+        return Ok(head);
+    }
+    // The checksum.
+    b.take(&mut head, 4)?;
+    Ok(head)
+}
+
+/// What [`Reader::next`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step<F> {
+    /// The next valid record.
+    Record(Record<F>),
+    /// The valid prefix ends: how the rest ends.
+    End(Tail),
+}
+
+/// Reads a segment: its header, then its records one at a time, each payload through a buffer of
+/// [`BUFFER`] bytes. It reads what [`scan`] reads of a segment held whole: the same header, the
+/// same valid prefix and the same [`Tail`], and fails where `scan` fails.
+pub struct Reader<S> {
+    bytes: Buffered<S>,
+    header: SegmentHeader,
+    seed: u32,
+    header_len: usize,
+    /// The last valid record's chain, the header's checksum before the first.
+    previous: u32,
+    /// The position the next record must have, `None` after the last position there is.
+    expected: Option<Position>,
+    /// The last valid record's position.
+    last: Option<Position>,
+    /// How the valid prefix ended, once it did.
+    tail: Option<Tail>,
+}
+
+impl<S: Source> Reader<S> {
+    /// Reads the segment's header. One cut short, damaged or of another format is an error: the
+    /// records cannot be trusted without it.
+    pub fn new(source: S) -> Result<Self, ReadError<S::Error>> {
+        let mut bytes = Buffered::new(source);
+        let head = header_bytes(&mut bytes).map_err(ReadError::Source)?;
+        let (header, seed, header_len) = header(&head)?;
+        let expected = Some(header.first_position);
+        Ok(Self {
+            bytes,
+            header,
+            seed,
+            header_len,
+            previous: seed,
+            expected,
+            last: None,
+            tail: None,
+        })
+    }
+
+    pub fn header(&self) -> &SegmentHeader {
+        &self.header
+    }
+
+    pub fn into_header(self) -> SegmentHeader {
+        self.header
+    }
+
+    /// The header's checksum, which seeds the first record's chain.
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    /// The byte offset just after the header.
+    pub fn header_len(&self) -> usize {
+        self.header_len
+    }
+
+    /// The next record of the valid prefix, or how the prefix ends (again on every later call). A
+    /// COMMIT record's frame is what `keep` keeps of it.
+    pub fn next<K: Keep>(&mut self, keep: &mut K) -> Result<Step<K::Kept>, ReadError<S::Error>> {
+        if let Some(tail) = self.tail {
+            return Ok(Step::End(tail));
+        }
+        let at = self.bytes.offset;
+        if !self.bytes.more().map_err(ReadError::Source)? {
+            return Ok(self.end(Tail::Clean));
+        }
+        let Some(head) = self
+            .bytes
+            .array::<RECORD_HEAD>()
+            .map_err(ReadError::Source)?
+        else {
+            return Ok(self.end(Tail::Torn { at }));
+        };
+        let mut t = Take(&head);
+        let (Some(len), Some(kind), Some(position)) = (t.u32(), t.u8(), t.u64()) else {
+            return Ok(self.end(Tail::Torn { at }));
+        };
+        // The chain covers the previous chain, the kind, the position and the payload.
+        let mut chain = crc32c::crc32c(&self.previous.to_le_bytes());
+        chain = crc32c::crc32c_append(chain, head.get(4..).unwrap_or_default());
+        let mut fixed = [0u8; FIXED_PAYLOAD];
+        let mut fixed_len = 0usize;
+        if kind == COMMIT {
+            keep.start(len);
+        }
+        let whole = self
+            .bytes
+            .stream(usize::try_from(len).unwrap_or(usize::MAX), |piece| {
+                chain = crc32c::crc32c_append(chain, piece);
+                if kind == COMMIT {
+                    keep.piece(piece);
+                } else if let Some(to) = fixed.get_mut(fixed_len..) {
+                    let n = to.len().min(piece.len());
+                    if let (Some(to), Some(from)) = (to.get_mut(..n), piece.get(..n)) {
+                        to.copy_from_slice(from);
+                    }
+                    fixed_len = fixed_len.saturating_add(n);
+                }
+            })
+            .map_err(ReadError::Source)?;
+        if !whole {
+            return Ok(self.end(Tail::Torn { at }));
+        }
+        let Some(found) = self
+            .bytes
+            .array::<RECORD_TAIL>()
+            .map_err(ReadError::Source)?
+        else {
+            return Ok(self.end(Tail::Torn { at }));
+        };
+        if u32::from_le_bytes(found) != chain {
+            return Ok(self.end(Tail::Torn { at }));
+        }
+        let Some(want) = self.expected else {
+            return Err(SegmentError::PositionOverflow {
+                after: self.last.unwrap_or(self.header.first_position),
+            }
+            .into());
         };
         if position != want {
-            break Tail::Gap {
+            return Ok(self.end(Tail::Gap {
                 at,
                 expected: want,
                 found: position,
-            };
+            }));
         }
-        let Some(body) = body_of(kind, payload) else {
-            break Tail::Malformed { at, kind };
+        let body = match kind {
+            COMMIT if len > 0 => Some(RecordBody::Commit {
+                frame: keep.finish(),
+            }),
+            COMMIT => None,
+            // Every fixed shape's payload fits: a longer one is none.
+            _ => usize::try_from(len)
+                .ok()
+                .filter(|&len| len <= fixed_len)
+                .and_then(|len| fixed.get(..len))
+                .and_then(|payload| fixed_body(kind, payload)),
         };
-        records.push(Record {
+        let Some(body) = body else {
+            return Ok(self.end(Tail::Malformed { at, kind }));
+        };
+        self.previous = chain;
+        self.expected = position.0.checked_add(1).map(Position);
+        self.last = Some(position);
+        Ok(Step::Record(Record {
             position,
             body,
             chain,
-            end: bytes.len().saturating_sub(t.rest_len()),
-        });
-        previous = chain;
-        expected = position.0.checked_add(1).map(Position);
+            end: self.bytes.offset,
+        }))
+    }
+
+    fn end<F>(&mut self, tail: Tail) -> Step<F> {
+        self.tail = Some(tail);
+        Step::End(tail)
+    }
+}
+
+fn infallible(e: ReadError<Infallible>) -> SegmentError {
+    match e {
+        ReadError::Source(never) => match never {},
+        ReadError::Segment(e) => e,
+    }
+}
+
+/// The segment's header and its longest valid prefix of records, read by a [`Reader`]. A header
+/// that is cut short, damaged or of another format is an error: the records cannot be trusted
+/// without it.
+pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
+    let mut reader = Reader::new(bytes).map_err(infallible)?;
+    let mut whole = Whole::default();
+    let mut records = Vec::new();
+    let tail = loop {
+        match reader.next(&mut whole).map_err(infallible)? {
+            Step::Record(r) => records.push(r),
+            Step::End(tail) => break tail,
+        }
     };
+    let (seed, header_len) = (reader.seed(), reader.header_len());
     Ok(Scan {
-        header,
+        header: reader.into_header(),
         seed,
         header_len,
         records,
         tail,
     })
+}
+
+/// The header of the segment `source` holds, the segment read to the end of its valid prefix as
+/// [`scan`] reads it and nothing kept of its records: it fails where `scan` fails.
+pub fn read_header<S: Source>(source: S) -> Result<SegmentHeader, ReadError<S::Error>> {
+    let mut reader = Reader::new(source)?;
+    while let Step::Record(_) = reader.next(&mut Skip)? {}
+    Ok(reader.into_header())
 }
 
 #[cfg(test)]

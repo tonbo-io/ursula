@@ -22,11 +22,13 @@
 //! `gen-<id32>.tmp`, fsynced, and published by one rename, and every one of its log segments
 //! names the generation directory it supersedes by id (a roll carries it over, so no trim loses
 //! it), so a crash that leaves two is finished at the next open ([`Root::finish_leftovers`]). Once
-//! the superseded directory is gone, the id names nothing and is never acted on. A superseded generation is renamed to `gen-<id32>.trash`
-//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory. A
-//! generation is published with page 1 written and marked, the page 1 of an empty database when
-//! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
-//! unmarked.
+//! the superseded directory is gone, the id names nothing and is never acted on. Which generation
+//! is current is one pure rule, [`Root::classify`]: the one no other supersedes. The open finishes
+//! the others by it, and reads the current one by it. A superseded generation is renamed to
+//! `gen-<id32>.trash` before it is deleted, so a crash midway never leaves a half-deleted `gen-`
+//! directory. A generation is published with page 1 written and marked, the page 1 of an empty
+//! database when nothing was applied ([`marker::empty_page_one`]), so no published db file is ever
+//! empty or unmarked.
 //!
 //! The superseded generation's fate ([`Fate`]) is written before the publishing rename: it is
 //! trashed, or salvaged, its manifest written into it first and the directory moved into
@@ -58,9 +60,10 @@ use std::sync::PoisonError;
 use std::sync::Weak;
 
 use crate::codec::marker;
+use crate::codec::segment::ReadError;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
-use crate::codec::segment::scan;
+use crate::codec::segment::read_header;
 use crate::config::Step as AbortStep;
 use crate::config::abort_at;
 use crate::ids::GenId;
@@ -333,13 +336,14 @@ fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
     let first = segments.first().ok_or_else(|| GenerationError::NoSegment {
         dir: dir.to_owned(),
     })?;
-    let bytes = fs::read(first).map_err(io("read", first))?;
-    scan(&bytes)
-        .map(|s| s.header)
-        .map_err(|source| GenerationError::Header {
+    let file = File::open(first).map_err(io("read", first))?;
+    read_header(file).map_err(|e| match e {
+        ReadError::Source(source) => io("read", first)(source),
+        ReadError::Segment(source) => GenerationError::Header {
             dir: dir.to_owned(),
             source,
-        })
+        },
+    })
 }
 
 /// Deletes every `reader-<m>/` of the stream root `root` but `keep` whose lock nobody holds, and
@@ -414,6 +418,82 @@ fn leftover(path: &Path, e: &std::io::Error) {
 struct Dir {
     path: PathBuf,
     id: GenId,
+}
+
+/// The `gen-<id32>` directories of the root `root`, by id: never a `.tmp`, a `.trash`, a reader
+/// directory or a salvage.
+fn generations(root: &Path) -> Result<Vec<Dir>, GenerationError> {
+    let mut gens = Vec::new();
+    for entry in fs::read_dir(root).map_err(io("list", root))? {
+        let entry = entry.map_err(io("list", root))?;
+        let name = entry.file_name();
+        let id = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(GEN))
+            .and_then(GenId::parse_hex);
+        if let Some(id) = id {
+            gens.push(Dir {
+                path: entry.path(),
+                id,
+            });
+        }
+    }
+    gens.sort_by_key(|g| g.id);
+    Ok(gens)
+}
+
+/// A root's generations as [`Root::classify`] found them.
+#[derive(Debug)]
+pub(crate) struct Classified {
+    root: PathBuf,
+    /// Every generation directory, by id.
+    gens: Vec<Dir>,
+    /// The ids another generation's first log segment names as superseded. Read only when there
+    /// are two or more generations.
+    superseded: Vec<GenId>,
+}
+
+impl Classified {
+    fn superseded(&self, g: &Dir) -> bool {
+        self.superseded.contains(&g.id)
+    }
+
+    /// The current generation's directory: the one no other supersedes, if any. Two or more are
+    /// ambiguous.
+    fn current_dir(self) -> Result<Option<Dir>, GenerationError> {
+        let Classified {
+            root,
+            gens,
+            superseded,
+        } = self;
+        let mut left: Vec<Dir> = gens
+            .into_iter()
+            .filter(|g| !superseded.contains(&g.id))
+            .collect();
+        match left.len() {
+            0 | 1 => Ok(left.pop()),
+            _ => Err(GenerationError::Ambiguous {
+                root,
+                ids: left.iter().map(|g| g.id).collect(),
+            }),
+        }
+    }
+
+    /// The current generation, if any, or its directory when its log's first segment header
+    /// cannot be read. Two or more that nothing supersedes are ambiguous.
+    pub(crate) fn current(self) -> Result<Option<Result<Generation, Unreadable>>, GenerationError> {
+        let Some(dir) = self.current_dir()? else {
+            return Ok(None);
+        };
+        let path = dir.path.clone();
+        match dir.generation() {
+            Ok(g) => Ok(Some(Ok(g))),
+            Err(error @ (GenerationError::Header { .. } | GenerationError::NoSegment { .. })) => {
+                Ok(Some(Err(Unreadable { dir: path, error })))
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Dir {
@@ -579,54 +659,18 @@ impl Root {
             .any(|id| *id == g.id)
     }
 
-    /// The generation directories, temporary ones apart, by id.
-    fn generations(&self) -> Result<Vec<Dir>, GenerationError> {
-        let mut gens = Vec::new();
-        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
-            let entry = entry.map_err(io("list", &self.dir))?;
-            let name = entry.file_name();
-            let id = name
-                .to_str()
-                .and_then(|n| n.strip_prefix(GEN))
-                .and_then(GenId::parse_hex);
-            if let Some(id) = id {
-                gens.push(Dir {
-                    path: entry.path(),
-                    id,
-                });
-            }
-        }
-        gens.sort_by_key(|g| g.id);
-        Ok(gens)
-    }
-
     /// The root directory.
     pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
 
-    /// Finishes what a crash left: deletes every `gen-*.tmp` and `gen-*.trash`, salvages every
-    /// generation another one's first segment says it supersedes that holds a salvage manifest
-    /// and deletes the others, deletes the manifest of a generation nothing supersedes (its
-    /// publish never happened), and completes every salvage still marked `moving`.
-    pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
-        let mut removed = false;
-        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
-            let entry = entry.map_err(io("list", &self.dir))?;
-            let leftover = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(GEN) && (n.ends_with(TMP) || n.ends_with(TRASH)));
-            if leftover {
-                let path = entry.path();
-                fs::remove_dir_all(&path).map_err(io("remove", &path))?;
-                removed = true;
-            }
-        }
-        if removed {
-            sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
-        }
-        let gens = self.generations()?;
+    /// Classifies the generations of the stream root `root` (design: Layout) and changes nothing:
+    /// a generation is superseded when another one's first log segment names it, and the current
+    /// one is the one nothing supersedes. Only `gen-<id32>` directories are read, and their first
+    /// segment headers only when there are two or more. With two or more, one whose header cannot
+    /// be read and that nothing supersedes is an error, its header's.
+    pub(crate) fn classify(root: &Path) -> Result<Classified, GenerationError> {
+        let gens = generations(root)?;
         let mut superseded = Vec::new();
         if gens.len() > 1 {
             // A generation whose header cannot be read is finished when a readable one says it
@@ -645,9 +689,38 @@ impl Root {
                 return Err(e);
             }
         }
-        for g in &gens {
+        Ok(Classified {
+            root: root.to_owned(),
+            gens,
+            superseded,
+        })
+    }
+
+    /// Finishes what a crash left: deletes every `gen-*.tmp` and `gen-*.trash`, salvages every
+    /// generation [`Root::classify`] finds superseded that holds a salvage manifest and deletes
+    /// the others, deletes the manifest of a generation nothing supersedes (its publish never
+    /// happened), and completes every salvage still marked `moving`.
+    pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
+        let mut removed = false;
+        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
+            let entry = entry.map_err(io("list", &self.dir))?;
+            let leftover = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(GEN) && (n.ends_with(TMP) || n.ends_with(TRASH)));
+            if leftover {
+                let path = entry.path();
+                fs::remove_dir_all(&path).map_err(io("remove", &path))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+        }
+        let classified = Self::classify(&self.dir)?;
+        for g in &classified.gens {
             salvage::clear_tmp(&g.path)?;
-            match (superseded.contains(&g.id), salvage::read_manifest(&g.path)?) {
+            match (classified.superseded(g), salvage::read_manifest(&g.path)?) {
                 (true, Some(manifest)) => {
                     let moved = salvage::move_into(&self.dir, &g.path, &manifest)?;
                     salvage::complete(&moved, manifest)?;
@@ -677,34 +750,17 @@ impl Root {
         self.current_dir()?.map(Dir::generation).transpose()
     }
 
-    /// The current generation, if any, or its directory when its log's first segment header
-    /// cannot be read. Two left after [`Root::finish_leftovers`] are an error.
+    /// The current generation ([`Root::classify`]), if any, or its directory when its log's first
+    /// segment header cannot be read. Two left after [`Root::finish_leftovers`] are an error.
     pub(crate) fn current_or_unreadable(
         &self,
     ) -> Result<Option<Result<Generation, Unreadable>>, GenerationError> {
-        let Some(dir) = self.current_dir()? else {
-            return Ok(None);
-        };
-        let path = dir.path.clone();
-        match dir.generation() {
-            Ok(g) => Ok(Some(Ok(g))),
-            Err(error @ (GenerationError::Header { .. } | GenerationError::NoSegment { .. })) => {
-                Ok(Some(Err(Unreadable { dir: path, error })))
-            }
-            Err(e) => Err(e),
-        }
+        Self::classify(&self.dir)?.current()
     }
 
-    /// The current generation directory, if any, its log not read.
+    /// The current generation directory ([`Root::classify`]), if any, its log not read.
     fn current_dir(&self) -> Result<Option<Dir>, GenerationError> {
-        let mut gens = self.generations()?;
-        match gens.len() {
-            0 | 1 => Ok(gens.pop()),
-            _ => Err(GenerationError::Ambiguous {
-                root: self.dir.clone(),
-                ids: gens.iter().map(|g| g.id).collect(),
-            }),
-        }
+        Self::classify(&self.dir)?.current_dir()
     }
 
     /// Starts building the generation of `h.lineage` in a fresh `gen-<id32>.tmp`: its log, with

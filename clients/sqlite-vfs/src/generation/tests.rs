@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::path::PathBuf;
 
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
@@ -286,7 +289,7 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
             fs::remove_dir_all(trash.join("log")).unwrap();
         }
         let root = Root::lock(dir.path(), &p).unwrap();
-        root.finish_leftovers().unwrap();
+        classify_then_finish(&root);
         let current = root.current().unwrap().unwrap();
         let entries: Vec<String> = fs::read_dir(root.path())
             .unwrap()
@@ -353,7 +356,7 @@ fn a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step() {
         let done = building.crash_after(Fate::Trash, steps).unwrap();
         drop(root);
         let root = Root::lock(dir.path(), &p).unwrap();
-        root.finish_leftovers().unwrap();
+        classify_then_finish(&root);
         let current = root.current().unwrap().unwrap();
         let entries: Vec<String> = fs::read_dir(root.path())
             .unwrap()
@@ -392,7 +395,7 @@ fn an_unreadable_generation_another_supersedes_is_finished() {
     fs::remove_dir_all(old.log_dir()).unwrap();
     drop(root);
     let root = Root::lock(dir.path(), &p).unwrap();
-    root.finish_leftovers().unwrap();
+    classify_then_finish(&root);
     assert_eq!(root.current().unwrap().unwrap().lineage, Lineage([2; 16]));
 }
 
@@ -409,6 +412,12 @@ fn an_unreadable_generation_nothing_supersedes_is_an_error() {
     // `b` supersedes nothing (it was built with no current generation), and `a` is unreadable.
     fs::remove_dir_all(a.log_dir()).unwrap();
     assert_eq!(b.first_header().unwrap().supersedes, None);
+    let before = tree(root.path());
+    assert!(matches!(
+        Root::classify(root.path()),
+        Err(GenerationError::NoSegment { .. } | GenerationError::Io { .. })
+    ));
+    assert_eq!(tree(root.path()), before);
     assert!(matches!(
         root.finish_leftovers(),
         Err(GenerationError::NoSegment { .. } | GenerationError::Io { .. })
@@ -450,7 +459,7 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
         .unwrap();
     drop(root);
     let root = Root::lock(dir.path(), &p).unwrap();
-    root.finish_leftovers().unwrap();
+    classify_then_finish(&root);
     let current = root.current().unwrap().unwrap();
     assert_eq!(current.lineage, old.lineage);
     assert_ne!(current.id, old.id);
@@ -463,6 +472,10 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
     let other = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     fs::rename(&side, &current.dir).unwrap();
     assert_eq!(other.first_header().unwrap().supersedes, None);
+    assert!(matches!(
+        Root::classify(root.path()).unwrap().current(),
+        Err(GenerationError::Ambiguous { ids, .. }) if ids.len() == 2
+    ));
     root.finish_leftovers().unwrap();
     assert!(matches!(
         root.current(),
@@ -523,7 +536,7 @@ fn a_crash_after_each_salvaging_publish_step_converges() {
             .unwrap();
         drop(root);
         let root = Root::lock(dir.path(), &p).unwrap();
-        root.finish_leftovers().unwrap();
+        classify_then_finish(&root);
         let current = root.current().unwrap().unwrap();
         let salvages = salvage::list(root.path()).unwrap();
         // Until the rename (step 5) the old generation stays, after it the new one.
@@ -674,7 +687,7 @@ fn a_crash_during_a_copy_leaves_one_generation_current() {
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let converge = |dir: &TempDir, old: &super::Generation, want: &[(Position, RecordBody)]| {
         let root = Root::lock(dir.path(), &p).unwrap();
-        root.finish_leftovers().unwrap();
+        classify_then_finish(&root);
         let current = root.current().unwrap().unwrap();
         let entries: Vec<String> = fs::read_dir(root.path())
             .unwrap()
@@ -740,4 +753,41 @@ fn a_failed_copy_leaves_no_tmp() {
         .filter(|n| n != "lock")
         .collect();
     assert_eq!(entries, vec![format!("gen-{}", old.id.hex())]);
+}
+
+/// Every entry under `dir` by its path there, with a file's bytes.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut entries = BTreeMap::new();
+    let mut todo = vec![dir.to_owned()];
+    while let Some(at) = todo.pop() {
+        for entry in fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.strip_prefix(dir).unwrap().to_owned();
+            if path.is_dir() {
+                entries.insert(name, None);
+                todo.push(path);
+            } else {
+                entries.insert(name, Some(fs::read(&path).unwrap()));
+            }
+        }
+    }
+    entries
+}
+
+/// Classifies the root's generations, checks that it changed nothing, then finishes the
+/// leftovers as the open does, and checks that the generation the open then reads is the one the
+/// classification chose.
+fn classify_then_finish(root: &Root) {
+    let before = tree(root.path());
+    let dirs = |current: Option<Result<super::Generation, super::Unreadable>>| {
+        current.map(|c| c.map(|g| g.dir).map_err(|u| u.dir))
+    };
+    let chosen = dirs(Root::classify(root.path()).unwrap().current().unwrap());
+    assert_eq!(
+        tree(root.path()),
+        before,
+        "the classification changed the root"
+    );
+    root.finish_leftovers().unwrap();
+    assert_eq!(dirs(root.current_or_unreadable().unwrap()), chosen);
 }

@@ -602,3 +602,107 @@ fn a_run_no_commit_frame_holds_is_refused_at_its_first_part() {
     };
     assert_eq!(run.push(short).unwrap(), None);
 }
+
+/// The commit id [`super::decode`] reads at the start of `bytes`, under a limit of their length.
+fn decoded_commit_id(bytes: &[u8]) -> Option<CommitId> {
+    match super::decode(bytes, bytes.len() as u64) {
+        Ok(Decoded::Frame {
+            frame: Frame::Commit { id, .. },
+            ..
+        }) => Some(id),
+        _ => None,
+    }
+}
+
+/// The commit id a [`super::CommitIdReader`] reads from `bytes` fed in pieces of `sizes`, in turn,
+/// an empty piece first.
+fn read_in_pieces(bytes: &[u8], sizes: &[usize]) -> Option<CommitId> {
+    let mut reader = super::CommitIdReader::default();
+    reader.feed(&[]);
+    let mut rest = bytes;
+    for size in sizes.iter().cycle() {
+        if rest.is_empty() {
+            break;
+        }
+        let (piece, after) = rest.split_at((*size).min(rest.len()));
+        reader.feed(piece);
+        rest = after;
+    }
+    reader.finish()
+}
+
+/// Frames of every kind, whole, followed by other bytes, cut short or with a damaged bit, and
+/// bytes that are no frame.
+fn frame_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let small_commit = (id(), vec(any::<u8>(), 1..80))
+        .prop_map(|(id, compressed)| encode(&Frame::Commit { id, compressed }).unwrap());
+    let whole = prop_oneof![small_commit, any_frame().prop_map(|f| encode(&f).unwrap())];
+    (whole, vec(any::<u8>(), 0..40), any::<usize>(), 0u8..4).prop_map(
+        |(mut bytes, other, at, how)| {
+            match how {
+                0 => bytes.extend(other),
+                1 => bytes.truncate(at % (bytes.len() + 1)),
+                2 => {
+                    let bit = at % (bytes.len() * 8);
+                    bytes[bit / 8] ^= 1 << (bit % 8);
+                }
+                _ => bytes = other,
+            }
+            bytes
+        },
+    )
+}
+
+proptest! {
+    // The commit id reader, fed in pieces of any size, reads exactly what `decode` reads, so a
+    // log reader that streams a frame tells caught-up commits from its own as the open did.
+    #[test]
+    fn the_commit_id_reader_reads_what_decode_reads(
+        bytes in frame_bytes(),
+        sizes in vec(1usize..48, 1..6),
+    ) {
+        let decoded = decoded_commit_id(&bytes);
+        prop_assert_eq!(read_in_pieces(&bytes, &sizes), decoded);
+        prop_assert_eq!(super::commit_id(&bytes), decoded);
+    }
+}
+
+// A whole COMMIT frame names its id however it is cut into pieces; a frame cut short, a frame of
+// another kind and a body of no commit name none.
+#[test]
+fn the_commit_id_reader_names_whole_commit_frames_only() {
+    let id = CommitId {
+        lineage: Lineage([3; 16]),
+        position: Position(42),
+    };
+    let frame = encode(&Frame::Commit {
+        id,
+        compressed: vec![9; 300],
+    })
+    .unwrap();
+    for size in [1, 7, 13, 37, 38, 299, frame.len()] {
+        assert_eq!(
+            read_in_pieces(&frame, &[size]),
+            Some(id),
+            "pieces of {size}"
+        );
+    }
+    let mut longer = frame.clone();
+    longer.extend_from_slice(b"after");
+    assert_eq!(super::commit_id(&longer), Some(id));
+    assert_eq!(super::commit_id(&frame[..frame.len() - 1]), None);
+    assert_eq!(
+        super::commit_id(&encode_claim(epoch(1), Activation([1; 16]))),
+        None
+    );
+    // A COMMIT header whose body holds only the id.
+    let mut bare = frame[..13 + 24].to_vec();
+    bare[5..9].copy_from_slice(&24u32.to_le_bytes());
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&[2]), &bare[13..]);
+    bare[9..13].copy_from_slice(&crc.to_le_bytes());
+    assert!(matches!(
+        super::decode(&bare, bare.len() as u64),
+        Err(FrameError::BodyLength { kind: 2, len: 24 })
+    ));
+    assert_eq!(super::commit_id(&bare), None);
+}

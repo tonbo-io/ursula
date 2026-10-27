@@ -660,6 +660,10 @@ directory and return the db path.
   published by one rename after the old one's fate is written. No published db file is ever empty
   or unmarked. Every segment names the directory its generation supersedes, and a roll carries
   that forward, so a crash that leaves two generations is finished at the next open.
+- The current generation is the one no other generation's first segment supersedes. One pure
+  function chooses it and changes nothing: it reads only `gen-<id32>` directories, and their first
+  segment headers only when there are two or more. The open finishes the others by it, deleting or
+  salvaging them, and then reads the current generation by it.
 - A superseded generation is renamed to `.trash` before it is deleted.
 
 Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
@@ -694,6 +698,12 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
 | 3 ACK | acked position, acked offset (a commit boundary), log bytes since the latest snapshot | at most once a second, at once during an open, before a snapshot publishes, and when a binding resets or retires |
 | 4 BASE | position | after F2, materialization, or a snapshot copy |
 
+- The log is read by one rule, which changes nothing: each segment streams through a 64 KiB
+  buffer, its chains are verified, and each record of the valid log goes to a fold that keeps what
+  its reader needs. The open's fold keeps every record's body, and the open then cuts. A read takes
+  the buffer and what the fold keeps, whatever the size of a record or a segment. The commit id of
+  a COMMIT record's frame is read as the frame streams by, which tells caught-up stream frames from
+  the generation's own commits.
 - Positions start at 1. The valid log is the longest prefix whose chain verifies and whose
   positions grow by one. Open cuts the log at its first broken record, whether or not a
   chain-valid record follows, and reports the cut. A power loss can keep later unsynced records and
@@ -709,8 +719,11 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
   the CLAIM record that follows.
 
 Tests: `codec/segment/tests.rs` `segments_round_trip`, `a_chain_break_keeps_the_prefix_before_it`,
-`a_position_gap_under_valid_chains_is_a_gap`, `every_header_bit_flip_is_refused`, `replog/tests.rs`
-`a_torn_tail_is_cut`, `crash_cuts_at_every_byte_keep_the_whole_records`,
+`a_position_gap_under_valid_chains_is_a_gap`, `every_header_bit_flip_is_refused`,
+`the_reader_reads_what_a_whole_segment_scan_reads`,
+`a_record_larger_than_the_buffer_streams_through_it`, `codec/frame/tests.rs`
+`the_commit_id_reader_reads_what_decode_reads`, `replog/tests.rs`
+`the_read_opens_logs_as_the_whole_segment_open_did`, `a_torn_tail_is_cut`, `crash_cuts_at_every_byte_keep_the_whole_records`,
 `a_record_lost_before_a_kept_one_is_cut_there`,
 `a_planted_look_alike_record_does_not_refuse_the_open`, `a_gap_under_valid_chains_is_an_error`,
 `caught_up_frames_no_ack_follows_are_cut`, `a_torn_roll_deletes_the_new_segment`,

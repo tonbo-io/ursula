@@ -341,6 +341,100 @@ pub fn part_index(bytes: &[u8]) -> Option<u32> {
     t.u32()
 }
 
+/// A COMMIT frame before its compressed record: the frame header and the commit id.
+const COMMIT_HEAD: usize = HEADER + ID;
+
+/// Reads the commit id of the COMMIT frame that starts a byte string fed to it piece by piece,
+/// as [`decode`] reads the whole string with the string's length as `max_body`: `Some` exactly
+/// when `decode` gives a COMMIT frame, whatever bytes follow the frame. It keeps the frame's head
+/// and a running checksum of its body, never the body, so a reader of the local log tells its own
+/// commits from caught-up ones in fixed memory, whatever their size.
+#[derive(Debug, Clone)]
+pub struct CommitIdReader {
+    /// The first bytes fed, up to the end of the commit id.
+    head: [u8; COMMIT_HEAD],
+    /// How many bytes were fed.
+    fed: u64,
+    /// The checksum of the kind and of the body bytes fed so far.
+    crc: u32,
+}
+
+impl Default for CommitIdReader {
+    fn default() -> Self {
+        Self {
+            head: [0; COMMIT_HEAD],
+            fed: 0,
+            crc: 0,
+        }
+    }
+}
+
+impl CommitIdReader {
+    /// The next piece of the bytes.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        let start = self.fed;
+        let end = start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if let Some(head) = usize::try_from(start)
+            .ok()
+            .and_then(|at| self.head.get_mut(at..))
+        {
+            let n = head.len().min(bytes.len());
+            if let (Some(to), Some(from)) = (head.get_mut(..n), bytes.get(..n)) {
+                to.copy_from_slice(from);
+            }
+        }
+        // The body's bytes among these. The head holds the kind and the body length by then: the
+        // body starts after them.
+        let body_start = HEADER as u64;
+        let body_end = body_start.saturating_add(u64::from(self.body_len()));
+        let (from, to) = (start.max(body_start), end.min(body_end));
+        if from < to {
+            if from == body_start {
+                self.crc = crc32c::crc32c(&[self.kind()]);
+            }
+            let at = |offset: u64| usize::try_from(offset.saturating_sub(start)).unwrap_or(0);
+            if let Some(body) = bytes.get(at(from)..at(to)) {
+                self.crc = crc32c::crc32c_append(self.crc, body);
+            }
+        }
+        self.fed = end;
+    }
+
+    fn kind(&self) -> u8 {
+        self.head.get(MAGIC.len()).copied().unwrap_or(0)
+    }
+
+    fn body_len(&self) -> u32 {
+        let mut t = Take(
+            self.head
+                .get(MAGIC.len().saturating_add(1)..)
+                .unwrap_or_default(),
+        );
+        t.u32().unwrap_or(0)
+    }
+
+    /// The commit id, if the bytes fed start with a whole COMMIT frame.
+    pub fn finish(&self) -> Option<CommitId> {
+        let mut t = Take(&self.head);
+        let magic = t.array::<4>()?;
+        let kind = t.u8()?;
+        let len = t.u32()?;
+        let crc = t.u32()?;
+        let lineage = Lineage(t.array()?);
+        let position = Position(t.u64()?);
+        let whole = self.fed >= (HEADER as u64).saturating_add(u64::from(len));
+        let commit = &magic == MAGIC && kind == COMMIT && u64::from(len) > ID as u64;
+        (commit && whole && crc == self.crc).then_some(CommitId { lineage, position })
+    }
+}
+
+/// The commit id of the COMMIT frame that starts `bytes`, as [`CommitIdReader`] reads it.
+pub fn commit_id(bytes: &[u8]) -> Option<CommitId> {
+    let mut reader = CommitIdReader::default();
+    reader.feed(bytes);
+    reader.finish()
+}
+
 /// The record's length in bytes for `pages` pages: at most 8 + (2^32 - 1) x 4100, so it never
 /// saturates.
 fn record_len(pages: u32) -> u64 {
