@@ -154,8 +154,12 @@ fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> FileT
     let mut cached = lock(cache);
     let read_before = cached.is_some();
     let last = cached.as_ref().and_then(|c| c.token.clone());
-    let (token, unusable) = match read {
-        Ok(token) => (Some(token), false),
+    // `changed`: a token other than the one the file held before, once it was read.
+    let (token, unusable, changed) = match read {
+        Ok(token) => {
+            let changed = read_before && last.as_deref() != Some(token.as_str());
+            (Some(token), false, changed)
+        }
         Err(e) => {
             if !cached.as_ref().is_some_and(|c| c.unusable) {
                 log::emit(Level::Warn, "token_file_unreadable", &[
@@ -164,7 +168,7 @@ fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> FileT
                     ("kept_previous", &last.is_some()),
                 ]);
             }
-            (last, true)
+            (last, true, false)
         }
     };
     *cached = Some(Cached {
@@ -173,10 +177,7 @@ fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> FileT
         token: token.clone(),
         unusable,
     });
-    FileToken {
-        changed: read_before && token != last,
-        token,
-    }
+    FileToken { token, changed }
 }
 
 /// The file's modification time and length, `None` when it cannot be read.
