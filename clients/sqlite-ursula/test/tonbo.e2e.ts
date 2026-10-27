@@ -362,7 +362,8 @@ describe("open by name", () => {
 			expect(refused).toMatchObject({ kind: "invalid_url", action: "fix" });
 		}
 		expect(api.of("management")).toHaveLength(2);
-		expect(api.of("token")).toEqual([]);
+		// The one Streams token is the first open's.
+		expect(api.of("token")).toHaveLength(1);
 	});
 
 	it("names the origin to check when the token endpoint's origin is unusable or answers outside its contract", async () => {
