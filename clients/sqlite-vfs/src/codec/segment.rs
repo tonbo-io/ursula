@@ -716,7 +716,8 @@ impl<S: Source> Reader<S> {
             return Ok(self.end(Tail::Torn { at }));
         };
         let mut t = Take(&head);
-        let (Some(len), Some(kind), Some(position)) = (t.u32(), t.u8(), t.u64()) else {
+        let (Some(len), Some(kind), Some(position)) = (t.u32(), t.u8(), t.u64().map(Position))
+        else {
             return Ok(self.end(Tail::Torn { at }));
         };
         // The chain covers the previous chain, the kind, the position and the payload.
