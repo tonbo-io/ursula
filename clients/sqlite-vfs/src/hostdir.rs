@@ -17,8 +17,10 @@
 //! the owner open (`local_setup`), before it claims anything: a symlink or a file that is not a
 //! directory included, so the extension never writes through a link.
 //!
-//! A record is named by the first 32 hex digits of the BLAKE3 of the directory's real path. It is
-//! written once (a temp file fsynced, linked into place, then the host directory fsynced) and never
+//! A record is a flat JSON object (every value a string, a number, a boolean or null), so a later
+//! line may add only such keys: a reader takes its `dir` whatever its `v` and ignores the rest. It
+//! is named by the first 32 hex digits of the BLAKE3 of the directory's real path. It is written
+//! once (a temp file fsynced, linked into place, then the host directory fsynced) and never
 //! changed: `link` never replaces a file, so a record is complete or absent. An open that finds the
 //! record, or loses the race to link it, checks that it names the same directory, and fsyncs the
 //! host directory too, so a record another process linked and never synced is durable before this
@@ -91,6 +93,9 @@ pub(crate) enum HostDirError {
 pub(crate) enum Found {
     #[error("records {0:?}")]
     Other(String),
+    /// A FIFO, a socket, a device or a directory: never read, so it cannot block the open.
+    #[error("is not a regular file")]
+    NotAFile,
     #[error("is not a record: {0}")]
     Malformed(#[source] Malformed),
 }
@@ -122,17 +127,17 @@ pub(crate) fn record(cache: &Path) -> Result<(), HostDirError> {
 pub(crate) fn host_dir() -> Option<PathBuf> {
     resolve(
         Path::new(DEFAULT),
-        config::host_dir_override(),
+        &config::host_dir_override,
         &|path: &Path| fs::symlink_metadata(path).map(drop),
     )
 }
 
-/// [`host_dir`] with the default, the hook and `lstat` given. A default `lstat` cannot reach (a
-/// confinement policy's `EACCES`) counts as absent: an error other than a missing path is logged
-/// once (`host_dir_unreadable`).
-pub(crate) fn resolve(
+/// [`host_dir`] with the default, the hook and `lstat` given. The hook is read only when the
+/// default is absent. A default `lstat` cannot reach (a confinement policy's `EACCES`) counts as
+/// absent: an error other than a missing path is logged once (`host_dir_unreadable`).
+pub(crate) fn resolve<'a>(
     default: &Path,
-    hook: Option<&Path>,
+    hook: &dyn Fn() -> Option<&'a Path>,
     lstat: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> Option<PathBuf> {
     match lstat(default) {
@@ -144,7 +149,7 @@ pub(crate) fn resolve(
             ) => {}
         Err(e) => unreadable_once(default, &e),
     }
-    let hook = hook?;
+    let hook = hook()?;
     lstat(hook).ok().map(|()| hook.to_owned())
 }
 
@@ -187,7 +192,7 @@ pub(crate) fn recorded_dir(bytes: &[u8]) -> Result<String, Malformed> {
 }
 
 /// The real path `real` of a cache directory as text.
-pub(crate) fn utf8(host: &Path, real: PathBuf) -> Result<String, HostDirError> {
+fn utf8(host: &Path, real: PathBuf) -> Result<String, HostDirError> {
     real.into_os_string()
         .into_string()
         .map_err(|cache| HostDirError::NotUtf8 {
@@ -219,7 +224,7 @@ pub(crate) fn record_dir(host: &Path, cache: &Path) -> Result<(), HostDirError> 
     let cache = utf8(host, real)?;
     let record = host.join(record_name(&cache));
     match read(&record) {
-        Ok(bytes) => check(host, &record, &cache, &bytes)?,
+        Ok(existing) => check(host, &record, &cache, existing)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => publish(host, &record, &cache)?,
         Err(e) => return Err(io(host, "read", &record)(e)),
     }
@@ -228,27 +233,43 @@ pub(crate) fn record_dir(host: &Path, cache: &Path) -> Result<(), HostDirError> 
     Ok(())
 }
 
-/// The bytes of the record at `path`, at most one past [`MAX_RECORD_BYTES`]. Never through a link.
-fn read(path: &Path) -> std::io::Result<Vec<u8>> {
+/// What a record's name holds.
+enum Existing {
+    /// A regular file's bytes, at most one past [`MAX_RECORD_BYTES`].
+    File(Vec<u8>),
+    /// Anything else, unread.
+    NotAFile,
+}
+
+/// What the record's name `path` holds. Never through a link, and never blocking: a FIFO opens at
+/// once (`O_NONBLOCK`, which a regular file ignores) and only a regular file is read.
+fn read(path: &Path) -> std::io::Result<Existing> {
     let file = File::options()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(Existing::NotAFile);
+    }
     let limit = u64::try_from(MAX_RECORD_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(Existing::File(bytes))
 }
 
-/// The record `bytes` at `record` names `cache`, or the open fails.
-fn check(host: &Path, record: &Path, cache: &str, bytes: &[u8]) -> Result<(), HostDirError> {
+/// What the record's name `record` holds, `existing`, is the record of `cache`, or the open fails.
+fn check(host: &Path, record: &Path, cache: &str, existing: Existing) -> Result<(), HostDirError> {
     let conflict = |found| HostDirError::Conflict {
         host: host.to_owned(),
         record: record.to_owned(),
         cache: cache.to_owned(),
         found,
     };
-    match recorded_dir(bytes) {
+    let bytes = match existing {
+        Existing::File(bytes) => bytes,
+        Existing::NotAFile => return Err(conflict(Found::NotAFile)),
+    };
+    match recorded_dir(&bytes) {
         Ok(dir) if dir == cache => Ok(()),
         Ok(other) => Err(conflict(Found::Other(other))),
         Err(malformed) => Err(conflict(Found::Malformed(malformed))),
@@ -283,8 +304,8 @@ fn publish(host: &Path, record: &Path, cache: &str) -> Result<(), HostDirError> 
         // An open of another stream in the same directory linked it first.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             discard(&tmp);
-            let bytes = read(record).map_err(io(host, "read", record))?;
-            check(host, record, cache, &bytes)
+            let existing = read(record).map_err(io(host, "read", record))?;
+            check(host, record, cache, existing)
         }
         Err(e) => {
             discard(&tmp);

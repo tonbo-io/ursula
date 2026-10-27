@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
@@ -17,7 +16,6 @@ use super::record_line;
 use super::record_name;
 use super::recorded_dir;
 use super::resolve;
-use super::utf8;
 use crate::config::host_dir_hook;
 use crate::generation::Root;
 use crate::generation::canonical_path;
@@ -42,8 +40,24 @@ fn name_of(cache: &Path) -> String {
     record_name(fs::canonicalize(cache).unwrap().to_str().unwrap())
 }
 
-// A default path that `lstat` finds selects it, whatever it is, over the hook: a directory, a
-// regular file or a symlink (which then fails the open). One `lstat` cannot reach counts as absent.
+/// The hook of a test: always `hook`.
+fn hook_at<'a>(hook: &'a Path) -> impl Fn() -> Option<&'a Path> {
+    move || Some(hook)
+}
+
+/// No hook.
+fn no_hook<'a>() -> Option<&'a Path> {
+    None
+}
+
+/// A hook that must not be read: the default was found.
+fn unread_hook<'a>() -> Option<&'a Path> {
+    panic!("the hook is read only when the default is absent")
+}
+
+// A default path that `lstat` finds selects it, whatever it is, over the hook, which is then not
+// even read: a directory, a regular file or a symlink (which then fails the open). One `lstat`
+// cannot reach counts as absent.
 #[test]
 fn the_default_wins_whenever_lstat_finds_it() {
     let t = TempDir::new("hostdir-resolve");
@@ -57,10 +71,10 @@ fn the_default_wins_whenever_lstat_finds_it() {
     symlink(t.path().join("nowhere"), &link).unwrap();
     for default in [&dir, &file, &link] {
         assert_eq!(
-            resolve(default, Some(hook.as_path()), &lstat),
+            resolve(default, &unread_hook, &lstat),
             Some(default.clone())
         );
-        assert_eq!(resolve(default, None, &lstat), Some(default.clone()));
+        assert_eq!(resolve(default, &no_hook, &lstat), Some(default.clone()));
     }
 
     // EACCES (a confinement policy) and ENOTDIR (a file above it) count as absent.
@@ -72,11 +86,8 @@ fn the_default_wins_whenever_lstat_finds_it() {
                 lstat(path)
             }
         };
-        assert_eq!(
-            resolve(&dir, Some(hook.as_path()), &denied),
-            Some(hook.clone())
-        );
-        assert_eq!(resolve(&dir, None, &denied), None);
+        assert_eq!(resolve(&dir, &hook_at(&hook), &denied), Some(hook.clone()));
+        assert_eq!(resolve(&dir, &no_hook, &denied), None);
     }
 }
 
@@ -89,14 +100,14 @@ fn without_the_default_the_hook_decides() {
     let hook = t.path().join("hook");
     fs::write(&hook, b"").unwrap();
     assert_eq!(
-        resolve(&missing, Some(hook.as_path()), &lstat),
+        resolve(&missing, &hook_at(&hook), &lstat),
         Some(hook.clone())
     );
     assert_eq!(
-        resolve(&missing, Some(t.path().join("gone").as_path()), &lstat),
+        resolve(&missing, &hook_at(&t.path().join("gone")), &lstat),
         None
     );
-    assert_eq!(resolve(&missing, None, &lstat), None);
+    assert_eq!(resolve(&missing, &no_hook, &lstat), None);
 
     assert_eq!(host_dir_hook(None), None);
     assert_eq!(host_dir_hook(Some(OsString::new())), None);
@@ -109,7 +120,8 @@ fn without_the_default_the_hook_decides() {
 }
 
 // The key is the first 32 hex digits of the BLAKE3 of the real path, and the record one line of
-// JSON that names it. A reader takes the directory whatever the version, ignoring other keys.
+// JSON that names it. A reader takes the directory whatever the version, ignoring other flat keys:
+// a record is a flat object, so a nested value is not a record.
 #[test]
 fn a_record_names_the_real_path_under_its_hash() {
     let a = "/home/app/.cache/sqlite-ursula/0.8";
@@ -138,6 +150,10 @@ fn a_record_names_the_real_path_under_its_hash() {
         recorded_dir(b"{\"dir\""),
         Err(Malformed::Syntax(_))
     ));
+    assert!(matches!(
+        recorded_dir(br#"{"v":2,"dir":"/x","host":{"id":1}}"#),
+        Err(Malformed::Syntax(_))
+    ));
     let long = format!("{{\"dir\":\"/x\",\"pad\":\"{}\"}}", "a".repeat(64 << 10));
     assert!(matches!(
         recorded_dir(long.as_bytes()),
@@ -145,14 +161,25 @@ fn a_record_names_the_real_path_under_its_hash() {
     ));
 }
 
-// A real path that is not UTF-8 cannot be recorded as JSON text: the open fails.
+// A cache directory whose real path is not UTF-8 cannot be recorded as JSON text: the open fails,
+// and writes nothing. Linux only: macOS refuses such a name.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_real_path_that_is_not_utf8_fails() {
-    let real = PathBuf::from(OsString::from_vec(b"/cache/\xff".to_vec()));
-    assert!(matches!(
-        utf8(Path::new("/host"), real),
-        Err(HostDirError::NotUtf8 { .. })
-    ));
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = TempDir::new("hostdir-utf8");
+    let host = t.path().join("host");
+    fs::create_dir(&host).unwrap();
+    let cache = t.path().join(OsStr::from_bytes(b"cache-\xff"));
+    fs::create_dir(&cache).unwrap();
+    let err = record_dir(&host, &cache).unwrap_err();
+    assert!(
+        matches!(&err, HostDirError::NotUtf8 { cache: real, .. } if *real == fs::canonicalize(&cache).unwrap()),
+        "{err}"
+    );
+    assert!(names(&host).is_empty());
 }
 
 // An owner open records the real path of its cache directory, given through a symlink: one record,
@@ -268,7 +295,45 @@ fn a_record_that_is_not_the_directorys_fails_the_open() {
     assert_eq!(fs::read_to_string(&record).unwrap(), later);
 }
 
-// A record a host deleted is written again by the next open that locks a root in the directory.
+// A FIFO or a directory under the record's name fails the open at once: it is never read, so a
+// FIFO cannot hold the open, and the root lock with it, forever.
+#[test]
+fn a_record_that_is_not_a_regular_file_fails_the_open() {
+    let t = TempDir::new("hostdir-fifo");
+    let host = t.path().join("host");
+    fs::create_dir(&host).unwrap();
+    let cache = t.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    let record = host.join(name_of(&cache));
+
+    let made = std::process::Command::new("mkfifo")
+        .arg(&record)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo: {made}");
+    let err = record_dir(&host, &cache).unwrap_err();
+    assert!(
+        matches!(&err, HostDirError::Conflict {
+            found: Found::NotAFile,
+            ..
+        }),
+        "{err}"
+    );
+
+    fs::remove_file(&record).unwrap();
+    fs::create_dir(&record).unwrap();
+    let err = record_dir(&host, &cache).unwrap_err();
+    assert!(
+        matches!(&err, HostDirError::Conflict {
+            found: Found::NotAFile,
+            ..
+        }),
+        "{err}"
+    );
+    assert_eq!(names(&host), vec![name_of(&cache)]);
+}
+
+// A deleted record is written again by the next open that locks a root in the directory.
 #[test]
 fn a_deleted_record_is_written_again() {
     let t = TempDir::new("hostdir-deleted");

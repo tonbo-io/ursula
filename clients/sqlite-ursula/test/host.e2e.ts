@@ -8,8 +8,8 @@
 //   `dir` leaves it as it is, and so do four processes that open four streams there at once.
 // - H2: a read-only open and an import record nothing.
 // - H3: with a regular file at the host directory's path, the open fails with `UrsulaSetupError`
-//   `local_setup` (action `fix`), and the stream was never touched. With a directory there, the
-//   next open succeeds.
+//   `local_setup` (action `fix`), and nothing was created on the stream. With a directory there,
+//   the next open succeeds.
 // - H4: with no host directory the extension writes nothing there, as in every other suite.
 // - H5: SIGKILL at each step of an open's record (URSULA_VFS_ABORT_AT `host_tmp_synced`,
 //   `host_linked`, `host_dir_synced`), and at steps after it, leaves a complete record or none,
@@ -133,7 +133,7 @@ describe("host directory", () => {
 		expect(names(host)).toEqual([]);
 	});
 
-	it("H3: a host directory the open cannot record in fails it with local_setup, before anything reaches the stream", async () => {
+	it("H3: a host directory the open cannot record in fails it with local_setup, before anything is created on the stream", async () => {
 		// A regular file in its place: no directory can be opened there, for root too.
 		const host = join(freshDir(), "host");
 		writeFileSync(host, "");
@@ -146,7 +146,7 @@ describe("host directory", () => {
 		await refused.stop();
 		expect(reply).toMatchObject({ ok: false, name: "UrsulaSetupError", kind: "local_setup", action: "fix" });
 		expect(String(reply.message)).toContain(`the host directory ${host}`);
-		// Nothing was claimed, or even asked: the stream does not exist.
+		// Nothing was claimed or created: the stream does not exist.
 		expect(await headStatus(s.path)).toBe(404);
 		// The root lock was released with the open, and the root holds no generation.
 		expect(rootEntries(dir)).toEqual(["lock"]);

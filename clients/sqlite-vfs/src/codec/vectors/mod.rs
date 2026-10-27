@@ -15,7 +15,7 @@
 //!   generation.
 //! - [`MANIFEST`]: a salvage's `manifest.json`.
 //! - [`HOST_RECORD`] and [`HOST_RECORD_NAME`]: a host directory's record of a cache directory, and
-//!   its name (design: Hosts), frozen within a release line from 0.11.2.
+//!   its name (design: Hosts), frozen within a release line.
 
 use std::io::Cursor;
 
