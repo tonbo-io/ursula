@@ -1,7 +1,9 @@
 // `@tonbo/sqlite-ursula/tonbo`'s `open` by name, through the real open against the e2e server
 // (test/stack.ts). test/tonbo-api.ts stands in for the Management API and the token endpoint, as
 // their published contracts document them, and serves databases whose URLs are streams of the
-// e2e server. In front of Ursula, the gate records which token each stream request carried.
+// e2e server. In front of Ursula, the gate records which token each stream request carried. The
+// process holds one token across providers, so each test waits until the bindings it opened retired
+// and the provider stopped: the next test starts with none held.
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -9,8 +11,8 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
-import { open, TonboError, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
-import { ext, freshDir, rejection, sentTokens, stream } from "./kit.ts";
+import { open as openByName, TonboError, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
+import { ext, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
 import { type FixtureDatabase, TonboApi } from "./tonbo-api.ts";
 
 loadUrsulaVfs(ext());
@@ -34,6 +36,15 @@ const VARIABLES = ["TONBO_API_KEY", "TONBO_API_ORIGIN", "TONBO_AUTH_ORIGIN", "XD
 
 let api: TonboApi;
 let saved: Record<string, string | undefined> = {};
+/** The paths the test bound, which it closes: each retires before the next test. */
+const bound: string[] = [];
+
+/** The `/tonbo` entry's `open`, recording the path it bound. */
+const open: typeof openByName = async (nameOrUrl, options) => {
+	const db = await openByName(nameOrUrl, options);
+	bound.push(db.boundPath);
+	return db;
+};
 
 beforeAll(async () => {
 	api = await TonboApi.start();
@@ -48,7 +59,11 @@ beforeEach(() => {
 	process.env.TONBO_AUTH_ORIGIN = api.origin;
 	api.reset();
 });
-afterEach(() => {
+afterEach(async () => {
+	const paths = bound.splice(0);
+	for (const path of paths) await retired(path);
+	// The pump delivers the retirements, and the provider stops: the next test holds no token.
+	if (paths.length > 0) await new Promise((r) => setTimeout(r, 500));
 	for (const v of VARIABLES) {
 		const value = saved[v];
 		if (value === undefined) delete process.env[v];

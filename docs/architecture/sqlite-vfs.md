@@ -1461,11 +1461,12 @@ resolves the URL and the Streams token: everything after is the root entry's ope
   back off from 250 ms up to 2 s, until the open's signal fires: then `UrsulaUnavailableError` with
   the last condition. An `active` database without a `url`, and any other status, fail
   `invalid_argument` naming the option and variable of that origin.
-- The Streams token comes from a provider per key, source of the key and auth origin, so each open
-  passes the same function and later opens reuse its token ([Tokens](#tokens)). It is attached only
-  to a stream URL that is `https://`, or `http://` to a loopback host: any other fails
-  `invalid_url`. The process carries one token, so one key per process: the last open's provider
-  serves every database. It posts
+- The Streams token comes from the provider each open passes, a closure over that open's key, its
+  source and the auth origin. The process holds one token whichever function minted it, so later
+  opens reuse it and the next refresh runs the last open's provider ([Tokens](#tokens)). It is
+  attached only to a stream URL that is `https://`, or `http://` to a loopback host: any other
+  fails `invalid_url`. One token per process means one key per process: an open with a second key
+  reuses the first key's token until the next refresh exchanges the second. It posts
   `{"audience":"https://streams.tonbo.dev"}` to `{auth origin}/api/iam/token`. A `401` or `403`
   there throws `invalid_api_key`, which fails for good. An explicit `token`, or
   `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key. The
@@ -1479,8 +1480,10 @@ resolves the URL and the Streams token: everything after is the root entry's ope
 Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
 stands in for the Management API and the token endpoint as their contracts document them, and
 serves databases whose URLs are streams of the suite's server. The credentials cases are the
-contract's own usable and unusable examples. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
-(test/tonbo-child.ts), where no open set a token first.
+contract's own usable and unusable examples. Each test waits until its bindings retired, so the
+next starts with no token held. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
+(test/tonbo-child.ts), on a stream and cache root of its own with a token no other test uses, where
+no open set a token first, and the gate shows every request carried the file's token.
 
 ### SQL functions
 

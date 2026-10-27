@@ -11,8 +11,9 @@
 //   audience, and that token is kept until it expires. A Streams token never goes to the
 //   Management API, and the key goes only to the two configured origins.
 // - The Streams token: POST {auth origin}/api/iam/token with audience https://streams.tonbo.dev,
-//   one provider per key, its source and auth origin, so later opens reuse its token. It goes only
-//   to a stream URL that is `https://`, or `http://` to a loopback host.
+//   from the provider each open passes. The process holds one token, so later opens reuse it and
+//   the next refresh runs the last open's provider (token.ts). It goes only to a stream URL that is
+//   `https://`, or `http://` to a loopback host.
 // - An explicit `token`, or URSULA_VFS_TOKEN_FILE, wins over the key for Streams requests.
 // - Redirects are never followed: a 3xx is an answer the open cannot use.
 //
@@ -509,21 +510,12 @@ function gaveUp(name: string, last: Transient | undefined, until: AbortSignal): 
 }
 
 /**
- * One provider per auth origin, key and source of the key: the same function on each open, so later
- * opens reuse its token, and its errors name the source this open took the key from.
+ * The provider of Streams tokens for `key`, whose errors name the source this open took the key
+ * from. A key the token endpoint refuses fails for good: the open rejects with `invalid_api_key`.
  */
-const providers = new Map<string, TokenProvider>();
-
-/** The provider of Streams tokens for `key`. A key the token endpoint refuses fails for good: the open rejects with `invalid_api_key`. */
 function streamsProvider(key: ApiKey, auth: string): TokenProvider {
-	const id = JSON.stringify([auth, key.from, key.value]);
-	let provider = providers.get(id);
-	if (provider === undefined) {
-		provider = async ({ signal }) => {
-			const got = await exchange(key, auth, STREAMS_AUDIENCE, signal);
-			return { token: got.token, expiresAt: got.expiresAt };
-		};
-		providers.set(id, provider);
-	}
-	return provider;
+	return async ({ signal }) => {
+		const got = await exchange(key, auth, STREAMS_AUDIENCE, signal);
+		return { token: got.token, expiresAt: got.expiresAt };
+	};
 }
