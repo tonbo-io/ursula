@@ -148,12 +148,24 @@ export const faultsUrl = (): string => inject("ursulaFaults");
 /**
  * Scripts a fault for the next `times` requests of `method` to the server: at the model
  * (clients/sqlite-vfs/src/model/faults.rs), or at the gate in front of Ursula (test/gate.mjs), which
- * scripts `delay <ms>` only.
+ * scripts `delay <ms>` and `status <code>` only.
  */
 export async function fault(line: string, times = 1, method?: string): Promise<void> {
 	const query = `times=${times}${method === undefined ? "" : `&method=${method}`}`;
 	const r = await fetch(`${faultsUrl()}?${query}`, { method: "POST", body: line });
 	expect(r.status, await r.text()).toBe(204);
+}
+
+/**
+ * The `Authorization` header of each request the gate in front of Ursula received for the stream at
+ * `path` (test/gate.mjs), oldest first, with its method: `undefined` on the model, which records none.
+ */
+export async function sentTokens(path: string): Promise<{ method: string; authorization: string | null }[] | undefined> {
+	const gate = inject("ursulaGate");
+	if (gate === "") return undefined;
+	const r = await fetch(`${gate}/requests?path=${encodeURIComponent(path)}`);
+	expect(r.status).toBe(200);
+	return (await r.json()) as { method: string; authorization: string | null }[];
 }
 
 /** An append to the stream at `path` by another writer: `body` with no producer headers. */

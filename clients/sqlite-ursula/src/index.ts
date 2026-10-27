@@ -17,15 +17,18 @@
 //   chunk, on only after `synced()`.
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
-// - token.ts: the bearer token from a provider, refreshed ahead of expiry and after a 401.
+// - token.ts: the bearer token, a string or the latest from a provider, refreshed ahead of expiry
+//   and after a 401.
+// - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
+import { raced, reasonOf } from "./abort.ts";
 import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
-import { dropTokenProvider, leaseToken, type TokenLease, type TokenProvider } from "./token.ts";
+import { leaseToken, type TokenLease, type TokenProvider, useStringToken } from "./token.ts";
 
 export { loadUrsulaVfs } from "./control.ts";
 export { type GateOptions, gate } from "./gate.ts";
@@ -54,11 +57,11 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	readonly dir?: string | undefined;
 	/**
 	 * The bearer token requests carry, or a {@link TokenProvider} that hands out tokens and when they
-	 * expire. The package calls a provider before the open's first request, again ahead of each
-	 * token's expiry, and again at once after a request was refused with 401, and stops once no
-	 * binding opened with a provider on this thread is bound. One token per process: the last open's
-	 * applies, so a later open with another provider takes over from this one, and one with a string
-	 * stops it.
+	 * expire. The package calls a provider before the open's first request when it holds no token,
+	 * again ahead of each token's expiry, and again at once after a request was refused with 401,
+	 * and stops once no binding opened with a provider on this thread is bound. One token per
+	 * process: the last open's applies, so a later open with another function takes over from this
+	 * one, and one with a string stops it on its thread. Pass the same function to reuse its token.
 	 */
 	readonly token?: string | TokenProvider | undefined;
 	/** Bounds the open: by default it gives up after 30 s. */
@@ -143,16 +146,16 @@ const byAbort = new WeakSet<object>();
  * the open met, or `cancelled` when it met none. With a token provider, the open also rejects with
  * the provider's own {@link UrsulaError} when it fails for good, with an `UrsulaSetupError`
  * `invalid_argument` when it hands out a token that cannot be sent, and with an
- * `UrsulaUnavailableError` `unauthorized` that says `retry` when it handed out no token before the
- * signal fired.
+ * `UrsulaUnavailableError` `unavailable` whose cause is the provider's last error when it handed out
+ * no token before the signal fired.
  */
 export async function open(url: string | URL, options: OpenOptions = {}): Promise<UrsulaDatabase> {
 	const { dir, token, signal, maxPendingBytes, recreate, readOnly, timeout, ...rest } = options;
 	const stream = String(url);
 	const settings: Record<string, unknown> = { timeout_ms: EXTENSION_OPEN_MS };
-	// A provider's tokens go through `ursula_set_token`, never in the options, which the open
-	// sends again on every retry of its bind, after a newer token may have been applied.
-	if (token !== undefined && typeof token !== "function") settings.token = token;
+	if (token !== undefined && typeof token !== "string" && typeof token !== "function") {
+		throw new UrsulaSetupError(`invalid_argument: token must be a string or a token provider function, not ${typeof token}`, "invalid_argument");
+	}
 	if (maxPendingBytes !== undefined) {
 		if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes < 0) {
 			throw new UrsulaSetupError(`invalid_argument: maxPendingBytes must be a whole number of bytes, not ${maxPendingBytes}`, "invalid_argument");
@@ -175,15 +178,17 @@ export async function open(url: string | URL, options: OpenOptions = {}): Promis
 	const json = JSON.stringify(settings);
 	const sqlite = { ...rest, timeout: timeout ?? DEFAULT_BUSY_MS, readOnly: readOnly === true };
 	const until = signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
-	if (typeof token !== "function") {
-		if (token !== undefined) dropTokenProvider();
-		return opened(stream, dir, json, sqlite, readOnly === true, until);
-	}
+	// Either kind of token is applied once, here, with `ursula_set_token`, never in `ursula_open`'s
+	// options, which a bind sends again on each of its retries, over a token applied meanwhile.
+	if (typeof token === "string") useStringToken(token);
+	if (typeof token !== "function") return opened(stream, dir, json, sqlite, readOnly === true, until);
 	const lease: TokenLease = await leaseToken(token, stream, until);
 	try {
 		const db = await opened(stream, dir, json, sqlite, readOnly === true, until);
 		lease.done(db.boundPath);
 		return db;
+	} catch (error) {
+		throw lease.failed(error);
 	} finally {
 		lease.done();
 	}
@@ -259,21 +264,11 @@ const marked = <E extends UrsulaError>(error: E): E => {
 	return error;
 };
 
-/** `promise`, or `signal`'s reason when it fires first. */
-function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	return new Promise((resolve, reject) => {
-		const abort = (): void => reject(signal.reason);
-		signal.addEventListener("abort", abort, { once: true });
-		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-	});
-}
-
 /** The open of `stream` gave up at `signal` before it met any condition. */
 function cancelled(stream: string, signal: AbortSignal): UrsulaUnavailableError {
 	return new UrsulaUnavailableError(`cancelled: the open of ${stream} gave up when its signal fired: ${reasonOf(signal.reason)}`, "cancelled", signal.reason);
 }
 
-const reasonOf = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason));
 /** A connection to what `ursula_open` bound, with node:sqlite's `settings`. */
 function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open">): UrsulaDatabase {
 	try {

@@ -43,26 +43,28 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 `token` is a string, or a provider: an async function that returns `{ token, expiresAt }`, where `expiresAt` is a `Date` or milliseconds since the epoch. The package then keeps the token fresh in the background, with no separate refresher process.
 
 ```ts
-import { open, UrsulaUnavailableError } from "@tonbo/sqlite-ursula";
+import { open, type TokenProvider, UrsulaUnavailableError } from "@tonbo/sqlite-ursula";
 
-const db = await open("https://streams.example.com/acme/notes", {
-  token: async ({ signal }) => {
-    const r = await fetch(exchangeUrl, { method: "POST", headers: { authorization: `Bearer ${apiKey}` }, signal });
-    if (r.status === 401) throw new UrsulaUnavailableError("unauthorized: the exchange refused the key", "unauthorized");
-    if (!r.ok) throw new Error(`the exchange answered ${r.status}`);
-    const { access_token, expires_in } = await r.json();
-    return { token: access_token, expiresAt: Date.now() + expires_in * 1000 };
-  },
-});
+const token: TokenProvider = async ({ signal }) => {
+  const r = await fetch(exchangeUrl, { method: "POST", headers: { authorization: `Bearer ${apiKey}` }, signal });
+  if (r.status === 401) throw new UrsulaUnavailableError("unauthorized: the exchange refused the key", "unauthorized");
+  if (!r.ok) throw new Error(`the exchange answered ${r.status}`);
+  const { access_token, expires_in } = await r.json();
+  return { token: access_token, expiresAt: Date.now() + expires_in * 1000 };
+};
+
+const db = await open("https://streams.example.com/acme/notes", { token });
 ```
 
-- The package calls the provider before the open's first request, again after 70 to 80% of each token's lifetime, and again at once when the extension reports a request refused with `401`. Concurrent calls share one, and a later open with the same provider reuses its token. `signal` fires when the package stops waiting for the answer, after 30 s.
-- A provider that throws an `UrsulaError` whose `action` is `fix` has failed for good: the open rejects with that error, and the package stops calling the provider until the next `open()` with one. Every other error is retried with backoff, from 1 s up to 30 s, and an unexpired token keeps serving meanwhile.
-- An open whose `signal` fires before the provider handed out a token rejects with `UrsulaUnavailableError` `unauthorized`, whose action is `retry` and whose `cause` is the provider's last error. A token that is not printable ASCII without spaces, or an `expiresAt` that is not a time, fails the open with `UrsulaSetupError` `invalid_argument`.
-- After the open, a provider that failed for good leaves its last token in place. Once the server refuses it, `status().replication.condition` is `unauthorized`, and commits continue until the backlog fills.
-- A request refused twice blocks replication as `unauthorized`, and the extension sends it again every 30 s, so a token the provider hands out after a `401` applies within 30 s.
-- The token is one per process. The last open that names a token sets it: a later open with another provider takes over the databases this one served, and an open with a string stops it. A function lives on one JavaScript thread, so each thread runs its own provider: give the threads of a process the same kind of token.
-- The provider's timers never keep the process alive. It stops once no database opened with a provider on its thread is bound.
+- The package calls the provider before an open's first request when it holds no token, again after 70 to 80% of each token's lifetime, and again at once when a request was refused with `401`. Concurrent calls share one. `signal` fires when the package stops waiting for the answer: after 30 s, or once another provider replaced this one or no database uses it.
+- A later open with the same function gets the token the package holds at once, even an expired one, so a connection on a database already bound needs no network. A refresh that is due runs in the background. Define the provider once, as above: an inline arrow is a new function on each open, and a new function starts afresh with a new call.
+- A provider that throws an `UrsulaError` whose `action` is `fix` has failed for good: an open waiting for its token rejects with that error, and the package stops calling the provider until the next `open()` with it. Every other error is retried with backoff, from 1 s up to 30 s, while the token held keeps serving.
+- An open waits for the provider only when the package holds no token. When its `signal` fires first, it rejects with `UrsulaUnavailableError` `unavailable` (action `retry`), whose `cause` is the provider's last error, or the signal's reason when the provider did not answer. A token that is not printable ASCII without spaces, or an `expiresAt` that is not a time, fails the open with `UrsulaSetupError` `invalid_argument`. So does an `expiresAt` below 10^12, which reads as seconds since the epoch (a JWT's `exp`) rather than milliseconds.
+- A bind refused with `401` fails `unauthorized` when its `signal` fires, as with a string token. The extension reports a `401` only for databases already bound, so the provider learns of it only then: the refused token is dropped, and the next open waits for a new one.
+- A request of a bound database refused twice blocks replication as `unauthorized`, and the extension sends it again every 30 s, so a token the provider hands out after a `401` applies within 30 s.
+- A provider failure after the open leaves the token held in place. Once the server refuses it, `status().replication.condition` is `unauthorized`, commits continue until the backlog fills, and the next open that fails `unauthorized` carries the provider's last error as its `cause`.
+- The token is one per process. The last open that names a token sets it. A later open with another function takes over the databases this one served, and the opens still waiting for a token get the new function's. An open with a string stops the provider on its thread, and the opens waiting for it go on under the string. A function lives on one JavaScript thread, so each thread runs its own provider, which sets its tokens at each refresh over a string another thread set: give the threads of a process the same kind of token.
+- The provider's timers keep the process alive only while an open waits for a token. The provider stops once no database opened with a provider on its thread is bound.
 - Plain string tokens and `URSULA_VFS_TOKEN_FILE` work as before. No token is logged.
 
 ## Gating outputs
@@ -117,7 +119,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (retry after `synced()`), `unsupported` (fix), `too_large` (fix: the commit's pages take more than `URSULA_VFS_MAX_COMMIT_BYTES`, 128 MiB by default, so split the transaction or raise the limit, at most 1 GiB) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
-| `UrsulaUnavailableError` | `open()` when its signal fired first, also before a token provider handed out a token (`unauthorized`, action `retry`) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
+| `UrsulaUnavailableError` | `open()` when its signal fired first, also while it waited for a token provider (`unavailable`, action `retry`) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except reads in a read transaction it had open, which keep its snapshot. A write in it still fails. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.

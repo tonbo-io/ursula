@@ -275,7 +275,13 @@ class Pump {
 				default:
 					break;
 			}
-			for (const watcher of watchers) watcher(event);
+			for (const watcher of watchers) {
+				try {
+					watcher(event);
+				} catch {
+					// A watcher's failure is its own: the rest of the batch applies.
+				}
+			}
 		}
 	}
 

@@ -1,14 +1,18 @@
-// The bearer token from a provider (design: API, Tokens): `open()`'s `token` may be a function that
-// hands out a token and when it expires. The package calls it before the open's first request,
-// again ahead of each token's expiry, and again at once when the extension reports a request
-// refused with 401 (the replication condition `unauthorized`). It applies each token with
-// `ursula_set_token`, so the token stays one per process, and the last open's token source wins: a
-// later open with another provider takes over the bindings this one served, and one with a string
-// stops it.
+// The bearer token (design: API, Tokens): `open()`'s `token` is a string or a function that hands
+// out a token and when it expires. Both kinds are applied with `ursula_set_token`, so the token stays
+// one per process and the last open that names one wins.
+//
+// The package calls a provider before an open's first request when it holds no token, again ahead
+// of each token's expiry, and again at once when a request was refused with 401: the replication
+// condition `unauthorized` of a bound database, or an open that failed `unauthorized` while it was
+// binding (the extension reports conditions of bound databases only). An open with another
+// function takes over: the waiting opens get its token. An open with a string stops it: the waiting
+// opens go on under the string.
 //
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
 // which the caller awaits. It stops once no binding opened with a provider on the thread is bound.
+import { raced, reasonOf } from "./abort.ts";
 import { call } from "./control.ts";
 import { UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { type PumpEvent, pump, watch } from "./pump.ts";
@@ -17,17 +21,18 @@ import { type PumpEvent, pump, watch } from "./pump.ts";
 export interface BearerToken {
 	/** The token, printable ASCII without spaces. Never logged. */
 	readonly token: string;
-	/** When the token expires: a `Date`, or milliseconds since the epoch. */
+	/** When the token expires: a `Date`, or milliseconds (not seconds) since the epoch. */
 	readonly expiresAt: Date | number;
 }
 
 /**
  * Hands out a fresh bearer token: `open()`'s `token` option. `signal` fires when the package no
- * longer waits for the answer (after 30 s, or once another open replaced the provider).
+ * longer waits for the answer: after 30 s, or once another open replaced the provider or no
+ * database uses it.
  *
  * To fail for good, throw an {@link UrsulaError} whose action is `fix`, such as
  * `new UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized")`: the package
- * stops calling the provider until the next `open()` with one. It retries every other error with
+ * stops calling the provider until the next `open()` with it. It retries every other error with
  * backoff.
  */
 export type TokenProvider = (options: { readonly signal: AbortSignal }) => Promise<BearerToken>;
@@ -44,23 +49,23 @@ const PROVIDER_MS = 30_000;
 /** The first retry after a failed call, doubled after each failure in a row up to {@link MAX_RETRY_MS}, then jittered down to half. */
 const FIRST_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
-/** The earliest refresh after a token arrived, whatever its lifetime. */
+/** The earliest refresh after a token arrived, or half its lifetime when that is shorter. */
 const MIN_REFRESH_MS = 1_000;
 /** The longest delay a timer takes. A refresh further out runs then. */
 const MAX_TIMER_MS = 2_147_483_647;
+/** The earliest `expiresAt` read as milliseconds since the epoch (2001-09-09): below it, it is seconds. */
+const MIN_EPOCH_MS = 1e12;
 /** A token as `Authorization: Bearer` carries it (clients/sqlite-vfs/src/auth.rs `usable`). */
 const USABLE = /^[\x21-\x7e]+$/;
 
-/** A refresh is due after 70 to 80% of the token's lifetime. */
-const refreshAfter = (lifetime: number): number => Math.max(MIN_REFRESH_MS, lifetime * (0.7 + 0.1 * Math.random()));
+/** A refresh is due after 70 to 80% of the token's lifetime, and never after it expired. */
+const refreshAfter = (lifetime: number): number => Math.max(Math.min(MIN_REFRESH_MS, lifetime / 2), lifetime * (0.7 + 0.1 * Math.random()));
 const retryAfter = (failures: number): number => Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(failures - 1, 16)) * (0.5 + 0.5 * Math.random());
 
-/** A failure the package does not retry: the provider's own UrsulaError that says `fix`, or a token it cannot send. */
+/** A failure the package does not retry: the provider's own UrsulaError that says `fix`, or an answer it cannot use. */
 const permanent = (error: unknown): error is UrsulaError => error instanceof UrsulaError && error.action === "fix";
 
-const reasonOf = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason));
-
-/** What the provider returned, checked: a token it cannot send fails for good, one that expired already is retried. */
+/** What the provider returned, checked: an answer the package cannot use fails for good, a token that expired already is retried. */
 function checked(got: unknown, now: number): Fresh {
 	const answer = got as { token?: unknown; expiresAt?: unknown } | null | undefined;
 	const token = typeof answer?.token === "string" ? answer.token.trim() : "";
@@ -72,6 +77,12 @@ function checked(got: unknown, now: number): Fresh {
 	if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
 		throw new UrsulaSetupError("invalid_argument: the token provider returned no expiresAt: a Date, or milliseconds since the epoch", "invalid_argument");
 	}
+	if (expiresAt < MIN_EPOCH_MS) {
+		throw new UrsulaSetupError(
+			`invalid_argument: the token provider returned expiresAt ${expiresAt}, which reads as seconds rather than milliseconds since the epoch: pass milliseconds (a JWT's exp * 1000) or a Date`,
+			"invalid_argument",
+		);
+	}
 	const lifetime = expiresAt - now;
 	if (lifetime <= 0) throw new Error(`the token provider returned a token that expired ${-lifetime} ms ago`);
 	return { token, expiresAt, refreshAt: now + refreshAfter(lifetime) };
@@ -82,53 +93,67 @@ const apply = (token: string): void => {
 	call("SELECT ursula_set_token('', ?)", token);
 };
 
-/** `promise`, or `signal`'s reason when it fires first. */
-function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	return new Promise((resolve, reject) => {
-		const abort = (): void => reject(signal.reason);
-		if (signal.aborted) abort();
-		signal.addEventListener("abort", abort, { once: true });
-		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-	});
-}
+/** What an open waiting for a token learns: the token (none when a string token replaced the provider), or a failure for good. */
+type Outcome = { token: string | undefined } | { error: UrsulaError };
 
-/** What an open waiting for a token learns of an attempt: a token, a failure for good, or a failure to retry. */
-type Outcome = { token: string } | { error: UrsulaError } | "retrying";
-
-/** One provider and its schedule. At most one call of it runs at a time: concurrent refreshes share it. */
+/** This thread's provider and its schedule. At most one call of it runs at a time: concurrent refreshes share it. */
 class Source {
-	readonly provider: TokenProvider;
-	readonly #stopped = new AbortController();
+	/** The provider of the thread's last open that named one, until an open with a string or idleness stopped it. */
+	#provider: TokenProvider | undefined;
+	/** The call in flight: aborting it discards its answer. */
+	#attempt: AbortController | undefined;
 	#current: Fresh | undefined;
-	#calling = false;
 	#timer: NodeJS.Timeout | undefined;
-	/** Failed calls in a row, and the last one's error. */
+	/** Failed calls in a row. */
 	#failures = 0;
-	#lastError: unknown;
+	/** The last call's failure, one for good included, until a call succeeds. */
+	#lastFailure: { readonly error: unknown } | undefined;
 	/** It failed for good: no call until the next open. */
 	#failed = false;
 	/** The opens waiting for a token. */
 	readonly #waiters = new Set<(outcome: Outcome) => void>();
 
-	constructor(provider: TokenProvider) {
-		this.provider = provider;
+	get provider(): TokenProvider | undefined {
+		return this.#provider;
+	}
+
+	/** Whether an open waits for it. */
+	get waited(): boolean {
+		return this.#waiters.size > 0;
+	}
+
+	/** The last call's failure, until a call succeeds. */
+	get lastFailure(): { readonly error: unknown } | undefined {
+		return this.#lastFailure;
 	}
 
 	/**
-	 * The token for an open of `stream`, applied: the current one until its refresh is due, else the
-	 * next the provider hands out. While a refresh fails, an unexpired token serves. Rejects with the
-	 * provider's error when it fails for good, and when `signal` fires first with an
-	 * {@link UrsulaUnavailableError} `unauthorized` that says `retry`.
+	 * `provider` serves from now on. Another function than the current one starts afresh: the token
+	 * held is dropped and the call in flight abandoned. The opens waiting keep waiting, for the new
+	 * provider's token, which is the token the process carries next anyway.
 	 */
-	token(stream: string, signal: AbortSignal): Promise<string> {
+	use(provider: TokenProvider): void {
+		if (provider === this.#provider) return;
+		this.#forget(new UrsulaUnavailableError("cancelled: an open replaced the token provider", "cancelled"));
+		this.#provider = provider;
+		if (this.#waiters.size > 0) this.#call();
+	}
+
+	/**
+	 * The token for an open of `stream`, applied. Any token held serves at once, expired or not: a
+	 * connection on a bound binding needs no network, and a bind the server refuses fails with the
+	 * extension's own condition. A refresh that is due runs in the background. With no token held,
+	 * the open waits for the provider: it rejects with the provider's error when that fails for good,
+	 * and with an {@link UrsulaUnavailableError} `unavailable` when `signal` fires first.
+	 */
+	token(stream: string, signal: AbortSignal): Promise<string | undefined> {
 		// A new open asks a provider that failed for good again.
 		const failed = this.#failed;
 		this.#failed = false;
-		const now = Date.now();
 		const current = this.#current;
-		if (current !== undefined && (now < current.refreshAt || ((failed || this.#failures > 0) && now < current.expiresAt))) {
+		if (current !== undefined) {
 			apply(current.token);
-			if (failed && !this.#calling) this.#call();
+			if (this.#attempt === undefined && (failed || this.#timer === undefined)) this.#call();
 			return Promise.resolve(current.token);
 		}
 		return new Promise((resolve, reject) => {
@@ -138,11 +163,6 @@ class Source {
 				if (this.#waiters.size === 0) this.#timer?.unref();
 			};
 			const waiter = (outcome: Outcome): void => {
-				if (outcome === "retrying") {
-					const c = this.#current;
-					if (c === undefined || Date.now() >= c.expiresAt) return;
-					outcome = { token: c.token };
-				}
 				done();
 				if ("token" in outcome) resolve(outcome.token);
 				else reject(outcome.error);
@@ -157,75 +177,93 @@ class Source {
 			}
 			this.#waiters.add(waiter);
 			signal.addEventListener("abort", abort, { once: true });
-			// A retry already scheduled runs on time; the open keeps the process alive meanwhile.
+			// A retry already scheduled runs on time: the open keeps the process alive meanwhile.
+			if (this.#attempt !== undefined) return;
 			if (this.#failures > 0 && this.#timer !== undefined) this.#timer.ref();
-			else if (!this.#calling) this.#call();
+			else this.#call();
 		});
 	}
 
-	/** A request was refused with 401: the current token is no good, ask for another at once. */
-	refused(): void {
-		if (this.#stopped.signal.aborted || this.#failed) return;
+	/** A request was refused with 401 under `token` (any token held when absent): drop it and ask for another at once. */
+	refused(token?: string): void {
+		const current = this.#current;
+		if (this.#provider === undefined || this.#failed || current === undefined) return;
+		if (token !== undefined && current.token !== token) return;
 		this.#current = undefined;
-		if (!this.#calling) this.#call();
+		if (this.#attempt === undefined) this.#call();
 	}
 
-	/** Stops it: no further call, its timer cleared, and the opens waiting for a token fail. */
-	stop(error: UrsulaError): void {
-		this.#stopped.abort(error);
+	/** No provider from now on. The opens waiting go on with the process's token, which `why` set. */
+	stop(why: string): void {
+		this.#forget(new UrsulaUnavailableError(`cancelled: the token provider stopped: ${why}`, "cancelled"));
+		this.#provider = undefined;
+		for (const waiter of [...this.#waiters]) waiter({ token: undefined });
+	}
+
+	/** Drops the token held, the call in flight (aborted with `reason`), the timer and the failures. */
+	#forget(reason: UrsulaError): void {
+		this.#attempt?.abort(reason);
+		this.#attempt = undefined;
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
-		for (const waiter of [...this.#waiters]) waiter({ error });
+		this.#current = undefined;
+		this.#failures = 0;
+		this.#lastFailure = undefined;
+		this.#failed = false;
 	}
 
 	#gaveUp(stream: string, signal: AbortSignal): UrsulaUnavailableError {
-		const why = this.#failures > 0 ? `it failed: ${reasonOf(this.#lastError)}` : `it did not answer: ${reasonOf(signal.reason)}`;
-		const cause = this.#failures > 0 ? this.#lastError : signal.reason;
-		return new UrsulaUnavailableError(`unauthorized: the token provider handed out no token (${why}): the open of ${stream} gave up when its signal fired`, "unauthorized", cause, "retry");
+		const last = this.#failures > 0 ? this.#lastFailure : undefined;
+		const why = last !== undefined ? `its last call failed: ${reasonOf(last.error)}` : `it did not answer: ${reasonOf(signal.reason)}`;
+		return new UrsulaUnavailableError(`unavailable: the token provider handed out no token (${why}): the open of ${stream} gave up when its signal fired`, "unavailable", last !== undefined ? last.error : signal.reason);
 	}
 
 	#call(): void {
+		const provider = this.#provider;
+		if (provider === undefined) return;
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
-		this.#calling = true;
-		const signal = AbortSignal.any([this.#stopped.signal, AbortSignal.timeout(PROVIDER_MS)]);
+		const attempt = new AbortController();
+		this.#attempt = attempt;
+		const signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(PROVIDER_MS)]);
 		raced(
-			Promise.resolve().then(() => this.provider({ signal })),
+			Promise.resolve().then(() => provider({ signal })),
 			signal,
 		)
 			.then((got) => {
 				const fresh = checked(got, Date.now());
-				if (!this.#stopped.signal.aborted) apply(fresh.token);
+				if (this.#attempt === attempt) apply(fresh.token);
 				return fresh;
 			})
 			.then(
-				(fresh) => this.#succeeded(fresh),
-				(error: unknown) => this.#failedWith(error),
+				(fresh) => {
+					if (this.#attempt === attempt) this.#succeeded(fresh);
+				},
+				(error: unknown) => {
+					if (this.#attempt === attempt) this.#failedWith(error);
+				},
 			);
 	}
 
 	#succeeded(fresh: Fresh): void {
-		this.#calling = false;
-		if (this.#stopped.signal.aborted) return;
+		this.#attempt = undefined;
 		this.#current = fresh;
 		this.#failures = 0;
-		this.#lastError = undefined;
+		this.#lastFailure = undefined;
 		for (const waiter of [...this.#waiters]) waiter({ token: fresh.token });
 		this.#schedule(fresh.refreshAt - Date.now());
 	}
 
 	#failedWith(error: unknown): void {
-		this.#calling = false;
-		if (this.#stopped.signal.aborted) return;
+		this.#attempt = undefined;
+		this.#lastFailure = { error };
 		if (permanent(error)) {
 			this.#failed = true;
 			for (const waiter of [...this.#waiters]) waiter({ error });
 			return;
 		}
 		this.#failures += 1;
-		this.#lastError = error;
 		this.#schedule(retryAfter(this.#failures));
-		for (const waiter of [...this.#waiters]) waiter("retrying");
 	}
 
 	/** The next call after `ms`. Its timer keeps the process alive only while an open waits. */
@@ -237,26 +275,22 @@ class Source {
 
 	#due(): void {
 		this.#timer = undefined;
-		if (this.#stopped.signal.aborted) return;
 		if (this.#waiters.size === 0 && !inUse()) {
-			drop(this, "no binding uses it");
+			this.stop("no binding uses it");
 			return;
 		}
 		this.#call();
 	}
-
-	/** Whether an open waits for it. */
-	get waited(): boolean {
-		return this.#waiters.size > 0;
-	}
 }
 
-/** This thread's token source, if its last open that named a token gave a provider. */
-let source: Source | undefined;
+/** This thread's token source. */
+const source = new Source();
 /** The bound paths opened with a provider on this thread since the last open with a string token. */
 const paths = new Set<string>();
 /** Opens that got a token from a provider and have not bound yet. */
 let opening = 0;
+/** Bumped by each open with a string token: an open with a provider from before it serves no path. */
+let generation = 0;
 let watching = false;
 
 /** Whether a binding opened with a provider is bound, or such an open is binding: retired paths are dropped. */
@@ -271,29 +305,22 @@ function inUse(): boolean {
 	return paths.size > 0 || opening > 0;
 }
 
-/** Stops `stopped`, this thread's source, because of `why`. */
-function drop(stopped: Source, why: string): void {
-	stopped.stop(new UrsulaUnavailableError(`cancelled: the token provider stopped: ${why}`, "cancelled"));
-	if (source === stopped) source = undefined;
-}
-
-/** The extension's events: a 401 asks for a token at once, and a retired binding may end the source. */
+/** The extension's events: a 401 asks for a token at once, and a retired binding may stop the provider. */
 function onEvent(event: PumpEvent): void {
-	const s = source;
-	if (s === undefined) return;
+	if (source.provider === undefined) return;
 	switch (event.event) {
 		case "condition":
-			if (event.condition === "unauthorized") s.refused();
+			if (event.condition === "unauthorized") source.refused();
 			break;
 		case "retired":
-			if (!s.waited && !inUse()) drop(s, "no binding uses it");
+			if (!source.waited && !inUse()) source.stop("no binding uses it");
 			break;
 		case "gap":
 			// The events it dropped may have held a 401: status still shows it.
 			for (const path of paths) {
 				try {
 					if (call<{ replication: { condition: string | null } }>("SELECT ursula_status(?)", path).replication.condition === "unauthorized") {
-						s.refused();
+						source.refused();
 						break;
 					}
 				} catch {
@@ -306,34 +333,35 @@ function onEvent(event: PumpEvent): void {
 	}
 }
 
-/** A token an open got from a provider: `done` once the open bound `path`, or failed (no path). */
+/** A token an open got from a provider. */
 export interface TokenLease {
-	readonly token: string;
+	/** The token the open's requests carry, or `undefined` when an open with a string token replaced the provider meanwhile. */
+	readonly token: string | undefined;
+	/** The open bound `path`, or failed (no path). */
 	done(path?: string): void;
+	/**
+	 * The open failed with `error`. A token refused with 401 is dropped, so the next open calls the
+	 * provider. Returns the error to throw: with the provider's last failure as its cause, if any.
+	 */
+	failed(error: unknown): unknown;
 }
 
 /**
  * The token for an open of `stream` from `provider`, applied to the process, bounded by `signal`.
- * `provider` becomes this thread's source, taking over the bindings an earlier provider served.
+ * `provider` becomes this thread's provider, and takes over the bindings an earlier one served.
  */
 export async function leaseToken(provider: TokenProvider, stream: string, signal: AbortSignal): Promise<TokenLease> {
-	if (source?.provider !== provider) {
-		if (source !== undefined) drop(source, "an open replaced it");
-		source = new Source(provider);
-	}
+	source.use(provider);
 	if (!watching) {
 		watching = true;
 		watch(onEvent);
 	}
-	const leased = source;
+	const leased = generation;
 	opening += 1;
-	let token: string;
-	try {
-		token = await leased.token(stream, signal);
-	} catch (error) {
+	const token = await source.token(stream, signal).catch((error: unknown) => {
 		opening -= 1;
 		throw error;
-	}
+	});
 	let open = true;
 	return {
 		token,
@@ -341,7 +369,7 @@ export async function leaseToken(provider: TokenProvider, stream: string, signal
 			if (!open) return;
 			open = false;
 			opening -= 1;
-			if (path === undefined || source !== leased) return;
+			if (path === undefined || generation !== leased) return;
 			paths.add(path);
 			// The pump delivers the 401s and the retirements it waits for.
 			try {
@@ -350,11 +378,20 @@ export async function leaseToken(provider: TokenProvider, stream: string, signal
 				// The pump is down: the scheduled refreshes go on.
 			}
 		},
+		failed: (error) => {
+			if (!(error instanceof UrsulaUnavailableError) || error.kind !== "unauthorized" || token === undefined || generation !== leased) return error;
+			const last = source.lastFailure;
+			source.refused(token);
+			if (last === undefined) return error;
+			return new UrsulaUnavailableError(`${error.message} (the token provider's last call failed: ${reasonOf(last.error)})`, "unauthorized", last.error);
+		},
 	};
 }
 
-/** An open with a string token: it applies to the process, so this thread's provider stops. */
-export function dropTokenProvider(): void {
-	if (source !== undefined) drop(source, "an open with a string token replaced it");
+/** An open with a string token: requests carry `token` from now on, and this thread's provider stops. */
+export function useStringToken(token: string): void {
+	generation += 1;
 	paths.clear();
+	if (source.provider !== undefined) source.stop("an open with a string token replaced it");
+	apply(token);
 }
