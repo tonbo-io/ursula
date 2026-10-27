@@ -1667,7 +1667,7 @@ mod tests {
             status: 403,
         };
         assert_eq!(forbidden.kind(), FailureKind::Other);
-        let mut failing = run(FailureKind::Unauthorized, 12, 0, now);
+        let mut failing = run(FailureKind::Unauthorized, 30, 0, now);
         assert_eq!(failing.wait, RETRY_MAX);
         assert!(failing.holds_back(0, now));
         assert!(failing.token_changed(now));
