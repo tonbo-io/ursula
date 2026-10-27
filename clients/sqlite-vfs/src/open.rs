@@ -1600,7 +1600,13 @@ impl Opening {
     /// The error of an open given up (`ursula_cancel`): the last condition it met, `cancelled`
     /// when it met none.
     pub(crate) fn given_up(&self) -> OpenError {
-        let seen = match &self.phase {
+        self.seen()
+            .map_or(OpenError::Cancelled, OpenError::Unavailable)
+    }
+
+    /// The last condition the open met, if any.
+    pub(crate) fn seen(&self) -> Option<Unavailable> {
+        match &self.phase {
             Phase::Reading { build, .. } => build.seen(),
             Phase::Preparing
             | Phase::Head
@@ -1608,8 +1614,7 @@ impl Opening {
             | Phase::Building { .. }
             | Phase::CatchingUp { .. }
             | Phase::CatchUpApplying(_) => self.retry.seen(),
-        };
-        seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
+        }
     }
 
     /// The timer fired: send again what failed.

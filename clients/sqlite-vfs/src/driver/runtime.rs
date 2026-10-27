@@ -12,6 +12,10 @@
 //! database's catch-up never stalls the others. A panic in the core is contained: inside a
 //! binding's step it resets that binding `internal`.
 //!
+//! A token change reaches the core as [`Core::token_changed`]: at once from `ursula_set_token`
+//! ([`token_changed`]), and from the token file within [`crate::auth::FILE_CHECK_MS`], which the
+//! driver thread checks for a change while a request waits blocked `unauthorized`.
+//!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
 use std::collections::BTreeMap;
@@ -43,6 +47,7 @@ use super::SyncError;
 use super::Ticket;
 use super::core::Core;
 use super::disk::DiskDone;
+use crate::auth;
 use crate::guard;
 use crate::ids::Position;
 use crate::open::OpenError;
@@ -106,6 +111,7 @@ enum Command {
         io: IoId,
         done: Box<DiskDone>,
     },
+    TokenChanged,
     Shutdown,
 }
 
@@ -208,14 +214,26 @@ pub(crate) struct Driver {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The process driver.
+static DRIVER: OnceLock<Driver> = OnceLock::new();
+
 /// The process driver, over HTTP, started on first use.
 pub(crate) fn driver() -> &'static Driver {
-    static DRIVER: OnceLock<Driver> = OnceLock::new();
     DRIVER.get_or_init(|| {
         let transports: Transports =
             Arc::new(|url: &str| Arc::new(HttpTransport::new(url)) as Arc<dyn Transport>);
         Driver::start(transports, seed())
     })
+}
+
+/// The token requests carry changed ([`crate::auth`]): the process driver, once started, sends
+/// again at once every request a `401` blocked.
+pub(crate) fn token_changed() {
+    if let Some(driver) = DRIVER.get()
+        && driver.command(Command::TokenChanged).is_err()
+    {
+        crate::log::emit(crate::log::Level::Warn, "driver_gone", &[]);
+    }
 }
 
 /// 32 bytes from the random device, or from the clock and the process id without one.
@@ -636,8 +654,15 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut cursor = 0;
+    // When the token file was last checked for a change.
+    let mut token_checked: u64 = 0;
     loop {
-        let received = match core.next_deadline() {
+        // While a request waits blocked `unauthorized`, the token file is checked every
+        // `FILE_CHECK_MS`, and a change sends it again at once.
+        let check = core
+            .unauthorized()
+            .then(|| token_checked.saturating_add(auth::FILE_CHECK_MS));
+        let received = match [core.next_deadline(), check].into_iter().flatten().min() {
             None => inbox
                 .recv()
                 .map_err(|_closed| mpsc::RecvTimeoutError::Disconnected),
@@ -654,6 +679,14 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
             None => core.tick(now()),
             Some(command) => handle(&mut core, command, now()),
         });
+        if core.unauthorized() && now() >= token_checked.saturating_add(auth::FILE_CHECK_MS) {
+            token_checked = now();
+            if auth::file_changed() {
+                ios.extend(guard::contain("driver_core", Vec::new, || {
+                    core.token_changed(now())
+                }));
+            }
+        }
         if core.next_deadline().is_some_and(|at| at <= now()) {
             ios.extend(guard::contain("driver_core", Vec::new, || core.tick(now())));
         }
@@ -736,6 +769,7 @@ fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
         Command::Cancel { open } => core.cancel(open, now_ms),
         Command::Completed { io, exchange } => core.completed(io, exchange, now_ms),
         Command::DiskDone { io, done } => core.disk_done(io, *done, now_ms),
+        Command::TokenChanged => core.token_changed(now_ms),
         Command::Shutdown => Vec::new(),
     }
 }

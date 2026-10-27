@@ -5,11 +5,13 @@
 //! Tests of the driver: [`Core`]s against the model server in a virtual-time world with real log
 //! and generation files in a temp dir, and the runtime over the model in process.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -66,6 +68,8 @@ use crate::open::StreamFormat;
 use crate::open::StreamState;
 use crate::open::Unavailable;
 use crate::options::Access;
+use crate::replicator::BlockedReason;
+use crate::replicator::Condition;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
 use crate::salvage::Reason;
@@ -717,6 +721,65 @@ fn an_open_creates_the_stream_commits_replicate_and_synced_resolves() {
         e,
         DriverEvent::Opened { result: Ok(binding), .. } if *binding == bound.binding
     )));
+    assert!(w.resets(c).is_empty());
+}
+
+// A token change sends again at once what a `401` blocked, an open's HEAD and then a bound
+// database's append, with no wait for the 30 s retry.
+#[test]
+fn a_token_change_resends_what_a_401_blocked_at_once() {
+    let dir = TempDir::new("driver-token");
+    let mut w = World::new();
+    let c = w.core();
+    let refusing = Rc::new(Cell::new(true));
+    let refuse = Rc::clone(&refusing);
+    w.rewrite = Some(Box::new(move |_, answer| {
+        if refuse.get() {
+            *answer = RawAnswer::new(401);
+        }
+    }));
+    let token_changed = |w: &mut World| {
+        let now = w.now;
+        let ios = w.c(c).token_changed(now);
+        w.queue_ios(c, ios);
+        w.run_for(100);
+    };
+
+    let open = OpenId(w.id());
+    let now = w.now;
+    let ios = w.c(c).open(open, spec(dir.path(), 1), now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    assert!(w.c(c).take_opened(open).is_none());
+    assert!(w.c(c).unauthorized());
+    refusing.set(false);
+    token_changed(&mut w);
+    let bound = w.c(c).take_opened(open).expect("resolved").unwrap();
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert!(!w.c(c).unauthorized());
+
+    refusing.set(true);
+    let frame = w.commit(c, &bound, 1).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c, ticket), None);
+    assert!(
+        w.events(c)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Condition {
+                condition: Some(Condition::Blocked(BlockedReason::Unauthorized)),
+                ..
+            }))
+    );
+    assert!(w.c(c).unauthorized());
+    // The same token refused again: still blocked.
+    token_changed(&mut w);
+    assert_eq!(w.outcome(c, ticket), None);
+    refusing.set(false);
+    token_changed(&mut w);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits(), vec![frame]);
+    assert!(!w.c(c).unauthorized());
     assert!(w.resets(c).is_empty());
 }
 

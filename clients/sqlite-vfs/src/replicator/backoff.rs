@@ -1,7 +1,8 @@
 //! The outstanding request ([`Link`]): what to do with an answer that decides nothing about the
 //! request itself (design: Appends, Answers). It resends the identical request after backoff,
 //! doubling from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped
-//! at 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
+//! at 60 s); retries a blocked request every 30 s, and one a `401` blocked at once when the token
+//! changes ([`super::Event::TokenChanged`]); and parks the request while a HEAD checks the
 //! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
 //! the re-key to the replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight
 //! hands it the re-cut ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a
@@ -227,8 +228,17 @@ impl Policy {
 #[derive(Debug, Clone)]
 enum LinkState {
     InFlight(RequestId),
-    Waiting { at_ms: u64, attempt: Attempt },
-    Checking { head: Box<Link>, reason: HeadReason },
+    /// `refused`: blocked `unauthorized`, with the [`Ctx::tokens`] its refused attempt went out
+    /// under.
+    Waiting {
+        at_ms: u64,
+        attempt: Attempt,
+        refused: Option<u64>,
+    },
+    Checking {
+        head: Box<Link>,
+        reason: HeadReason,
+    },
 }
 
 /// One request, from its first attempt to a definite answer.
@@ -239,7 +249,15 @@ pub(crate) struct Link {
     policy: Policy,
     /// Lost answers in a row.
     lost: u8,
+    /// [`Ctx::tokens`] when the latest attempt went out.
+    tokens: u64,
 }
+
+/// The attempt that sends a request again under a changed token: the token file read again.
+const NEW_TOKEN: Attempt = Attempt {
+    fresh_connection: false,
+    refresh_token: true,
+};
 
 impl Link {
     /// Sends the first attempt of `request`.
@@ -255,6 +273,7 @@ impl Link {
             state: LinkState::InFlight(id),
             policy: Policy::default(),
             lost: 0,
+            tokens: ctx.tokens,
         }
     }
 
@@ -293,6 +312,7 @@ impl Link {
             attempt,
         });
         self.state = LinkState::InFlight(id);
+        self.tokens = ctx.tokens;
     }
 
     /// Carries out what the policy decided. `Err` is a reset.
@@ -309,9 +329,20 @@ impl Link {
                 attempt,
                 condition,
             } => {
+                let refused = matches!(condition, Condition::Blocked(BlockedReason::Unauthorized))
+                    .then_some(self.tokens);
+                if refused.is_some_and(|tokens| tokens != ctx.tokens) {
+                    // The token changed while the refused attempt was out: the new one goes now.
+                    self.resend(NEW_TOKEN, ctx, actions);
+                    return Ok(());
+                }
                 ctx.set_condition(Some(condition), actions);
                 actions.push(Action::Timer { at_ms, jitter_ms });
-                self.state = LinkState::Waiting { at_ms, attempt };
+                self.state = LinkState::Waiting {
+                    at_ms,
+                    attempt,
+                    refused,
+                };
             }
             Next::Resend(attempt) => self.resend(attempt, ctx, actions),
             Next::Head(reason) => {
@@ -446,12 +477,19 @@ impl Link {
         }
     }
 
-    /// A tick: a due resend goes out, a timer not yet due is asked for again.
+    /// A tick: a due resend goes out, and so does a request a `401` blocked under a token changed
+    /// since. A timer not yet due is asked for again.
     pub(crate) fn tick(&mut self, now_ms: u64, ctx: &mut Ctx, actions: &mut Vec<Action>) {
         match &mut self.state {
             LinkState::InFlight(_) => {}
-            LinkState::Waiting { at_ms, attempt } => {
-                if now_ms >= *at_ms {
+            LinkState::Waiting {
+                at_ms,
+                attempt,
+                refused,
+            } => {
+                if refused.is_some_and(|tokens| tokens != ctx.tokens) {
+                    self.resend(NEW_TOKEN, ctx, actions);
+                } else if now_ms >= *at_ms {
                     let attempt = *attempt;
                     self.resend(attempt, ctx, actions);
                 } else {

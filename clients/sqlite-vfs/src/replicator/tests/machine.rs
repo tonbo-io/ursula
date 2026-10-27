@@ -267,6 +267,70 @@ fn a_401_rereads_the_token_once_then_blocks() {
     assert_eq!(condition(&actions), Some(None));
 }
 
+/// The attempt of the first send among `actions`.
+fn attempt_of(actions: &[Action]) -> crate::transport::Attempt {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Send { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no send: {actions:?}"))
+}
+
+// A token change sends a request a `401` blocked again at once, the token file read again, with
+// no wait for the 30 s retry. The new token refused too blocks again at once, until the next
+// change. A change that finds nothing blocked sends nothing.
+#[test]
+fn a_token_change_resends_a_request_blocked_unauthorized_at_once() {
+    let mut h = streaming(1);
+    assert!(sends(&h.on(Event::TokenChanged)).is_empty());
+    let first = h.last_request().clone();
+    h.answer(&RawAnswer::new(401));
+    let actions = h.answer(&RawAnswer::new(401));
+    assert_eq!(
+        condition(&actions),
+        Some(Some(Condition::Blocked(BlockedReason::Unauthorized)))
+    );
+    let actions = h.on(Event::TokenChanged);
+    assert_eq!(sends(&actions), vec![&first]);
+    assert!(attempt_of(&actions).refresh_token);
+    let actions = h.answer(&RawAnswer::new(401));
+    assert!(sends(&actions).is_empty());
+    assert_eq!(timer_of(&actions).unwrap().0, h.now_ms + BLOCKED_RETRY_MS);
+    assert_eq!(sends(&h.on(Event::TokenChanged)), vec![&first]);
+    let len = u64::try_from(first.body.len()).unwrap();
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        1,
+        37,
+        37 + len,
+        None,
+    )));
+    assert_eq!(condition(&actions), Some(None));
+}
+
+// A token that changes while the token reread after a `401` is out: that attempt carried the old
+// token, so its `401` sends the request again at once instead of blocking it.
+#[test]
+fn a_token_changed_while_the_refused_attempt_was_out_goes_at_once() {
+    let mut h = streaming(1);
+    let first = h.last_request().clone();
+    h.answer(&RawAnswer::new(401));
+    assert!(sends(&h.on(Event::TokenChanged)).is_empty(), "in flight");
+    let actions = h.answer(&RawAnswer::new(401));
+    assert_eq!(sends(&actions), vec![&first]);
+    assert!(attempt_of(&actions).refresh_token);
+    assert_eq!(condition(&actions), None);
+    // Refused under the new token too: blocked.
+    let actions = h.answer(&RawAnswer::new(401));
+    assert_eq!(
+        condition(&actions),
+        Some(Some(Condition::Blocked(BlockedReason::Unauthorized)))
+    );
+}
+
 #[test]
 fn redirects_are_resent_a_few_times_then_block() {
     let mut h = streaming(1);

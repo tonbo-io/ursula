@@ -165,6 +165,11 @@ struct OpenSlot {
 }
 
 impl OpenSlot {
+    /// Whether the open waits blocked `unauthorized`.
+    fn unauthorized(&self) -> bool {
+        self.wake_at.is_some() && self.opening.seen() == Some(Unavailable::Unauthorized)
+    }
+
     fn deadline(&self) -> Option<u64> {
         if self.failing.is_some() {
             return None;
@@ -200,6 +205,19 @@ enum Local {
         build: Box<Build>,
         wake_at: Option<u64>,
     },
+}
+
+impl Local {
+    /// Whether a rebuild waits blocked `unauthorized`.
+    fn unauthorized(&self) -> bool {
+        matches!(
+            self,
+            Self::Rebuilding {
+                build,
+                wake_at: Some(_),
+            } if build.seen() == Some(Unavailable::Unauthorized)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -264,6 +282,20 @@ struct Binding {
 }
 
 impl Binding {
+    /// Whether a request of the binding waits blocked `unauthorized`: its rebuild's, or its
+    /// replicator's.
+    fn unauthorized(&self) -> bool {
+        let rebuilding =
+            matches!(&self.stage, Stage::Opening { local, .. } if local.unauthorized());
+        rebuilding
+            || self
+                .replicator
+                .ctx()
+                .and_then(|ctx| ctx.condition.as_ref())
+                .map(Unavailable::from)
+                == Some(Unavailable::Unauthorized)
+    }
+
     fn with_log<R>(
         &mut self,
         f: impl FnOnce(&mut Log) -> Result<R, LogError>,
@@ -1646,6 +1678,39 @@ impl Core {
             }
         }
         ios
+    }
+
+    /// The token requests carry changed (design: Transport): every request a `401` blocked goes
+    /// again at once under the new one, the replicators' ([`Event::TokenChanged`]), the opens' and
+    /// the rebuilds'.
+    pub(crate) fn token_changed(&mut self, now_ms: u64) -> Vec<Io> {
+        for slot in self.opens.values_mut() {
+            if slot.unauthorized() {
+                slot.wake_at = Some(now_ms);
+            }
+        }
+        for b in self.bindings.values_mut() {
+            if let Stage::Opening { local, .. } = &mut b.stage
+                && local.unauthorized()
+                && let Local::Rebuilding { wake_at, .. } = local
+            {
+                *wake_at = Some(now_ms);
+            }
+        }
+        let mut ios = Vec::new();
+        let bindings: Vec<BindingId> = self.bindings.keys().copied().collect();
+        for binding in bindings {
+            self.drive(binding, Event::TokenChanged, now_ms, &mut ios);
+        }
+        ios.extend(self.tick(now_ms));
+        ios
+    }
+
+    /// Whether a request waits blocked `unauthorized`: the driver then watches the token file for
+    /// a change ([`crate::auth::file_changed`]).
+    pub(crate) fn unauthorized(&self) -> bool {
+        self.opens.values().any(OpenSlot::unauthorized)
+            || self.bindings.values().any(Binding::unauthorized)
     }
 
     fn tick_binding(&mut self, binding: BindingId, now_ms: u64, ios: &mut Vec<Io>) {

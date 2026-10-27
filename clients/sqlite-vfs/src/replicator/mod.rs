@@ -275,6 +275,10 @@ pub(crate) enum Event {
     Answer { id: RequestId, exchange: Exchange },
     /// The time moved; timers that are due fire.
     Tick,
+    /// The token requests carry changed (`ursula_set_token`, the token file): a request a `401`
+    /// blocked goes again at once under the new one ([`backoff::Link`]). The rest is a
+    /// [`Event::Tick`].
+    TokenChanged,
     /// A batch must end exactly at `position` (a snapshot's `k`, design: Snapshots): once it is
     /// acknowledged, [`Action::Boundary`] reports it.
     Boundary(Position),
@@ -527,6 +531,8 @@ pub(crate) struct Ctx {
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
     next_id: u64,
+    /// How many times the token requests carry changed ([`Event::TokenChanged`]).
+    pub(crate) tokens: u64,
     /// The negative controls the proptest checks its properties against.
     #[cfg(test)]
     pub(crate) knobs: Knobs,
@@ -604,6 +610,7 @@ impl Ctx {
             pre_checked: None,
             producer,
             next_id: 0,
+            tokens: 0,
             #[cfg(test)]
             knobs: Knobs::default(),
         })
@@ -1270,6 +1277,10 @@ fn common_event(
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
+        Event::TokenChanged => {
+            ctx.tokens = ctx.tokens.saturating_add(1);
+            Ok(Some(Event::Tick))
+        }
         Event::Answer { .. } | Event::Tick | Event::CaughtUp { .. } => Ok(Some(event)),
     }
 }
@@ -1321,7 +1332,8 @@ fn activating(
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::Claim { epoch, link },
                 ctx,
@@ -1394,7 +1406,8 @@ fn activating(
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::Reconcile { reconcile, link },
                 ctx,
@@ -1430,7 +1443,8 @@ fn activating(
             | Event::Boundary(_)
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::Applying { reconcile, end },
                 ctx,
@@ -1467,7 +1481,8 @@ fn activating(
             | Event::Boundary(_)
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
-            | Event::Stop => Replicator::Activating {
+            | Event::Stop
+            | Event::TokenChanged => Replicator::Activating {
                 kind,
                 step: Step::CatchingUp(done),
                 ctx,
@@ -2563,7 +2578,8 @@ impl Stream {
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
-            | Event::Stop => self.kick(actions),
+            | Event::Stop
+            | Event::TokenChanged => self.kick(actions),
         }
     }
 
