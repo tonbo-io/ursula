@@ -410,11 +410,6 @@ fn read_trickled(bytes: &[u8], step: usize) -> Result<Scan, SegmentError> {
             Step::End(tail) => break tail,
         }
     };
-    // The end stays the end.
-    assert_eq!(
-        reader.next(&mut whole).map_err(infallible)?,
-        Step::End(tail)
-    );
     let (seed, header_len) = (reader.seed(), reader.header_len());
     Ok(Scan {
         header: reader.into_header(),
@@ -566,8 +561,11 @@ fn a_record_larger_than_the_buffer_streams_through_it() {
         reader.next(&mut whole).map_err(infallible).unwrap(),
         Step::Record(records[1].clone())
     );
-    assert_eq!(
-        reader.next(&mut whole).map_err(infallible).unwrap(),
-        Step::End(Tail::Clean)
-    );
+    // The end stays the end.
+    for _ in 0..2 {
+        assert_eq!(
+            reader.next(&mut whole).map_err(infallible).unwrap(),
+            Step::End(Tail::Clean)
+        );
+    }
 }
