@@ -13,9 +13,11 @@
 //!
 //! The host directory is [`DEFAULT`] when `lstat` finds anything there, whatever its type, and
 //! otherwise the test hook `URSULA_VFS_HOST_DIR` when `lstat` finds that. Without either the
-//! extension records nothing and refuses nothing. With one, a record that cannot be written fails
-//! the owner open (`local_setup`), before it claims anything: a symlink or a file that is not a
-//! directory included, so the extension never writes through a link.
+//! extension records nothing and refuses nothing. With one, a host directory that cannot be opened
+//! as a directory (a symlink or another file in its place, so the extension never writes through a
+//! link), a missing record that cannot be written, or a record that is not the directory's fails
+//! the owner open (`local_setup`), before it claims anything. An existing matching record is only
+//! read, so a read-only, full or unwritable host directory refuses nothing an earlier open recorded.
 //!
 //! A record is a flat JSON object (every value a string, a number, a boolean or null), so a later
 //! line may add only such keys: a reader takes its `dir` whatever its `v` and ignores the rest. It
@@ -25,7 +27,14 @@
 //! record, or loses the race to link it, checks that it names the same directory, and fsyncs the
 //! host directory too, so a record another process linked and never synced is durable before this
 //! open logs anything.
+//!
+//! The host directory's path is resolved once, by the open of the directory itself (`O_DIRECTORY`
+//! and `O_NOFOLLOW`, so its last component is no link). Every later step (the temp file's create,
+//! the link, the unlink, the record's read and the fsync) goes through that descriptor (`at`),
+//! so a path swapped after the open cannot redirect it. Only the cache directory's real path is
+//! resolved by path, and it names a directory outside the host directory.
 
+use std::ffi::c_uint;
 use std::fs;
 use std::fs::File;
 use std::fs::Permissions;
@@ -61,6 +70,8 @@ const TMP: &str = ".tmp-";
 const MAX_RECORD_BYTES: usize = 64 << 10;
 /// The record format's version.
 const VERSION: u64 = 1;
+/// A record's mode, and its temp file's.
+const MODE: c_uint = 0o444;
 
 /// A host directory that cannot take the record of an owner open's cache directory. The open
 /// fails `local_setup`, having claimed nothing.
@@ -222,11 +233,11 @@ pub(crate) fn record_dir(host: &Path, cache: &Path) -> Result<(), HostDirError> 
         .map_err(io(host, "open", host))?;
     let real = fs::canonicalize(cache).map_err(io(host, "resolve", cache))?;
     let cache = utf8(host, real)?;
-    let record = host.join(record_name(&cache));
-    match read(&record) {
-        Ok(existing) => check(host, &record, &cache, existing)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => publish(host, &record, &cache)?,
-        Err(e) => return Err(io(host, "read", &record)(e)),
+    let name = record_name(&cache);
+    match read(&dir, &name) {
+        Ok(existing) => check(host, &name, &cache, existing)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => publish(&dir, host, &name, &cache)?,
+        Err(e) => return Err(io(host, "read", &host.join(&name))(e)),
     }
     dir.sync_all().map_err(io(host, "fsync", host))?;
     abort_at(AbortStep::HostDirSynced);
@@ -241,13 +252,12 @@ enum Existing {
     NotAFile,
 }
 
-/// What the record's name `path` holds. Never through a link, and never blocking: a FIFO opens at
-/// once (`O_NONBLOCK`, which a regular file ignores) and only a regular file is read.
-fn read(path: &Path) -> std::io::Result<Existing> {
-    let file = File::options()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+/// What the record's name `name` in the host directory `dir` holds. Never through a link, and never
+/// blocking: a FIFO opens at once (`O_NONBLOCK`, which a regular file ignores) and only a regular
+/// file is read.
+fn read(dir: &File, name: &str) -> std::io::Result<Existing> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let file = at::open(dir, name, flags, 0)?;
     if !file.metadata()?.is_file() {
         return Ok(Existing::NotAFile);
     }
@@ -257,11 +267,11 @@ fn read(path: &Path) -> std::io::Result<Existing> {
     Ok(Existing::File(bytes))
 }
 
-/// What the record's name `record` holds, `existing`, is the record of `cache`, or the open fails.
-fn check(host: &Path, record: &Path, cache: &str, existing: Existing) -> Result<(), HostDirError> {
+/// What the record's name `name` holds, `existing`, is the record of `cache`, or the open fails.
+fn check(host: &Path, name: &str, cache: &str, existing: Existing) -> Result<(), HostDirError> {
     let conflict = |found| HostDirError::Conflict {
         host: host.to_owned(),
-        record: record.to_owned(),
+        record: host.join(name),
         cache: cache.to_owned(),
         found,
     };
@@ -276,40 +286,37 @@ fn check(host: &Path, record: &Path, cache: &str, existing: Existing) -> Result<
     }
 }
 
-/// Publishes the record of `cache` at `record`: a temp file of mode 0444 written and fsynced, then
-/// linked into place. When another open linked it first, its record is checked instead.
-fn publish(host: &Path, record: &Path, cache: &str) -> Result<(), HostDirError> {
+/// Publishes the record of `cache` as `name` in the host directory `dir`: a temp file of mode 0444
+/// written and fsynced, then linked into place. When another open linked it first, its record is
+/// checked instead.
+fn publish(dir: &File, host: &Path, name: &str, cache: &str) -> Result<(), HostDirError> {
     let random = random16().map_err(io(host, "read", Path::new(URANDOM)))?;
     let suffix: String = random.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let tmp = host.join(format!("{TMP}{}-{suffix}", std::process::id()));
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .mode(0o444)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)
-        .map_err(io(host, "create", &tmp))?;
+    let tmp_name = format!("{TMP}{}-{suffix}", std::process::id());
+    let tmp = host.join(&tmp_name);
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+    let mut file = at::open(dir, &tmp_name, flags, MODE).map_err(io(host, "create", &tmp))?;
     let written = fill(&mut file, host, &tmp, cache);
     drop(file);
     if let Err(e) = written {
-        discard(&tmp);
+        discard(dir, host, &tmp_name);
         return Err(e);
     }
     abort_at(AbortStep::HostTmpSynced);
-    match fs::hard_link(&tmp, record) {
+    match at::link(dir, &tmp_name, name) {
         Ok(()) => {
             abort_at(AbortStep::HostLinked);
-            fs::remove_file(&tmp).map_err(io(host, "unlink", &tmp))
+            at::unlink(dir, &tmp_name).map_err(io(host, "unlink", &tmp))
         }
         // An open of another stream in the same directory linked it first.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            discard(&tmp);
-            let existing = read(record).map_err(io(host, "read", record))?;
-            check(host, record, cache, existing)
+            discard(dir, host, &tmp_name);
+            let existing = read(dir, name).map_err(io(host, "read", &host.join(name)))?;
+            check(host, name, cache, existing)
         }
         Err(e) => {
-            discard(&tmp);
-            Err(io(host, "link", record)(e))
+            discard(dir, host, &tmp_name);
+            Err(io(host, "link", &host.join(name))(e))
         }
     }
 }
@@ -317,23 +324,24 @@ fn publish(host: &Path, record: &Path, cache: &str) -> Result<(), HostDirError> 
 /// Writes the record of `cache` into the temp file `tmp`, mode 0444 whatever the umask, and fsyncs
 /// it.
 fn fill(file: &mut File, host: &Path, tmp: &Path, cache: &str) -> Result<(), HostDirError> {
-    file.set_permissions(Permissions::from_mode(0o444))
+    file.set_permissions(Permissions::from_mode(MODE))
         .map_err(io(host, "chmod", tmp))?;
     file.write_all(record_line(cache).as_bytes())
         .map_err(io(host, "write", tmp))?;
     file.sync_all().map_err(io(host, "fsync", tmp))
 }
 
-/// Removes the temp file of a publish that failed. One left behind is ignored by readers, and a
-/// host deletes it once its process is gone.
-fn discard(tmp: &Path) {
-    if let Err(e) = fs::remove_file(tmp) {
+/// Removes the temp file `tmp_name` of a publish that failed. One left behind is ignored by readers,
+/// and a host in the writer's PID namespace deletes it once that PID is gone.
+fn discard(dir: &File, host: &Path, tmp_name: &str) {
+    if let Err(e) = at::unlink(dir, tmp_name) {
         log::emit(Level::Warn, "host_dir_leftover", &[
-            ("path", &tmp.display()),
+            ("path", &host.join(tmp_name).display()),
             ("error", &e),
         ]);
     }
 }
 
+mod at;
 #[cfg(test)]
 mod tests;

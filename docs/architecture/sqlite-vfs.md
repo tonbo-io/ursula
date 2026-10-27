@@ -1171,7 +1171,10 @@ snapshot holds a commit the stream lacks. The extension tells it where to look.
 
 The host creates the host directory, `/var/lib/sqlite-ursula/host`, before any process that may
 load the extension starts. Every such process must be able to create files in it, for example a
-root-owned directory of mode 1777. A process that cannot see the directory records nothing.
+root-owned directory of mode 1777. Every ancestor of it must be a directory the process can search:
+a missing, unsearchable or non-directory ancestor makes the host directory absent to that process,
+which then records nothing. Links among the ancestors are followed, only the host directory itself
+must not be a link.
 
 ```text
 /var/lib/sqlite-ursula/host/
@@ -1191,14 +1194,18 @@ changed. `link` never replaces a file, so a record is complete or absent. An ope
 record, or loses the race to link it, checks that it names the same directory and fsyncs the
 directory too, so the record is durable before the open logs anything.
 
-When the host directory exists and the record cannot be written, the open fails with
+When the host directory exists and the open cannot record its directory, it fails with
 `local_setup`, action `fix`, before it claims anything, and nothing reaches the stream: a symlink or
-a file that is not a directory in its place, a filesystem that is read-only or full, a directory the
-process cannot write, something under the record's name that is not a record of this directory, or
-a real path that is not UTF-8. The open claimed, built and logged nothing, so the root is as the
-open found it (a fresh one holds only its `lock` file), and the next open tries again. A reader or
-an import records nothing, since neither logs a commit of its own, and loads, commits, `synced()`
-and status never consult the host directory.
+a file that is not a directory in place of the host directory, something under the record's name
+that is not a record of this directory, a real path that is not UTF-8, or a missing record that
+cannot be written because the filesystem is read-only or full or the process cannot write the
+directory. An open that finds its record only reads it and fsyncs the directory, so a read-only,
+full or unwritable host directory refuses no open whose directory is already recorded. After the
+directory's open (`O_DIRECTORY` and `O_NOFOLLOW`), every step goes through its descriptor (`openat`,
+`linkat`, `unlinkat`), so a path swapped meanwhile cannot redirect one. The open claimed, built and
+logged nothing, so the root is as the open found it (a fresh one holds only its `lock` file), and
+the next open tries again. A reader or an import records nothing, since neither logs a commit of its
+own, and loads, commits, `synced()` and status never consult the host directory.
 
 - The host directory is the compiled-in path when `lstat` finds anything there, whatever its type.
   A path the process cannot `lstat`, such as one a confinement policy hides, counts as absent
@@ -1207,7 +1214,14 @@ and status never consult the host directory.
   compiled-in path.
 - A host may delete the record of a directory that no longer exists, while nothing that may load
   the extension runs: an open that locks a root in a directory at that path again records it
-  before it can log. It may also delete a `.tmp-<pid>-*` whose process is gone.
+  before it can log.
+- A `.tmp-<pid>-*` carries the writer's PID as its own PID namespace numbers it. A host may delete
+  one only when it shares that namespace and no process with that PID runs. A PID from another
+  namespace says nothing about the processes the host sees.
+- A mode-1777 directory is no boundary between the processes that share it. Any of them can link a
+  record under a name another's directory hashes to, failing that one's opens, or record a
+  directory that is not its own. Processes that must not affect each other need host directories
+  of their own, which means separate mount namespaces, since the path is compiled in.
 - A record is a flat JSON object: every value is a string, a number, a boolean or null, never an
   object or an array, so a later line may add only such keys. A reader takes its `dir` whatever
   its `v` and ignores keys it does not know. The format is frozen within a release line.
