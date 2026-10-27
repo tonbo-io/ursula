@@ -1,5 +1,6 @@
 //! Settings and test hooks read from the environment (`URSULA_VFS_*`), once per process.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -67,8 +68,9 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
 }
 
 /// A step of the commit path, of a checkpoint, of a re-key, of a trim or cut of the log, of a
-/// generation's copy or of its publish that `URSULA_VFS_ABORT_AT` can stop the process at (design:
-/// Capture, Fsyncs, Layout, Materialize, History).
+/// generation's copy or of its publish, or of an owner open's record in the host directory that
+/// `URSULA_VFS_ABORT_AT` can stop the process at (design: Capture, Fsyncs, Layout, Materialize,
+/// History, Hosts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// A write transaction's first WAL write, admitted.
@@ -119,6 +121,15 @@ pub(crate) enum Step {
     /// An open cutting the log after its valid prefix: the later segments removed and the
     /// directory fsynced, before the current segment is truncated.
     CutRemoved,
+    /// An owner open recording its cache directory: the temp file written and fsynced, before it
+    /// is linked into place (design: Hosts).
+    HostTmpSynced,
+    /// An owner open recording its cache directory: the record linked into place, before the
+    /// temp file is unlinked.
+    HostLinked,
+    /// An owner open recording its cache directory: the host directory fsynced, the record
+    /// published or found, before the open goes on.
+    HostDirSynced,
 }
 
 impl Step {
@@ -146,6 +157,9 @@ impl Step {
             Step::CopyLog => "copy_log",
             Step::TrimUnlinked => "trim_unlinked",
             Step::CutRemoved => "cut_removed",
+            Step::HostTmpSynced => "host_tmp_synced",
+            Step::HostLinked => "host_linked",
+            Step::HostDirSynced => "host_dir_synced",
         }
     }
 }
@@ -283,6 +297,26 @@ pub(crate) fn fail_sync() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| non_empty("URSULA_VFS_FAIL_SYNC"))
         .as_deref()
+}
+
+/// Test hook `URSULA_VFS_HOST_DIR=<absolute dir>`: the host directory when the compiled-in one
+/// (`hostdir::DEFAULT`) does not exist (design: Hosts). It serves the e2e suites, and no host
+/// relies on it: an application can scrub its environment, never the compiled-in path. A relative
+/// path is ignored, logged once (`setting_adjusted`).
+pub(crate) fn host_dir_override() -> Option<&'static Path> {
+    static V: OnceLock<Option<PathBuf>> = OnceLock::new();
+    V.get_or_init(|| host_dir_hook(std::env::var_os("URSULA_VFS_HOST_DIR")))
+        .as_deref()
+}
+
+/// The host directory the hook's `value` names: none when it is unset, empty or relative.
+pub(crate) fn host_dir_hook(value: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value.filter(|v| !v.is_empty())?);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    adjusted("URSULA_VFS_HOST_DIR", &path.to_string_lossy(), &"none");
+    None
 }
 
 fn non_empty(name: &str) -> Option<String> {

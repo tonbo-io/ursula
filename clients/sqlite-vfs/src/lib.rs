@@ -56,7 +56,11 @@
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`, `URSULA_VFS_MAX_COMMIT_BYTES`.
 //! Test hooks: `URSULA_VFS_ABORT_AT=<step>[:<n>]` (`config::Step`), `URSULA_VFS_PANIC_IN=<entry>`,
 //! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`,
-//! `URSULA_VFS_SNAPSHOT_HOLD=<dir>`.
+//! `URSULA_VFS_SNAPSHOT_HOLD=<dir>`, `URSULA_VFS_HOST_DIR=<absolute dir>` (the host directory when
+//! the compiled-in `/var/lib/sqlite-ursula/host` does not exist).
+//!
+//! An owner `ursula_open` records its cache directory in the host directory, when there is one,
+//! before it claims anything, and fails `local_setup` when it cannot (`hostdir`, design: Hosts).
 //!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
@@ -87,6 +91,8 @@
 //!   stream.
 //! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
+//! - `hostdir`: the host directory, where an owner open records its cache directory for a host
+//!   that snapshots or moves the process.
 //! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
@@ -123,6 +129,7 @@ mod extension;
 mod generation;
 mod guard;
 mod host;
+mod hostdir;
 pub mod ids;
 mod import;
 mod json;
