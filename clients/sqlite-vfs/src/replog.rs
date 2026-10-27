@@ -48,6 +48,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
@@ -154,6 +155,9 @@ pub(crate) enum LogError {
     },
     #[error("log {}: refused after a failed cut", .dir.display())]
     Broken { dir: PathBuf },
+    /// The read's [`Fold`] stopped it before the end of the log ([`Fold::stopped`]).
+    #[error("log {}: the read stopped before the end of the log", .dir.display())]
+    Stopped { dir: PathBuf },
 }
 
 /// A record of the log.
@@ -369,6 +373,12 @@ pub(crate) trait Fold {
     /// segment's header with the carried-over fields brought to the end of the log, and `cut`
     /// where the valid log ends before the bytes on disk do, if it does.
     fn end(&mut self, state: &SegmentHeader, cut: Option<&Cut>);
+
+    /// Whether the read stops after the record it just handed over, failing
+    /// [`LogError::Stopped`]: a host's read that ran out of time. The open never stops.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// The [`Keep`] [`Log::read`] reads COMMIT records with: the commit id each frame names, read as
@@ -438,6 +448,114 @@ impl Fold for Records {
             .any(|r| matches!(r.body, RecordBody::Commit { .. }));
         let min = state.base.min(state.acked);
         self.records.retain(|r| r.position > min);
+    }
+}
+
+/// Keeps a COMMIT frame's length and none of its bytes.
+#[derive(Debug, Default)]
+pub(crate) struct Length(u32);
+
+impl Keep for Length {
+    type Kept = u32;
+
+    fn start(&mut self, len: u32) {
+        self.0 = len;
+    }
+
+    fn piece(&mut self, _bytes: &[u8]) {}
+
+    fn finish(&mut self) -> u32 {
+        self.0
+    }
+}
+
+/// A host's fold over [`Log::read`] (design: Hosts): the position and frame length of each of the
+/// generation's own COMMIT records above the latest ACK, dropped as later ACKs come, so it keeps no
+/// frame and 16 bytes per pending commit. At the end it holds what [`Recovered::pending`] holds,
+/// unless an ACK went below an earlier one and brought back a commit the fold had dropped: a second
+/// read [`Unacknowledged::above`] the latest ACK then keeps exactly those. It stops the read once
+/// its deadline passes ([`Fold::stopped`]).
+#[derive(Debug, Default)]
+pub(crate) struct Unacknowledged {
+    commits: Vec<(Position, u64)>,
+    /// Drop only the commits at or below this position, not those at or below each ACK.
+    floor: Option<Position>,
+    /// The highest position an ACK dropped.
+    dropped: Option<Position>,
+    /// At the end of the log: whether a lower ACK brought back a commit an earlier one dropped,
+    /// which the fold no longer has.
+    lowered: bool,
+    /// The state at the end of the log, once the read ended.
+    state: Option<SegmentHeader>,
+    deadline: Option<Instant>,
+}
+
+impl Fold for Unacknowledged {
+    type Frames = Length;
+
+    fn record(&mut self, position: Position, body: RecordBody<Logged<u32>>, state: &SegmentHeader) {
+        if let RecordBody::Commit { frame } = &body
+            && !foreign(frame.id, state.lineage)
+        {
+            self.commits.push((position, u64::from(frame.kept)));
+        }
+        self.drop_through(state.acked);
+    }
+
+    fn cut(&mut self, from: Position) {
+        self.commits.retain(|(p, _)| *p < from);
+    }
+
+    fn end(&mut self, state: &SegmentHeader, _cut: Option<&Cut>) {
+        self.drop_through(state.acked);
+        self.lowered = self.dropped.is_some_and(|d| d > state.acked);
+        self.state = Some(state.clone());
+    }
+
+    fn stopped(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+impl Unacknowledged {
+    /// A fold that stops the read at `deadline`, when there is one.
+    pub(crate) fn until(deadline: Option<Instant>) -> Unacknowledged {
+        Unacknowledged {
+            deadline,
+            ..Unacknowledged::default()
+        }
+    }
+
+    /// A fold for a second read of a log whose ACKs went below an earlier one: it keeps every own
+    /// commit above `floor`, the latest ACK the first read found.
+    pub(crate) fn above(floor: Position, deadline: Option<Instant>) -> Unacknowledged {
+        Unacknowledged {
+            floor: Some(floor),
+            deadline,
+            ..Unacknowledged::default()
+        }
+    }
+
+    fn drop_through(&mut self, acked: Position) {
+        let through = self.floor.unwrap_or(acked);
+        for (p, _) in self.commits.iter().filter(|(p, _)| *p <= through) {
+            self.dropped = self.dropped.max(Some(*p));
+        }
+        self.commits.retain(|(p, _)| *p > through);
+    }
+
+    /// The state at the end of the log, once the read ended.
+    pub(crate) fn state(&self) -> Option<&SegmentHeader> {
+        self.state.as_ref()
+    }
+
+    /// The pending commits once the read ended: `None` before, when a lower ACK brought back a
+    /// commit an earlier one dropped, or when a read [`Unacknowledged::above`] a floor found
+    /// another latest ACK (the log changed between the reads).
+    pub(crate) fn pending(&self) -> Option<&[(Position, u64)]> {
+        let state = self.state.as_ref()?;
+        let exact = !self.lowered && self.floor.is_none_or(|f| f == state.acked);
+        exact.then_some(self.commits.as_slice())
     }
 }
 
@@ -710,6 +828,11 @@ impl Log {
                 end = to_u64(r.end);
                 last = Some(r.position);
                 fold.record(r.position, r.body, &carried);
+                if fold.stopped() {
+                    return Err(LogError::Stopped {
+                        dir: dir.to_owned(),
+                    });
+                }
             };
             next = match last {
                 Some(position) => position.checked_add_one(dir)?,

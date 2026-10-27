@@ -66,10 +66,14 @@ pub(crate) const DEFAULT: &str = "/var/lib/sqlite-ursula/host";
 const RECORD: &str = "dir-";
 /// A temp file's name before `<pid>-<16 hex>`.
 const TMP: &str = ".tmp-";
+/// The host's lock file.
+const HOLD: &str = "hold";
+/// Names reserved for the host start so.
+const HOST: &str = "host";
 /// The most bytes of a record read back.
 const MAX_RECORD_BYTES: usize = 64 << 10;
 /// The record format's version.
-const VERSION: u64 = 1;
+pub(crate) const VERSION: u64 = 1;
 /// A record's mode, and its temp file's.
 const MODE: c_uint = 0o444;
 
@@ -189,17 +193,71 @@ pub(crate) fn record_line(cache: &str) -> String {
 /// The directory a record names, whatever its `v`: a later line's record of the same directory
 /// serves this one too, and keys it does not know are ignored.
 pub(crate) fn recorded_dir(bytes: &[u8]) -> Result<String, Malformed> {
+    parse_record(bytes).map(|record| record.dir)
+}
+
+/// What a record holds: its `dir`, and its `v` when that is a whole number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Record {
+    pub(crate) version: Option<u64>,
+    pub(crate) dir: String,
+}
+
+/// The record `bytes` hold. Keys other than `v` and `dir` are ignored.
+pub(crate) fn parse_record(bytes: &[u8]) -> Result<Record, Malformed> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(Malformed::TooLong);
     }
     let text = std::str::from_utf8(bytes).map_err(Malformed::NotUtf8)?;
-    json::parse_object(text)?
-        .into_iter()
-        .find_map(|(key, value)| match (key.as_str(), value) {
-            ("dir", Value::Text(dir)) => Some(dir),
-            _ => None,
-        })
-        .ok_or(Malformed::NoDir)
+    let mut version = None;
+    let mut dir = None;
+    for (key, value) in json::parse_object(text)? {
+        match (key.as_str(), value) {
+            // The first of each counts, as for any key a reader looks up.
+            ("v", Value::Number(n)) if version.is_none() => version = json::whole(n),
+            ("dir", Value::Text(text)) if dir.is_none() => dir = Some(text),
+            _ => {}
+        }
+    }
+    Ok(Record {
+        version,
+        dir: dir.ok_or(Malformed::NoDir)?,
+    })
+}
+
+/// What a name in the host directory is (design: Hosts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// `dir-<32 hex>`: a record.
+    Record,
+    /// `.tmp-<pid>-<16 hex>`: a record being published.
+    Tmp,
+    /// `hold`, or a name starting `host`: the host's.
+    Host,
+    /// Anything else: written by nothing this line knows.
+    Unrecognized,
+}
+
+/// What the name `name` in the host directory is.
+pub(crate) fn entry(name: &str) -> Entry {
+    let hex = |s: &str, len: usize| {
+        s.len() == len
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if name.strip_prefix(RECORD).is_some_and(|key| hex(key, 32)) {
+        return Entry::Record;
+    }
+    let tmp = name.strip_prefix(TMP).and_then(|rest| rest.split_once('-'));
+    if tmp.is_some_and(|(pid, suffix)| {
+        !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && hex(suffix, 16)
+    }) {
+        return Entry::Tmp;
+    }
+    if name == HOLD || name.starts_with(HOST) {
+        return Entry::Host;
+    }
+    Entry::Unrecognized
 }
 
 /// The real path `real` of a cache directory as text.
@@ -225,12 +283,7 @@ fn io(host: &Path, op: &'static str, path: &Path) -> impl FnOnce(std::io::Error)
 /// Records the cache directory `cache` in the host directory `host` (design: Hosts): checks the
 /// record that exists, or publishes it, then fsyncs `host`.
 pub(crate) fn record_dir(host: &Path, cache: &Path) -> Result<(), HostDirError> {
-    // A directory, not a link to one and not another file: the kernel says so at the open.
-    let dir = File::options()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(host)
-        .map_err(io(host, "open", host))?;
+    let dir = open_dir(host).map_err(io(host, "open", host))?;
     let real = fs::canonicalize(cache).map_err(io(host, "resolve", cache))?;
     let cache = utf8(host, real)?;
     let name = record_name(&cache);
@@ -244,8 +297,17 @@ pub(crate) fn record_dir(host: &Path, cache: &Path) -> Result<(), HostDirError> 
     Ok(())
 }
 
+/// Opens the host directory `host`: a directory, not a link to one and not another file, as the
+/// kernel says at the open.
+pub(crate) fn open_dir(host: &Path) -> std::io::Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(host)
+}
+
 /// What a record's name holds.
-enum Existing {
+pub(crate) enum Existing {
     /// A regular file's bytes, at most one past [`MAX_RECORD_BYTES`].
     File(Vec<u8>),
     /// Anything else, unread.
@@ -255,7 +317,7 @@ enum Existing {
 /// What the record's name `name` in the host directory `dir` holds. Never through a link, and never
 /// blocking: a FIFO opens at once (`O_NONBLOCK`, which a regular file ignores) and only a regular
 /// file is read.
-fn read(dir: &File, name: &str) -> std::io::Result<Existing> {
+pub(crate) fn read(dir: &File, name: &str) -> std::io::Result<Existing> {
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let file = at::open(dir, name, flags, 0)?;
     if !file.metadata()?.is_file() {

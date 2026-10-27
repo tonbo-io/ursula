@@ -77,7 +77,7 @@ use crate::salvage::Manifest;
 use crate::salvage::SalvageError;
 
 /// The lock file in a root.
-const LOCK: &str = "lock";
+pub(crate) const LOCK: &str = "lock";
 /// A reader directory's name before its number.
 const READER: &str = "reader-";
 /// How often [`Root::open_lock`] tries a directory a cleanup keeps moving.
@@ -217,6 +217,24 @@ pub(crate) fn root_name(p: &CanonicalPath) -> String {
         label.push_str("stream");
     }
     format!("{label}-{}", hash.as_str().get(..32).unwrap_or_default())
+}
+
+/// Whether `name` has the grammar of a root directory's name ([`root_name`]): a label of 1 to 64
+/// characters of `[a-z0-9_-]`, `-`, and 32 lowercase hex digits. The one test of it: a host's
+/// inspection finds roots by it, and the root locks open processes hold.
+pub(crate) fn is_root_name(name: &str) -> bool {
+    let Some((label, hash)) = name.rsplit_once('-') else {
+        return false;
+    };
+    let label_ok = (1..=64).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    let hash_ok = hash.len() == 32
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    label_ok && hash_ok
 }
 
 /// The root directory of stream `p` under the cache root `dir`.

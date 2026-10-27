@@ -22,14 +22,11 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
-use super::Cut;
-use super::Fold;
 use super::Log;
 use super::LogError;
-use super::Logged;
+use super::Unacknowledged;
 use crate::codec::frame::Frame;
 use crate::codec::segment::BUFFER;
-use crate::codec::segment::Keep;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
@@ -904,77 +901,6 @@ fn every_segment_names_what_its_generation_supersedes() {
     assert_eq!(records(&original), records(&recopied));
 }
 
-/// Keeps a frame's length.
-#[derive(Debug, Default)]
-struct Length(u32);
-
-impl Keep for Length {
-    type Kept = u32;
-
-    fn start(&mut self, len: u32) {
-        self.0 = len;
-    }
-
-    fn piece(&mut self, _bytes: &[u8]) {}
-
-    fn finish(&mut self) -> u32 {
-        self.0
-    }
-}
-
-/// A host's fold over [`Log::read`]: the position and frame length of each of the generation's own
-/// COMMIT records above the latest ACK, dropped as later ACKs come, so it keeps no frame and 16
-/// bytes per pending commit.
-#[derive(Debug, Default)]
-struct Unacknowledged {
-    commits: Vec<(Position, u64)>,
-    /// The highest position an ACK dropped.
-    dropped: Option<Position>,
-    /// At the end of the log: whether a lower ACK brought back a commit an earlier one dropped,
-    /// which the fold no longer has.
-    lowered: bool,
-    /// Where the read cut, as [`Fold::end`] says.
-    cut: Option<Cut>,
-}
-
-impl Fold for Unacknowledged {
-    type Frames = Length;
-
-    fn record(&mut self, position: Position, body: RecordBody<Logged<u32>>, state: &SegmentHeader) {
-        if let RecordBody::Commit { frame } = &body
-            && !super::foreign(frame.id, state.lineage)
-        {
-            self.commits.push((position, u64::from(frame.kept)));
-        }
-        self.drop_through(state.acked);
-    }
-
-    fn cut(&mut self, from: Position) {
-        self.commits.retain(|(p, _)| *p < from);
-    }
-
-    fn end(&mut self, state: &SegmentHeader, cut: Option<&Cut>) {
-        self.drop_through(state.acked);
-        self.lowered = self.dropped.is_some_and(|d| d > state.acked);
-        self.cut = cut.cloned();
-    }
-}
-
-impl Unacknowledged {
-    fn drop_through(&mut self, acked: Position) {
-        for (p, _) in self.commits.iter().filter(|(p, _)| *p <= acked) {
-            self.dropped = self.dropped.max(Some(*p));
-        }
-        self.commits.retain(|(p, _)| *p > acked);
-    }
-
-    /// The pending commits once the read ended, `None` when a lower ACK brought back a commit an
-    /// earlier one dropped.
-    fn pending(&self) -> Option<&[(Position, u64)]> {
-        (!self.lowered).then_some(self.commits.as_slice())
-    }
-}
-
 /// What a test writes to a log.
 #[derive(Debug, Clone)]
 enum Op {
@@ -1298,8 +1224,8 @@ fn opens_as_before(dir: &Path, acks_go_back: bool) -> Result<(), TestCaseError> 
     let read = Log::read(dir, &mut unacknowledged);
     prop_assert_eq!(snapshot(dir), files);
     match (read, &before) {
-        (Ok(_), Ok((_, recovered))) => {
-            prop_assert_eq!(&unacknowledged.cut, &recovered.cut);
+        (Ok(valid), Ok((_, recovered))) => {
+            prop_assert_eq!(&valid.cut, &recovered.cut);
             let pending: Vec<(Position, u64)> = recovered
                 .pending()
                 .iter()
@@ -1307,8 +1233,15 @@ fn opens_as_before(dir: &Path, acks_go_back: bool) -> Result<(), TestCaseError> 
                 .collect();
             match unacknowledged.pending() {
                 Some(kept) => prop_assert_eq!(kept, pending.as_slice()),
-                // Only an ACK below an earlier one brings back a commit the fold dropped.
-                None => prop_assert!(acks_go_back, "the fold lost its pending commits"),
+                // Only an ACK below an earlier one brings back a commit the fold dropped, and a
+                // second read above the latest ACK keeps it.
+                None => {
+                    prop_assert!(acks_go_back, "the fold lost its pending commits");
+                    let acked = unacknowledged.state().map(|s| s.acked).unwrap();
+                    let mut again = Unacknowledged::above(acked, None);
+                    Log::read(dir, &mut again).unwrap();
+                    prop_assert_eq!(again.pending(), Some(pending.as_slice()));
+                }
             }
         }
         (Err(read), Err(open)) => prop_assert_eq!(format!("{read:?}"), format!("{open:?}")),
@@ -1375,14 +1308,33 @@ fn a_hosts_fold_keeps_the_pending_commits_without_their_frames() {
     ]);
     assert!(!acks_go_back);
     let mut fold = Unacknowledged::default();
-    Log::read(&log_dir, &mut fold).unwrap();
-    assert_eq!(fold.cut.as_ref().map(|c| c.at > 0), Some(true));
+    let valid = Log::read(&log_dir, &mut fold).unwrap();
+    assert_eq!(valid.cut.as_ref().map(|c| c.at > 0), Some(true));
     let frame = commit_frame(header().lineage, 5, 3, BUFFER * 2).len() as u64;
     assert_eq!(
         fold.pending(),
         Some([(Position(5), frame), (Position(6), 10)].as_slice())
     );
     opens_as_before(&log_dir, acks_go_back).unwrap();
+}
+
+// A host's fold whose deadline passed stops the read after the record it was handed, and the read
+// changes nothing.
+#[test]
+fn a_fold_past_its_deadline_stops_the_read() {
+    let dir = TempDir::new("log-read-stopped");
+    let log_dir = dir.path().join("log");
+    write_log(&log_dir, 1000, &[Op::Own {
+        frame: true,
+        fill: 1,
+        len: 10,
+    }]);
+    let files = snapshot(&log_dir);
+    let mut fold = Unacknowledged::until(Some(std::time::Instant::now()));
+    let err = Log::read(&log_dir, &mut fold).unwrap_err();
+    assert!(matches!(err, LogError::Stopped { .. }), "{err}");
+    assert_eq!(fold.pending(), None);
+    assert_eq!(snapshot(&log_dir), files);
 }
 
 // A later segment that does not follow (one gone between, another lineage, or a first position

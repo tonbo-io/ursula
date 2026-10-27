@@ -237,8 +237,9 @@ export class Child {
 	/** How the process ended. */
 	readonly exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 
-	constructor(url: string, dir: string, env: NodeJS.ProcessEnv = {}, script = "core-child.mjs", args: readonly string[] = []) {
-		this.proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, script), ext(), url, dir, ...args], {
+	/** `extension` is the library the child loads: the one under test (SQLITE_URSULA_VFS) by default. */
+	constructor(url: string, dir: string, env: NodeJS.ProcessEnv = {}, script = "core-child.mjs", args: readonly string[] = [], extension = ext()) {
+		this.proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, script), extension, url, dir, ...args], {
 			stdio: ["pipe", "pipe", "inherit"],
 			env: { ...process.env, ...env },
 		});
@@ -252,6 +253,13 @@ export class Child {
 			this.deliver(undefined);
 		});
 		children.add(this);
+	}
+
+	/** The process's id. */
+	get pid(): number {
+		const pid = this.proc.pid;
+		if (pid === undefined) throw new Error("the child did not start");
+		return pid;
 	}
 
 	private deliver(line: string | undefined): void {
