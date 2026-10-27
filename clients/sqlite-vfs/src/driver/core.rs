@@ -1651,7 +1651,9 @@ impl Core {
     /// The token requests carry changed (design: Transport): every request a `401` blocked goes
     /// again at once under the new one, and one out under the old token goes again on its `401`
     /// ([`crate::replicator::backoff::Policy`]). The opens and the rebuilds count the change
-    /// themselves, the replicators through [`Event::TokenChanged`].
+    /// themselves, the replicators through [`Event::TokenChanged`], and a snapshot attempt a `401`
+    /// failed starts again at once ([`crate::snapshotter::Snapshots::token_changed`]). Timers
+    /// that are not a `401`'s stay as they were.
     pub(crate) fn token_changed(&mut self, now_ms: u64) -> Vec<Io> {
         for slot in self.opens.values_mut() {
             let waiting = slot.wake_at.is_some();
@@ -1669,6 +1671,9 @@ impl Core {
                 *wake_at = Some(now_ms);
             }
         }
+        for handle in self.bindings.values().filter_map(Binding::handle) {
+            handle.snapshots.token_changed();
+        }
         let mut ios = Vec::new();
         let bindings: Vec<BindingId> = self.bindings.keys().copied().collect();
         for binding in bindings {
@@ -1679,7 +1684,8 @@ impl Core {
     }
 
     /// Whether an open or a writer binding may send requests, which a token change concerns: the
-    /// driver then checks the token file for a change ([`crate::auth::check_file`]).
+    /// driver then checks the token file for a change while requests carry its token
+    /// ([`crate::auth::watching`], [`crate::auth::check_file`]).
     pub(crate) fn requesting(&self) -> bool {
         !self.opens.is_empty() || !self.bindings.is_empty()
     }

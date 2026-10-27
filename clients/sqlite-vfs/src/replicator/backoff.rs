@@ -2,13 +2,13 @@
 //! request itself (design: Appends, Answers). It resends the identical request after backoff,
 //! doubling from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped
 //! at 60 s); retries a blocked request every 30 s, and one a `401` blocked at once when the token
-//! changes ([`Policy::wakes`]); and parks the request while a HEAD checks the
-//! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
-//! the re-key to the replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight
-//! hands it the re-cut ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a
-//! body above [`LOST_HEAD_BYTES`] send a HEAD before the next resend: a layer in front of the
-//! server may answer a body above its limit without reading it and close, which looks like a lost
-//! answer, while a HEAD through it learns its limit.
+//! changes ([`Link::token_changed`]); and parks the request while a HEAD checks the stream's token,
+//! cluster and limit. A HEAD naming a history that inherits the generation hands the re-key to the
+//! replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight hands it the re-cut
+//! ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a body above
+//! [`LOST_HEAD_BYTES`] send a HEAD before the next resend: a layer in front of the server may
+//! answer a body above its limit without reading it and close, which looks like a lost answer,
+//! while a HEAD through it learns its limit.
 
 use std::time::Duration;
 
@@ -475,13 +475,12 @@ impl Link {
         }
     }
 
-    /// A tick: a due resend goes out, and so does a request a `401` blocked under a token changed
-    /// since. A timer not yet due is asked for again.
+    /// A tick: a due resend goes out, a timer not yet due is asked for again.
     pub(crate) fn tick(&mut self, now_ms: u64, ctx: &mut Ctx, actions: &mut Vec<Action>) {
         match &mut self.state {
             LinkState::InFlight(_) => {}
             LinkState::Waiting { at_ms, attempt } => {
-                if self.policy.wakes(ctx.token_changes) || now_ms >= *at_ms {
+                if now_ms >= *at_ms {
                     let attempt = *attempt;
                     self.resend(attempt, ctx, actions);
                 } else {
@@ -492,6 +491,22 @@ impl Link {
                 }
             }
             LinkState::Checking { head, .. } => head.tick(now_ms, ctx, actions),
+        }
+    }
+
+    /// The token requests carry changed (`ctx.token_changes` counts it already): the request, or
+    /// the HEAD it waits on, goes again at once if a `401` blocked it under an older token
+    /// ([`Policy::wakes`]). Any other wait, and the timer it asked for, stay as they were.
+    pub(crate) fn token_changed(&mut self, ctx: &mut Ctx, actions: &mut Vec<Action>) {
+        match &mut self.state {
+            LinkState::InFlight(_) => {}
+            LinkState::Waiting { attempt, .. } => {
+                if self.policy.wakes(ctx.token_changes) {
+                    let attempt = *attempt;
+                    self.resend(attempt, ctx, actions);
+                }
+            }
+            LinkState::Checking { head, .. } => head.token_changed(ctx, actions),
         }
     }
 }

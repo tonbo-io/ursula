@@ -477,7 +477,6 @@ impl World {
         self.queue_ios(core, ios);
         self.deliver();
     }
-    /// Runs the held disk jobs, and what they lead to.
     /// The requests `hold_sends` held reach the server now, and no more are held.
     fn release_sends(&mut self) {
         self.hold_sends = None;
@@ -494,6 +493,7 @@ impl World {
         self.run_for(100);
     }
 
+    /// Runs the held disk jobs, and what they lead to.
     fn release_held(&mut self) {
         self.hold = None;
         for (core, DiskIo { id, job }) in std::mem::take(&mut self.held) {

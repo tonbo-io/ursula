@@ -3,7 +3,7 @@
 //! endpoint refused a token. One token per process. A change of it sends again at once every
 //! request a `401` blocked ([`crate::driver::runtime::token_changed`]): a token set at once, and a
 //! file whose token changed when a read finds the new one, by a request or by the driver's check
-//! every [`FILE_CHECK_MS`] ([`check_file`]).
+//! every [`FILE_CHECK_MS`] while requests carry it ([`watching`], [`check_file`]).
 
 use std::fs;
 use std::sync::Mutex;
@@ -15,8 +15,8 @@ use crate::config::token_file;
 use crate::log;
 use crate::log::Level;
 
-/// How often the driver checks the token file for a change ([`check_file`]) while an open or a
-/// writer may send requests.
+/// How often the driver checks the token file for a change ([`check_file`]) while requests carry
+/// its token ([`watching`]) and an open or a writer may send requests.
 pub(crate) const FILE_CHECK_MS: u64 = 1_000;
 
 /// The token the application set, if any.
@@ -114,6 +114,12 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
         changed();
     }
     read.token
+}
+
+/// Whether requests carry the token file's token: one is configured and no token is set. Only
+/// then can [`check_file`] find a change.
+pub(crate) fn watching() -> bool {
+    token_file().is_some() && lock(&SET).is_none()
 }
 
 /// Reads the token file again if it changed since the last read, while no token is set: a new

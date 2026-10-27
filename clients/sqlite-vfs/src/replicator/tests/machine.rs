@@ -330,6 +330,22 @@ fn a_token_changed_while_the_refused_attempt_was_out_goes_at_once() {
     );
 }
 
+// A token change leaves a request that waits on anything but a `401` to its timer: a resend in
+// backoff goes out at its jittered time, and the timer is not asked for again.
+#[test]
+fn a_token_change_leaves_a_resend_in_backoff_to_its_timer() {
+    let mut h = streaming(1);
+    let first = h.last_request().clone();
+    let actions = h.answer(&RawAnswer::new(503));
+    assert_eq!(condition(&actions), Some(Some(Condition::Retrying)));
+    let (at, jitter) = timer_of(&actions).unwrap();
+    assert_eq!(at, h.now_ms, "no floor: due at once, with jitter");
+    let actions = h.on(Event::TokenChanged);
+    assert!(sends(&actions).is_empty(), "{actions:?}");
+    assert_eq!(timer_of(&actions), None);
+    assert_eq!(sends(&h.tick_at(at + jitter)), vec![&first]);
+}
+
 #[test]
 fn redirects_are_resent_a_few_times_then_block() {
     let mut h = streaming(1);

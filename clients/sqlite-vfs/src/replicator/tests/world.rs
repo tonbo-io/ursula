@@ -2565,8 +2565,6 @@ impl World {
             }
             Op::TokenChanged(o) => {
                 let i = self.owner(o);
-                // A tick besides: the timer it takes is asked for again while not due.
-                self.owners[i].inst.timer = None;
                 self.event(i, Event::TokenChanged);
             }
             Op::NewHistory => self.server.history_event(HistoryEvent::NewHistory).unwrap(),

@@ -314,6 +314,19 @@ impl Snapshots {
             self.snapper.request();
         }
     }
+
+    /// The token requests carry changed (design: Transport): an attempt a `401` failed goes again
+    /// at once.
+    pub(crate) fn token_changed(&self) {
+        let rescheduled = self
+            .lock()
+            .failing
+            .as_mut()
+            .is_some_and(|f| f.token_changed(Instant::now()));
+        if rescheduled {
+            self.snapper.reschedule();
+        }
+    }
 }
 
 /// The snapshot threads of the process, joined as they end.
@@ -581,6 +594,7 @@ impl SnapshotFailure {
         match self {
             Self::TooLarge { .. } => FailureKind::Size,
             Self::Outage { .. } | Self::StagedPartsFull { .. } => FailureKind::Outage,
+            Self::Status { status: 401, .. } => FailureKind::Unauthorized,
             _ => FailureKind::Other,
         }
     }
@@ -1401,6 +1415,8 @@ pub(crate) enum FailureKind {
     Size,
     /// No answer, or a 5xx: the server or a layer in front of it is unavailable.
     Outage,
+    /// A `401`: the endpoint refused the token, until it changes.
+    Unauthorized,
     /// Anything else.
     Other,
 }
@@ -1409,7 +1425,7 @@ impl FailureKind {
     fn retry_max(self) -> Duration {
         match self {
             FailureKind::Size => SIZE_RETRY_MAX,
-            FailureKind::Outage | FailureKind::Other => RETRY_MAX,
+            FailureKind::Outage | FailureKind::Unauthorized | FailureKind::Other => RETRY_MAX,
         }
     }
 
@@ -1418,6 +1434,7 @@ impl FailureKind {
         match self {
             FailureKind::Size => "size",
             FailureKind::Outage => "outage",
+            FailureKind::Unauthorized => "unauthorized",
             FailureKind::Other => "other",
         }
     }
@@ -1429,7 +1446,7 @@ impl FailureKind {
 /// or take a fifth, so the owners a cluster-wide outage failed together do not try again together.
 /// An attempt does not wait once the database is below three quarters of the image that last
 /// failed. After an outage, the first acknowledged commit brings the next attempt forward, once a
-/// run.
+/// run. After a `401`, a token change brings it forward to at once ([`Snapshots::token_changed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SnapshotFailing {
     /// How many failed in a row.
@@ -1507,6 +1524,16 @@ impl SnapshotFailing {
         self.brought_forward = true;
         true
     }
+
+    /// The token requests carry changed at `now`: after a `401`, the next attempt starts at once.
+    /// Whether it moved.
+    pub(crate) fn token_changed(&mut self, now: Instant) -> bool {
+        if self.kind != FailureKind::Unauthorized || now >= self.until {
+            return false;
+        }
+        self.until = now;
+        true
+    }
 }
 
 /// How far after the commit that brings it forward an attempt may start.
@@ -1537,6 +1564,7 @@ mod tests {
     use super::SIZE_RETRY_MAX;
     use super::Snapper;
     use super::SnapshotFailing;
+    use super::SnapshotFailure;
     use super::jittered;
 
     fn run(kind: FailureKind, n: usize, pages: u32, now: Instant) -> SnapshotFailing {
@@ -1579,8 +1607,14 @@ mod tests {
         );
         assert!(asked.until >= now + Duration::from_secs(9));
         assert_eq!(
-            [FailureKind::Size, FailureKind::Outage, FailureKind::Other].map(FailureKind::name),
-            ["size", "outage", "other"]
+            [
+                FailureKind::Size,
+                FailureKind::Outage,
+                FailureKind::Unauthorized,
+                FailureKind::Other
+            ]
+            .map(FailureKind::name),
+            ["size", "outage", "unauthorized", "other"]
         );
     }
 
@@ -1616,6 +1650,32 @@ mod tests {
         assert!(next.brought_forward);
         assert!(!run(FailureKind::Size, 1, 0, now).commit_acknowledged(now));
         assert!(!run(FailureKind::Other, 1, 0, now).commit_acknowledged(now));
+    }
+
+    // A `401` waits like any other failure, until the token changes: the next attempt then starts
+    // at once. A token change brings no other failure forward.
+    #[test]
+    fn a_token_change_brings_an_attempt_a_401_failed_forward() {
+        let now = Instant::now();
+        let refused = SnapshotFailure::Status {
+            what: "commit",
+            status: 401,
+        };
+        assert_eq!(refused.kind(), FailureKind::Unauthorized);
+        let forbidden = SnapshotFailure::Status {
+            what: "commit",
+            status: 403,
+        };
+        assert_eq!(forbidden.kind(), FailureKind::Other);
+        let mut failing = run(FailureKind::Unauthorized, 12, 0, now);
+        assert_eq!(failing.wait, RETRY_MAX);
+        assert!(failing.holds_back(0, now));
+        assert!(failing.token_changed(now));
+        assert!(!failing.holds_back(0, now));
+        assert!(!failing.token_changed(now), "due already");
+        for kind in [FailureKind::Size, FailureKind::Outage, FailureKind::Other] {
+            assert!(!run(kind, 1, 0, now).token_changed(now));
+        }
     }
 
     #[test]

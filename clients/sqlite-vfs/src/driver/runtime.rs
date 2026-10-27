@@ -14,8 +14,8 @@
 //!
 //! A token change reaches the core as [`Core::token_changed`] ([`token_changed`]): from
 //! `ursula_set_token` at once, and from the token file when a read finds a new token in it, a
-//! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while an open
-//! or a writer may send requests.
+//! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while requests
+//! carry the file's token and an open or a writer may send them.
 //!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
@@ -658,11 +658,10 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
     // When the token file was last checked for a change.
     let mut token_checked: u64 = 0;
     loop {
-        // While an open or a writer may send requests, the token file is checked every
-        // `FILE_CHECK_MS`: a new token in it comes back as `Command::TokenChanged`.
-        let check = core
-            .requesting()
-            .then(|| token_checked.saturating_add(auth::FILE_CHECK_MS));
+        // While requests carry the token file's token and an open or a writer may send them, the
+        // file is checked every `FILE_CHECK_MS`: a new token in it comes back as
+        // `Command::TokenChanged`.
+        let check = watch_file(&core).then(|| token_checked.saturating_add(auth::FILE_CHECK_MS));
         let received = match [core.next_deadline(), check].into_iter().flatten().min() {
             None => inbox
                 .recv()
@@ -680,7 +679,7 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
             None => core.tick(now()),
             Some(command) => handle(&mut core, command, now()),
         });
-        if core.requesting() && now() >= token_checked.saturating_add(auth::FILE_CHECK_MS) {
+        if watch_file(&core) && now() >= token_checked.saturating_add(auth::FILE_CHECK_MS) {
             token_checked = now();
             auth::check_file();
         }
@@ -741,6 +740,12 @@ fn publish(core: &mut Core, cursor: &mut u64, shared: &Shared) -> Vec<BindingId>
         shared.changed.notify_all();
     }
     retire
+}
+
+/// Whether the driver checks the token file for a change: requests carry its token, and an open or
+/// a writer may send them.
+fn watch_file(core: &Core) -> bool {
+    core.requesting() && auth::watching()
 }
 
 fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {

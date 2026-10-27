@@ -568,8 +568,9 @@ of the durable acknowledged position the `410` rule compares with.
 - **Not published.** A body above `Ursula-Max-Snapshot-Bytes`, or above `L` on a server without a
   cold store (parts answered `501`), is not published, and status reports `snapshot.error`.
 - **Failures** wait before the next attempt from 100 ms, doubling, up to five minutes, or an hour
-  when the body is too large. Requests carry the binding's current token, so snapshots go on after
-  a re-key.
+  when the body is too large. An attempt a `401` failed starts again at once when the bearer token
+  changes ([Transport](#transport)). Requests carry the binding's current token, so snapshots go on
+  after a re-key.
 - **Builds** read a snapshot in byte ranges sized from HEAD's limit, and a chunk that does not
   continue the download restarts the build.
 
@@ -591,7 +592,8 @@ Tests:
   "publishes a snapshot body above the request limit in parts with a cold store, and reports it in
   snapshot.error without one".
 - Backoff: `snapshotter.rs` `failures_double_the_wait_up_to_their_kinds_limit`,
-  `a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks`.
+  `a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks`,
+  `a_token_change_brings_an_attempt_a_401_failed_forward`.
 - Ranged builds: `driver/tests.rs` `a_build_reads_the_snapshot_in_chunks_of_the_request_limit`,
   `a_chunk_that_does_not_continue_the_download_restarts_the_build`,
   `a_whole_body_answer_to_a_ranged_read_installs_it`,
@@ -622,11 +624,12 @@ Tests:
 - One bearer token per process: the last open's `token`, `ursula_set_token`, or the file
   `URSULA_VFS_TOKEN_FILE` names, re-read when it changes and after a `401`. A token change sends
   every request a `401` blocked again at once, with no wait for the 30 s retry: the replicators',
-  the opens' and the rebuilds' alike, through the retry policy they share (`Core::token_changed`).
-  A `401` to an attempt sent before the change sends the request again under the new token instead
-  of blocking it. A token set changes at once. A token in the file changes when a read finds it:
-  any request's, or the driver thread's check of the file every second while an open or a writer
-  may send requests. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent over `http://`
+  the opens' and the rebuilds' alike, through the retry policy they share (`Core::token_changed`),
+  and a snapshot attempt a `401` failed. Other waits keep their timers and jitter. A `401` to an
+  attempt sent before the change sends the request again under the new token instead of blocking
+  it. A token set changes at once. A token in the file changes when a read finds it: any
+  request's, or the driver thread's check of the file every second while requests carry the
+  file's token (no token set) and an open or a writer may send requests. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent over `http://`
   to a host that is not a loopback address logs `token_in_clear` once.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
@@ -640,7 +643,8 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `the_read_that_finds_a_new_token_signals_the_change`,
 `a_lent_token_goes_back_unless_another_was_set_since`, `replicator/tests/machine.rs`
 `a_token_change_resends_a_request_blocked_unauthorized_at_once`,
-`a_token_changed_while_the_refused_attempt_was_out_goes_at_once`, `driver/tests.rs`
+`a_token_changed_while_the_refused_attempt_was_out_goes_at_once`,
+`a_token_change_leaves_a_resend_in_backoff_to_its_timer`, `driver/tests.rs`
 `a_token_change_resends_what_a_401_blocked_at_once`,
 `a_token_changed_while_an_opens_reread_is_out_goes_at_once`,
 `a_token_change_resends_a_rebuilds_read_a_401_blocked`, the replicator proptest's token changes,
