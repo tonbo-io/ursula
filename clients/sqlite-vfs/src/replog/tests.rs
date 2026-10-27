@@ -1237,9 +1237,13 @@ fn opens_as_before(dir: &Path, acks_go_back: bool) -> Result<(), TestCaseError> 
                 // second read above the latest ACK keeps it.
                 None => {
                     prop_assert!(acks_go_back, "the fold lost its pending commits");
-                    let acked = unacknowledged.state().map(|s| s.acked).unwrap();
+                    let Some(acked) = unacknowledged.state().map(|s| s.acked) else {
+                        return Err(TestCaseError::fail("the read ended with no state"));
+                    };
                     let mut again = Unacknowledged::above(acked, None);
-                    Log::read(dir, &mut again).unwrap();
+                    if let Err(e) = Log::read(dir, &mut again) {
+                        return Err(TestCaseError::fail(format!("the second read: {e}")));
+                    }
                     prop_assert_eq!(again.pending(), Some(pending.as_slice()));
                 }
             }
