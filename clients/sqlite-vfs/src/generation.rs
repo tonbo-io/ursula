@@ -22,11 +22,13 @@
 //! `gen-<id32>.tmp`, fsynced, and published by one rename, and every one of its log segments
 //! names the generation directory it supersedes by id (a roll carries it over, so no trim loses
 //! it), so a crash that leaves two is finished at the next open ([`Root::finish_leftovers`]). Once
-//! the superseded directory is gone, the id names nothing and is never acted on. A superseded generation is renamed to `gen-<id32>.trash`
-//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory. A
-//! generation is published with page 1 written and marked, the page 1 of an empty database when
-//! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
-//! unmarked.
+//! the superseded directory is gone, the id names nothing and is never acted on. Which generation
+//! is current is one pure rule, [`Root::classify`]: the one no other supersedes. The open finishes
+//! the others by it, and reads the current one by it. A superseded generation is renamed to
+//! `gen-<id32>.trash` before it is deleted, so a crash midway never leaves a half-deleted `gen-`
+//! directory. A generation is published with page 1 written and marked, the page 1 of an empty
+//! database when nothing was applied ([`marker::empty_page_one`]), so no published db file is ever
+//! empty or unmarked.
 //!
 //! The superseded generation's fate ([`Fate`]) is written before the publishing rename: it is
 //! trashed, or salvaged, its manifest written into it first and the directory moved into
@@ -58,9 +60,10 @@ use std::sync::PoisonError;
 use std::sync::Weak;
 
 use crate::codec::marker;
+use crate::codec::segment::ReadError;
+use crate::codec::segment::Reader;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
-use crate::codec::segment::scan;
 use crate::config::Step as AbortStep;
 use crate::config::abort_at;
 use crate::ids::GenId;
@@ -243,11 +246,18 @@ pub(crate) enum GenerationError {
     #[error("generation {}: no log segment", .dir.display())]
     NoSegment { dir: PathBuf },
     #[error(
-        "{}: generations {}, none superseding the others",
+        "{}: generations {}, where one is expected",
         .root.display(),
         .ids.iter().map(GenId::hex).collect::<Vec<_>>().join(", ")
     )]
     Ambiguous { root: PathBuf, ids: Vec<GenId> },
+    /// Generations that all supersede one another: only damage or a copy by hand makes them.
+    #[error(
+        "{}: generations {}, each superseded by another",
+        .root.display(),
+        .ids.iter().map(GenId::hex).collect::<Vec<_>>().join(", ")
+    )]
+    Circular { root: PathBuf, ids: Vec<GenId> },
     #[error("{}: a generation of this id exists", .path.display())]
     Exists { path: PathBuf },
     #[error("a generation id from {}: {source}", crate::ids::URANDOM)]
@@ -312,7 +322,7 @@ impl Generation {
     }
 }
 
-/// The header of the first log segment of the generation in `dir`.
+/// The header of the first log segment of the generation in `dir`: only the header is read.
 fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
     let log = dir.join("log");
     let entries = match fs::read_dir(&log) {
@@ -333,13 +343,15 @@ fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
     let first = segments.first().ok_or_else(|| GenerationError::NoSegment {
         dir: dir.to_owned(),
     })?;
-    let bytes = fs::read(first).map_err(io("read", first))?;
-    scan(&bytes)
-        .map(|s| s.header)
-        .map_err(|source| GenerationError::Header {
+    let file = File::open(first).map_err(io("open", first))?;
+    match Reader::new(file) {
+        Ok(reader) => Ok(reader.into_header()),
+        Err(ReadError::Source(source)) => Err(io("read", first)(source)),
+        Err(ReadError::Segment(source)) => Err(GenerationError::Header {
             dir: dir.to_owned(),
             source,
-        })
+        }),
+    }
 }
 
 /// Deletes every `reader-<m>/` of the stream root `root` but `keep` whose lock nobody holds, and
@@ -414,6 +426,87 @@ fn leftover(path: &Path, e: &std::io::Error) {
 struct Dir {
     path: PathBuf,
     id: GenId,
+}
+
+/// The `gen-<id32>` directories of the root `root`, by id: never a `.tmp`, a `.trash`, a reader
+/// directory or a salvage.
+fn generations(root: &Path) -> Result<Vec<Dir>, GenerationError> {
+    let mut gens = Vec::new();
+    for entry in fs::read_dir(root).map_err(io("list", root))? {
+        let entry = entry.map_err(io("list", root))?;
+        let name = entry.file_name();
+        let id = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(GEN))
+            .and_then(GenId::parse_hex);
+        if let Some(id) = id {
+            gens.push(Dir {
+                path: entry.path(),
+                id,
+            });
+        }
+    }
+    gens.sort_by_key(|g| g.id);
+    Ok(gens)
+}
+
+/// A root's generations as [`Root::classify`] found them.
+#[derive(Debug)]
+pub(crate) struct Classified {
+    root: PathBuf,
+    /// Every generation directory, by id.
+    gens: Vec<Dir>,
+    /// The ids another generation's first log segment names as superseded. Read only when there
+    /// are two or more generations.
+    superseded: Vec<GenId>,
+}
+
+impl Classified {
+    fn superseded(&self, g: &Dir) -> bool {
+        self.superseded.contains(&g.id)
+    }
+
+    /// The current generation's directory: the one no other supersedes. `None` only for a root
+    /// with no generation. Two or more that nothing supersedes are ambiguous, and generations
+    /// that all supersede one another are circular: neither names a current generation.
+    fn current_dir(self) -> Result<Option<Dir>, GenerationError> {
+        let Classified {
+            root,
+            gens,
+            superseded,
+        } = self;
+        let ids: Vec<GenId> = gens.iter().map(|g| g.id).collect();
+        let mut left: Vec<Dir> = gens
+            .into_iter()
+            .filter(|g| !superseded.contains(&g.id))
+            .collect();
+        match left.len() {
+            0 if ids.is_empty() => Ok(None),
+            0 => Err(GenerationError::Circular { root, ids }),
+            1 => Ok(left.pop()),
+            _ => Err(GenerationError::Ambiguous {
+                root,
+                ids: left.iter().map(|g| g.id).collect(),
+            }),
+        }
+    }
+
+    /// The current generation, `None` only for a root with no generation, or its directory when
+    /// its log's first segment header cannot be read. Two or more that nothing supersedes are
+    /// ambiguous, and generations that all supersede one another circular.
+    pub(crate) fn current(self) -> Result<Option<Result<Generation, Unreadable>>, GenerationError> {
+        let Some(dir) = self.current_dir()? else {
+            return Ok(None);
+        };
+        let path = dir.path.clone();
+        match dir.generation() {
+            Ok(g) => Ok(Some(Ok(g))),
+            Err(error @ (GenerationError::Header { .. } | GenerationError::NoSegment { .. })) => {
+                Ok(Some(Err(Unreadable { dir: path, error })))
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Dir {
@@ -579,54 +672,18 @@ impl Root {
             .any(|id| *id == g.id)
     }
 
-    /// The generation directories, temporary ones apart, by id.
-    fn generations(&self) -> Result<Vec<Dir>, GenerationError> {
-        let mut gens = Vec::new();
-        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
-            let entry = entry.map_err(io("list", &self.dir))?;
-            let name = entry.file_name();
-            let id = name
-                .to_str()
-                .and_then(|n| n.strip_prefix(GEN))
-                .and_then(GenId::parse_hex);
-            if let Some(id) = id {
-                gens.push(Dir {
-                    path: entry.path(),
-                    id,
-                });
-            }
-        }
-        gens.sort_by_key(|g| g.id);
-        Ok(gens)
-    }
-
     /// The root directory.
     pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
 
-    /// Finishes what a crash left: deletes every `gen-*.tmp` and `gen-*.trash`, salvages every
-    /// generation another one's first segment says it supersedes that holds a salvage manifest
-    /// and deletes the others, deletes the manifest of a generation nothing supersedes (its
-    /// publish never happened), and completes every salvage still marked `moving`.
-    pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
-        let mut removed = false;
-        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
-            let entry = entry.map_err(io("list", &self.dir))?;
-            let leftover = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(GEN) && (n.ends_with(TMP) || n.ends_with(TRASH)));
-            if leftover {
-                let path = entry.path();
-                fs::remove_dir_all(&path).map_err(io("remove", &path))?;
-                removed = true;
-            }
-        }
-        if removed {
-            sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
-        }
-        let gens = self.generations()?;
+    /// Classifies the generations of the stream root `root` (design: Layout) and changes nothing:
+    /// a generation is superseded when another one's first log segment names it, and the current
+    /// one is the one nothing supersedes. Only `gen-<id32>` directories are read, and their first
+    /// segment headers only when there are two or more. With two or more, one whose header cannot
+    /// be read and that nothing supersedes is an error, its header's.
+    pub(crate) fn classify(root: &Path) -> Result<Classified, GenerationError> {
+        let gens = generations(root)?;
         let mut superseded = Vec::new();
         if gens.len() > 1 {
             // A generation whose header cannot be read is finished when a readable one says it
@@ -645,9 +702,38 @@ impl Root {
                 return Err(e);
             }
         }
-        for g in &gens {
+        Ok(Classified {
+            root: root.to_owned(),
+            gens,
+            superseded,
+        })
+    }
+
+    /// Finishes what a crash left: deletes every `gen-*.tmp` and `gen-*.trash`, salvages every
+    /// generation [`Root::classify`] finds superseded that holds a salvage manifest and deletes
+    /// the others, deletes the manifest of a generation nothing supersedes (its publish never
+    /// happened), and completes every salvage still marked `moving`.
+    pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
+        let mut removed = false;
+        for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
+            let entry = entry.map_err(io("list", &self.dir))?;
+            let leftover = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(GEN) && (n.ends_with(TMP) || n.ends_with(TRASH)));
+            if leftover {
+                let path = entry.path();
+                fs::remove_dir_all(&path).map_err(io("remove", &path))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+        }
+        let classified = Self::classify(&self.dir)?;
+        for g in &classified.gens {
             salvage::clear_tmp(&g.path)?;
-            match (superseded.contains(&g.id), salvage::read_manifest(&g.path)?) {
+            match (classified.superseded(g), salvage::read_manifest(&g.path)?) {
                 (true, Some(manifest)) => {
                     let moved = salvage::move_into(&self.dir, &g.path, &manifest)?;
                     salvage::complete(&moved, manifest)?;
@@ -671,33 +757,25 @@ impl Root {
         sync_dir(&self.dir).map_err(io("fsync", &self.dir))
     }
 
-    /// The current generation, if any. Two left after [`Root::finish_leftovers`] are an error.
+    /// The root's one generation, if any: two or more are ambiguous, as for [`Root::build`].
     #[cfg(test)]
     pub(crate) fn current(&self) -> Result<Option<Generation>, GenerationError> {
-        self.current_dir()?.map(Dir::generation).transpose()
+        self.only_dir()?.map(Dir::generation).transpose()
     }
 
-    /// The current generation, if any, or its directory when its log's first segment header
-    /// cannot be read. Two left after [`Root::finish_leftovers`] are an error.
+    /// The current generation ([`Root::classify`]), if any, or its directory when its log's first
+    /// segment header cannot be read. Two left after [`Root::finish_leftovers`] are an error.
     pub(crate) fn current_or_unreadable(
         &self,
     ) -> Result<Option<Result<Generation, Unreadable>>, GenerationError> {
-        let Some(dir) = self.current_dir()? else {
-            return Ok(None);
-        };
-        let path = dir.path.clone();
-        match dir.generation() {
-            Ok(g) => Ok(Some(Ok(g))),
-            Err(error @ (GenerationError::Header { .. } | GenerationError::NoSegment { .. })) => {
-                Ok(Some(Err(Unreadable { dir: path, error })))
-            }
-            Err(e) => Err(e),
-        }
+        Self::classify(&self.dir)?.current()
     }
 
-    /// The current generation directory, if any, its log not read.
-    fn current_dir(&self) -> Result<Option<Dir>, GenerationError> {
-        let mut gens = self.generations()?;
+    /// The root's one generation directory, if any, its log not read. Two or more are ambiguous
+    /// whichever supersedes which: [`Root::finish_leftovers`] leaves one, and a build over a
+    /// superseded leftover would leave it named by nobody.
+    fn only_dir(&self) -> Result<Option<Dir>, GenerationError> {
+        let mut gens = generations(&self.dir)?;
         match gens.len() {
             0 | 1 => Ok(gens.pop()),
             _ => Err(GenerationError::Ambiguous {
@@ -708,9 +786,11 @@ impl Root {
     }
 
     /// Starts building the generation of `h.lineage` in a fresh `gen-<id32>.tmp`: its log, with
-    /// `h` naming the current generation directory as the one it supersedes, and an empty db.
+    /// `h` naming the root's one generation directory as the one it supersedes, and an empty db.
+    /// A root that holds two or more is ambiguous: the build runs after
+    /// [`Root::finish_leftovers`].
     pub(crate) fn build(&self, mut h: SegmentHeader) -> Result<Building, GenerationError> {
-        let supersedes = self.current_dir()?;
+        let supersedes = self.only_dir()?;
         h.supersedes = supersedes.as_ref().map(|g| g.id);
         let id = GenId::random().map_err(|source| GenerationError::Random { source })?;
         let name = format!("{GEN}{}", id.hex());

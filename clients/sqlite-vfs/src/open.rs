@@ -101,6 +101,8 @@ use crate::generation::GenerationError;
 use crate::generation::PathError;
 use crate::generation::Root;
 use crate::generation::canonical_path;
+use crate::hostdir;
+use crate::hostdir::HostDirError;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -272,6 +274,10 @@ pub(crate) enum LocalSetup {
     Log(#[from] LogError),
     #[error("the generation is of stream {found:?}, not {expected:?}")]
     OtherStream { found: String, expected: String },
+    /// The host directory exists and cannot take the record of the cache directory (design:
+    /// Hosts).
+    #[error(transparent)]
+    HostDir(#[from] HostDirError),
 }
 
 /// Why an open failed (design: Errors, `UrsulaSetupError` and `UrsulaUnavailableError`).
@@ -370,7 +376,10 @@ pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
         LocalSetup::Local(LocalError::Log(log))
         | LocalSetup::Log(log)
         | LocalSetup::Generation(GenerationError::Log(log)) => bug(log),
-        LocalSetup::Local(_) | LocalSetup::Generation(_) | LocalSetup::OtherStream { .. } => false,
+        LocalSetup::Local(_)
+        | LocalSetup::Generation(_)
+        | LocalSetup::OtherStream { .. }
+        | LocalSetup::HostDir(_) => false,
     };
     if internal {
         OpenError::Internal(e)
@@ -400,6 +409,8 @@ pub(crate) enum Failure {
 pub(crate) struct Retry {
     policy: Policy,
     condition: Option<Unavailable>,
+    /// The token changes the open was told of ([`Retry::token_changed`]).
+    token_changes: u64,
 }
 
 impl Retry {
@@ -417,6 +428,17 @@ impl Retry {
         self.policy = Policy::default();
     }
 
+    /// The token requests carry changed.
+    pub(crate) fn token_changed(&mut self) {
+        self.token_changes = self.token_changes.wrapping_add(1);
+    }
+
+    /// While no request is out: whether the request a `401` blocked goes again at once, under a
+    /// token changed since ([`Policy::wakes`]).
+    pub(crate) fn wakes(&mut self) -> bool {
+        self.policy.wakes(self.token_changes)
+    }
+
     /// What to do after `exchange`, which decided nothing about the request itself.
     pub(crate) fn failed(&mut self, exchange: &Exchange, now_ms: u64) -> Failure {
         let no_answer = Common::Resend {
@@ -428,7 +450,10 @@ impl Retry {
             Exchange::Answered(answer) => (decide_status(answer), Some(answer)),
         };
         let retry_after = answer.and_then(|a| a.retry_after);
-        match self.policy.decide(common, retry_after, now_ms) {
+        match self
+            .policy
+            .decide(common, retry_after, now_ms, self.token_changes)
+        {
             Next::Wait {
                 at_ms,
                 jitter_ms,
@@ -804,6 +829,13 @@ impl Build {
     /// The last condition met, if any.
     pub(crate) fn seen(&self) -> Option<Unavailable> {
         self.retry.seen()
+    }
+
+    /// The token requests carry changed. `waiting`: no read is out. Whether the read a `401`
+    /// blocked goes again at once.
+    pub(crate) fn token_changed(&mut self, waiting: bool) -> bool {
+        self.retry.token_changed();
+        waiting && self.retry.wakes()
     }
 
     /// The answer to the last request.
@@ -1274,10 +1306,15 @@ pub(crate) fn prepare(spec: &OpenSpec, root: Option<Arc<Root>>) -> Result<Prepar
     prepare_locked(root, spec)
 }
 
-/// [`prepare`] in a root this open holds locked already. A current generation that a reset
-/// binding's connections still hold is copied first, and the copy published in its place.
+/// [`prepare`] in a root this open holds locked already. An owner's open first records the cache
+/// directory in the host directory, if there is one, before anything can be logged in the root
+/// ([`hostdir::record`], design: Hosts). A current generation that a reset binding's connections
+/// still hold is copied first, and the copy published in its place.
 pub(crate) fn prepare_locked(root: Arc<Root>, spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let name = canonical_path(&spec.url)?;
+    if let Access::Owner { .. } = spec.access {
+        hostdir::record(&spec.dir).map_err(local)?;
+    }
     root.finish_leftovers().map_err(local)?;
     let current = match root.current_or_unreadable().map_err(local)? {
         Some(Ok(generation)) if root.held(&generation) => {
@@ -1610,6 +1647,22 @@ impl Opening {
             | Phase::CatchUpApplying(_) => self.retry.seen(),
         };
         seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
+    }
+
+    /// The token requests carry changed. `waiting`: no request or disk job of the open is out.
+    /// Whether the request a `401` blocked, the open's own or its build's, goes again at once.
+    pub(crate) fn token_changed(&mut self, waiting: bool) -> bool {
+        self.retry.token_changed();
+        match &mut self.phase {
+            // The build's reads are the open's requests while it reads.
+            Phase::Reading { build, .. } => build.token_changed(waiting),
+            Phase::Preparing
+            | Phase::Head
+            | Phase::Create
+            | Phase::Building { .. }
+            | Phase::CatchingUp { .. }
+            | Phase::CatchUpApplying(_) => waiting && self.retry.wakes(),
+        }
     }
 
     /// The timer fired: send again what failed.

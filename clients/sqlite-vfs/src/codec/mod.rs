@@ -64,10 +64,6 @@ impl<'a> Take<'a> {
         self.0.len()
     }
 
-    fn rest_slice(&self) -> &'a [u8] {
-        self.0
-    }
-
     fn rest(self) -> &'a [u8] {
         self.0
     }

@@ -273,7 +273,8 @@ body = one CLAIM frame, or one sealed batch
   never reads the owner's own parts as foreign.
 - **Retries** resend the identical request with no budget, on a fresh connection after a request
   that got no answer. Backoff doubles from 25 ms to 5 s with full jitter and never comes before
-  `Retry-After`, capped at 60 s. A blocked condition retries every 30 s.
+  `Retry-After`, capped at 60 s. A blocked condition retries every 30 s, and `unauthorized` at once
+  when the token changes ([Transport](#transport)).
 
 Tests:
 
@@ -567,8 +568,9 @@ of the durable acknowledged position the `410` rule compares with.
 - **Not published.** A body above `Ursula-Max-Snapshot-Bytes`, or above `L` on a server without a
   cold store (parts answered `501`), is not published, and status reports `snapshot.error`.
 - **Failures** wait before the next attempt from 100 ms, doubling, up to five minutes, or an hour
-  when the body is too large. Requests carry the binding's current token, so snapshots go on after
-  a re-key.
+  when the body is too large. An attempt a `401` failed starts again at once when the bearer token
+  changes ([Transport](#transport)). Requests carry the binding's current token, so snapshots go on
+  after a re-key.
 - **Builds** read a snapshot in byte ranges sized from HEAD's limit, and a chunk that does not
   continue the download restarts the build.
 
@@ -590,7 +592,8 @@ Tests:
   "publishes a snapshot body above the request limit in parts with a cold store, and reports it in
   snapshot.error without one".
 - Backoff: `snapshotter.rs` `failures_double_the_wait_up_to_their_kinds_limit`,
-  `a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks`.
+  `a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks`,
+  `a_token_change_brings_an_attempt_a_401_failed_forward`.
 - Ranged builds: `driver/tests.rs` `a_build_reads_the_snapshot_in_chunks_of_the_request_limit`,
   `a_chunk_that_does_not_continue_the_download_restarts_the_build`,
   `a_whole_body_answer_to_a_ranged_read_installs_it`,
@@ -620,9 +623,15 @@ Tests:
   the last addresses for up to 10 minutes.
 - One bearer token per process: the last open's `token` (a string, or the latest a provider handed
   out, see [Tokens](#tokens)), `ursula_set_token`, or the file `URSULA_VFS_TOKEN_FILE` names,
-  re-read when it changes and after a `401`. A private CA bundle
-  goes in `URSULA_VFS_CA_FILE`. A token sent over `http://` to a host that is not a loopback
-  address logs `token_in_clear` once.
+  re-read when it changes and after a `401`. A token change sends every request a `401` blocked
+  again at once, with no wait for the 30 s retry: the replicators', the opens' and the rebuilds'
+  alike, through the retry policy they share (`Core::token_changed`), and a snapshot attempt a
+  `401` failed. Other waits keep their timers and jitter. A `401` to an attempt sent before the
+  change sends the request again under the new token instead of blocking it. A token set changes
+  at once. A token in the file changes when a read finds it: any request's, or the driver thread's
+  check of the file every second while requests carry the file's token (no token set) and an open
+  or a writer may send requests. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent
+  over `http://` to a host that is not a loopback address logs `token_in_clear` once.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `every_body_carries_content_length`, `time_limits_scale_with_the_body_and_the_answer`,
@@ -631,7 +640,16 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `net.rs` `requests_within_30_s_of_a_lookup_make_none`,
 `a_failed_lookup_uses_the_last_addresses_until_the_retry`,
 `a_failed_lookup_past_the_stale_limit_fails_as_never_sent`. Tokens: `auth.rs`
-`tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`.
+`tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`,
+`the_read_that_finds_a_new_token_signals_the_change`,
+`a_lent_token_goes_back_unless_another_was_set_since`, `replicator/tests/machine.rs`
+`a_token_change_resends_a_request_blocked_unauthorized_at_once`,
+`a_token_changed_while_the_refused_attempt_was_out_goes_at_once`,
+`a_token_change_leaves_a_resend_in_backoff_to_its_timer`, `driver/tests.rs`
+`a_token_change_resends_what_a_401_blocked_at_once`,
+`a_token_changed_while_an_opens_reread_is_out_goes_at_once`,
+`a_token_change_resends_a_rebuilds_read_a_401_blocked`, the replicator proptest's token changes,
+and `test/token-change.e2e.ts`.
 
 ## Local state
 
@@ -661,6 +679,16 @@ directory and return the db path.
   published by one rename after the old one's fate is written. No published db file is ever empty
   or unmarked. Every segment names the directory its generation supersedes, and a roll carries
   that forward, so a crash that leaves two generations is finished at the next open.
+- The current generation is the one no other generation's first segment supersedes. One pure
+  function chooses it and changes nothing: it reads only `gen-<id32>` directories, and their first
+  segment headers only when there are two or more. Two that nothing supersedes are ambiguous, and
+  generations that all supersede one another (only damage or a copy by hand makes them) are
+  circular. Either is an error, told apart from a root with no generation. The open finishes the
+  superseded ones by it, deleting or salvaging them, and then reads the current generation by it.
+  Every circular generation is superseded, so the open finishes them all and then sees none.
+- A build supersedes the root's one generation, and refuses a root that holds two or more: it
+  runs after the open finished them, and building over a superseded one would leave it named by
+  nobody.
 - A superseded generation is renamed to `.trash` before it is deleted.
 
 Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
@@ -668,6 +696,8 @@ Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
 `a_crash_after_each_publish_step_converges_to_one_generation`,
 `a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step`,
 `two_directories_of_one_lineage_resolve_by_supersedes`,
+`a_build_refuses_a_root_with_two_generations`,
+`generations_that_supersede_one_another_are_circular`,
 `a_generation_is_published_with_page_one_written`, `ids.rs`
 `generation_ids_spell_as_32_hex_digits`, `db.rs` `the_default_dir_is_versioned`, `replog/tests.rs`
 `every_segment_names_what_its_generation_supersedes`.
@@ -695,13 +725,21 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
 | 3 ACK | acked position, acked offset (a commit boundary), log bytes since the latest snapshot | at most once a second, at once during an open, before a snapshot publishes, and when a binding resets or retires |
 | 4 BASE | position | after F2, materialization, or a snapshot copy |
 
+- The log is read by one rule, which changes nothing: each segment streams through a 64 KiB
+  buffer, its chains are verified, and each record of the valid log goes to a fold that keeps what
+  its reader needs, and then the log's end: the state there and where the log is cut. The open's
+  fold keeps every record's body, and the open then cuts. Whatever the size of a record or a
+  segment, a read takes the list of segments, the buffer, what the fold keeps, a mark per frame of
+  the longest run of caught-up stream frames, and the headers of the segments that run reaches. The commit id of a COMMIT record's frame is read as the frame streams by, which tells
+  caught-up stream frames from the generation's own commits.
 - Positions start at 1. The valid log is the longest prefix whose chain verifies and whose
   positions grow by one. Open cuts the log at its first broken record, whether or not a
   chain-valid record follows, and reports the cut. A power loss can keep later unsynced records and
   lose an earlier one, and a user can store bytes that verify as a later record, so neither may
   refuse the open. The cut keeps L3, since pages reach the db only after F1 fsyncs the log.
-- A gap or a malformed record under valid chains fails as `internal`. Caught-up stream frames with
-  no ACK after them are cut, since a catch-up applies its frames only once that ACK is fsynced.
+- A gap, a position that overflows, or a malformed record under valid chains fails as `internal`,
+  in the first segment as in any other. Caught-up stream frames with no ACK after them are cut,
+  since a catch-up applies its frames only once that ACK is fsynced.
 - A binding writes an ACK when it resets or retires. A clean retire and a `rewound` reset fsync
   it, so a cleanly closed log holds no commit after its latest ACK but ones never acknowledged.
 - A segment goes once all its records are at or below `min(base, acked)` (F3). Disk use is the
@@ -710,8 +748,14 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
   the CLAIM record that follows.
 
 Tests: `codec/segment/tests.rs` `segments_round_trip`, `a_chain_break_keeps_the_prefix_before_it`,
-`a_position_gap_under_valid_chains_is_a_gap`, `every_header_bit_flip_is_refused`, `replog/tests.rs`
-`a_torn_tail_is_cut`, `crash_cuts_at_every_byte_keep_the_whole_records`,
+`a_position_gap_under_valid_chains_is_a_gap`, `every_header_bit_flip_is_refused`,
+`the_reader_reads_what_a_whole_segment_scan_reads`,
+`a_record_larger_than_the_buffer_streams_through_it`, `codec/frame/tests.rs`
+`the_commit_id_reader_reads_what_decode_reads`, `replog/tests.rs`
+`the_read_opens_logs_as_the_whole_segment_open_did`,
+`a_hosts_fold_keeps_the_pending_commits_without_their_frames`,
+`a_later_segment_that_does_not_follow_fails_after_its_records`, `a_torn_tail_is_cut`,
+`crash_cuts_at_every_byte_keep_the_whole_records`,
 `a_record_lost_before_a_kept_one_is_cut_there`,
 `a_planted_look_alike_record_does_not_refuse_the_open`, `a_gap_under_valid_chains_is_an_error`,
 `caught_up_frames_no_ack_follows_are_cut`, `a_torn_roll_deletes_the_new_segment`,
@@ -759,8 +803,10 @@ checkpoints and crashes) and the `test/crash.e2e.ts` matrix. L5 by the world's p
 ### Open
 
 `open()` checks in-process state, then the first disk job takes the root's `lock` (`in_use` when
-another process holds it), finishes leftovers (`.tmp`, `.trash`, a superseded generation, a salvage
-marked `moving`), checks page 1 and the segment header, and materializes the current generation.
+another process holds it), records the cache directory in the host directory when the open is an
+owner's and there is one ([Hosts](#hosts)), finishes leftovers (`.tmp`, `.trash`, a superseded
+generation, a salvage marked `moving`), checks page 1 and the segment header, and materializes the
+current generation.
 Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
 
 | local generation | HEAD | the open |
@@ -928,6 +974,7 @@ Every row resumes or rebuilds with no manual step.
 | during a salvaging publish | the publish or the salvage finished from the manifest | [Layout](#layout) | `salvage_marked`, `publish_renamed`, `salvage_moved` |
 | during a copy | one generation current | [Materialize](#materialize) | `copy_db`, `copy_log` |
 | during a trim or a cut | the log reads the same | F3, L1 | `trim_unlinked`, `cut_removed` |
+| while an owner open records its cache directory | the record is complete or absent, at most a temp file beside it, and the open claimed, built and logged nothing: the root is as the open found it (a fresh one holds only its `lock`) | [Hosts](#hosts) | `host_tmp_synced`, `host_linked`, `host_dir_synced` |
 | during a claim | its CLAIM record marks it ours, the next claim goes higher | [Claims](#claims) | |
 | power loss | the durable log prefix with L3: unacknowledged commits after the last log fsync lost, acknowledged ones return from the stream | L4 | |
 | a failed fsync, a WAL page that reads back other bytes | reset `local_damage`, materialization rewrites pages since the BASE | L3 | |
@@ -939,8 +986,9 @@ transaction applied, and the reopen sends it whole", `test/core.e2e.ts` "keeps e
 SIGKILL interrupts: the reopen sends what never reached the stream", `generation/tests.rs`
 `a_crash_after_each_salvaging_publish_step_converges`, `replog/tests.rs`
 `a_crash_after_the_roll_before_the_claim_leaves_the_new_token`,
-`a_crash_before_the_rename_keeps_the_old_header`. Power loss: the world's restarts after a power
-loss (`replicator/tests/world.rs`
+`a_crash_before_the_rename_keeps_the_old_header`, `test/host.e2e.ts` "crashes while an owner open
+records its cache directory". Power loss: the world's restarts after a power loss
+(`replicator/tests/world.rs`
 `a_provisional_restart_after_a_power_loss_of_acknowledged_commits_goes_stale`) and
 `driver/tests.rs` `a_provisional_open_whose_log_lost_acknowledged_commits_goes_stale`.
 
@@ -1134,6 +1182,85 @@ divergent commit fences exactly one", "resets `stale` with nothing sent when its
 writing", "goes live over an idle original and fences it", "goes live over an idle original that
 never wrote and fences it", and "rebuilds a copy that fell behind retention, never trusting the
 original's snapshot". An old disk snapshot whose catch-up and next commit take the commit id of the original's unsent tail: `test/stale.e2e.ts` "S5: an old disk snapshot catches up and commits under the id of the original's unsent tail, and the original rebuilds without sending it".
+
+### Hosts
+
+A host that snapshots or moves the process, or the VM it runs in, needs to know whether the
+snapshot holds a commit the stream lacks. The extension tells it where to look.
+
+The host creates the host directory, `/var/lib/sqlite-ursula/host`, before any process that may
+load the extension starts. Every such process must be able to create files in it, for example a
+root-owned directory of mode 1777. Every ancestor of it must be a directory the process can search:
+a missing, unsearchable or non-directory ancestor makes the host directory absent to that process,
+which then records nothing. Links among the ancestors are followed, only the host directory itself
+must not be a link.
+
+```text
+/var/lib/sqlite-ursula/host/
+  dir-<key>               a record of a cache directory, mode 0444, never changed by the extension
+  .tmp-<pid>-<16 hex>     a record being published, ignored by readers
+  hold, host<anything>    reserved for the host: the extension never writes these names
+```
+
+An owner open that locks a stream's root records the root's cache directory there before it claims
+anything, as `dir-<key>`: one JSON line with the directory's real path, such as
+`{"v":1,"dir":"/home/app/.cache/sqlite-ursula/0.8"}`, where `<key>` is the first 32 hex digits of
+the BLAKE3 of that path. Every owner open that locks a root records, a fresh lock as much as one
+beside a reset binding or after an abandoned build, so every root an owner open locks while the
+host directory exists lives in a recorded directory, wherever the application put it. A record is
+written once (a temp file, fsynced, linked into place, then the directory fsynced) and never
+changed. `link` never replaces a file, so a record is complete or absent. An open that finds the
+record, or loses the race to link it, checks that it names the same directory and fsyncs the
+directory too, so the record is durable before the open logs anything.
+
+When the host directory exists and the open cannot record its directory, it fails with
+`local_setup`, action `fix`, before it claims anything, and nothing reaches the stream: a symlink or
+a file that is not a directory in place of the host directory, something under the record's name
+that is not a record of this directory, a real path that is not UTF-8, or a missing record that
+cannot be written because the filesystem is read-only or full or the process cannot write the
+directory. An open that finds its record only reads it and fsyncs the directory, so a read-only,
+full or unwritable host directory refuses no open whose directory is already recorded. After the
+directory's open (`O_DIRECTORY` and `O_NOFOLLOW`), every step goes through its descriptor (`openat`,
+`linkat`, `unlinkat`), so a path swapped meanwhile cannot redirect one. The open claimed, built and
+logged nothing, so the root is as the open found it (a fresh one holds only its `lock` file), and
+the next open tries again. A reader or an import records nothing, since neither logs a commit of its
+own, and loads, commits, `synced()` and status never consult the host directory.
+
+- The host directory is the compiled-in path when `lstat` finds anything there, whatever its type.
+  A path the process cannot `lstat`, such as one a confinement policy hides, counts as absent
+  (logged once, `host_dir_unreadable`). `URSULA_VFS_HOST_DIR` is a test hook, read only when that
+  path is absent, and not a setting: an application can scrub its environment, never the
+  compiled-in path.
+- A host may delete the record of a directory that no longer exists, while nothing that may load
+  the extension runs: an open that locks a root in a directory at that path again records it
+  before it can log.
+- A `.tmp-<pid>-*` carries the writer's PID as its own PID namespace numbers it. A host may delete
+  one only when it shares that namespace and no process with that PID runs. A PID from another
+  namespace says nothing about the processes the host sees.
+- A mode-1777 directory is no boundary between the processes that share it. Any of them can link a
+  record under a name another's directory hashes to, failing that one's opens, or record a
+  directory that is not its own. Processes that must not affect each other need host directories
+  of their own, which means separate mount namespaces, since the path is compiled in.
+- A record is a flat JSON object: every value is a string, a number, a boolean or null, never an
+  object or an array, so a later line may add only such keys. A reader takes its `dir` whatever
+  its `v` and ignores keys it does not know. The format is frozen within a release line.
+
+Moving or deleting a cache directory, or a directory above it, while a root in it holds
+unacknowledged commits and no process has it open hides them from the host, as from the extension,
+until the root is opened where it now is.
+
+Tests: `hostdir/tests.rs` `the_default_wins_whenever_lstat_finds_it`,
+`without_the_default_the_hook_decides`, `a_record_names_the_real_path_under_its_hash`,
+`a_real_path_that_is_not_utf8_fails`, `an_open_records_its_cache_directory_once`,
+`eight_threads_recording_eight_roots_leave_one_record`,
+`a_record_that_is_not_the_directorys_fails_the_open`,
+`a_record_that_is_not_a_regular_file_fails_the_open`, `a_deleted_record_is_written_again`,
+`a_host_directory_that_is_not_a_directory_fails_the_open`,
+`a_host_directory_the_process_cannot_write_fails_the_open`, `codec/vectors/mod.rs`
+`the_host_directory_record_is_frozen`, and `test/host.e2e.ts` H1 to H5 (the record before the first
+commit, through a symlink and under concurrent opens, nothing from readers and imports, the
+`local_setup` refusal with nothing created on the stream, nothing without a host directory, and a
+crash at each step of the record).
 
 ## API
 
@@ -1421,8 +1548,8 @@ meanwhile. So the last open that names a token sets it.
   it waits rejects with `UrsulaUnavailableError` `unavailable`, action `retry`, whose `cause` is the
   last failure, or the signal's reason when no call failed.
 - The pump's `condition` event `unauthorized` (a request of a bound binding refused twice with
-  `401`) drops the token held and calls the provider at once, unless a retry is scheduled. The
-  blocked request carries the new token at its next attempt ([Answers](#answers)). After a `gap`,
+  `401`) drops the token held and calls the provider at once, unless a retry is scheduled. Setting
+  the new token sends the blocked request again at once ([Transport](#transport)). After a `gap`,
   and when a failed pump worker is replaced, the bound paths' status says whether one was missed.
   The pump replaces a failed worker while the source serves a bound path, so no `401` goes unheard.
   The driver reports conditions of bound bindings only, so a bind refused with `401` reaches the
@@ -1484,8 +1611,9 @@ since neither e2e server checks tokens.
 - Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.
   Events include `open`, `provisional`, `live`, `rekey`, `salvaged`, `reset`, `recut`, `log_cut`,
   `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`,
-  `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`, `setting_adjusted`
-  and `panic`.
+  `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`, `setting_adjusted`,
+  `host_dir_unreadable` (the host directory's path cannot be read, so it counts as absent) and
+  `panic`.
 - Alert on a growing `commits.pending_bytes`, any `replication.condition` that stays, refused
   writes, any reset, and a `snapshot.log_bytes` that stays above a few times `due_bytes`.
 
@@ -1531,13 +1659,14 @@ runs every e2e suite against one real node with an in-memory cold store and agai
 | stream frames | `USQ2` ([Frames](#frames)), and the reserved import activation `ursula-import-v1` ([Import](#import)) |
 | snapshot bodies | `USS3` ([Snapshots](#snapshots)), digest BLAKE3 of the length-prefixed content type and the body |
 | local state | generation directories ([Layout](#layout)), `USL1` log segments ([Log](#log)), the page-1 marker ([Marker](#marker)), `db-uwal`, `manifest.json` |
+| host directory | `dir-<key>` records ([Hosts](#hosts)) |
 | producer | `Producer-Id: sqlite-ursula-vfs/2`, `Producer-Digest`, receipt contiguity |
 | content type | `application/vnd.ursula.sqlite-vfs.v2` |
 
-Within 0.8.x these formats do not change, so owners upgrade one at a time. Golden vectors freeze
-their bytes. The APIs that may only grow within 0.8.x are the `options_json` keys, the
-`ursula_open` result, status keys and values, event shapes, error kinds and actions, the result
-codes 7178, 266 and 778, and the SQL function names and arities.
+Within a release line these formats do not change, so owners upgrade one at a time. Golden
+vectors freeze their bytes. The APIs that may only grow within a release line are the
+`options_json` keys, the `ursula_open` result, status keys and values, event shapes, error kinds
+and actions, the result codes 7178, 266 and 778, and the SQL function names and arities.
 
 0.8 refuses 0.7 streams (`stream_format`) and 0.7 servers and never reads 0.7 caches, since the
 default directory and the names changed. 0.7 fails closed on 0.8 files.
@@ -1555,8 +1684,8 @@ Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_
 `the_part_frames_are_frozen`, `the_log_segment_is_frozen`,
 `a_fresh_builds_segment_header_is_frozen`, `the_snapshot_header_is_frozen`,
 `the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
-`the_import_activation_is_frozen`, `codec/digest.rs` `snapshot_digests_equal_the_servers`,
-`producer_digests_are_blake3`.
+`the_import_activation_is_frozen`, `the_host_directory_record_is_frozen`, `codec/digest.rs`
+`snapshot_digests_equal_the_servers`, `producer_digests_are_blake3`.
 
 ## Verification
 
@@ -1595,7 +1724,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
 - **Idle expiry.** An owner idle past producer expiry whose own claim frame the pre-check cannot
   see resets `stale`.
 - **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
-  restored copy needs its own disk ([Clones](#clones)).
+  restored copy needs its own disk ([Clones](#clones)). A host that snapshots the process finds
+  the directories whose roots may hold commits in the host directory ([Hosts](#hosts)).
 - **Copies of a live cache.** A copy of a cache directory opened offline while its original is
   bound and idle continues the original's claim once the stream answers, goes live and fences the
   original, though the copy's open was provisional. Every commit the original acknowledged stays
