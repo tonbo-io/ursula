@@ -109,10 +109,10 @@ const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaEr
 export const actionOf = (kind: string): UrsulaErrorAction => ACTIONS.get(kind) ?? "fix";
 
 /**
- * A failure of the extension: the base class of the four the package throws. `kind` names what
- * failed and `action` what to do ({@link UrsulaErrorAction}): branch on `action`. `cause` is the error
- * the failure surfaced as, usually SQLite's, and when it is SQLite's its `code`, `errcode` and
- * `errstr` are copied, so code that reads them keeps working.
+ * A failure of the extension or of an open: the base class of every error the package throws.
+ * `kind` names what failed and `action` what to do ({@link UrsulaErrorAction}): branch on `action`.
+ * `cause` is the error the failure surfaced as, usually SQLite's, and when it is SQLite's its
+ * `code`, `errcode` and `errstr` are copied, so code that reads them keeps working.
  */
 export class UrsulaError extends Error {
 	readonly kind: UrsulaErrorKind;

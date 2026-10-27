@@ -11,8 +11,10 @@
 //   audience, and that token is kept until it expires. A Streams token never goes to the
 //   Management API, and the key goes only to the two configured origins.
 // - The Streams token: POST {auth origin}/api/iam/token with audience https://streams.tonbo.dev,
-//   one provider per key and auth origin, so later opens reuse its token.
+//   one provider per key, its source and auth origin, so later opens reuse its token. It goes only
+//   to a stream URL that is `https://`, or `http://` to a loopback host.
 // - An explicit `token`, or URSULA_VFS_TOKEN_FILE, wins over the key for Streams requests.
+// - Redirects are never followed: a 3xx is an answer the open cannot use.
 //
 // Nothing here logs, and no error message carries a key or a token.
 import { constants } from "node:fs";
@@ -20,10 +22,10 @@ import { lstat, open as openFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { reasonOf } from "./abort.ts";
-import { type TonboKind, type UnavailableKind, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
+import { DEFAULT_OPEN_MS, reasonOf } from "./abort.ts";
+import { actionOf, type TonboKind, type UnavailableKind, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { type OpenOptions, open as openStream, type UrsulaDatabase } from "./index.ts";
-import type { TokenProvider } from "./token.ts";
+import { MAX_TIMER_MS, type TokenProvider, USABLE } from "./token.ts";
 
 export { type GateOptions, gate } from "./gate.ts";
 export { type ResetListener, UrsulaDatabase, type UrsulaSalvage, type UrsulaStatus } from "./database.ts";
@@ -49,19 +51,18 @@ const DEFAULT_API_ORIGIN = "https://api.tonbo.dev";
 const DEFAULT_AUTH_ORIGIN = "https://tonbo.dev";
 /** The audience of a Streams token. */
 const STREAMS_AUDIENCE = "https://streams.tonbo.dev";
-/** How long an open may take without a signal, the root entry's default. */
-const DEFAULT_OPEN_MS = 30_000;
 /** A Management API token is exchanged again this long before it expires. */
 const EXPIRY_MARGIN_MS = 30_000;
 /** The first wait before looking a database up again (backoff, or a database still `creating`), doubled up to {@link MAX_RETRY_MS}. */
 const FIRST_RETRY_MS = 250;
 const MAX_RETRY_MS = 2_000;
-/** A key or token as `Authorization: Bearer` carries it. */
-const USABLE = /^[\x21-\x7e]+$/;
 /** An RFC 3339 date-time, as the credentials file's `expires_at` holds one. */
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/i;
 /** The fix for every problem of the login file. */
 const LOGIN = "Run: tonbo login";
+/** What the open calls the Management API and the token endpoint in messages, and the option and variable that name each origin. */
+const MANAGEMENT = { what: "the Tonbo Management API", fix: "Check apiOrigin (or TONBO_API_ORIGIN)" } as const;
+const TOKEN_ENDPOINT = { what: "the Tonbo token endpoint", fix: "Check authOrigin (or TONBO_AUTH_ORIGIN)" } as const;
 
 /**
  * A Tonbo API key or login the open cannot use, or a database the account does not have. `kind` names
@@ -81,7 +82,7 @@ export class TonboError extends UrsulaError {
 	/** The Tonbo API's request id of the answer that failed, for support. */
 	readonly requestId: string | undefined;
 	constructor(what: string, kind: TonboKind, fix: string, requestId?: string, cause?: unknown) {
-		super(`${kind}: ${what}${requestId === undefined ? "" : ` (request ${requestId})`}. ${fix}`, kind, "fix", cause);
+		super(`${kind}: ${what}${requestId === undefined ? "" : ` (request ${requestId})`}. ${fix}`, kind, actionOf(kind), cause);
 		this.name = "TonboError";
 		this.fix = fix;
 		this.requestId = requestId;
@@ -135,8 +136,10 @@ class Transient extends Error {
  *
  * Throws {@link TonboError} for a key or database to fix, {@link UrsulaUnavailableError} when the
  * signal fired while the Tonbo API did not answer (`unreachable`, `unavailable` or `rate_limited`,
- * action `retry`), {@link UrsulaSetupError} `invalid_argument` for an option it cannot use, and the
- * root entry's errors from the open of the stream.
+ * action `retry`), {@link UrsulaSetupError} `invalid_argument` for an option it cannot use or an
+ * answer of the Tonbo API it cannot read, `invalid_url` for a stream URL that would get the key's
+ * Streams tokens over plain http to another host, and the root entry's errors from the open of the
+ * stream.
  */
 export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = {}): Promise<UrsulaDatabase> {
 	const { apiKey, apiOrigin, authOrigin, ...rest } = options;
@@ -149,11 +152,38 @@ export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = 
 	const streamsToken = rest.token !== undefined || nonEmpty(process.env.URSULA_VFS_TOKEN_FILE) !== undefined;
 	const key = name !== undefined || !streamsToken ? await apiKeyOf(apiKey) : undefined;
 	const url = name !== undefined && key !== undefined ? await lookUp(name, key, api, auth, until) : String(nameOrUrl);
+	if (!streamsToken && key !== undefined) refuseExposed(url, name);
 	const token = rest.token ?? (streamsToken || key === undefined ? undefined : streamsProvider(key, auth));
 	return openStream(url, { ...rest, token, signal: until });
 }
 
 const nonEmpty = (value: string | undefined): string | undefined => (value === undefined || value.trim() === "" ? undefined : value.trim());
+
+/** Whether requests to `url` may carry the key, or a token exchanged for it: `https://`, or `http://` to a loopback host. */
+function confidential(url: URL): boolean {
+	const loopback = url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(url.hostname);
+	return url.protocol === "https:" || (url.protocol === "http:" && loopback);
+}
+
+/** Refuses to send Streams tokens for the key to the stream at `url` (of database `name`) over plain http to another host. */
+function refuseExposed(url: string, name: string | undefined): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		// The root entry's open fails it `invalid_url`, before any request.
+		return;
+	}
+	if (confidential(parsed)) return;
+	const of = name === undefined ? "" : ` of database "${name}"`;
+	throw new UrsulaSetupError(
+		`invalid_url: the stream URL ${url}${of} gets no Streams token for the API key, since it is not https:// (http:// only to a loopback host). Open an https:// URL, or pass token`,
+		"invalid_url",
+	);
+}
+
+/** `path` as one shell word: as it is when it needs no quoting, single-quoted otherwise. */
+const shellWord = (path: string): string => (/^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`);
 
 /** The origin `option`, else the variable `env`, else `fallback`: `https://`, or `http://` to a loopback host only, since requests carry the key. */
 function originOf(option: string | undefined, name: string, env: string, fallback: string): string {
@@ -168,8 +198,7 @@ function originOf(option: string | undefined, name: string, env: string, fallbac
 		throw wrong(reasonOf(error));
 	}
 	if (url.pathname !== "/" || url.search !== "" || url.hash !== "" || url.username !== "" || url.password !== "") throw wrong("an origin has no path, query or credentials");
-	const loopback = url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(url.hostname);
-	if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) throw wrong("use https://, since requests carry the API key (http:// only to a loopback host)");
+	if (!confidential(url)) throw wrong("use https://, since requests carry the API key (http:// only to a loopback host)");
 	return url.origin;
 }
 
@@ -205,6 +234,8 @@ async function loginKey(): Promise<ApiKey | undefined> {
 	const refused = (why: string, fix: string): TonboError => new TonboError(`the tonbo login at ${path} ${why}, so it is not read`, "credentials_refused", fix);
 	const notRegular = (): TonboError => refused("is not a regular file", `Remove it, then ${LOGIN.toLowerCase()}`);
 	const symlink = (): TonboError => refused("is a symlink", `Replace it with the file itself, or remove it, then ${LOGIN.toLowerCase()}`);
+	const unreadable = (error: unknown): UrsulaSetupError =>
+		new UrsulaSetupError(`local_setup: cannot read the tonbo login at ${path}: ${reasonOf(error)}. Run: chmod 600 ${shellWord(path)}, or ${LOGIN.toLowerCase()}`, "local_setup", error);
 	try {
 		const entry = await lstat(path);
 		if (entry.isSymbolicLink()) throw symlink();
@@ -213,7 +244,7 @@ async function loginKey(): Promise<ApiKey | undefined> {
 		if (error instanceof TonboError) throw error;
 		const code = (error as { code?: unknown }).code;
 		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-		throw new UrsulaSetupError(`local_setup: cannot read the tonbo login at ${path}: ${reasonOf(error)}`, "local_setup", error);
+		throw unreadable(error);
 	}
 	try {
 		// O_NOFOLLOW: a symlink put in place since the check is refused, not followed.
@@ -222,7 +253,7 @@ async function loginKey(): Promise<ApiKey | undefined> {
 			const stat = await file.stat();
 			if (!stat.isFile()) throw notRegular();
 			if (posix && (stat.mode & 0o077) !== 0) {
-				throw refused(`has group or other permissions (mode ${(stat.mode & 0o777).toString(8)})`, `Run: chmod 600 ${path}`);
+				throw refused(`has group or other permissions (mode ${(stat.mode & 0o777).toString(8)})`, `Run: chmod 600 ${shellWord(path)}`);
 			}
 			return keyOfLogin(path, await file.readFile("utf8"));
 		} finally {
@@ -231,7 +262,7 @@ async function loginKey(): Promise<ApiKey | undefined> {
 	} catch (error) {
 		if (error instanceof TonboError) throw error;
 		if ((error as { code?: unknown }).code === "ELOOP") throw symlink();
-		throw new UrsulaSetupError(`local_setup: cannot read the tonbo login at ${path}: ${reasonOf(error)}`, "local_setup", error);
+		throw unreadable(error);
 	}
 }
 
@@ -281,8 +312,24 @@ async function problemOf(response: Response): Promise<Problem> {
 		// Not JSON: the status says it all.
 	}
 	const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
-	return { code: text(body.code), title: text(body.title), detail: text(body.detail), requestId: text(body.request_id) ?? text(response.headers.get("x-request-id")) };
+	return { code: text(body.code), title: text(body.title), detail: text(body.detail), requestId: text(body.request_id) ?? requestIdOf(response) };
 }
+
+/** The answer's `X-Request-Id`. */
+const requestIdOf = (response: Response): string | undefined => response.headers.get("x-request-id") || undefined;
+
+/**
+ * An answer the open cannot use, from `api`: a status the contract does not have, a redirect (never
+ * followed), or a body without what it must hold. The fix names the option and variable of `api`'s origin.
+ */
+function unexpected(api: { readonly what: string; readonly fix: string }, answer: string, problem: Problem | undefined, requestId: string | undefined): UrsulaSetupError {
+	const detail = problem?.detail === undefined ? "" : `: ${problem.detail}`;
+	const request = requestId === undefined ? "" : ` (request ${requestId})`;
+	return new UrsulaSetupError(`invalid_argument: ${api.what} answered ${answer}${detail}${request}. ${api.fix}`, "invalid_argument");
+}
+
+/** The words for an unexpected `status`. */
+const answered = (status: number): string => (status >= 300 && status < 400 ? `${status} (a redirect, never followed)` : String(status));
 
 /** `Retry-After`, in ms: delta-seconds or an HTTP date. */
 function retryAfterMs(response: Response): number | undefined {
@@ -315,13 +362,14 @@ interface Exchanged {
 
 /** Exchanges `key` at the token endpoint of `auth`: for the Management API with no audience, or for `audience`. */
 async function exchange(key: ApiKey, auth: string, audience: string | undefined, signal: AbortSignal): Promise<Exchanged> {
-	const what = "the Tonbo token endpoint";
+	const what = TOKEN_ENDPOINT.what;
 	let response: Response;
 	try {
 		response = await fetch(`${auth}/api/iam/token`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${key.value}`, "content-type": "application/json", accept: "application/json" },
 			body: JSON.stringify(audience === undefined ? {} : { audience }),
+			redirect: "manual",
 			signal,
 		});
 	} catch (error) {
@@ -333,14 +381,15 @@ async function exchange(key: ApiKey, auth: string, audience: string | undefined,
 	if (transient !== undefined) throw transient;
 	if (!response.ok) {
 		const problem = await problemOf(response);
-		throw new UrsulaSetupError(`invalid_argument: ${what} answered ${response.status}${problem.detail === undefined ? "" : `: ${problem.detail}`}`, "invalid_argument");
+		throw unexpected(TOKEN_ENDPOINT, answered(response.status), problem, problem.requestId);
 	}
-	let body: { access_token?: unknown; expires_in?: unknown } | null = null;
+	let parsed: unknown;
 	try {
-		body = (await response.json()) as typeof body;
+		parsed = await response.json();
 	} catch {
 		// Below.
 	}
+	const body = parsed as { access_token?: unknown; expires_in?: unknown } | null | undefined;
 	const token = body?.access_token;
 	const lifetime = body?.expires_in;
 	if (typeof token !== "string" || !USABLE.test(token) || typeof lifetime !== "number" || !(lifetime > 0)) {
@@ -367,12 +416,16 @@ async function managementBearer(key: ApiKey, auth: string, signal: AbortSignal, 
 	return got.token;
 }
 
-/** One lookup of `name`: the database, or a {@link TonboError}, or a {@link Transient}. */
-async function lookUpOnce(name: string, key: ApiKey, api: string, auth: string, signal: AbortSignal): Promise<Database> {
-	const what = "the Tonbo Management API";
+/** One lookup of `name`: the database and the answer's request id, or a {@link TonboError}, or a {@link Transient}. */
+async function lookUpOnce(name: string, key: ApiKey, api: string, auth: string, signal: AbortSignal): Promise<{ database: Database; requestId: string | undefined }> {
+	const what = MANAGEMENT.what;
 	const get = async (bearer: string): Promise<Response> => {
 		try {
-			return await fetch(`${api}/v1/databases/${encodeURIComponent(name)}`, { headers: { authorization: `Bearer ${bearer}`, accept: "application/json" }, signal });
+			return await fetch(`${api}/v1/databases/${encodeURIComponent(name)}`, {
+				headers: { authorization: `Bearer ${bearer}`, accept: "application/json" },
+				redirect: "manual",
+				signal,
+			});
 		} catch (error) {
 			if (signal.aborted) throw error;
 			throw new Transient(`${what} did not answer: ${reasonOf(error)}`, "unreachable", undefined, error);
@@ -397,7 +450,7 @@ async function lookUpOnce(name: string, key: ApiKey, api: string, auth: string, 
 		if (database === null || typeof database !== "object" || typeof (database as Database).state !== "string") {
 			throw new Transient(`${what} answered ${response.status} without a database`, "unavailable");
 		}
-		return database as Database;
+		return { database: database as Database, requestId: requestIdOf(response) };
 	}
 	const transient = transientOf(response, what);
 	if (transient !== undefined) throw transient;
@@ -410,33 +463,35 @@ async function lookUpOnce(name: string, key: ApiKey, api: string, auth: string, 
 		case 404:
 			throw notFound(name, problem.requestId);
 		default:
-			throw new UrsulaSetupError(
-				`invalid_argument: ${what} answered ${response.status} for database "${name}"${problem.detail === undefined ? "" : `: ${problem.detail}`}${problem.requestId === undefined ? "" : ` (request ${problem.requestId})`}`,
-				"invalid_argument",
-			);
+			throw unexpected(MANAGEMENT, `${answered(response.status)} for database "${name}"`, problem, problem.requestId);
 	}
 }
 
-const notFound = (name: string, requestId?: string): TonboError => new TonboError(`database "${name}" not found`, "database_not_found", `Run: tonbo database create ${name}`, requestId);
+const notFound = (name: string, requestId: string | undefined): TonboError => new TonboError(`database "${name}" not found`, "database_not_found", `Run: tonbo database create ${name}`, requestId);
 
 /** The stream URL of database `name`: looked up until it is active, retrying failures that pass, until `until` fires. */
 async function lookUp(name: string, key: ApiKey, api: string, auth: string, until: AbortSignal): Promise<string> {
 	let last: Transient | undefined;
 	for (let attempt = 0; ; attempt += 1) {
+		const backoff = Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(attempt, 8));
 		let wait: number;
 		try {
-			const database = await lookUpOnce(name, key, api, auth, until);
-			if (database.state === "active" && typeof database.url === "string") return database.url;
-			if (database.state === "deleting" || database.state === "deleted") throw notFound(name);
+			const { database, requestId } = await lookUpOnce(name, key, api, auth, until);
+			if (database.state === "active") {
+				if (typeof database.url === "string") return database.url;
+				throw unexpected(MANAGEMENT, `database "${name}" active without a url`, undefined, requestId);
+			}
+			if (database.state === "deleting" || database.state === "deleted") throw notFound(name, requestId);
 			// `creating`, or a state this package does not know yet: look again.
 			last = new Transient(`database "${name}" is ${String(database.state)}`, "unavailable");
-			wait = Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(attempt, 8));
+			wait = backoff;
 		} catch (error) {
 			if (error instanceof UrsulaError) throw error;
 			if (until.aborted) throw gaveUp(name, last, until);
 			if (!(error instanceof Transient)) throw error;
 			last = error;
-			wait = error.waitMs ?? Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(attempt, 8));
+			// Never sooner than the backoff, so `Retry-After: 0` or a past date does not spin, and never past a timer's range.
+			wait = Math.min(MAX_TIMER_MS, Math.max(error.waitMs ?? 0, backoff));
 		}
 		try {
 			await delay(wait, undefined, { signal: until });
@@ -453,12 +508,15 @@ function gaveUp(name: string, last: Transient | undefined, until: AbortSignal): 
 	return new UrsulaUnavailableError(`${kind}: the lookup of database "${name}" gave up when its signal fired: ${why}`, kind, last ?? until.reason);
 }
 
-/** One provider per auth origin and key: the same function on each open, so later opens reuse its token. */
+/**
+ * One provider per auth origin, key and source of the key: the same function on each open, so later
+ * opens reuse its token, and its errors name the source this open took the key from.
+ */
 const providers = new Map<string, TokenProvider>();
 
 /** The provider of Streams tokens for `key`. A key the token endpoint refuses fails for good: the open rejects with `invalid_api_key`. */
 function streamsProvider(key: ApiKey, auth: string): TokenProvider {
-	const id = `${auth}\n${key.value}`;
+	const id = JSON.stringify([auth, key.from, key.value]);
 	let provider = providers.get(id);
 	if (provider === undefined) {
 		provider = async ({ signal }) => {

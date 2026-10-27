@@ -1450,19 +1450,26 @@ resolves the URL and the Streams token: everything after is the root entry's ope
   another version or schema, or one whose `expires_at` has passed, fails `invalid_api_key`.
 - A name is looked up with `GET {api origin}/v1/databases/{name}`, the key as the bearer token. A
   `401` with `exchange_required` exchanges the key at the token endpoint with no audience and sends
-  the lookup again once with that token, which is kept per key until 30 s before it expires. The key
-  goes only to the two configured origins, never to an endpoint an answer names, and a Streams
-  token never goes to the Management API.
+  the lookup again once with that token, which is kept per key until 30 s before it expires. A
+  `401` to a held token exchanges again and retries once. The key goes only to the two configured
+  origins, never to an endpoint an answer names, and no redirect is followed (`redirect: "manual"`,
+  a 3xx fails `invalid_argument`). A Streams token never goes to the Management API.
 - An `active` database opens its `url`. `creating`, or a state the package does not know, is looked
   up again with backoff. `deleting` and `deleted` fail `database_not_found`, as `404` does. `401`
   fails `invalid_api_key`, as `403` does with a message that the key cannot read the database. `429`
-  waits for `Retry-After`, and `408`, `5xx` and network failures back off from 250 ms up to 2 s,
-  until the open's signal fires: then `UrsulaUnavailableError` with the last condition.
-- The Streams token comes from a provider per key and auth origin, so each open passes the same
-  function and later opens reuse its token ([Tokens](#tokens)). It posts
+  waits for `Retry-After` but never less than the backoff, and `408`, `5xx` and network failures
+  back off from 250 ms up to 2 s, until the open's signal fires: then `UrsulaUnavailableError` with
+  the last condition. An `active` database without a `url`, and any other status, fail
+  `invalid_argument` naming the option and variable of that origin.
+- The Streams token comes from a provider per key, source of the key and auth origin, so each open
+  passes the same function and later opens reuse its token ([Tokens](#tokens)). It is attached only
+  to a stream URL that is `https://`, or `http://` to a loopback host: any other fails
+  `invalid_url`. The process carries one token, so one key per process: the last open's provider
+  serves every database. It posts
   `{"audience":"https://streams.tonbo.dev"}` to `{auth origin}/api/iam/token`. A `401` or `403`
   there throws `invalid_api_key`, which fails for good. An explicit `token`, or
-  `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key.
+  `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key. The
+  extension reads the file only while no open of the process has set a token.
 - Origins are `https://`, or `http://` to a loopback host. `TONBO_API_ORIGIN` and
   `TONBO_AUTH_ORIGIN` set them when the options do not.
 - Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key`
@@ -1472,7 +1479,8 @@ resolves the URL and the Streams token: everything after is the root entry's ope
 Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
 stands in for the Management API and the token endpoint as their contracts document them, and
 serves databases whose URLs are streams of the suite's server. The credentials cases are the
-contract's own usable and unusable examples.
+contract's own usable and unusable examples. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
+(test/tonbo-child.ts), where no open set a token first.
 
 ### SQL functions
 

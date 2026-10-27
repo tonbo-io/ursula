@@ -6,7 +6,7 @@
 // Keys: `tbo_...` is a personal key the Management API takes directly, `agent_...` an Agent key it
 // answers with 401 `exchange_required`, and any key in `revoked` is refused by both. Keys in
 // `noStreams` get no Streams token. The token endpoint hands out `mgmt-<n>` with no audience and
-// `streams-<n>` for the Streams audience, each for 600 s.
+// `streams-<n>` for the Streams audience, each for 600 s, until `forget` revokes one.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -40,6 +40,8 @@ export class TonboApi {
 	readonly noStreams = new Set<string>(["tbo_nostreams"]);
 	/** Answers the next lookups give first, in order: a status and a `Retry-After`. */
 	readonly scripted: { status: number; retryAfter?: string }[] = [];
+	/** The `token_endpoint` an `exchange_required` answer names: its own by default. */
+	tokenEndpoint: string | undefined;
 	/** The tokens handed out, and for which API. */
 	readonly #issued = new Map<string, "management" | "streams">();
 	#n = 0;
@@ -70,6 +72,12 @@ export class TonboApi {
 	reset(): void {
 		this.seen.length = 0;
 		this.scripted.length = 0;
+		this.tokenEndpoint = undefined;
+	}
+
+	/** Revokes the token `issued`: the Management API refuses it from now on. */
+	forget(issued: string): void {
+		this.#issued.delete(issued);
 	}
 
 	/** The requests of one API. */
@@ -122,7 +130,7 @@ export class TonboApi {
 				return;
 			}
 			if (bearer.startsWith("agent_") && !this.revoked.has(bearer)) {
-				this.#problem(res, 401, "exchange_required", "Exchange required", {}, { token_endpoint: `${this.origin}/api/iam/token` });
+				this.#problem(res, 401, "exchange_required", "Exchange required", {}, { token_endpoint: this.tokenEndpoint ?? `${this.origin}/api/iam/token` });
 				return;
 			}
 			const personal = bearer.startsWith("tbo_") && !this.revoked.has(bearer);
