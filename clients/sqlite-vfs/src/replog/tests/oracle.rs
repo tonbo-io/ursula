@@ -1,6 +1,12 @@
 //! The log's open as it was before [`super::super::Log::read`]: every segment read whole and
 //! scanned, the records kept, then the catch-up cut found from them. The equivalence proptest
 //! holds the read and the open built on it to it.
+//!
+//! It scans each segment with today's [`crate::codec::segment::scan`], which streams the segment
+//! through a [`crate::codec::segment::Reader`], not with the whole-segment scan the open used
+//! before, so it is not independent of the reader. The segment proptest
+//! (`the_reader_reads_what_a_whole_segment_scan_reads`) holds that scan to the whole-segment one,
+//! and the two equivalences together hold the read to the open before it.
 
 use std::fs::File;
 use std::fs::{self};

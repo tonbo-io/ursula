@@ -662,8 +662,13 @@ directory and return the db path.
   that forward, so a crash that leaves two generations is finished at the next open.
 - The current generation is the one no other generation's first segment supersedes. One pure
   function chooses it and changes nothing: it reads only `gen-<id32>` directories, and their first
-  segment headers only when there are two or more. The open finishes the others by it, deleting or
-  salvaging them, and then reads the current generation by it.
+  segment headers only when there are two or more. Two that nothing supersedes are ambiguous, and
+  generations that all supersede one another (only damage makes them) are circular. Either is an
+  error, told apart from a root with no generation. The open finishes the others by it, deleting
+  or salvaging them, and then reads the current generation by it.
+- A build supersedes the root's one generation, and refuses a root that holds two or more: it
+  runs after the open finished them, and building over a superseded one would leave it named by
+  nobody.
 - A superseded generation is renamed to `.trash` before it is deleted.
 
 Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
@@ -671,6 +676,8 @@ Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
 `a_crash_after_each_publish_step_converges_to_one_generation`,
 `a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step`,
 `two_directories_of_one_lineage_resolve_by_supersedes`,
+`a_build_refuses_a_root_with_two_generations`,
+`generations_that_supersede_one_another_are_circular`,
 `a_generation_is_published_with_page_one_written`, `ids.rs`
 `generation_ids_spell_as_32_hex_digits`, `db.rs` `the_default_dir_is_versioned`, `replog/tests.rs`
 `every_segment_names_what_its_generation_supersedes`.
@@ -700,10 +707,12 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
 
 - The log is read by one rule, which changes nothing: each segment streams through a 64 KiB
   buffer, its chains are verified, and each record of the valid log goes to a fold that keeps what
-  its reader needs. The open's fold keeps every record's body, and the open then cuts. A read takes
-  the buffer and what the fold keeps, whatever the size of a record or a segment. The commit id of
-  a COMMIT record's frame is read as the frame streams by, which tells caught-up stream frames from
-  the generation's own commits.
+  its reader needs, and then the log's end: the state there and where the log is cut. The open's
+  fold keeps every record's body, and the open then cuts. Whatever the size of a record or a
+  segment, a read takes the list of segments, the buffer, what the fold keeps, and for the
+  caught-up stream frames at the end of the log a mark per frame and the headers of the segments
+  they reach. The commit id of a COMMIT record's frame is read as the frame streams by, which tells
+  caught-up stream frames from the generation's own commits.
 - Positions start at 1. The valid log is the longest prefix whose chain verifies and whose
   positions grow by one. Open cuts the log at its first broken record, whether or not a
   chain-valid record follows, and reports the cut. A power loss can keep later unsynced records and
@@ -723,7 +732,10 @@ Tests: `codec/segment/tests.rs` `segments_round_trip`, `a_chain_break_keeps_the_
 `the_reader_reads_what_a_whole_segment_scan_reads`,
 `a_record_larger_than_the_buffer_streams_through_it`, `codec/frame/tests.rs`
 `the_commit_id_reader_reads_what_decode_reads`, `replog/tests.rs`
-`the_read_opens_logs_as_the_whole_segment_open_did`, `a_torn_tail_is_cut`, `crash_cuts_at_every_byte_keep_the_whole_records`,
+`the_read_opens_logs_as_the_whole_segment_open_did`,
+`a_hosts_fold_keeps_the_pending_commits_without_their_frames`,
+`a_later_segment_that_does_not_follow_fails_after_its_records`, `a_torn_tail_is_cut`,
+`crash_cuts_at_every_byte_keep_the_whole_records`,
 `a_record_lost_before_a_kept_one_is_cut_there`,
 `a_planted_look_alike_record_does_not_refuse_the_open`, `a_gap_under_valid_chains_is_an_error`,
 `caught_up_frames_no_ack_follows_are_cut`, `a_torn_roll_deletes_the_new_segment`,

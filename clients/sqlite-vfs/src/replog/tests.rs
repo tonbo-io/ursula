@@ -13,6 +13,7 @@ use proptest::prelude::Just;
 use proptest::prelude::ProptestConfig;
 use proptest::prelude::Strategy;
 use proptest::prelude::any;
+use proptest::prop_assert;
 use proptest::prop_assert_eq;
 use proptest::prop_oneof;
 use proptest::proptest;
@@ -21,6 +22,7 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
+use super::Cut;
 use super::Fold;
 use super::Log;
 use super::LogError;
@@ -29,7 +31,11 @@ use crate::codec::frame::Frame;
 use crate::codec::segment::BUFFER;
 use crate::codec::segment::Keep;
 use crate::codec::segment::RecordBody;
+use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
+use crate::codec::segment::encode_header;
+use crate::codec::segment::encode_record;
+use crate::codec::segment::scan;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -924,6 +930,11 @@ struct Unacknowledged {
     commits: Vec<(Position, u64)>,
     /// The highest position an ACK dropped.
     dropped: Option<Position>,
+    /// At the end of the log: whether a lower ACK brought back a commit an earlier one dropped,
+    /// which the fold no longer has.
+    lowered: bool,
+    /// Where the read cut, as [`Fold::end`] says.
+    cut: Option<Cut>,
 }
 
 impl Fold for Unacknowledged {
@@ -941,6 +952,12 @@ impl Fold for Unacknowledged {
     fn cut(&mut self, from: Position) {
         self.commits.retain(|(p, _)| *p < from);
     }
+
+    fn end(&mut self, state: &SegmentHeader, cut: Option<&Cut>) {
+        self.drop_through(state.acked);
+        self.lowered = self.dropped.is_some_and(|d| d > state.acked);
+        self.cut = cut.cloned();
+    }
 }
 
 impl Unacknowledged {
@@ -951,14 +968,10 @@ impl Unacknowledged {
         self.commits.retain(|(p, _)| *p > acked);
     }
 
-    /// The pending commits, `end` the state at the end of the log; `None` when a lower ACK
-    /// brought back a commit an earlier one dropped.
-    fn finish(mut self, end: &SegmentHeader) -> Option<Vec<(Position, u64)>> {
-        self.drop_through(end.acked);
-        if self.dropped.is_some_and(|d| d > end.acked) {
-            return None;
-        }
-        Some(self.commits)
+    /// The pending commits once the read ended, `None` when a lower ACK brought back a commit an
+    /// earlier one dropped.
+    fn pending(&self) -> Option<&[(Position, u64)]> {
+        (!self.lowered).then_some(self.commits.as_slice())
     }
 }
 
@@ -1021,11 +1034,14 @@ fn commit_frame(lineage: Lineage, position: u64, fill: u8, len: usize) -> Vec<u8
     .unwrap()
 }
 
-/// Writes `ops` to a new log in `dir`, rolled past `roll` bytes.
-fn write_log(dir: &Path, roll: u64, ops: &[Op]) {
+/// Writes `ops` to a new log in `dir`, rolled past `roll` bytes. Returns whether an ACK went below
+/// an earlier one.
+fn write_log(dir: &Path, roll: u64, ops: &[Op]) -> bool {
     let mut log = Log::create(dir, header()).unwrap();
     log.set_roll_bytes(roll);
     let mut acked = 0;
+    let mut highest = 0;
+    let mut went_back = false;
     for op in ops {
         let last = log.next_position().0 - 1;
         let body = match op {
@@ -1050,17 +1066,23 @@ fn write_log(dir: &Path, roll: u64, ops: &[Op]) {
             },
             Op::Ack { back } => {
                 acked = last.saturating_sub(*back).max(acked);
+                went_back |= acked < highest;
+                highest = highest.max(acked);
                 RecordBody::Ack {
                     acked: Position(acked),
                     acked_offset: Offset::from_u64(acked * 10),
                     log_bytes: 0,
                 }
             }
-            Op::AnyAck(n) => RecordBody::Ack {
-                acked: Position(*n),
-                acked_offset: Offset::from_u64(*n),
-                log_bytes: 1,
-            },
+            Op::AnyAck(n) => {
+                went_back |= *n < highest;
+                highest = highest.max(*n);
+                RecordBody::Ack {
+                    acked: Position(*n),
+                    acked_offset: Offset::from_u64(*n),
+                    log_bytes: 1,
+                }
+            }
             Op::Base { back } => RecordBody::Base {
                 position: Position(last.saturating_sub(*back)),
             },
@@ -1077,6 +1099,7 @@ fn write_log(dir: &Path, roll: u64, ops: &[Op]) {
         log.append(&body).unwrap();
     }
     log.sync().unwrap();
+    went_back
 }
 
 /// What a crash or a damage may leave of the log's segment files.
@@ -1095,6 +1118,18 @@ enum Damage {
     },
     /// The first segment gone.
     DropFirst,
+    /// A segment between the first and the last gone: the next one does not follow.
+    DropMiddle {
+        segment: usize,
+    },
+    /// A later segment written again with a valid header and chains: of another lineage, or with
+    /// a record after the last position there is (a header that does not follow, and a record the
+    /// reader refuses after it), or both.
+    Rewrite {
+        segment: usize,
+        lineage: bool,
+        overflow: bool,
+    },
     /// A later segment zero-filled: a roll whose header never reached the disk.
     ZeroLater {
         segment: usize,
@@ -1109,6 +1144,16 @@ fn damage() -> impl Strategy<Value = Damage> {
         3 => (any::<usize>(), any::<usize>()).prop_map(|(segment, at)| Damage::Cut { segment, at }),
         2 => (any::<usize>(), any::<usize>()).prop_map(|(segment, bit)| Damage::Flip { segment, bit }),
         1 => Just(Damage::DropFirst),
+        1 => any::<usize>().prop_map(|segment| Damage::DropMiddle { segment }),
+        2 => (
+            any::<usize>(),
+            prop_oneof![Just((true, false)), Just((true, true)), Just((false, true))],
+        )
+            .prop_map(|(segment, (lineage, overflow))| Damage::Rewrite {
+                segment,
+                lineage,
+                overflow,
+            }),
         1 => any::<usize>().prop_map(|segment| Damage::ZeroLater { segment }),
         1 => proptest::collection::vec(any::<u8>(), 1..40).prop_map(Damage::Garbage),
     ]
@@ -1143,6 +1188,43 @@ fn apply(dir: &Path, damage: &Damage) {
         }
         Damage::DropFirst if n > 1 => fs::remove_file(&files[0]).unwrap(),
         Damage::DropFirst => {}
+        Damage::DropMiddle { segment } if n > 2 => {
+            fs::remove_file(&files[1 + segment % (n - 2)]).unwrap();
+        }
+        Damage::DropMiddle { .. } => {}
+        Damage::Rewrite {
+            segment,
+            lineage,
+            overflow,
+        } if n > 1 => {
+            let path = &files[1 + segment % (n - 1)];
+            let scanned = scan(&fs::read(path).unwrap()).unwrap();
+            let mut h = scanned.header;
+            if *lineage {
+                h.lineage = Lineage([8; 16]);
+            }
+            let records: Vec<(Position, RecordBody)> = if *overflow {
+                h.first_position = Position(u64::MAX);
+                let base = |at| RecordBody::Base {
+                    position: Position(at),
+                };
+                vec![(Position(u64::MAX), base(1)), (Position(1), base(2))]
+            } else {
+                scanned
+                    .records
+                    .into_iter()
+                    .map(|r| (r.position, r.body))
+                    .collect()
+            };
+            let (mut bytes, mut chain) = encode_header(&h).unwrap();
+            for (position, body) in &records {
+                let (record, next) = encode_record(chain, *position, body).unwrap();
+                bytes.extend(record);
+                chain = next;
+            }
+            fs::write(path, bytes).unwrap();
+        }
+        Damage::Rewrite { .. } => {}
         Damage::ZeroLater { segment } if n > 1 => {
             let path = &files[1 + segment % (n - 1)];
             let len = fs::metadata(path).unwrap().len() as usize;
@@ -1180,10 +1262,11 @@ fn restore(dir: &Path, files: &BTreeMap<String, Vec<u8>>) {
     }
 }
 
-/// Checks that the open built on [`Log::read`] opens the log in `dir` as the open before it did:
-/// the same log and the same records, or the same error, and the same files after; that the read
-/// changes nothing; and that a host's fold over the read keeps the open's pending commits.
-fn opens_as_before(dir: &Path) -> Result<(), TestCaseError> {
+/// Checks that the open built on [`Log::read`] opens the log in `dir` as the open before it did,
+/// with the same log and the same records, or the same error, and the same files after. Checks
+/// too that the read changes nothing, and that a host's fold over the read keeps the open's
+/// pending commits, unless `acks_go_back` and the fold found an ACK below an earlier one.
+fn opens_as_before(dir: &Path, acks_go_back: bool) -> Result<(), TestCaseError> {
     let files = snapshot(dir);
     let before = oracle::open(dir);
     let files_before = snapshot(dir);
@@ -1215,15 +1298,17 @@ fn opens_as_before(dir: &Path) -> Result<(), TestCaseError> {
     let read = Log::read(dir, &mut unacknowledged);
     prop_assert_eq!(snapshot(dir), files);
     match (read, &before) {
-        (Ok(valid), Ok((_, recovered))) => {
-            prop_assert_eq!(&valid.cut, &recovered.cut);
+        (Ok(_), Ok((_, recovered))) => {
+            prop_assert_eq!(&unacknowledged.cut, &recovered.cut);
             let pending: Vec<(Position, u64)> = recovered
                 .pending()
                 .iter()
                 .map(|(p, frame)| (*p, frame.len() as u64))
                 .collect();
-            if let Some(kept) = unacknowledged.finish(&valid.state) {
-                prop_assert_eq!(kept, pending);
+            match unacknowledged.pending() {
+                Some(kept) => prop_assert_eq!(kept, pending.as_slice()),
+                // Only an ACK below an earlier one brings back a commit the fold dropped.
+                None => prop_assert!(acks_go_back, "the fold lost its pending commits"),
             }
         }
         (Err(read), Err(open)) => prop_assert_eq!(format!("{read:?}"), format!("{open:?}")),
@@ -1242,10 +1327,10 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Over own and caught-up commits, records larger than the reader's buffer, ACKs, BASEs,
-    // CLAIMs, rolls, re-keys and trims, then a cut, a damaged bit, a lost or zero-filled segment
-    // or bytes after the end: the open built on the streaming read opens the log exactly as the
-    // whole-segment open did, the read changes nothing, and a fold that keeps only positions and
-    // lengths keeps the open's pending commits.
+    // CLAIMs, rolls, re-keys and trims, then a cut, a damaged bit, a lost, zero-filled or
+    // rewritten segment or bytes after the end: the open built on the streaming read opens the
+    // log exactly as the whole-segment open did, the read changes nothing, and a fold that keeps
+    // only positions and lengths keeps the open's pending commits.
     #[test]
     fn the_read_opens_logs_as_the_whole_segment_open_did(
         ops in proptest::collection::vec(op(), 0..14),
@@ -1254,9 +1339,9 @@ proptest! {
     ) {
         let dir = TempDir::new("log-read-equivalence");
         let log_dir = dir.path().join("log");
-        write_log(&log_dir, roll, &ops);
+        let acks_go_back = write_log(&log_dir, roll, &ops);
         apply(&log_dir, &harm);
-        opens_as_before(&log_dir)?;
+        opens_as_before(&log_dir, acks_go_back)?;
     }
 }
 
@@ -1267,7 +1352,7 @@ proptest! {
 fn a_hosts_fold_keeps_the_pending_commits_without_their_frames() {
     let dir = TempDir::new("log-read-fold");
     let log_dir = dir.path().join("log");
-    write_log(&log_dir, 1000, &[
+    let acks_go_back = write_log(&log_dir, 1000, &[
         Op::Own {
             frame: true,
             fill: 1,
@@ -1288,11 +1373,73 @@ fn a_hosts_fold_keeps_the_pending_commits_without_their_frames() {
         },
         Op::CaughtUp { fill: 5, len: 10 },
     ]);
+    assert!(!acks_go_back);
     let mut fold = Unacknowledged::default();
-    let valid = Log::read(&log_dir, &mut fold).unwrap();
-    assert_eq!(valid.cut.as_ref().map(|c| c.at > 0), Some(true));
-    let kept = fold.finish(&valid.state).unwrap();
+    Log::read(&log_dir, &mut fold).unwrap();
+    assert_eq!(fold.cut.as_ref().map(|c| c.at > 0), Some(true));
     let frame = commit_frame(header().lineage, 5, 3, BUFFER * 2).len() as u64;
-    assert_eq!(kept, vec![(Position(5), frame), (Position(6), 10)]);
-    opens_as_before(&log_dir).unwrap();
+    assert_eq!(
+        fold.pending(),
+        Some([(Position(5), frame), (Position(6), 10)].as_slice())
+    );
+    opens_as_before(&log_dir, acks_go_back).unwrap();
+}
+
+// A later segment that does not follow (one gone between, another lineage, or a first position
+// that is not the next) fails the open, and a record its reader refuses fails it first, as a scan
+// of the whole segment did.
+#[test]
+fn a_later_segment_that_does_not_follow_fails_after_its_records() {
+    let ops: Vec<Op> = (0..12u8)
+        .map(|fill| Op::Own {
+            frame: true,
+            fill,
+            len: 100,
+        })
+        .collect();
+    let overflow = |e: &LogError| {
+        matches!(e, LogError::Segment {
+            source: SegmentError::PositionOverflow { .. },
+            ..
+        })
+    };
+    let cases: [(Damage, &dyn Fn(&LogError) -> bool); 4] = [
+        (Damage::DropMiddle { segment: 0 }, &|e| {
+            matches!(e, LogError::Gap { at: 0, .. })
+        }),
+        (
+            Damage::Rewrite {
+                segment: 0,
+                lineage: true,
+                overflow: false,
+            },
+            &|e| matches!(e, LogError::Lineage { .. }),
+        ),
+        (
+            Damage::Rewrite {
+                segment: 0,
+                lineage: true,
+                overflow: true,
+            },
+            &overflow,
+        ),
+        (
+            Damage::Rewrite {
+                segment: 0,
+                lineage: false,
+                overflow: true,
+            },
+            &overflow,
+        ),
+    ];
+    for (harm, refused) in cases {
+        let dir = TempDir::new("log-later-segment");
+        let log_dir = dir.path().join("log");
+        let acks_go_back = write_log(&log_dir, 300, &ops);
+        assert!(segment_files(&log_dir).len() > 2);
+        apply(&log_dir, &harm);
+        let err = Log::open(&log_dir).unwrap_err();
+        assert!(refused(&err), "{harm:?}: {err:?}");
+        opens_as_before(&log_dir, acks_go_back).unwrap();
+    }
 }

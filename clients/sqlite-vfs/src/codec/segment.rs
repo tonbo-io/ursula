@@ -439,23 +439,35 @@ pub trait Keep {
     fn finish(&mut self) -> Self::Kept;
 }
 
-/// Keeps a frame whole.
+/// Keeps a frame whole. The frame's buffer grows with the bytes that arrive, at most doubling and
+/// never past the length the record declares, so a kept frame holds no more than its own bytes.
+/// The declared length is never reserved up front: a torn record's length is garbage.
 #[derive(Debug, Default)]
-pub struct Whole(Vec<u8>);
+pub struct Whole {
+    frame: Vec<u8>,
+    /// The payload length the record declares.
+    declared: usize,
+}
 
 impl Keep for Whole {
     type Kept = Vec<u8>;
 
-    fn start(&mut self, _len: u32) {
-        self.0.clear();
+    fn start(&mut self, len: u32) {
+        self.frame = Vec::new();
+        self.declared = usize::try_from(len).unwrap_or(usize::MAX);
     }
 
     fn piece(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(bytes);
+        if self.frame.spare_capacity_mut().len() < bytes.len() {
+            let filled = self.frame.len();
+            let left = self.declared.saturating_sub(filled);
+            self.frame.reserve_exact(left.min(filled.max(bytes.len())));
+        }
+        self.frame.extend_from_slice(bytes);
     }
 
     fn finish(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.0)
+        std::mem::take(&mut self.frame)
     }
 }
 
@@ -699,7 +711,8 @@ impl<S: Source> Reader<S> {
     }
 
     /// The next record of the valid prefix, or how the prefix ends (again on every later call). A
-    /// COMMIT record's frame is what `keep` keeps of it.
+    /// COMMIT record's frame is what `keep` keeps of it. An error ends the read: the reader may
+    /// have stopped inside a record, so a caller drops it.
     pub fn next<K: Keep>(&mut self, keep: &mut K) -> Result<Step<K::Kept>, ReadError<S::Error>> {
         if let Some(tail) = self.tail {
             return Ok(Step::End(tail));
@@ -829,14 +842,6 @@ pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
         records,
         tail,
     })
-}
-
-/// The header of the segment `source` holds, the segment read to the end of its valid prefix as
-/// [`scan`] reads it and nothing kept of its records: it fails where `scan` fails.
-pub fn read_header<S: Source>(source: S) -> Result<SegmentHeader, ReadError<S::Error>> {
-    let mut reader = Reader::new(source)?;
-    while let Step::Record(_) = reader.next(&mut Skip)? {}
-    Ok(reader.into_header())
 }
 
 #[cfg(test)]

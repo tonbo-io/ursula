@@ -667,7 +667,7 @@ proptest! {
     }
 }
 
-// A whole COMMIT frame names its id however it is cut into pieces; a frame cut short, a frame of
+// A whole COMMIT frame names its id however it is cut into pieces. A frame cut short, a frame of
 // another kind and a body of no commit name none.
 #[test]
 fn the_commit_id_reader_names_whole_commit_frames_only() {

@@ -483,6 +483,81 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
     ));
 }
 
+// A build supersedes the root's one generation. Beside a superseded one a crash after a publish's
+// rename left, it refuses, though the classification finds the current one: the open finishes the
+// superseded one first, and the build then supersedes the current one.
+#[test]
+fn a_build_refuses_a_root_with_two_generations() {
+    let dir = TempDir::new("gen-build-two");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    root.build(header(2))
+        .unwrap()
+        .crash_after(Fate::Trash, 5)
+        .unwrap();
+    assert!(matches!(
+        root.build(header(3)),
+        Err(GenerationError::Ambiguous { ids, .. }) if ids.len() == 2
+    ));
+    assert!(matches!(
+        root.current(),
+        Err(GenerationError::Ambiguous { ids, .. }) if ids.len() == 2
+    ));
+    let current = Root::classify(root.path())
+        .unwrap()
+        .current()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.lineage, Lineage([2; 16]));
+    assert_eq!(current.first_header().unwrap().supersedes, Some(old.id));
+    root.finish_leftovers().unwrap();
+    let built = root.build(header(3)).unwrap().publish(Fate::Trash).unwrap();
+    assert_eq!(built.first_header().unwrap().supersedes, Some(current.id));
+    assert_eq!(root.current().unwrap(), Some(built));
+}
+
+// Generations that all supersede one another (only damage or a copy by hand makes them) name no
+// current generation: the classification says so, changing nothing, where a root with no
+// generation has none. The open finishes them all as superseded.
+#[test]
+fn generations_that_supersede_one_another_are_circular() {
+    let dir = TempDir::new("gen-circular");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    assert!(matches!(
+        Root::classify(root.path()).unwrap().current(),
+        Ok(None)
+    ));
+    let a = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    root.build(header(2))
+        .unwrap()
+        .crash_after(Fate::Trash, 5)
+        .unwrap();
+    let b = Root::classify(root.path())
+        .unwrap()
+        .current()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.first_header().unwrap().supersedes, Some(a.id));
+    // `a`'s log written again, naming `b` as the generation it supersedes.
+    let copied = dir.path().join("log-copy");
+    crate::replog::copy(&a.log_dir(), &copied, b.id).unwrap();
+    fs::remove_dir_all(a.log_dir()).unwrap();
+    fs::rename(&copied, a.log_dir()).unwrap();
+    assert_eq!(a.first_header().unwrap().supersedes, Some(b.id));
+    let before = tree(root.path());
+    assert!(matches!(
+        Root::classify(root.path()).unwrap().current(),
+        Err(GenerationError::Circular { ids, .. }) if ids.len() == 2
+    ));
+    assert_eq!(tree(root.path()), before);
+    root.finish_leftovers().unwrap();
+    assert!(matches!(root.current_or_unreadable(), Ok(None)));
+}
+
 // A generation nothing was applied to is published with the page 1 of an empty database, marked
 // (design: Layout): no published db file is empty or unmarked. One a commit or a snapshot wrote
 // keeps its pages.

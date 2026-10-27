@@ -4,35 +4,37 @@
 //! The valid log is the longest prefix whose chains verify and whose positions grow by one across
 //! segments. [`Log::read`], the one reading rule, finds it and changes nothing: it streams every
 //! segment through one buffer ([`crate::codec::segment::Reader`]) and hands each record to a
-//! [`Fold`], which keeps what its caller needs, so a read takes that buffer and what the fold keeps.
-//! [`Log::open`] reads the log so, keeping every record's body, then cuts the log after the valid
-//! prefix and reports the cut ([`Cut`]) with a warning, whatever follows the first broken record: after a power loss the filesystem may keep
-//! later unsynced records and lose an earlier one, and a database user can store bytes that look
-//! like a record inside a commit. That keeps L3, since pages reach the db only after F1 fsyncs the
-//! log, so every record whose pages could be there is in the durable prefix. Stream frames a
-//! catch-up logged with no ACK after them are cut the same way: a catch-up applies its frames only
-//! once that ACK is fsynced, so they were never applied, and the valid log then holds no COMMIT
-//! record after its latest ACK but the generation's own pending ones. A gap or a malformed
-//! record under valid chains fails (`internal`: the extension wrote them), and so does a segment
-//! header of another format or version. Segments are removed from the front (trim, oldest first)
-//! and cut from the back (open deletes the later segments before it truncates), each step made
-//! durable before the next, so a crash between steps leaves a log open reads the same way. [`Log::append`]
-//! writes a record with one positioned write and no fsync, and cuts the segment back when the
-//! write fails. [`Log::sync`] fdatasyncs the current segment when it holds unsynced records. A roll
-//! fdatasyncs the segment it leaves and fsyncs the new one and the directory before the first
-//! record goes there, so no record of a later segment outlives an earlier one's. [`Log::trim`]
-//! deletes the segments whose records are all at or below `min(base, acked)` (F3), after an fsync
-//! that makes those records durable, and does nothing (no fsync) when no segment would go.
-//! [`Log::rekey`] re-keys the generation to a new stream token (design: Log, History): the log
-//! rolls to a segment whose header names the token, and the CLAIM record of the claim that follows
-//! goes there, fsynced. A crash before the CLAIM leaves a latest segment that names the new token,
-//! which the next open reads as the generation's token. A clean close or a reset after the roll and
-//! before the claim lands leaves the same, not only a crash: two history events with no write
-//! between them then name a token from before the roll, and the next open salvages a generation
-//! that lost nothing (accepted, design: History). A current segment with no record has its header
-//! replaced instead (a temp file renamed over it), since a roll would start at the same position.
-//! [`copy`] copies a log for a copy of its generation: every segment written again to name the
-//! generation it supersedes.
+//! [`Fold`], which keeps what its caller needs. Besides the list of segments, a read takes that
+//! buffer, what the fold keeps, and for the caught-up frames at the end of the log a mark per frame
+//! and the headers of the segments they reach ([`Log::read`]). [`Log::open`] reads the log so,
+//! keeping every record's body, then cuts the log after the valid prefix and reports the cut
+//! ([`Cut`]) with a warning, whatever follows the first broken record: after a power loss the
+//! filesystem may keep later unsynced records and lose an earlier one, and a database user can
+//! store bytes that look like a record inside a commit. That keeps L3, since pages reach the db
+//! only after F1 fsyncs the log, so every record whose pages could be there is in the durable
+//! prefix. Stream frames a catch-up logged with no ACK after them are cut the same way: a catch-up
+//! applies its frames only once that ACK is fsynced, so they were never applied, and the valid log
+//! then holds no COMMIT record after its latest ACK but the generation's own pending ones. A gap or
+//! a malformed record under valid chains fails (`internal`: the extension wrote them), and so does
+//! a segment header of another format or version. Segments are removed from the front (trim, oldest
+//! first) and cut from the back (open deletes the later segments before it truncates), each step
+//! made durable before the next, so a crash between steps leaves a log open reads the same way.
+//! [`Log::append`] writes a record with one positioned write and no fsync, and cuts the segment
+//! back when the write fails. [`Log::sync`] fdatasyncs the current segment when it holds unsynced
+//! records. A roll fdatasyncs the segment it leaves and fsyncs the new one and the directory before
+//! the first record goes there, so no record of a later segment outlives an earlier one's.
+//! [`Log::trim`] deletes the segments whose records are all at or below `min(base, acked)` (F3),
+//! after an fsync that makes those records durable, and does nothing (no fsync) when no segment
+//! would go. [`Log::rekey`] re-keys the generation to a new stream token (design: Log, History):
+//! the log rolls to a segment whose header names the token, and the CLAIM record of the claim that
+//! follows goes there, fsynced. A crash before the CLAIM leaves a latest segment that names the new
+//! token, which the next open reads as the generation's token. A clean close or a reset after the
+//! roll and before the claim lands leaves the same, not only a crash: two history events with no
+//! write between them then name a token from before the roll, and the next open salvages a
+//! generation that lost nothing (accepted, design: History). A current segment with no record has
+//! its header replaced instead (a temp file renamed over it), since a roll would start at the same
+//! position. [`copy`] copies a log for a copy of its generation: every segment written again to
+//! name the generation it supersedes.
 //!
 //! Every segment's header names the generation directory its generation superseded: a roll, a
 //! re-key's included, carries it over from the segment it leaves. So whatever a trim leaves, the
@@ -344,8 +346,8 @@ pub(crate) struct Logged<K> {
     pub(crate) kept: K,
 }
 
-/// What [`Log::read`] hands the records of the valid log to, in log order. The open keeps every
-/// record's body; a reader that needs less keeps less.
+/// What [`Log::read`] hands the records of the valid log to, in log order, and then its end. The
+/// open keeps every record's body. A reader that needs less keeps less.
 pub(crate) trait Fold {
     /// What the fold keeps of a COMMIT record's frame.
     type Frames: Keep + Default;
@@ -362,6 +364,11 @@ pub(crate) trait Fold {
     /// The records from `from` on are not part of the log: stream frames a catch-up logged with
     /// no ACK after them, which the read cuts once it reaches the end of the log.
     fn cut(&mut self, from: Position);
+
+    /// The valid log ends, once, after every record and any [`Fold::cut`]: `state` is the current
+    /// segment's header with the carried-over fields brought to the end of the log, and `cut`
+    /// where the valid log ends before the bytes on disk do, if it does.
+    fn end(&mut self, state: &SegmentHeader, cut: Option<&Cut>);
 }
 
 /// The [`Keep`] [`Log::read`] reads COMMIT records with: the commit id each frame names, read as
@@ -393,11 +400,13 @@ impl<K: Keep> Keep for WithId<K> {
     }
 }
 
-/// The open's [`Fold`]: every record with its body whole, and every CLAIM.
+/// The open's [`Fold`]: every record after `min(base, acked)` with its body whole, every CLAIM,
+/// and whether the valid log holds a COMMIT record.
 #[derive(Debug, Default)]
 struct Records {
     records: Vec<LogRecord>,
     claims: Vec<(Epoch, Activation)>,
+    any_commit: bool,
 }
 
 impl Fold for Records {
@@ -420,6 +429,15 @@ impl Fold for Records {
 
     fn cut(&mut self, from: Position) {
         self.records.retain(|r| r.position < from);
+    }
+
+    fn end(&mut self, state: &SegmentHeader, _cut: Option<&Cut>) {
+        self.any_commit = self
+            .records
+            .iter()
+            .any(|r| matches!(r.body, RecordBody::Commit { .. }));
+        let min = state.base.min(state.acked);
+        self.records.retain(|r| r.position > min);
     }
 }
 
@@ -451,60 +469,70 @@ pub(crate) struct Valid {
 struct Run {
     /// The position of its first record.
     first: Position,
-    /// Per record, in log order: its segment's index among the kept ones, where it starts, and
-    /// the chain before it.
+    /// Per record, in log order: its segment in `reached`, where it starts, and the chain before
+    /// it.
     marks: Vec<(usize, u64, u32)>,
-    /// Per segment it reaches, in log order: the segment's index and the state carried to the
-    /// run's first record there.
-    states: Vec<(usize, SegmentHeader)>,
+    /// The segments it reaches, in log order.
+    reached: Vec<Reached>,
 }
 
-/// Where [`Run::unapplied`] cuts: the record, its segment, where it starts, the chain before it
-/// and the state carried to it.
+/// A segment a [`Run`] reaches.
+#[derive(Debug)]
+struct Reached {
+    /// The segment's index among the kept ones.
+    index: usize,
+    header: SegmentHeader,
+    header_len: u64,
+    /// The state carried to the run's first record there.
+    carried: SegmentHeader,
+}
+
+/// Where [`Run::unapplied`] cuts: the record, its segment, where it starts and the chain before
+/// it.
 #[derive(Debug)]
 struct Unapplied<'a> {
     position: Position,
-    segment: usize,
+    segment: &'a Reached,
     start: u64,
     before: u32,
-    state: &'a SegmentHeader,
 }
 
 impl Run {
+    /// The record at `position`, starting at `start` after chain `before`, in the kept segment
+    /// `index`, which `reach` describes when the run reaches it there.
     fn push(
         &mut self,
-        segment: usize,
+        position: Position,
         start: u64,
         before: u32,
-        position: Position,
-        carried: &SegmentHeader,
+        index: usize,
+        reach: impl FnOnce() -> Reached,
     ) {
         if self.marks.is_empty() {
             self.first = position;
         }
-        if self.states.last().is_none_or(|(s, _)| *s != segment) {
-            self.states.push((segment, carried.clone()));
+        if self.reached.last().is_none_or(|r| r.index != index) {
+            self.reached.push(reach());
         }
-        self.marks.push((segment, start, before));
+        let slot = self.reached.len().saturating_sub(1);
+        self.marks.push((slot, start, before));
     }
 
     fn clear(&mut self) {
         self.marks.clear();
-        self.states.clear();
+        self.reached.clear();
     }
 
     /// The first of its records above `acked`: it and every later one were never applied.
     fn unapplied(&self, acked: Position) -> Option<Unapplied<'_>> {
         // Positions grow by one along the run, so those at or below `acked` come first.
         let below = acked.0.checked_add(1)?.saturating_sub(self.first.0);
-        let &(segment, start, before) = self.marks.get(usize::try_from(below).ok()?)?;
-        let (_, state) = self.states.iter().find(|(s, _)| *s == segment)?;
+        let &(slot, start, before) = self.marks.get(usize::try_from(below).ok()?)?;
         Some(Unapplied {
             position: Position(self.first.0.checked_add(below)?),
-            segment,
+            segment: self.reached.get(slot)?,
             start,
             before,
-            state,
         })
     }
 }
@@ -575,12 +603,13 @@ impl Log {
     }
 
     /// Reads the log in `dir` (design: Log) and changes nothing: finds the valid prefix, a torn
-    /// tail after it,
-    /// and stream frames a catch-up logged with no ACK after them, and hands each record of the
-    /// valid log to `fold`, in log order. A gap or a malformed record under valid chains, a
-    /// segment header of another format or version, and a log missing records it still needs
-    /// fail. Every segment streams through one buffer, so the read takes that and what `fold`
-    /// keeps, whatever the size of a record or a segment.
+    /// tail after it, and stream frames a catch-up logged with no ACK after them, hands each
+    /// record of the valid log to `fold`, in log order, and then its end ([`Fold::end`]). A gap or
+    /// a malformed record under valid chains, a segment header of another format or version, and
+    /// a log missing records it still needs fail. Every segment streams through one buffer, so
+    /// whatever the size of a record or a segment, the read takes the list of segments, that
+    /// buffer, what `fold` keeps, and for the caught-up frames at the end of the log a mark per
+    /// frame and the headers of the segments they reach ([`Run`]).
     pub(crate) fn read<F: Fold>(dir: &Path, fold: &mut F) -> Result<Valid, LogError> {
         let listed = list(dir)?;
         if listed.is_empty() {
@@ -590,8 +619,6 @@ impl Log {
         }
         let mut kept: Vec<Segment> = Vec::new();
         let mut removed = Vec::new();
-        // Per kept segment: its header and the header's length.
-        let mut heads: Vec<(SegmentHeader, u64)> = Vec::new();
         // The current segment's header, length, header length and last chain.
         let mut current: Option<(SegmentHeader, u64, u64, u32)> = None;
         let mut state: Option<SegmentHeader> = None;
@@ -604,7 +631,7 @@ impl Log {
                 removed.push(segment);
                 continue;
             }
-            let file = File::open(&segment.path).map_err(io("read", &segment.path))?;
+            let file = File::open(&segment.path).map_err(io("open", &segment.path))?;
             let mut reader = match Reader::new(file) {
                 Ok(reader) => reader,
                 // The first segment's header is the log's identity, and any header of another
@@ -669,7 +696,12 @@ impl Log {
                 };
                 if matches!(&r.body, RecordBody::Commit { frame } if foreign(frame.id, header.lineage))
                 {
-                    run.push(index, end, chain, r.position, &carried);
+                    run.push(r.position, end, chain, index, || Reached {
+                        index,
+                        header: header.clone(),
+                        header_len,
+                        carried: carried.clone(),
+                    });
                 } else {
                     run.clear();
                 }
@@ -711,7 +743,6 @@ impl Log {
                     });
                 }
             }
-            heads.push((header.clone(), header_len));
             current = Some((header, end, header_len, chain));
             state = Some(carried);
             kept.push(segment);
@@ -724,15 +755,18 @@ impl Log {
         // re-key rolled to, say) may name another token.
         if let Some(acked) = state.as_ref().map(|st| st.acked)
             && let Some(unapplied) = run.unapplied(acked)
-            && let (Some((h, header_len)), Some(path)) = (
-                heads.get(unapplied.segment).cloned(),
-                kept.get(unapplied.segment).map(|k| k.path.clone()),
-            )
+            && let Some(path) = kept.get(unapplied.segment.index).map(|k| k.path.clone())
         {
-            let later = kept.split_off(unapplied.segment.saturating_add(1));
+            let at = unapplied.segment;
+            let later = kept.split_off(at.index.saturating_add(1));
             removed.splice(0..0, later);
-            state = Some(unapplied.state.clone());
-            current = Some((h, unapplied.start, header_len, unapplied.before));
+            state = Some(at.carried.clone());
+            current = Some((
+                at.header.clone(),
+                unapplied.start,
+                at.header_len,
+                unapplied.before,
+            ));
             next = unapplied.position;
             fold.cut(unapplied.position);
             cut = Some(Cut {
@@ -760,6 +794,7 @@ impl Log {
         // The current segment's identity with the state at the end of the log.
         state.first_position = header.first_position;
         state.supersedes = header.supersedes;
+        fold.end(&state, cut.as_ref());
         Ok(Valid {
             segments: kept,
             removed,
@@ -818,14 +853,10 @@ impl Log {
             }
         }
         let Records {
-            mut records,
+            records,
             claims,
+            any_commit,
         } = found;
-        let any_commit = records
-            .iter()
-            .any(|r| matches!(r.body, RecordBody::Commit { .. }));
-        let min = state.base.min(state.acked);
-        records.retain(|r| r.position > min);
         let recovered = Recovered {
             base: state.base,
             acked: state.acked,

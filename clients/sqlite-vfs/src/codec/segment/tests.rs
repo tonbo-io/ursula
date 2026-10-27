@@ -38,7 +38,6 @@ use super::Whole;
 use super::encode_header;
 use super::encode_record;
 use super::infallible;
-use super::read_header;
 use super::scan;
 use crate::ids::Activation;
 use crate::ids::GenId;
@@ -500,8 +499,9 @@ proptest! {
 
     // The streaming reader reads what a scan of the segment held whole read before it, through a
     // buffer smaller than a record or not: the same header, records and tail, or the same error,
-    // torn, gapped and malformed tails included. Reading only the header fails where the scan
-    // fails.
+    // torn, gapped and malformed tails included. Reading only the header reads the scan's header,
+    // and fails where the scan fails but for a record after the last position, which only the
+    // records show.
     #[test]
     fn the_reader_reads_what_a_whole_segment_scan_reads(
         h in header(),
@@ -521,11 +521,16 @@ proptest! {
             before.as_ref().map(|s| s.tail)
         );
         prop_assert!(agree(&scan(&bytes), &before));
-        let header = read_header(Trickle { bytes: &bytes, step }).map_err(infallible);
-        prop_assert_eq!(
-            format!("{:?}", header),
-            format!("{:?}", before.map(|s| s.header))
-        );
+        let header = Reader::new(Trickle { bytes: &bytes, step })
+            .map(Reader::into_header)
+            .map_err(infallible);
+        match before {
+            Err(SegmentError::PositionOverflow { .. }) => prop_assert!(matches!(header, Ok(_))),
+            before => prop_assert_eq!(
+                format!("{:?}", header),
+                format!("{:?}", before.map(|s| s.header))
+            ),
+        }
     }
 }
 
@@ -545,10 +550,17 @@ fn a_record_larger_than_the_buffer_streams_through_it() {
     let (bytes, _, records) = segment(&sample(), &bodies);
     let mut reader = Reader::new(bytes.as_slice()).map_err(infallible).unwrap();
     let mut whole = Whole::default();
-    assert_eq!(
-        reader.next(&mut whole).map_err(infallible).unwrap(),
-        Step::Record(records[0].clone())
-    );
+    let read = reader.next(&mut whole).map_err(infallible).unwrap();
+    assert_eq!(read, Step::Record(records[0].clone()));
+    // The kept frame grew to its own length, and no further.
+    let Step::Record(Record {
+        body: RecordBody::Commit { frame: kept },
+        ..
+    }) = read
+    else {
+        panic!("a COMMIT record");
+    };
+    assert_eq!(kept.capacity(), frame.len());
     let mut skip = Reader::new(bytes.as_slice()).map_err(infallible).unwrap();
     let Step::Record(first) = skip.next(&mut Skip).map_err(infallible).unwrap() else {
         panic!("a record");
