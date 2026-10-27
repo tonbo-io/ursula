@@ -10,6 +10,8 @@
 // (`sync_failed`) only when it was abandoned or its binding was not bound, and all of a binding's
 // tickets fail with its `reset` event.
 //
+// The token provider (token.ts) follows the events through `watch`: a 401 and a retired binding.
+//
 // The worker is unref'd while nothing waits, so an idle process exits as if it were not there, and
 // ref'd while an `open()` or a `synced()` is pending, so `await db.synced()` never lets the process
 // exit with the wait unresolved.
@@ -34,7 +36,8 @@ export type PumpEvent =
 	| { event: "sync_failed"; ticket: number; kind: string }
 	| { event: "reset"; path: string | null; kind: string; action: string }
 	| { event: "gap"; dropped: number }
-	| { event: "acked" | "condition" | "retired"; path: string | null };
+	| { event: "condition"; path: string | null; condition: string | null }
+	| { event: "acked" | "retired"; path: string | null };
 
 interface Ticket {
 	readonly path: string;
@@ -66,6 +69,13 @@ const MAX_FAILURES = 3;
 /** The stop flags of this thread's pump workers, set when the thread exits. */
 const stops = new Set<Int32Array>();
 let exitListener = false;
+/** What else follows the events: the token provider (token.ts). */
+const watchers = new Set<(event: PumpEvent) => void>();
+
+/** Calls `watcher` with every event this thread's pumps deliver, after the pump handled it. */
+export function watch(watcher: (event: PumpEvent) => void): void {
+	watchers.add(watcher);
+}
 
 /** Fires `target`'s listeners on the resets of its path. */
 export function track(target: ResetTarget): void {
@@ -265,6 +275,7 @@ class Pump {
 				default:
 					break;
 			}
+			for (const watcher of watchers) watcher(event);
 		}
 	}
 

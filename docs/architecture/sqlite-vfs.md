@@ -618,8 +618,9 @@ Tests:
 - No redirect is followed, so the stream URL names a gateway or a single node.
 - The DNS cache serves a host's addresses for 30 s after a lookup, and after a failed lookup keeps
   the last addresses for up to 10 minutes.
-- One bearer token per process: the last open's `token`, `ursula_set_token`, or the file
-  `URSULA_VFS_TOKEN_FILE` names, re-read when it changes and after a `401`. A private CA bundle
+- One bearer token per process: the last open's `token` (a string, or the latest a provider handed
+  out, see [Tokens](#tokens)), `ursula_set_token`, or the file `URSULA_VFS_TOKEN_FILE` names,
+  re-read when it changes and after a `401`. A private CA bundle
   goes in `URSULA_VFS_CA_FILE`. A token sent over `http://` to a host that is not a loopback
   address logs `token_in_clear` once.
 
@@ -1142,7 +1143,7 @@ export function importSqlite(url: string | URL, file: string, options?: ImportOp
 
 export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
   dir?: string;             // cache root, default <user cache>/sqlite-ursula/0.8
-  token?: string;           // one per process: the last open's applies
+  token?: string | TokenProvider; // one per process: the last open's applies (Tokens)
   signal?: AbortSignal;     // bounds the open, 30 s without one
   maxPendingBytes?: number; // default 64 MiB of compressed frames
   recreate?: boolean;       // stream missing, local data present: salvage, create, take over
@@ -1156,6 +1157,12 @@ export class UrsulaDatabase extends DatabaseSync {
   on(event: "reset", listener: (error: UrsulaResetError) => void): this;
   off(event: "reset", listener: (error: UrsulaResetError) => void): this;
 }
+
+export interface BearerToken {
+  token: string;
+  expiresAt: Date | number; // epoch ms
+}
+export type TokenProvider = (options: { signal: AbortSignal }) => Promise<BearerToken>;
 
 export interface GateOptions {
   signal?: AbortSignal;     // bounds the wait for the outcome (Gates)
@@ -1264,7 +1271,7 @@ mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
-| `UrsulaUnavailableError` | `open()` when its signal fires, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
+| `UrsulaUnavailableError` | `open()` when its signal fires (also before a token provider handed out a token: `unauthorized`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 Network failures never throw from statements or `synced()`. A refused write fails with
@@ -1381,6 +1388,43 @@ Tests: `test/synced.e2e.ts` "waits without blocking the event loop while the str
 answer back", "asks again for what a gap in the events may have dropped", "keeps the process alive
 while it waits: `await db.synced()` never ends the process unresolved", "lets an idle process exit
 on its own, its database left open", `test/workers.e2e.ts`.
+
+### Tokens
+
+`open()`'s `token` is a string or a provider, an async function that returns `{ token, expiresAt }`
+(`token.ts`). The extension knows only the process's token, which the package sets with
+`ursula_set_token`. A provider's tokens never go into `ursula_open`'s options, which a bind sends
+again on each of its retries and would put back a token older than one applied meanwhile.
+
+- One source per JavaScript thread, since a function lives on the thread that made it. The last
+  open that names a token wins: an open with another provider replaces the source and takes over
+  the bound paths it served, an open with a string stops it. An open without `token` changes
+  nothing.
+- An open asks the source for a token before its first request. The current token serves until
+  its refresh is due, else the open waits for the next call. At most one call of the provider runs
+  at a time, and concurrent opens share it.
+- A refresh is due after 70 to 80% of the token's lifetime (at least 1 s). A failed call is retried
+  after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, while an unexpired token serves the opens.
+  The provider's own `UrsulaError` with action `fix`, or a token that is not printable ASCII without
+  spaces, or an `expiresAt` that is not a time, fails for good: the waiting opens reject with it,
+  and the source calls the provider again only for the next open. An open whose signal fires first
+  rejects with `UrsulaUnavailableError` `unauthorized`, action `retry`, whose `cause` is the last
+  failure.
+- The pump's `condition` event `unauthorized` (a request refused twice with `401`) drops the
+  current token and calls the provider at once. The blocked request goes out again within 30 s
+  ([Answers](#answers)), under the new token. After a `gap`, the bound paths' status says whether
+  one was missed.
+- Timers are unref'd, except while an open waits for a token. When a refresh is due, or a binding
+  retires, the source stops if no path it serves is bound and no open waits for it or is binding.
+- `importSqlite` takes a string only: it blocks its thread, so nothing could refresh it meanwhile.
+
+Tests: `test/token.e2e.ts` "is called before the open's first request, again ahead of each expiry,
+and no more once no binding uses it", "is called once for concurrent opens, and a later open reuses
+its token", "is called again at once when a request is refused with 401", "fails the open with its
+own error when it fails for good, and is retried after any other failure", "hands the bindings it
+served to the provider of a later open", "never keeps the process alive: an idle process exits on
+its own". Neither e2e server checks tokens, so no test shows a refreshed token admitted where the
+previous one is refused.
 
 ## Status
 

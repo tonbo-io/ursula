@@ -29,6 +29,7 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 `open(url, { dir, token, signal, maxPendingBytes, recreate, readOnly, ...sqlite })` returns a promise of an `UrsulaDatabase`, a `node:sqlite` `DatabaseSync` subclass, so drizzle, kysely and Pi's driver take it. The rest of the options go to `DatabaseSync`.
 
 - The first open of a stream in the process binds its cache in `dir` (by default `<user cache>/sqlite-ursula/0.8`), catches it up and claims the stream: the last open that reaches the stream owns it. Later opens in the process return another connection on the same binding, with no network. Concurrent opens share one. Worker threads call `open` too.
+- `token` is the bearer token requests carry, or a provider that hands out tokens: see [Tokens](#tokens).
 - The open gives up when `signal` fires, after 30 s without one.
 - Several connections share one binding and its files, so node:sqlite's busy `timeout` defaults to 5000 ms. Pass `timeout` to change it.
 - A local cache the open cannot keep is moved aside when it holds data. That happens after a history change of the stream that lost commits the cache acknowledged (a restore to an earlier point), after any history change while the cache holds commits it has recorded no acknowledgement for (made offline, or acknowledged just before a crash), when its db file is not its own, and with `recreate: true` when the stream is missing. A cache that holds no data is replaced with nothing moved aside. A moved cache goes into `salvage/` in the stream's cache directory as a plain SQLite database with a `manifest.json`, `status().salvage` lists it, and the open builds a new cache from the stream. Without `recreate`, a missing stream over a cache that holds data fails with `not_found`.
@@ -36,6 +37,33 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 - `readOnly: true` claims nothing and never fences the owner, and writes fail with `SQLITE_READONLY` (8). In a process that owns the stream it returns a read-only connection on the owner's binding, which sees the owner's latest commits, acknowledged or not, so its `synced()` waits as the owner's does. In any other process it builds or catches up a reader cache of its own (`role: "reader"`, `reader-<n>/` in the stream's cache directory, one per reader process) to the stream's tail at the open, and reads the stream as of then: it does not follow later commits, and its `synced()` resolves at once. A closed stream opens too. A reader cache built on another deployment fails with `wrong_cluster`, as an owner's cache does, and an empty one builds. Close every read-only connection of the process and open again to read newer commits. When the stream is unreachable it opens an earlier reader cache as it is, and otherwise waits until the signal fires. A missing stream fails with `not_found`. `readOnly` with `recreate` fails with `invalid_argument`.
 
 `UrsulaDatabase` adds `name` (the stream's path, such as `/acme/notes`), `synced({ signal })`, `status()` and `on("reset", listener)` / `off("reset", listener)`.
+
+## Tokens
+
+`token` is a string, or a provider: an async function that returns `{ token, expiresAt }`, where `expiresAt` is a `Date` or milliseconds since the epoch. The package then keeps the token fresh in the background, with no separate refresher process.
+
+```ts
+import { open, UrsulaUnavailableError } from "@tonbo/sqlite-ursula";
+
+const db = await open("https://streams.example.com/acme/notes", {
+  token: async ({ signal }) => {
+    const r = await fetch(exchangeUrl, { method: "POST", headers: { authorization: `Bearer ${apiKey}` }, signal });
+    if (r.status === 401) throw new UrsulaUnavailableError("unauthorized: the exchange refused the key", "unauthorized");
+    if (!r.ok) throw new Error(`the exchange answered ${r.status}`);
+    const { access_token, expires_in } = await r.json();
+    return { token: access_token, expiresAt: Date.now() + expires_in * 1000 };
+  },
+});
+```
+
+- The package calls the provider before the open's first request, again after 70 to 80% of each token's lifetime, and again at once when the extension reports a request refused with `401`. Concurrent calls share one, and a later open with the same provider reuses its token. `signal` fires when the package stops waiting for the answer, after 30 s.
+- A provider that throws an `UrsulaError` whose `action` is `fix` has failed for good: the open rejects with that error, and the package stops calling the provider until the next `open()` with one. Every other error is retried with backoff, from 1 s up to 30 s, and an unexpired token keeps serving meanwhile.
+- An open whose `signal` fires before the provider handed out a token rejects with `UrsulaUnavailableError` `unauthorized`, whose action is `retry` and whose `cause` is the provider's last error. A token that is not printable ASCII without spaces, or an `expiresAt` that is not a time, fails the open with `UrsulaSetupError` `invalid_argument`.
+- After the open, a provider that failed for good leaves its last token in place. Once the server refuses it, `status().replication.condition` is `unauthorized`, and commits continue until the backlog fills.
+- A request refused twice blocks replication as `unauthorized`, and the extension sends it again every 30 s, so a token the provider hands out after a `401` applies within 30 s.
+- The token is one per process. The last open that names a token sets it: a later open with another provider takes over the databases this one served, and an open with a string stops it. A function lives on one JavaScript thread, so each thread runs its own provider: give the threads of a process the same kind of token.
+- The provider's timers never keep the process alive. It stops once no database opened with a provider on its thread is bound.
+- Plain string tokens and `URSULA_VFS_TOKEN_FILE` work as before. No token is logged.
 
 ## Gating outputs
 
@@ -74,6 +102,7 @@ What the gate does not cover:
 
 `importSqlite(url, file, { token, timeoutMs })` imports a plain SQLite database file into a new stream, as the stream's first snapshot, and returns `{ offset, digest, pages, bytes }`. Then `open(url)` it as any other stream.
 
+- `token` is a string, for the import alone. The import blocks its thread, so no provider could refresh a token meanwhile: pass `(await provider({ signal })).token`.
 - The file must have 4096-byte pages, with no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
 - The stream must be missing, or empty. A stream of another content type fails with `stream_format`, anything else with `stream_state`, and nothing is published. A server of another release line fails with `protocol_mismatch`, and an answer without `Ursula-Protocol` and `Ursula-Cluster-Id` with `no_server_identity`.
 - While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until it is deleted or recreated. `UrsulaUnavailableError` from an import says `fix` for that reason.
@@ -88,7 +117,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (retry after `synced()`), `unsupported` (fix), `too_large` (fix: the commit's pages take more than `URSULA_VFS_MAX_COMMIT_BYTES`, 128 MiB by default, so split the transaction or raise the limit, at most 1 GiB) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
-| `UrsulaUnavailableError` | `open()` when its signal fired first | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
+| `UrsulaUnavailableError` | `open()` when its signal fired first, also before a token provider handed out a token (`unauthorized`, action `retry`) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except reads in a read transaction it had open, which keep its snapshot. A write in it still fails. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.

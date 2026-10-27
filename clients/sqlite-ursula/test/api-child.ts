@@ -2,13 +2,15 @@
 // the stream at argv[2] in the cache root argv[3] with the package's `open`, commits, then:
 // - `gate`: holds the next append's answer back for 2 s (argv[4] is where faults are scripted, as
 //   `faultsUrl` in test/kit.ts), awaits `db.synced()` and prints `synced`;
-// - `idle`: awaits `db.synced()` and prints `idle`.
+// - `idle`: awaits `db.synced()` and prints `idle`;
+// - `token`: as `idle`, opened with a token provider whose token lasts an hour, and prints `token`.
 // It never closes the database or exits by itself: the process ends when nothing keeps it alive.
 import { loadUrsulaVfs, open } from "../src/index.ts";
 
 const [url, dir, mode, faults] = process.argv.slice(2) as [string, string, string, string];
 loadUrsulaVfs();
-const db = await open(url, { dir });
+const provider = async () => ({ token: "child-token", expiresAt: Date.now() + 3_600_000 });
+const db = await open(url, mode === "token" ? { dir, token: provider } : { dir });
 db.exec("CREATE TABLE IF NOT EXISTS t(x)");
 if (mode === "gate") {
 	await db.synced();
@@ -19,5 +21,5 @@ if (mode === "gate") {
 	process.stdout.write(`synced ${Date.now() - started}\n`);
 } else {
 	await db.synced();
-	process.stdout.write("idle\n");
+	process.stdout.write(mode === "token" ? "token\n" : "idle\n");
 }
