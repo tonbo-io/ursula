@@ -194,7 +194,8 @@ fn a_pass_counts_the_bytes_the_open_would_resend() {
     assert!(json.contains("\"held\":false"), "{json}");
 
     let mut log = Log::open(&h.log_dir()).unwrap().0;
-    log.append(&ack(3)).unwrap();
+    // Records 1 to 4 are the log so far: the commits at 3 and 4 are pending.
+    log.append(&ack(4)).unwrap();
     log.sync().unwrap();
     let seen = h.inspect(Vec::new());
     assert!(seen.clean(), "{}", seen.to_json());
