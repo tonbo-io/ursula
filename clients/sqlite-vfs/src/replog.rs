@@ -5,8 +5,8 @@
 //! segments. [`Log::read`], the one reading rule, finds it and changes nothing: it streams every
 //! segment through one buffer ([`crate::codec::segment::Reader`]) and hands each record to a
 //! [`Fold`], which keeps what its caller needs. Besides the list of segments, a read takes that
-//! buffer, what the fold keeps, and for the caught-up frames at the end of the log a mark per frame
-//! and the headers of the segments they reach ([`Log::read`]). [`Log::open`] reads the log so,
+//! buffer, what the fold keeps, a mark per frame of the longest run of caught-up frames, and the
+//! headers of the segments that run reaches ([`Log::read`]). [`Log::open`] reads the log so,
 //! keeping every record's body, then cuts the log after the valid prefix and reports the cut
 //! ([`Cut`]) with a warning, whatever follows the first broken record: after a power loss the
 //! filesystem may keep later unsynced records and lose an earlier one, and a database user can
@@ -608,8 +608,8 @@ impl Log {
     /// a malformed record under valid chains, a segment header of another format or version, and
     /// a log missing records it still needs fail. Every segment streams through one buffer, so
     /// whatever the size of a record or a segment, the read takes the list of segments, that
-    /// buffer, what `fold` keeps, and for the caught-up frames at the end of the log a mark per
-    /// frame and the headers of the segments they reach ([`Run`]).
+    /// buffer, what `fold` keeps, a mark per frame of the longest run of caught-up frames, and the
+    /// headers of the segments that run reaches ([`Run`]).
     pub(crate) fn read<F: Fold>(dir: &Path, fold: &mut F) -> Result<Valid, LogError> {
         let listed = list(dir)?;
         if listed.is_empty() {

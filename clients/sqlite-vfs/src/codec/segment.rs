@@ -34,8 +34,8 @@
 //!
 //! A [`Reader`] passes every record's payload through one buffer of [`BUFFER`] bytes and keeps of
 //! a COMMIT record's frame only what its [`Keep`] keeps, so reading a segment takes that buffer
-//! whatever the size of a record or of the segment. Only the header is read whole: at most 131 KiB
-//! by its format.
+//! whatever the size of a record or of the segment. Only the header is read whole: at most
+//! 131,192 bytes by its format.
 
 use std::convert::Infallible;
 use std::fs::File;

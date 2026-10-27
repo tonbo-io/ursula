@@ -663,9 +663,10 @@ directory and return the db path.
 - The current generation is the one no other generation's first segment supersedes. One pure
   function chooses it and changes nothing: it reads only `gen-<id32>` directories, and their first
   segment headers only when there are two or more. Two that nothing supersedes are ambiguous, and
-  generations that all supersede one another (only damage makes them) are circular. Either is an
-  error, told apart from a root with no generation. The open finishes the others by it, deleting
-  or salvaging them, and then reads the current generation by it.
+  generations that all supersede one another (only damage or a copy by hand makes them) are
+  circular. Either is an error, told apart from a root with no generation. The open finishes the
+  superseded ones by it, deleting or salvaging them, and then reads the current generation by it.
+  Every circular generation is superseded, so the open finishes them all and then sees none.
 - A build supersedes the root's one generation, and refuses a root that holds two or more: it
   runs after the open finished them, and building over a superseded one would leave it named by
   nobody.
@@ -709,17 +710,17 @@ claim   = u8 0 | u8 1 u64 epoch [16] activation
   buffer, its chains are verified, and each record of the valid log goes to a fold that keeps what
   its reader needs, and then the log's end: the state there and where the log is cut. The open's
   fold keeps every record's body, and the open then cuts. Whatever the size of a record or a
-  segment, a read takes the list of segments, the buffer, what the fold keeps, and for the
-  caught-up stream frames at the end of the log a mark per frame and the headers of the segments
-  they reach. The commit id of a COMMIT record's frame is read as the frame streams by, which tells
+  segment, a read takes the list of segments, the buffer, what the fold keeps, a mark per frame of
+  the longest run of caught-up stream frames, and the headers of the segments that run reaches. The commit id of a COMMIT record's frame is read as the frame streams by, which tells
   caught-up stream frames from the generation's own commits.
 - Positions start at 1. The valid log is the longest prefix whose chain verifies and whose
   positions grow by one. Open cuts the log at its first broken record, whether or not a
   chain-valid record follows, and reports the cut. A power loss can keep later unsynced records and
   lose an earlier one, and a user can store bytes that verify as a later record, so neither may
   refuse the open. The cut keeps L3, since pages reach the db only after F1 fsyncs the log.
-- A gap or a malformed record under valid chains fails as `internal`. Caught-up stream frames with
-  no ACK after them are cut, since a catch-up applies its frames only once that ACK is fsynced.
+- A gap, a position that overflows, or a malformed record under valid chains fails as `internal`,
+  in the first segment as in any other. Caught-up stream frames with no ACK after them are cut,
+  since a catch-up applies its frames only once that ACK is fsynced.
 - A binding writes an ACK when it resets or retires. A clean retire and a `rewound` reset fsync
   it, so a cleanly closed log holds no commit after its latest ACK but ones never acknowledged.
 - A segment goes once all its records are at or below `min(base, acked)` (F3). Disk use is the
