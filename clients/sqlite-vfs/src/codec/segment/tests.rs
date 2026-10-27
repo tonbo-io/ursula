@@ -525,7 +525,9 @@ proptest! {
             .map(Reader::into_header)
             .map_err(infallible);
         match before {
-            Err(SegmentError::PositionOverflow { .. }) => prop_assert!(matches!(header, Ok(_))),
+            Err(SegmentError::PositionOverflow { .. }) => {
+                prop_assert!(header.is_ok(), "{:?}", header);
+            }
             before => prop_assert_eq!(
                 format!("{:?}", header),
                 format!("{:?}", before.map(|s| s.header))

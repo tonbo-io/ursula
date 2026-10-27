@@ -1397,23 +1397,21 @@ fn a_later_segment_that_does_not_follow_fails_after_its_records() {
             len: 100,
         })
         .collect();
-    let overflow = |e: &LogError| {
-        matches!(e, LogError::Segment {
-            source: SegmentError::PositionOverflow { .. },
-            ..
-        })
-    };
-    let cases: [(Damage, &dyn Fn(&LogError) -> bool); 4] = [
-        (Damage::DropMiddle { segment: 0 }, &|e| {
-            matches!(e, LogError::Gap { at: 0, .. })
-        }),
+    // The error a case fails with.
+    enum Refusal {
+        Gap,
+        Lineage,
+        Overflow,
+    }
+    let cases = [
+        (Damage::DropMiddle { segment: 0 }, Refusal::Gap),
         (
             Damage::Rewrite {
                 segment: 0,
                 lineage: true,
                 overflow: false,
             },
-            &|e| matches!(e, LogError::Lineage { .. }),
+            Refusal::Lineage,
         ),
         (
             Damage::Rewrite {
@@ -1421,7 +1419,7 @@ fn a_later_segment_that_does_not_follow_fails_after_its_records() {
                 lineage: true,
                 overflow: true,
             },
-            &overflow,
+            Refusal::Overflow,
         ),
         (
             Damage::Rewrite {
@@ -1429,17 +1427,25 @@ fn a_later_segment_that_does_not_follow_fails_after_its_records() {
                 lineage: false,
                 overflow: true,
             },
-            &overflow,
+            Refusal::Overflow,
         ),
     ];
-    for (harm, refused) in cases {
+    for (harm, refusal) in cases {
         let dir = TempDir::new("log-later-segment");
         let log_dir = dir.path().join("log");
         let acks_go_back = write_log(&log_dir, 300, &ops);
         assert!(segment_files(&log_dir).len() > 2);
         apply(&log_dir, &harm);
         let err = Log::open(&log_dir).unwrap_err();
-        assert!(refused(&err), "{harm:?}: {err:?}");
+        let refused = match refusal {
+            Refusal::Gap => matches!(err, LogError::Gap { at: 0, .. }),
+            Refusal::Lineage => matches!(err, LogError::Lineage { .. }),
+            Refusal::Overflow => matches!(err, LogError::Segment {
+                source: SegmentError::PositionOverflow { .. },
+                ..
+            }),
+        };
+        assert!(refused, "{harm:?}: {err:?}");
         opens_as_before(&log_dir, acks_go_back).unwrap();
     }
 }
