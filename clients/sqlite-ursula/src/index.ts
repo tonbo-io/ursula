@@ -28,7 +28,7 @@ import { type Binding, UrsulaDatabase } from "./database.ts";
 import { raced, reasonOf } from "./abort.ts";
 import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
-import { leaseToken, type TokenLease, type TokenProvider, useStringToken } from "./token.ts";
+import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
 
 export { loadUrsulaVfs } from "./control.ts";
 export { type GateOptions, gate } from "./gate.ts";
@@ -57,11 +57,11 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	readonly dir?: string | undefined;
 	/**
 	 * The bearer token requests carry, or a {@link TokenProvider} that hands out tokens and when they
-	 * expire. The package calls a provider before the open's first request when it holds no token,
-	 * again ahead of each token's expiry, and again at once after a request was refused with 401,
-	 * and stops once no binding opened with a provider on this thread is bound. One token per
-	 * process: the last open's applies, so a later open with another function takes over from this
-	 * one, and one with a string stops it on its thread. Pass the same function to reuse its token.
+	 * expire. The package calls a provider before the open's first request when it holds no valid
+	 * token, again ahead of each token's expiry, and again at once after a request was refused with
+	 * 401, and stops once no binding this thread opened is bound. One token per process: the last
+	 * open's applies. A later open with another function names the function the next call runs, and
+	 * shares the token held meanwhile. One with a string stops the provider on its thread.
 	 */
 	readonly token?: string | TokenProvider | undefined;
 	/** Bounds the open: by default it gives up after 30 s. */
@@ -147,7 +147,8 @@ const byAbort = new WeakSet<object>();
  * the provider's own {@link UrsulaError} when it fails for good, with an `UrsulaSetupError`
  * `invalid_argument` when it hands out a token that cannot be sent, and with an
  * `UrsulaUnavailableError` `unavailable` whose cause is the provider's last error when it handed out
- * no token before the signal fired.
+ * no token before the signal fired. A bind refused with 401 after a failed call of the provider
+ * fails `unauthorized` with that failure as its cause, and action `retry` unless it failed for good.
  */
 export async function open(url: string | URL, options: OpenOptions = {}): Promise<UrsulaDatabase> {
 	const { dir, token, signal, maxPendingBytes, recreate, readOnly, timeout, ...rest } = options;
@@ -180,18 +181,9 @@ export async function open(url: string | URL, options: OpenOptions = {}): Promis
 	const until = signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
 	// Either kind of token is applied once, here, with `ursula_set_token`, never in `ursula_open`'s
 	// options, which a bind sends again on each of its retries, over a token applied meanwhile.
+	if (typeof token === "function") return openWithProvider(token, stream, until, () => opened(stream, dir, json, sqlite, readOnly === true, until));
 	if (typeof token === "string") useStringToken(token);
-	if (typeof token !== "function") return opened(stream, dir, json, sqlite, readOnly === true, until);
-	const lease: TokenLease = await leaseToken(token, stream, until);
-	try {
-		const db = await opened(stream, dir, json, sqlite, readOnly === true, until);
-		lease.done(db.boundPath);
-		return db;
-	} catch (error) {
-		throw lease.failed(error);
-	} finally {
-		lease.done();
-	}
+	return bound(await opened(stream, dir, json, sqlite, readOnly === true, until));
 }
 
 /** The open of `stream` once its token is set: a connection on its binding, binding it first unless another open does. */

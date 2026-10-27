@@ -1,14 +1,15 @@
 // `open()`'s token provider against the e2e server (test/stack.ts): the package calls it before
 // the open's first request, again ahead of each token's expiry and at once after a 401, shares one
-// call between concurrent opens, stops once no binding uses it or another open's token replaced
-// it, and never keeps the process alive. Its failures are typed. The 401s are scripted faults (the
+// call between concurrent opens, whatever functions they passed, stops once no binding of the thread
+// is bound or an open with a string replaced it, and never keeps the process alive. Its failures are typed. The 401s are scripted faults (the
 // model's, or test/gate.mjs's in front of Ursula), since neither server checks tokens. In front of
 // Ursula the gate records each request's `Authorization` header (`sentTokens`), so there the suite
-// also checks which token each request carried.
+// also checks which token each request carried. The token is one per process, so each test closes
+// its databases and waits until the provider stopped (`closeAll`): the next test starts with none held.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { type BearerToken, loadUrsulaVfs, open, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
+import { type BearerToken, loadUrsulaVfs, open, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
 import { ext, fault, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
@@ -43,6 +44,13 @@ async function until(what: string, done: () => boolean, ms = 10_000): Promise<vo
 		expect(Date.now(), what).toBeLessThan(deadline);
 		await sleep(20);
 	}
+}
+
+/** Closes `dbs` and waits until each retired and the pump told the provider, which stops then. */
+async function closeAll(...dbs: UrsulaDatabase[]): Promise<void> {
+	for (const db of dbs) db.close();
+	for (const db of dbs) await retired(db.boundPath);
+	await sleep(500);
 }
 
 /** Runs test/api-child.ts in `token` mode: its output, exit code and how long it took to exit after its output. */
@@ -81,7 +89,7 @@ describe("a token provider", () => {
 			expect(after.length).toBeGreaterThan(0);
 			expect(after.every((r) => r.authorization === "Bearer bind-2")).toBe(true);
 		}
-		db.close();
+		await closeAll(db);
 	});
 
 	it("is called before the open's first request, again ahead of each expiry, and no more once no binding uses it", async () => {
@@ -125,27 +133,30 @@ describe("a token provider", () => {
 			const sent = await sentTokens(s.path);
 			if (sent !== undefined) expect(sent[0]?.authorization).toBe("Bearer shared-1");
 		}
-		for (const db of dbs) db.close();
+		await closeAll(...dbs);
 	});
 
-	it("serves concurrent opens with different functions the last one's token", async () => {
+	it("serves concurrent opens with different functions from one call, and runs the last one next", async () => {
 		const dir = freshDir();
 		const called: string[] = [];
 		// A new function on each call, as an inline arrow is.
 		const inline = (label: string) => async (): Promise<BearerToken> => {
 			called.push(label);
 			await sleep(300);
-			return { token: `inline-${label}`, expiresAt: Date.now() + 3_600_000 };
+			return { token: `inline-${label}`, expiresAt: Date.now() + 2_000 };
 		};
 		const streams = ["a", "b", "c"].map((label) => ({ label, s: stream(`token-inline-${label}`) }));
 		const dbs = await Promise.all(streams.map(({ label, s }) => open(s.url, { dir, token: inline(label) })));
-		// Each open replaced the provider before the last one's call answered: that call served all three.
-		expect(called).toEqual(["a", "b", "c"]);
+		// The first open's call was in flight when the others named their functions: it served all three.
+		expect(called).toEqual(["a"]);
 		for (const { s } of streams) {
 			const sent = await sentTokens(s.path);
-			if (sent !== undefined) expect(sent[0]?.authorization).toBe("Bearer inline-c");
+			if (sent !== undefined) expect(sent[0]?.authorization).toBe("Bearer inline-a");
 		}
-		for (const db of dbs) db.close();
+		// The refresh runs the function the last open named.
+		await until("a refresh", () => called.length >= 2, 5_000);
+		expect(called[1]).toBe("c");
+		await closeAll(...dbs);
 	});
 
 	it("serves the token it holds at once, expired too, while its refresh fails", async () => {
@@ -161,8 +172,26 @@ describe("a token provider", () => {
 		const started = Date.now();
 		const again = await open(s.url, { dir, token: p.fn, signal: AbortSignal.timeout(5_000) });
 		expect(Date.now() - started).toBeLessThan(1_000);
-		again.close();
-		db.close();
+		await closeAll(again, db);
+	});
+
+	it("waits for the refresh in flight rather than serve an expired token while it is healthy", async () => {
+		const dir = freshDir();
+		// Every refresh takes 2 s, longer than what is left of the 1.5 s token when it starts.
+		const p = provider("slow", 1_500, (n) => (n > 1 ? sleep(2_000) : undefined));
+		const a = await open(stream("token-slow-a").url, { dir, token: p.fn });
+		await until("the refresh in flight", () => p.calls.length >= 2, 5_000);
+		await sleep(600);
+		// The token held expired and the refresh has not answered: the open waits for it.
+		const b = stream("token-slow-b");
+		const db = await open(b.url, { dir, token: p.fn, signal: AbortSignal.timeout(5_000) });
+		expect(p.calls).toHaveLength(2);
+		const sent = await sentTokens(b.path);
+		if (sent !== undefined) {
+			expect(sent.length).toBeGreaterThan(0);
+			expect(sent[0]?.authorization).toBe("Bearer slow-2");
+		}
+		await closeAll(db, a);
 	});
 
 	it("is called again at once when a request is refused with 401", async () => {
@@ -187,7 +216,7 @@ describe("a token provider", () => {
 			expect(posts.at(-1)).toBe("Bearer refused-2");
 			expect(posts.slice(-3, -1)).toEqual(["Bearer refused-1", "Bearer refused-1"]);
 		}
-		db.close();
+		await closeAll(db);
 	});
 
 	it("fails the open with its own error when it fails for good, and is retried after any other failure", async () => {
@@ -204,7 +233,7 @@ describe("a token provider", () => {
 		});
 		const db = await open(stream("token-flaky").url, { dir: freshDir(), token: flaky.fn });
 		expect(flaky.calls).toHaveLength(3);
-		db.close();
+		await closeAll(db);
 	});
 
 	it("fails the open at its signal with `unavailable`, `retry`, when it handed out no token", async () => {
@@ -243,33 +272,51 @@ describe("a token provider", () => {
 		const [a, b] = await Promise.all([open(waiting.url, { dir, token: p.fn }), open(stream("string-after-token").url, { dir, token: "a-string-token" })]);
 		const sent = await sentTokens(waiting.path);
 		if (sent !== undefined) expect(sent[0]?.authorization).toBe("Bearer a-string-token");
-		const calls = p.calls.length;
-		expect(calls).toBe(1);
+		// The string open stopped the provider in the same tick, before its call started: it never ran.
+		expect(p.calls).toHaveLength(0);
 		await sleep(3_000);
-		expect(p.calls).toHaveLength(calls);
-		a.close();
-		b.close();
+		expect(p.calls).toHaveLength(0);
+		await closeAll(a, b);
 	});
 
-	it("hands the bindings it served to the provider of a later open", async () => {
+	it("hands the bindings it served to the provider of a later open, which shares the token held", async () => {
 		const dir = freshDir();
 		const first = provider("first", 2_000);
 		const second = provider("second", 2_000);
 		const s = stream("token-first");
 		const a = await open(s.url, { dir, token: first.fn });
 		const b = await open(stream("token-second").url, { dir, token: second.fn });
+		// The token held served the second open: no call of the second function yet.
+		expect(second.calls).toHaveLength(0);
 		const path = b.boundPath;
 		b.close();
 		await retired(path);
 		// `a` still needs a fresh token: the second provider keeps refreshing, the first never runs again.
-		const calls = first.calls.length;
-		await until("a refresh for the first binding", () => second.calls.length >= 3, 6_000);
-		expect(first.calls).toHaveLength(calls);
+		await until("a refresh for the first binding", () => second.calls.length >= 3, 8_000);
+		expect(first.calls).toHaveLength(1);
 		a.exec("CREATE TABLE t(x)");
 		await a.synced();
 		const sent = await sentTokens(s.path);
 		if (sent !== undefined) expect(nth("second", sent.filter((r) => r.method === "POST").at(-1)?.authorization)).toBeGreaterThanOrEqual(3);
-		a.close();
+		await closeAll(a);
+	});
+
+	it("keeps refreshing while a binding opened with a string token is bound", async () => {
+		const dir = freshDir();
+		const p = provider("any", 2_000);
+		const s = stream("token-string-bound");
+		const a = await open(s.url, { dir, token: "a-string-token" });
+		const b = await open(stream("token-provider-bound").url, { dir, token: p.fn });
+		const path = b.boundPath;
+		b.close();
+		await retired(path);
+		// The provider's tokens are the process's, so `a` carries them now: it keeps them fresh.
+		await until("a refresh for the binding opened with a string", () => p.calls.length >= 3, 8_000);
+		a.exec("CREATE TABLE t(x)");
+		await a.synced();
+		const sent = await sentTokens(s.path);
+		if (sent !== undefined) expect(nth("any", sent.filter((r) => r.method === "POST").at(-1)?.authorization)).toBeGreaterThanOrEqual(3);
+		await closeAll(a);
 	});
 
 	it("never keeps the process alive: an idle process exits on its own", async () => {
