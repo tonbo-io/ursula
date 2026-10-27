@@ -14,6 +14,8 @@
 //! - [`MARKER`] and [`EMPTY_PAGE_ONE_BLAKE3`]: the page-1 marker, and page 1 of an empty
 //!   generation.
 //! - [`MANIFEST`]: a salvage's `manifest.json`.
+//! - [`HOST_RECORD`] and [`HOST_RECORD_NAME`]: a host directory's record of a cache directory, and
+//!   its name (design: Hosts), frozen within a release line from 0.11.2.
 
 use std::io::Cursor;
 
@@ -34,6 +36,7 @@ use super::segment::Tail;
 use super::snapshot;
 use super::snapshot::SnapshotFields;
 use super::snapshot::SnapshotHeader;
+use crate::hostdir;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::GenId;
@@ -116,6 +119,12 @@ const MANIFEST: &str = concat!(
     r#""incarnation":"4503599627370497","stream_incarnation":"4503599627370498","#,
     r#""acknowledged_position":3,"acknowledged_offset":100,"unacknowledged":1,"plain":true}"#
 );
+
+/// The host directory's record of the cache directory `/home/app/.cache/sqlite-ursula/0.8`.
+const HOST_RECORD: &str = "{\"v\":1,\"dir\":\"/home/app/.cache/sqlite-ursula/0.8\"}\n";
+
+/// [`HOST_RECORD`]'s name: `dir-` and the first 32 hex digits of the BLAKE3 of the path.
+const HOST_RECORD_NAME: &str = "dir-5ffc76874c90c473b24da34f49bd5f98";
 
 fn unhex(text: &str) -> Vec<u8> {
     let digits: Vec<u8> = text
@@ -384,4 +393,12 @@ fn the_salvage_manifest_is_frozen() {
         plain: true,
     });
     assert_eq!(manifest.render(), MANIFEST);
+}
+
+#[test]
+fn the_host_directory_record_is_frozen() {
+    let dir = "/home/app/.cache/sqlite-ursula/0.8";
+    assert_eq!(hostdir::record_line(dir), HOST_RECORD);
+    assert_eq!(hostdir::record_name(dir), HOST_RECORD_NAME);
+    assert_eq!(hostdir::recorded_dir(HOST_RECORD.as_bytes()).unwrap(), dir);
 }

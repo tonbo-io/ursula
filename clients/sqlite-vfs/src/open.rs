@@ -101,6 +101,8 @@ use crate::generation::GenerationError;
 use crate::generation::PathError;
 use crate::generation::Root;
 use crate::generation::canonical_path;
+use crate::hostdir;
+use crate::hostdir::HostDirError;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -272,6 +274,10 @@ pub(crate) enum LocalSetup {
     Log(#[from] LogError),
     #[error("the generation is of stream {found:?}, not {expected:?}")]
     OtherStream { found: String, expected: String },
+    /// The host directory exists and cannot take the record of the cache directory (design:
+    /// Hosts).
+    #[error(transparent)]
+    HostDir(#[from] HostDirError),
 }
 
 /// Why an open failed (design: Errors, `UrsulaSetupError` and `UrsulaUnavailableError`).
@@ -370,7 +376,10 @@ pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
         LocalSetup::Local(LocalError::Log(log))
         | LocalSetup::Log(log)
         | LocalSetup::Generation(GenerationError::Log(log)) => bug(log),
-        LocalSetup::Local(_) | LocalSetup::Generation(_) | LocalSetup::OtherStream { .. } => false,
+        LocalSetup::Local(_)
+        | LocalSetup::Generation(_)
+        | LocalSetup::OtherStream { .. }
+        | LocalSetup::HostDir(_) => false,
     };
     if internal {
         OpenError::Internal(e)
@@ -1274,10 +1283,15 @@ pub(crate) fn prepare(spec: &OpenSpec, root: Option<Arc<Root>>) -> Result<Prepar
     prepare_locked(root, spec)
 }
 
-/// [`prepare`] in a root this open holds locked already. A current generation that a reset
-/// binding's connections still hold is copied first, and the copy published in its place.
+/// [`prepare`] in a root this open holds locked already. An owner's open first records the cache
+/// directory in the host directory, if there is one, before anything can be logged in the root
+/// ([`hostdir::record`], design: Hosts). A current generation that a reset binding's connections
+/// still hold is copied first, and the copy published in its place.
 pub(crate) fn prepare_locked(root: Arc<Root>, spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let name = canonical_path(&spec.url)?;
+    if let Access::Owner { .. } = spec.access {
+        hostdir::record(&spec.dir).map_err(local)?;
+    }
     root.finish_leftovers().map_err(local)?;
     let current = match root.current_or_unreadable().map_err(local)? {
         Some(Ok(generation)) if root.held(&generation) => {

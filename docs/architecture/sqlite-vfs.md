@@ -953,6 +953,7 @@ Every row resumes or rebuilds with no manual step.
 | during a salvaging publish | the publish or the salvage finished from the manifest | [Layout](#layout) | `salvage_marked`, `publish_renamed`, `salvage_moved` |
 | during a copy | one generation current | [Materialize](#materialize) | `copy_db`, `copy_log` |
 | during a trim or a cut | the log reads the same | F3, L1 | `trim_unlinked`, `cut_removed` |
+| while an owner open records its cache directory | the record is complete or absent, at most a temp file beside it, and the root holds no generation yet | [Hosts](#hosts) | `host_tmp_synced`, `host_linked`, `host_dir_synced` |
 | during a claim | its CLAIM record marks it ours, the next claim goes higher | [Claims](#claims) | |
 | power loss | the durable log prefix with L3: unacknowledged commits after the last log fsync lost, acknowledged ones return from the stream | L4 | |
 | a failed fsync, a WAL page that reads back other bytes | reset `local_damage`, materialization rewrites pages since the BASE | L3 | |
@@ -964,7 +965,8 @@ transaction applied, and the reopen sends it whole", `test/core.e2e.ts` "keeps e
 SIGKILL interrupts: the reopen sends what never reached the stream", `generation/tests.rs`
 `a_crash_after_each_salvaging_publish_step_converges`, `replog/tests.rs`
 `a_crash_after_the_roll_before_the_claim_leaves_the_new_token`,
-`a_crash_before_the_rename_keeps_the_old_header`. Power loss: the world's restarts after a power
+`a_crash_before_the_rename_keeps_the_old_header`, `test/host.e2e.ts` "crashes while an owner open
+records its cache directory". Power loss: the world's restarts after a power
 loss (`replicator/tests/world.rs`
 `a_provisional_restart_after_a_power_loss_of_acknowledged_commits_goes_stale`) and
 `driver/tests.rs` `a_provisional_open_whose_log_lost_acknowledged_commits_goes_stale`.
@@ -1159,6 +1161,67 @@ divergent commit fences exactly one", "resets `stale` with nothing sent when its
 writing", "goes live over an idle original and fences it", "goes live over an idle original that
 never wrote and fences it", and "rebuilds a copy that fell behind retention, never trusting the
 original's snapshot". An old disk snapshot whose catch-up and next commit take the commit id of the original's unsent tail: `test/stale.e2e.ts` "S5: an old disk snapshot catches up and commits under the id of the original's unsent tail, and the original rebuilds without sending it".
+
+### Hosts
+
+A host that snapshots or moves the process, or the VM it runs in, needs to know whether the
+snapshot holds a commit the stream lacks. The extension tells it where to look.
+
+The host creates the host directory, `/var/lib/sqlite-ursula/host`, before any process that may
+load the extension starts. Every such process must be able to create files in it, for example a
+root-owned directory of mode 1777. A process that cannot see the directory records nothing.
+
+```text
+/var/lib/sqlite-ursula/host/
+  dir-<key>               a record of a cache directory, mode 0444, never changed by the extension
+  .tmp-<pid>-<16 hex>     a record being published, ignored by readers
+  hold, host<anything>    reserved for the host: the extension never writes these names
+```
+
+An owner open that locks a stream's root records the root's cache directory there before it claims
+anything, as `dir-<key>`: one JSON line with the directory's real path, such as
+`{"v":1,"dir":"/home/app/.cache/sqlite-ursula/0.8"}`, where `<key>` is the first 32 hex digits of
+the BLAKE3 of that path. Every owner open that locks a root records, a fresh lock as much as one
+beside a reset binding or after an abandoned build, so every owner root lives in a recorded
+directory, whatever directory the application chose. A record is written once (a temp file,
+fsynced, linked into place, then the directory fsynced) and never changed. `link` never replaces a
+file, so a record is complete or absent. An open that finds the record, or loses the race to link
+it, checks that it names the same directory and fsyncs the directory too, so the record is durable
+before the open logs anything.
+
+When the host directory exists and the record cannot be written, the open fails with
+`local_setup`, action `fix`, before it claims anything, and nothing reaches the stream: a symlink or
+a file that is not a directory in its place, a filesystem that is read-only or full, a directory the
+process cannot write, a record under the name that names another directory, or a real path that is
+not UTF-8. Its root keeps its `lock` file and no generation, and the next open tries again. A
+reader or an import records nothing, since neither logs a commit of its own, and loads, commits,
+`synced()` and status never consult the host directory.
+
+- The host directory is the compiled-in path when `lstat` finds anything there, whatever its type.
+  A path the process cannot `lstat`, such as one a confinement policy hides, counts as absent.
+  `URSULA_VFS_HOST_DIR` is a test hook, read only when that path is absent, and not a setting: an
+  application can scrub its environment, never the compiled-in path.
+- A host may delete a record while nothing that may load the extension runs, and the next open
+  that locks a root in the directory records it again before it can log. It may also delete a
+  `.tmp-<pid>-*` whose process is gone.
+- A reader of a record takes its `dir` whatever its `v` and ignores keys it does not know. The
+  format is frozen within a release line.
+
+Moving or deleting a cache directory, or a directory above it, while a root in it holds
+unacknowledged commits and no process has it open hides them from the host, as from the extension,
+until the root is opened where it now is.
+
+Tests: `hostdir/tests.rs` `the_default_wins_whenever_lstat_finds_it`,
+`without_the_default_the_hook_decides`, `a_record_names_the_real_path_under_its_hash`,
+`a_real_path_that_is_not_utf8_fails`, `an_open_records_its_cache_directory_once`,
+`eight_threads_recording_eight_roots_leave_one_record`,
+`a_record_that_is_not_the_directorys_fails_the_open`, `a_deleted_record_is_written_again`,
+`a_host_directory_that_is_not_a_directory_fails_the_open`,
+`a_host_directory_the_process_cannot_write_fails_the_open`, `codec/vectors/mod.rs`
+`the_host_directory_record_is_frozen`, and `test/host.e2e.ts` H1 to H5 (the record before the first
+commit, through a symlink and under concurrent opens, nothing from readers and imports, the
+`local_setup` refusal with nothing sent, nothing without a host directory, and a crash at each step
+of the record).
 
 ## API
 
@@ -1483,11 +1546,12 @@ runs every e2e suite against one real node with an in-memory cold store and agai
 | stream frames | `USQ2` ([Frames](#frames)), and the reserved import activation `ursula-import-v1` ([Import](#import)) |
 | snapshot bodies | `USS3` ([Snapshots](#snapshots)), digest BLAKE3 of the length-prefixed content type and the body |
 | local state | generation directories ([Layout](#layout)), `USL1` log segments ([Log](#log)), the page-1 marker ([Marker](#marker)), `db-uwal`, `manifest.json` |
+| host directory | `dir-<key>` records ([Hosts](#hosts)) |
 | producer | `Producer-Id: sqlite-ursula-vfs/2`, `Producer-Digest`, receipt contiguity |
 | content type | `application/vnd.ursula.sqlite-vfs.v2` |
 
-Within 0.8.x these formats do not change, so owners upgrade one at a time. Golden vectors freeze
-their bytes. The APIs that may only grow within 0.8.x are the `options_json` keys, the
+Within a release line these formats do not change, so owners upgrade one at a time. Golden
+vectors freeze their bytes. The APIs that may only grow within a release line are the `options_json` keys, the
 `ursula_open` result, status keys and values, event shapes, error kinds and actions, the result
 codes 7178, 266 and 778, and the SQL function names and arities.
 
@@ -1507,7 +1571,7 @@ Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_
 `the_part_frames_are_frozen`, `the_log_segment_is_frozen`,
 `a_fresh_builds_segment_header_is_frozen`, `the_snapshot_header_is_frozen`,
 `the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
-`the_import_activation_is_frozen`, `codec/digest.rs` `snapshot_digests_equal_the_servers`,
+`the_import_activation_is_frozen`, `the_host_directory_record_is_frozen`, `codec/digest.rs` `snapshot_digests_equal_the_servers`,
 `producer_digests_are_blake3`.
 
 ## Verification
@@ -1547,7 +1611,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
 - **Idle expiry.** An owner idle past producer expiry whose own claim frame the pre-check cannot
   see resets `stale`.
 - **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
-  restored copy needs its own disk ([Clones](#clones)).
+  restored copy needs its own disk ([Clones](#clones)). A host that snapshots the process finds
+  the directories whose roots may hold commits in the host directory ([Hosts](#hosts)).
 - **Copies of a live cache.** A copy of a cache directory opened offline while its original is
   bound and idle continues the original's claim once the stream answers, goes live and fences the
   original, though the copy's open was provisional. Every commit the original acknowledged stays
