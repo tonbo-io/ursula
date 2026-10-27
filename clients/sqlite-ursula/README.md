@@ -137,6 +137,34 @@ const storage = await openUrsulaPiStorage("https://streams.example.com/acme/agen
 
 Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0.
 
+## Tonbo
+
+`@tonbo/sqlite-ursula/tonbo` opens a database of a Tonbo account by name, with a Tonbo API key:
+
+```ts
+import { open } from "@tonbo/sqlite-ursula/tonbo";
+
+const db = await open("notes"); // or the database's https:// URL, which skips the lookup
+```
+
+- `open(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the root entry's options and returns the same `UrsulaDatabase`, so `synced()`, `status()`, `gate()`, `dir` and the 30 s default signal work as there. The signal also bounds the lookup.
+- The key comes from `apiKey`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`. The login file must be a regular file that no group or other permission bit is set on (mode `0600`). A symlink, a non-regular file or a file open to others is refused (`credentials_refused`) and never read, and no other source is tried. A login that expired, or one this package does not read, fails with `invalid_api_key`: run `tonbo login`.
+- A name is looked up with `GET https://api.tonbo.dev/v1/databases/{name}`, with the key as the bearer token. When the API answers `401` with `exchange_required` (an Agent key), the key is exchanged at the token endpoint with no audience, the lookup is sent again once with that token, and the token is kept until it expires. A database still being created is waited for.
+- Streams requests carry tokens exchanged for the key at `POST https://tonbo.dev/api/iam/token` with the audience `https://streams.tonbo.dev`, through a [token provider](#tokens) the package keeps per key, so later opens reuse its token. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead: then opening a URL needs no key.
+- `apiOrigin` (or `TONBO_API_ORIGIN`) and `authOrigin` (or `TONBO_AUTH_ORIGIN`) name other origins for the Management API and the token endpoint. Each must be `https://`, or `http://` to a loopback host, since its requests carry the key. The key goes to these two origins only, and a Streams token never goes to the Management API.
+- No key or token is logged, and no error message carries one.
+
+Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`, `fix` (the variable to set or the command to run, which ends the message) and `requestId` (the API's, when it answered):
+
+| kind | when | fix |
+| --- | --- | --- |
+| `missing_credentials` | no `apiKey`, no `TONBO_API_KEY` and no login file | `Set TONBO_API_KEY, or run: tonbo login` |
+| `credentials_refused` | the login file is a symlink, not a regular file, or open to group or others | `Run: chmod 600 <path>`, or replace the file |
+| `invalid_api_key` | the API refused the key (`401`), the key cannot read the database (`403`), or the login expired or is not one this package reads | pass a valid `apiKey`, set `TONBO_API_KEY` to a valid key, or `Run: tonbo login`, after the key's source |
+| `database_not_found` | the key's account has no database of that name (`404`), or it is being deleted | `Run: tonbo database create <name>` |
+
+A `429` is looked up again after its `Retry-After`, and a `5xx` or a network failure after a backoff, until the signal fires. Then `open()` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`), and with `unavailable` when the database was still being created. A token endpoint that refuses the key a Streams token fails the open with `invalid_api_key`. Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
+
 ## SQL functions
 
 Other hosts call the extension's SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats`, `ursula_set_token` and `ursula_import(url, file, options_json, timeout_ms)`, whose `timeout_ms` must be positive. A host reopens through `ursula_open` after closing: once a database retired, a plain `new DatabaseSync(path)` of its path is refused until `ursula_open` binds it again.

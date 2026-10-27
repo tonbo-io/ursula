@@ -55,7 +55,13 @@ export type SetupKind =
 	| "not_bound"
 	| "internal";
 
-export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind;
+/**
+ * The kinds of the `/tonbo` entry's `TonboError` (tonbo.ts): a Tonbo API key that is missing, refused
+ * or unusable, a login file the package refuses to read, or a database the account does not have.
+ */
+export type TonboKind = "missing_credentials" | "credentials_refused" | "invalid_api_key" | "database_not_found";
+
+export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind | TonboKind;
 
 const WRITE_REFUSED_KINDS: ReadonlySet<string> = new Set<WriteRefusedKind>(["backlog_full", "unsupported", "too_large"]);
 const RESET_KINDS: ReadonlySet<string> = new Set<ResetKind>(["fenced", "stale", "rewound", "deleted", "local_damage", "stream_state", "internal"]);
@@ -93,6 +99,10 @@ const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaEr
 	["protocol_mismatch", "fix"],
 	["not_bound", "fix"],
 	["bound_elsewhere", "fix"],
+	["missing_credentials", "fix"],
+	["credentials_refused", "fix"],
+	["invalid_api_key", "fix"],
+	["database_not_found", "fix"],
 ]);
 
 /** The action of `kind`, `fix` for a kind this package does not know (a newer extension's). */
