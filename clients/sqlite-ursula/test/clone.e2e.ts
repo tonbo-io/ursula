@@ -97,7 +97,7 @@ describe("copies of a live cache", () => {
 		expect((await status(copy)).epoch).toBeGreaterThan((await status(original)).epoch);
 
 		await original.exec("INSERT INTO t VALUES (3)");
-		expect((await resetOf(original)).reset).toEqual({ kind: "fenced", action: "stop" });
+		expect((await resetOf(original)).reset).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 		await rejects(original, "fenced");
 		await original.stop();
 
@@ -145,7 +145,7 @@ describe("copies of a live cache", () => {
 		await synced(a);
 		await b.exec("INSERT INTO t VALUES (3)");
 		await rejects(b, "fenced");
-		expect((await resetOf(b)).reset).toEqual({ kind: "fenced", action: "stop" });
+		expect((await resetOf(b)).reset).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 		await b.stop();
 
 		await a.exec("INSERT INTO t VALUES (4)");
@@ -199,7 +199,7 @@ describe("copies of a live cache", () => {
 			const before = await frames(s.path);
 
 			await mode("forward");
-			expect((await resetOf(copy)).reset).toEqual({ kind: "stale", action: "reopen" });
+			expect((await resetOf(copy)).reset).toMatchObject({ kind: "stale", action: "reopen", class: "reset" });
 			await rejects(copy, "stale");
 			await copy.stop();
 			expect(await frames(s.path)).toEqual(before);
@@ -233,7 +233,7 @@ describe("copies of a live cache", () => {
 
 				// The original's output gate finds the copy's claim past its tail, with no commit of its own.
 				await rejects(original, "fenced");
-				expect((await resetOf(original)).reset).toEqual({ kind: "fenced", action: "stop" });
+				expect((await resetOf(original)).reset).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 				expect(await original.send({ exec: "INSERT INTO t VALUES (3)" })).toMatchObject({ ok: false });
 				await original.stop();
 
@@ -291,7 +291,7 @@ describe("copies of a live cache", () => {
 		expect(await copy.rows("SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
 
 		await original.exec("INSERT INTO t VALUES (-1, NULL)");
-		expect((await resetOf(original)).reset).toEqual({ kind: "fenced", action: "stop" });
+		expect((await resetOf(original)).reset).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 		await original.stop();
 
 		await copy.exec("INSERT INTO t VALUES (0, NULL)");

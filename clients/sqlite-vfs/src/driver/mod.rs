@@ -107,19 +107,38 @@ pub(crate) struct DiskIo {
     pub(crate) job: DiskJob,
 }
 
-impl ResetKind {
-    /// The stable kind token (design: Resets).
-    pub(crate) fn kind(self) -> &'static str {
-        match self {
-            Self::Fenced => "fenced",
-            Self::Stale => "stale",
-            Self::Rewound => "rewound",
-            Self::Deleted => "deleted",
-            Self::LocalDamage => "local_damage",
-            Self::StreamState => "stream_state",
-            Self::Internal => "internal",
+/// [`ResetKind::kind`] and its inverse [`ResetKind::from_kind`] from one list: a reset added without
+/// its token fails to build `kind`, and a token listed twice fails the lint of an unreachable pattern
+/// in `from_kind`.
+macro_rules! reset_tokens {
+    ($($kind:ident => $token:literal,)*) => {
+        impl ResetKind {
+            /// The stable kind token (design: Resets).
+            pub(crate) fn kind(self) -> &'static str {
+                match self {
+                    $(Self::$kind => $token,)*
+                }
+            }
+
+            /// The reset whose token is `token`.
+            pub(crate) fn from_kind(token: &str) -> Option<Self> {
+                match token {
+                    $($token => Some(Self::$kind),)*
+                    _ => None,
+                }
+            }
         }
-    }
+    };
+}
+
+reset_tokens! {
+    Fenced => "fenced",
+    Stale => "stale",
+    Rewound => "rewound",
+    Deleted => "deleted",
+    LocalDamage => "local_damage",
+    StreamState => "stream_state",
+    Internal => "internal",
 }
 
 /// Why a `synced()` call will never resolve.

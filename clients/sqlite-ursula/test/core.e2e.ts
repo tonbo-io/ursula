@@ -4,6 +4,7 @@
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { type Described, errorOf, SQLITE_ERROR, type UrsulaError, UrsulaResetError, UrsulaSetupError, UrsulaUnavailableError, UrsulaWriteRefusedError } from "../src/errors.ts";
 import { loadUrsulaVfs } from "../src/index.ts";
 import { Child, directUrl, fault, fromStream, frames, freshDir, killChildren, onModel, type Opened, stream } from "./kit.ts";
 
@@ -20,8 +21,8 @@ interface Status {
 	commits: { logged: number; confirmed: number; acknowledged: number; pending: number; pending_bytes: number };
 	replication: { state: string; condition: string | null };
 	snapshot: { offset: number | null; age_ms: number | null; failures: number; error: string | null; log_bytes: number; due_bytes: number };
-	refused: { kind: string; action: string; message: string } | null;
-	reset: { kind: string; action: string } | null;
+	refused: { kind: string; action: string; class: string; message: string } | null;
+	reset: { kind: string; action: string; class: string; message: string } | null;
 }
 
 /** One SQL function's JSON result on the control connection. */
@@ -30,6 +31,7 @@ function call<T>(sql: string, ...args: (string | number)[]): T {
 	return JSON.parse(Object.values(row)[0] as string) as T;
 }
 
+const classify = (message: string, errcode: number, path = ""): Record<string, unknown> | null => call("SELECT ursula_classify(?, ?, ?)", message, errcode, path);
 const open = (url: string, dir: string): Opened => call<Opened>("SELECT ursula_open(?, ?, '{}', 20000)", url, dir);
 const status = (path: string): Status => call<Status>("SELECT ursula_status(?)", path);
 const synced = (path: string, ms = 10_000): { synced: boolean; target: number; acknowledged: number } => call("SELECT ursula_synced(?, ?)", path, ms);
@@ -98,13 +100,75 @@ describe("the 0.8 core on node:sqlite", () => {
 			.prepare("SELECT DISTINCT name FROM pragma_function_list WHERE name LIKE 'ursula!_%' ESCAPE '!' ORDER BY name")
 			.all()
 			.map((row) => (row as { name: string }).name);
-		expect(names).toEqual(["ursula_cancel", "ursula_events", "ursula_import", "ursula_open", "ursula_set_token", "ursula_stats", "ursula_status", "ursula_synced"]);
-		expect(() => call("SELECT ursula_status('/nowhere/db')")).toThrow(/^ursula_status: not_bound: /);
+		expect(names).toEqual(["ursula_cancel", "ursula_classify", "ursula_events", "ursula_import", "ursula_open", "ursula_set_token", "ursula_stats", "ursula_status", "ursula_synced"]);
+		let failed: Error & { errcode?: number } = new Error("ursula_status did not fail");
+		try {
+			call("SELECT ursula_status('/nowhere/db')");
+		} catch (error) {
+			failed = error as Error & { errcode?: number };
+		}
+		expect(failed.message).toMatch(/^ursula_status: not_bound: /);
+		// The failure as a host throws it: its kind, what to do and its class, its message kept.
+		expect(classify(failed.message, failed.errcode ?? 0)).toEqual({ kind: "not_bound", action: "fix", class: "setup", message: failed.message, fix: null, request_id: null });
+		// SQLite's own failures, and an I/O error of a database the extension did not bind, are not the extension's.
+		expect(classify("UNIQUE constraint failed: t.x", 2067)).toBeNull();
+		expect(classify("disk I/O error", SQLITE_IOERR_READ, "/nowhere/db")).toBeNull();
 		// A database the extension did not bind passes through its VFS unchanged.
 		const plain = new DatabaseSync(join(freshDir(), "plain.db"));
 		plain.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (42)");
 		expect(plain.prepare("SELECT x FROM t").get()).toEqual({ x: 42 });
 		plain.close();
+	});
+
+	it("names every kind of the extension with the error and the action the package's own errors default to", () => {
+		// The package's own errors of these kinds (a cancelled open, a failed pump worker, an invalid
+		// argument) take their constructor's default action: it must be the extension's, and the
+		// class the extension names must pick that constructor. `ursula_status` fails a bound
+		// database, `ursula_open` an open, where `stream_state` and `internal` are setup errors.
+		// The list is written out by hand: a new `ErrorKind` in `error.rs` needs a row here.
+		const made: [fn: "status" | "open", error: UrsulaError][] = [
+			["status", new UrsulaWriteRefusedError("", "backlog_full", undefined)],
+			["status", new UrsulaWriteRefusedError("", "unsupported", undefined)],
+			["status", new UrsulaWriteRefusedError("", "too_large", undefined)],
+			["status", new UrsulaResetError("", "fenced")],
+			["status", new UrsulaResetError("", "stale")],
+			["status", new UrsulaResetError("", "rewound")],
+			["status", new UrsulaResetError("", "deleted")],
+			["status", new UrsulaResetError("", "local_damage")],
+			["status", new UrsulaResetError("", "stream_state")],
+			["status", new UrsulaResetError("", "internal")],
+			["open", new UrsulaUnavailableError("", "unreachable")],
+			["open", new UrsulaUnavailableError("", "unavailable")],
+			["open", new UrsulaUnavailableError("", "rate_limited")],
+			["open", new UrsulaUnavailableError("", "unauthorized")],
+			["open", new UrsulaUnavailableError("", "payment_required")],
+			["open", new UrsulaUnavailableError("", "forbidden")],
+			["open", new UrsulaUnavailableError("", "cancelled")],
+			["open", new UrsulaSetupError("", "invalid_argument")],
+			["open", new UrsulaSetupError("", "invalid_url")],
+			["open", new UrsulaSetupError("", "not_found")],
+			["open", new UrsulaSetupError("", "in_use")],
+			["open", new UrsulaSetupError("", "bound_elsewhere")],
+			["open", new UrsulaSetupError("", "local_setup")],
+			["open", new UrsulaSetupError("", "stream_format")],
+			["open", new UrsulaSetupError("", "no_server_identity")],
+			["open", new UrsulaSetupError("", "protocol_mismatch")],
+			["open", new UrsulaSetupError("", "wrong_cluster")],
+			["open", new UrsulaSetupError("", "stream_state")],
+			["open", new UrsulaSetupError("", "claim_races")],
+			["open", new UrsulaSetupError("", "not_bound")],
+			["open", new UrsulaSetupError("", "internal")],
+		];
+		for (const [fn, error] of made) {
+			const message = `ursula_${fn}: ${error.kind}: x`;
+			const classified = classify(message, SQLITE_ERROR);
+			expect(classified, message).not.toBeNull();
+			const named = classified as unknown as Described;
+			expect({ kind: named.kind, action: named.action }, message).toEqual({ kind: error.kind, action: error.action });
+			expect(errorOf(named, message, undefined).constructor, message).toBe(error.constructor);
+		}
+		// `invalid_name` is the `/tonbo` entry's own: the extension has no such kind.
+		expect(classify("ursula_open: invalid_name: x", SQLITE_ERROR)).toBeNull();
 	});
 
 	it("commits locally, confirms each commit, and synced() waits for the stream to hold them", async () => {
@@ -216,15 +280,24 @@ describe("the 0.8 core on node:sqlite", () => {
 		const gate = await owner.send({ synced: 10_000 });
 		expect(gate.ok).toBe(false);
 		expect(String(gate.error)).toMatch(/ursula_synced: fenced: /);
+		expect(gate.classified).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 		expect(await owner.send({ conn: 2, all: "SELECT x FROM t" })).toMatchObject({ ok: true, rows: [{ x: 1 }] });
 		const write = await owner.send({ conn: 2, exec: "INSERT INTO t VALUES (2); COMMIT" });
-		expect(write).toMatchObject({ ok: false, errcode: SQLITE_IOERR_WRITE });
+		// SQLite's I/O errors say nothing: the database's reset names them.
+		expect(write).toMatchObject({ ok: false, errcode: SQLITE_IOERR_WRITE, classified: { kind: "fenced", action: "stop", class: "reset" } });
+		expect((write.classified as { message: string }).message).toMatch(/^write refused, the database was reset \(fenced\): /);
 		const read = await owner.send({ all: "SELECT x FROM t" });
-		expect(read).toMatchObject({ ok: false, errcode: SQLITE_IOERR_READ });
+		expect(read).toMatchObject({ ok: false, errcode: SQLITE_IOERR_READ, classified: { kind: "fenced", action: "stop", class: "reset" } });
+		expect((read.classified as { message: string }).message).toMatch(/^read refused, the database was reset \(fenced\): /);
 		const st = (await owner.send({ status: true })).status as Status;
-		expect(st.reset).toEqual({ kind: "fenced", action: "stop" });
+		expect(st.reset).toEqual({
+			kind: "fenced",
+			action: "stop",
+			class: "reset",
+			message: "the database was reset (fenced): another owner took the stream over: stop using this database, and never reopen it in a loop.",
+		});
 		const events = (await owner.send({ events: true })).events as Record<string, unknown>[];
-		expect(events).toContainEqual(expect.objectContaining({ event: "reset", kind: "fenced", action: "stop" }));
+		expect(events).toContainEqual(expect.objectContaining({ event: "reset", kind: "fenced", action: "stop", class: "reset", message: st.reset?.message }));
 		await taker.exec("INSERT INTO t VALUES (4)");
 		expect((await taker.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
 		await taker.stop();
@@ -290,7 +363,7 @@ describe("the 0.8 core on node:sqlite", () => {
 			const commit = await failing.send({ exec: "BEGIN; INSERT INTO t VALUES (1); INSERT INTO other.u VALUES (1); COMMIT" });
 			expect(commit.ok).toBe(false);
 			const st = (await failing.send({ status: true })).status as Status;
-			expect(st.reset).toEqual({ kind: "local_damage", action: "reopen" });
+			expect(st.reset).toMatchObject({ kind: "local_damage", action: "reopen", class: "reset" });
 			expect(await failing.send({ all: "SELECT x FROM t" })).toMatchObject({ ok: false, errcode: SQLITE_IOERR_READ });
 			await failing.stop();
 			const reopened = new Child(s.url, dir);
@@ -464,16 +537,25 @@ describe("the 0.8 core on node:sqlite", () => {
 		const db = new DatabaseSync(opened.path);
 		db.exec("CREATE TABLE t(x)");
 		db.exec("PRAGMA locking_mode=EXCLUSIVE");
-		let errcode: number | undefined;
+		let failed: { message?: string; errcode?: number } = {};
 		try {
 			db.exec("INSERT INTO t VALUES (1)");
 		} catch (error) {
-			errcode = (error as { errcode?: number }).errcode;
+			failed = error as { message?: string; errcode?: number };
 		}
-		expect(errcode).toBe(SQLITE_IOERR_AUTH);
+		expect(failed.errcode).toBe(SQLITE_IOERR_AUTH);
 		const st = status(opened.path);
-		expect(st.refused?.kind).toBe("unsupported");
+		expect(st.refused).toMatchObject({ kind: "unsupported", action: "fix", class: "write_refused" });
 		expect(st.reset).toBeNull();
+		// The database's refused write names its SQLITE_IOERR_AUTH, which says nothing.
+		expect(classify(failed.message ?? "", SQLITE_IOERR_AUTH, opened.path)).toEqual({
+			kind: "unsupported",
+			action: "fix",
+			class: "write_refused",
+			message: `${st.refused?.message}. Nothing was committed.`,
+			fix: null,
+			request_id: null,
+		});
 		db.close();
 	});
 });

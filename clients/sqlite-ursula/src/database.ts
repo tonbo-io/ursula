@@ -1,5 +1,5 @@
 // The database `open` returns: a node:sqlite DatabaseSync, a subclass of it, so drizzle, kysely and
-// Pi's node driver take it. Its methods that run SQL throw what `classify` (errors.ts) makes of their
+// Pi's node driver take it. Its methods that run SQL throw what `classify` (control.ts) makes of their
 // errors: an UrsulaError for a failure of the extension, and every other error unchanged. Its
 // statements are node:sqlite's own StatementSync objects, whose run, get, all and iterate (and the
 // iterator's next) do the same. Every argument goes through to node:sqlite as given. On top of
@@ -14,8 +14,8 @@
 // remembered error instead, and so does a ROLLBACK TO or RELEASE that finds no savepoint, since the
 // transaction around the savepoint is gone too.
 import { DatabaseSync, type DatabaseSyncOptions, type StatementSync } from "node:sqlite";
-import { call } from "./control.ts";
-import { classify, errcode, type FailureStatus, SQLITE_ERROR, UrsulaError, UrsulaResetError } from "./errors.ts";
+import { call, classify } from "./control.ts";
+import { errcode, SQLITE_ERROR, UrsulaError, UrsulaResetError } from "./errors.ts";
 import { pump, type ResetTarget, resetError, track, untrack, waitTicket } from "./pump.ts";
 
 /** SQLite's message for a ROLLBACK, and the start of its message for a ROLLBACK TO or RELEASE, that finds nothing to undo. */
@@ -128,15 +128,16 @@ export interface UrsulaStatus {
 		/** The `log_bytes` past which a snapshot is due. */
 		readonly due_bytes: number;
 	};
-	/** The last write refused with nothing committed. */
-	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
+	/** The last write refused with nothing committed. `class` is `write_refused`. */
+	readonly refused: { readonly kind: string; readonly action: string; readonly class: string; readonly message: string } | null;
 	/**
 	 * Local caches of this stream moved aside, oldest first, never read or deleted by the extension:
 	 * each `dir` holds a plain SQLite database `db` (a replaced file as it was found), its log and a
 	 * `manifest.json`.
 	 */
 	readonly salvage: readonly UrsulaSalvage[];
-	readonly reset: { readonly kind: string; readonly action: string } | null;
+	/** The reset, once one happened. `class` is `reset`, and `message` says what happened and what to do. */
+	readonly reset: { readonly kind: string; readonly action: string; readonly class: string; readonly message: string } | null;
 }
 
 /**
@@ -273,21 +274,15 @@ export class UrsulaDatabase extends DatabaseSync implements ResetTarget {
 	currentReset(): UrsulaResetError | undefined {
 		try {
 			const reset = this.status().reset;
-			return reset === null ? undefined : resetError(reset.kind);
+			return reset === null ? undefined : resetError(reset);
 		} catch {
 			return undefined;
 		}
 	}
 
-	/** What classifies a statement's I/O error: the reset this database knows of, else its status. */
-	readonly #failure = (): FailureStatus => {
-		if (this.#reset !== undefined) return { reset: { kind: this.#reset.kind, action: this.#reset.action }, refused: null };
-		return this.status();
-	};
-
 	readonly #classify = (error: unknown): unknown => {
 		if (!this.#bound) return error;
-		const classified = classify(error, this.#failure);
+		const classified = classify(error, this.boundPath);
 		if (classified instanceof UrsulaResetError) this.#reset ??= classified;
 		return classified;
 	};

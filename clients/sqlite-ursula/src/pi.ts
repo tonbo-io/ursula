@@ -4,7 +4,8 @@
 import * as durable from "@earendil-works/pi-durable";
 import { type SqliteExecutor, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { type NodeSqliteStorageOptions, openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { classifyWrapped, UrsulaResetError, UrsulaWriteRefusedError } from "./errors.ts";
+import { classifyWrapped } from "./control.ts";
+import { UrsulaResetError, UrsulaWriteRefusedError } from "./errors.ts";
 import { type OpenOptions, open } from "./index.ts";
 
 /**
@@ -66,7 +67,7 @@ export async function openUrsulaPiStorage(url: string | URL, options: UrsulaPiSt
 	};
 	const backlogFull = (error: unknown): error is UrsulaWriteRefusedError => error instanceof UrsulaWriteRefusedError && error.kind === "backlog_full";
 	function failure(error: unknown): unknown {
-		const classified = classifyWrapped(error, () => db.status());
+		const classified = classifyWrapped(error, db.boundPath);
 		if (StorageRejected !== undefined && backlogFull(classified)) {
 			return new StorageRejected(classified.message, { cause: classified });
 		}

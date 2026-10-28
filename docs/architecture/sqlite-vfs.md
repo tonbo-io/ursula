@@ -1589,22 +1589,61 @@ rejects, the listeners run, statements throw".
 
 ### Errors
 
-Four classes with `kind`, `action` (`retry`, `reopen`, `stop`, `fix`), `message` and `cause`,
-mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
+Four classes with `kind`, `action` (`retry`, `reopen`, `stop`, `fix`), `message` and `cause`.
+Callers branch on `action`. The extension says which failure is which error: `ursula_classify`
+(`error.rs` `classify`) maps a failure a host met to its kind, action and class, and every event
+and status field that names a kind names its action and class beside it. A reset (its event,
+`status().reset`) and a failed `synced()` (its `sync_failed` event) also carry the message a host
+shows, which ends with what to do. The package picks the error by class (`errors.ts` `errorOf`)
+and takes the action and message as the extension gives them. Errors the package itself makes (an
+invalid argument, a cancelled open) take their class's default action, which repeats
+`ErrorKind::action`, and `test/core.e2e.ts` checks it against the extension for every kind.
+`loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a library older than the
+package fails there with `UrsulaSetupError` (`local_setup`).
 
-| class | thrown by | kinds |
+| class (`class`) | thrown by | kinds |
 | --- | --- | --- |
-| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
-| `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
-| `UrsulaUnavailableError` | `open()` when its signal fires (also while it waits for a token provider: `unavailable`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `invalid_name` (`/tonbo`), `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaWriteRefusedError` (`write_refused`) | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
+| `UrsulaResetError` (`reset`) | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
+| `UrsulaUnavailableError` (`unavailable`) | `open()` when its signal fires (also while it waits for a token provider: `unavailable`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
+| `UrsulaSetupError` (`setup`) | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `invalid_name` (`/tonbo`), `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 Network failures never throw from statements or `synced()`. A refused write fails with
 `SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
 with `SQLITE_IOERR_WRITE` (778). Other errors stay SQLite's own. Every SQL function's error reads
 `<function>: <kind>: <message>`.
 
-Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`, `test/open.e2e.ts`
+`ursula_classify(message, errcode, path)` takes SQLite's message and result code for a failure and
+returns `{kind, action, class, message, fix, request_id}`, or `null` for a failure that is not the
+extension's (a constraint, a syntax error, an I/O error of an attached database while the database
+at `path` has no reset and has refused no write):
+
+- A SQL function's error (`SQLITE_ERROR`) names its kind. `stream_state` and `internal` are setup
+  errors of an open (`ursula_open`, `ursula_cancel`, `ursula_import`, an `opened` event) and
+  resets of a bound database. An `ursula_import` that met a stream not answering as it must says
+  `fix`, since it may have claimed the stream.
+- A statement's I/O error says nothing, so the state of the database at `path` names it: its reset
+  for any I/O error, else its last refused write for `SQLITE_IOERR_AUTH`, which the VFS returns
+  only for a refusal. That refusal stays until the next one, so a commit another connection logs
+  before the host classifies leaves it in place, while `status().refused` clears at the next
+  logged commit. The message then says what was refused and what to do. A reset database's
+  connections keep this after a reopen bound the stream anew. A `SQLITE_IOERR_AUTH` that a
+  database used through `ATTACH DATABASE` raised reads as the last write the database at `path`
+  refused, however old, and as `null` only while that database refused none.
+- `message` is the error's message, the SQL function's own for its errors. `fix` and `request_id`
+  are `null` for every failure of the extension.
+
+Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`,
+`every_kind_reads_back_from_its_token`, `a_function_error_is_classified_where_it_surfaced`,
+`an_unavailable_import_says_fix`, `only_a_function_error_in_its_format_is_the_extensions`,
+`a_statement_of_a_reset_database_fails_with_its_reset`,
+`a_refused_write_is_the_last_one_its_database_refused`,
+`an_io_error_the_database_does_not_name_stays_sqlites`, `test/core.e2e.ts` "loads into the running
+SQLite and registers the 0.8 functions only", "names every kind of the extension with the error and
+the action the package's own errors default to", "resets a database another process took over: 266
+for reads, 778 for writes, a fenced event", "refuses a write in EXCLUSIVE locking mode alone, as
+unsupported", `test/reopen.e2e.ts` "succeeds after a fenced reset: the old read keeps its snapshot,
+its new statements fail, the new database commits", `test/open.e2e.ts`
 "refuses a URL it cannot take, as a setup error to fix", "reports the last condition the open met
 when its signal fires", "refuses an unsupported write alone, and leaves SQLite", `test/limits.e2e.ts`
 "refuses a transaction above the commit limit alone, as too_large, and commits the next".
@@ -1718,6 +1757,7 @@ returns at once.
   bounded queue of 4,096, acknowledgements coalesced, what was dropped reported.
 - `ursula_import(url, file, options_json, timeout_ms)`: [Import](#import). `timeout_ms` must be
   positive.
+- `ursula_classify(message, errcode, path)`: what a failure a host met is ([Errors](#errors)).
 - `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
   `ursula_set_token(path, token)`.
 
@@ -1866,9 +1906,9 @@ since neither e2e server checks tokens.
   "replication": { "state": "streaming", "condition": null },   // activating | streaming | reset | refused | stopped | none
   "attach": { "local": "resumed", "snapshot_offset": null },    // resumed | rekeyed | caught_up | built | salvaged
   "snapshot": { "offset": 1048576, "age_ms": 1000, "failures": 0, "error": null, "log_bytes": 123, "due_bytes": 8388608 },
-  "refused": null,                  // the last write refused with nothing committed
+  "refused": null,                  // the last write refused with nothing committed: { kind, action, class, message }
   "salvage": [],                    // { dir, reason, time, incarnation, stream_incarnation, acknowledged_position, unacknowledged, plain }
-  "reset": null                     // { kind, action }
+  "reset": null                     // { kind, action, class, message }
 }
 ```
 

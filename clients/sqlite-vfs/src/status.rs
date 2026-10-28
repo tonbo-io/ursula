@@ -8,9 +8,12 @@ use crate::driver::Attach;
 use crate::driver::DriverEvent;
 use crate::driver::Life;
 use crate::driver::SyncError;
+use crate::error::Classified;
 use crate::error::Error;
 use crate::error::ErrorKind;
-use crate::error::reset_action;
+use crate::error::Surface;
+use crate::error::reset_message;
+use crate::error::sync_failed_message;
 use crate::ids::Position;
 use crate::json;
 use crate::json::null;
@@ -22,6 +25,28 @@ use crate::replicator::Condition;
 use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
+
+/// An object of `before`, a failure's kind with what to do about it and the error a host throws
+/// for it as it surfaced at `surface` (design: Errors), then `after`.
+fn with_kind(
+    before: &[(&str, String)],
+    kind: ErrorKind,
+    surface: Surface,
+    after: &[(&str, String)],
+) -> String {
+    let named = [
+        ("kind", json_str(kind.as_str())),
+        ("action", json_str(kind.action().as_str())),
+        ("class", json_str(kind.class(surface).as_str())),
+    ];
+    let fields: Vec<(&str, String)> = before
+        .iter()
+        .cloned()
+        .chain(named)
+        .chain(after.iter().cloned())
+        .collect();
+    object(&fields)
+}
 
 /// The token of a replication condition (design: Answers, Status).
 fn condition(c: &Condition) -> &'static str {
@@ -61,7 +86,7 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     let logged = h.last_commit();
     let (confirmed, refused) = {
         let c = b.lock();
-        (c.confirmed, c.refused.clone())
+        (c.confirmed, c.standing_refusal().cloned())
     };
     let commits = object(&[
         ("logged", logged.0.to_string()),
@@ -129,17 +154,16 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
         ]),
     };
     let refused = refused.map_or_else(null, |r| {
-        object(&[
-            ("kind", json_str(r.kind().as_str())),
-            ("action", json_str(r.kind().action().as_str())),
-            ("message", json_str(&r.to_string())),
-        ])
+        with_kind(&[], r.kind(), Surface::Bound, &[(
+            "message",
+            json_str(&r.to_string()),
+        )])
     });
     let reset_json = reset.map_or_else(null, |kind| {
-        object(&[
-            ("kind", json_str(kind.kind())),
-            ("action", json_str(reset_action(kind).as_str())),
-        ])
+        with_kind(&[], ErrorKind::Reset(kind), Surface::Bound, &[(
+            "message",
+            json_str(&reset_message(kind)),
+        )])
     });
     let salvage: Vec<String> = h.salvage()?.iter().map(salvaged_json).collect();
     let lineage: String = h
@@ -292,13 +316,24 @@ pub(crate) fn synced_json(
     ])
 }
 
-/// An open's failure: `{kind, action, message}`.
+/// An open's failure: `{kind, action, class, message}`.
 pub(crate) fn error_json(e: &OpenError) -> String {
-    let kind = e.error_kind();
+    with_kind(&[], e.error_kind(), Surface::Open, &[(
+        "message",
+        json_str(&e.to_string()),
+    )])
+}
+
+/// `ursula_classify`'s result. `fix` and `request_id` are `null`: no failure of the extension
+/// carries them.
+pub(crate) fn classified_json(c: &Classified) -> String {
     object(&[
-        ("kind", json_str(kind.as_str())),
-        ("action", json_str(kind.action().as_str())),
-        ("message", json_str(&e.to_string())),
+        ("kind", json_str(c.kind.as_str())),
+        ("action", json_str(c.action.as_str())),
+        ("class", json_str(c.class.as_str())),
+        ("message", json_str(&c.message)),
+        ("fix", null()),
+        ("request_id", null()),
     ])
 }
 
@@ -334,12 +369,12 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                     c.as_ref().map_or_else(null, |c| json_str(condition(c))),
                 ),
             ]),
-            DriverEvent::Reset { binding, cause } => object(&[
-                ("event", json_str("reset")),
-                ("path", path(*binding)),
-                ("kind", json_str(cause.kind())),
-                ("action", json_str(reset_action(*cause).as_str())),
-            ]),
+            DriverEvent::Reset { binding, cause } => with_kind(
+                &[("event", json_str("reset")), ("path", path(*binding))],
+                ErrorKind::Reset(*cause),
+                Surface::Bound,
+                &[("message", json_str(&reset_message(*cause)))],
+            ),
             DriverEvent::Synced { binding, through } => object(&[
                 ("event", json_str("synced")),
                 ("path", path(*binding)),
@@ -351,11 +386,15 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                     SyncError::NotBound => ErrorKind::NotBound,
                     error => Error::from(*error).kind(),
                 };
-                object(&[
-                    ("event", json_str("sync_failed")),
-                    ("ticket", ticket.0.to_string()),
-                    ("kind", json_str(kind.as_str())),
-                ])
+                with_kind(
+                    &[
+                        ("event", json_str("sync_failed")),
+                        ("ticket", ticket.0.to_string()),
+                    ],
+                    kind,
+                    Surface::Bound,
+                    &[("message", json_str(&sync_failed_message(kind)))],
+                )
             }
             DriverEvent::Retired { binding } => {
                 object(&[("event", json_str("retired")), ("path", path(*binding))])
@@ -373,6 +412,7 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::events_json;
@@ -382,9 +422,12 @@ mod tests {
     use crate::driver::BindingId;
     use crate::driver::DriverEvent;
     use crate::driver::Life;
+    use crate::driver::OpenId;
     use crate::driver::SyncError;
     use crate::driver::Ticket;
     use crate::ids::Position;
+    use crate::open::OpenError;
+    use crate::open::StreamState;
     use crate::replicator::Condition;
     use crate::replicator::ResetKind;
     use crate::stats::CommitStat;
@@ -423,8 +466,9 @@ mod tests {
         );
     }
 
-    // Events of a binding the process no longer has carry a null path; resets name their kind and
-    // action.
+    // Events of a binding the process no longer has carry a null path. Resets, failed tickets and
+    // failed opens name their kind, action and class, a `stream_state` an open's setup error, and
+    // the message a host shows for them.
     #[test]
     fn events_render_as_one_object() {
         let id = BindingId(u64::MAX);
@@ -442,6 +486,14 @@ mod tests {
                     ticket: Ticket(4),
                     error: SyncError::Reset(ResetKind::Fenced),
                 },
+                DriverEvent::SyncFailed {
+                    ticket: Ticket(5),
+                    error: SyncError::NotBound,
+                },
+                DriverEvent::Opened {
+                    open: OpenId(6),
+                    result: Err(Arc::new(OpenError::StreamState(StreamState::NotSqlite))),
+                },
                 DriverEvent::Gap { dropped: 2 },
             ],
             9,
@@ -450,9 +502,16 @@ mod tests {
             json,
             concat!(
                 r#"{"cursor":9,"events":["#,
-                r#"{"event":"reset","path":null,"kind":"fenced","action":"stop"},"#,
+                r#"{"event":"reset","path":null,"kind":"fenced","action":"stop","class":"reset","#,
+                r#""message":"the database was reset (fenced): another owner took the stream over: "#,
+                r#"stop using this database, and never reopen it in a loop."},"#,
                 r#"{"event":"condition","path":null,"condition":"retrying"},"#,
-                r#"{"event":"sync_failed","ticket":4,"kind":"fenced"},"#,
+                r#"{"event":"sync_failed","ticket":4,"kind":"fenced","action":"stop","class":"reset","#,
+                r#""message":"synced() failed: fenced: another owner took the stream over: stop "#,
+                r#"using this database, and never reopen it in a loop."},"#,
+                r#"{"event":"sync_failed","ticket":5,"kind":"not_bound","action":"fix","class":"setup","#,
+                r#""message":"synced() failed: not_bound: fix the cause, then open() the database again."},"#,
+                r#"{"event":"opened","request":6,"ok":false,"error":{"kind":"stream_state","action":"fix","class":"setup","message":"stream_state: NotSqlite"}},"#,
                 r#"{"event":"gap","dropped":2}]}"#
             )
         );

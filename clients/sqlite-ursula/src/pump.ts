@@ -18,7 +18,7 @@
 // exit with the wait unresolved.
 import { Worker } from "node:worker_threads";
 import { call, loadedLibrary } from "./control.ts";
-import { actionOf, advice, errorOf, UrsulaResetError, UrsulaSetupError } from "./errors.ts";
+import { type Described, errorOf, type ResetKind, UrsulaResetError, type UrsulaErrorAction, UrsulaSetupError } from "./errors.ts";
 
 /** A database whose `reset` listeners the pump fires: `UrsulaDatabase`. */
 export interface ResetTarget {
@@ -34,8 +34,8 @@ export interface ResetTarget {
 export type PumpEvent =
 	| { event: "opened"; request: number; ok: boolean }
 	| { event: "synced"; path: string | null; through: number }
-	| { event: "sync_failed"; ticket: number; kind: string }
-	| { event: "reset"; path: string | null; kind: string; action: string }
+	| ({ event: "sync_failed"; ticket: number } & Described)
+	| ({ event: "reset"; path: string | null } & Described)
 	| { event: "gap"; dropped: number }
 	| { event: "condition"; path: string | null; condition: string | null }
 	| { event: "acked" | "retired"; path: string | null };
@@ -46,11 +46,9 @@ interface Ticket {
 	reject(error: unknown): void;
 }
 
-/** The reset error of `kind`, for `synced()` and the listeners. */
-export const resetError = (kind: string): UrsulaResetError => {
-	const error = errorOf(kind, `the database was reset (${kind}): ${advice(actionOf(kind))}`, undefined, true);
-	return error instanceof UrsulaResetError ? error : new UrsulaResetError(error.message, "internal", error);
-};
+/** The error of the reset the extension `named` (a `reset` event, `status().reset`), with its message, for `synced()` and the listeners. */
+export const resetError = (named: Described): UrsulaResetError =>
+	new UrsulaResetError(named.message, named.kind as ResetKind, undefined, named.action as UrsulaErrorAction);
 
 /**
  * The open databases of this thread by bound path, whose listeners the pump fires. Held weakly: a
@@ -279,11 +277,11 @@ class Pump {
 				case "sync_failed": {
 					const t = tickets.get(event.ticket);
 					tickets.delete(event.ticket);
-					t?.reject(errorOf(event.kind, `synced() failed: ${event.kind}: ${advice(actionOf(event.kind))}`, undefined, true));
+					t?.reject(errorOf(event, event.message, undefined));
 					break;
 				}
 				case "reset":
-					this.#reset(event.path, event.kind);
+					this.#reset(event.path, event);
 					break;
 				case "gap":
 					this.#gap();
@@ -302,7 +300,7 @@ class Pump {
 	}
 
 	/** A reset of `path` (null: a binding the process no longer has): its pending `synced()` calls reject, then its listeners run. */
-	#reset(path: string | null, kind: string): void {
+	#reset(path: string | null, named: Described): void {
 		const hit: [ResetTarget, UrsulaResetError][] = [];
 		if (path === null) {
 			for (const target of live()) {
@@ -310,12 +308,12 @@ class Pump {
 				if (error !== undefined) hit.push([target, error]);
 			}
 		} else {
-			for (const target of live(path)) hit.push([target, resetError(kind)]);
+			for (const target of live(path)) hit.push([target, resetError(named)]);
 		}
 		for (const [id, t] of [...tickets]) {
 			if (path === null ? hit.some(([target]) => target.boundPath === t.path) : t.path === path) {
 				tickets.delete(id);
-				t.reject(resetError(kind));
+				t.reject(resetError(named));
 			}
 		}
 		// After the rejections' handlers ran: the listeners see what a `synced()` caller saw first.

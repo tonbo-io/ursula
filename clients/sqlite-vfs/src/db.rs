@@ -8,7 +8,8 @@
 //! [`BindingHandle`], read without the mutex. After its last connection closes the binding drains
 //! and retires, unless an open takes it back first ([`BindingHandle::revive`]). A reset binding
 //! leaves the registry at the next open of its stream, which binds anew beside the connections
-//! still open on it: they keep their generation's files, and the new binding works on a copy.
+//! still open on it: they keep their generation's files, the new binding works on a copy, and
+//! their statements' errors still read as the reset ([`failure_state`]).
 //!
 //! The path an open hands out stays openable until a connection opens it, or until it waited for
 //! one too long ([`BindingHandle::revive`]). A stream binds under one cache root at a time in the
@@ -38,6 +39,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
+use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -54,6 +56,7 @@ use crate::driver::Role;
 use crate::driver::Undone;
 use crate::driver::runtime::driver;
 use crate::error::Error;
+use crate::error::FailureState;
 use crate::error::WriteRefusal;
 use crate::generation::canonical_path;
 use crate::host::full_pathname;
@@ -119,11 +122,22 @@ pub(crate) struct Commit {
     /// The last commit SQLite published (PHASETWO), and the last BASE record written.
     pub(crate) confirmed: Position,
     pub(crate) based: Position,
-    /// The latest write refused, until a commit is logged.
-    pub(crate) refused: Option<WriteRefusal>,
+    /// The latest write refused, until the next refusal.
+    pub(crate) refusal: Option<Refusal>,
     /// The snapshot thread's window (design: Snapshots).
     pub(crate) window: Window,
     pub(crate) stats: Stats,
+}
+
+/// The latest write a binding refused. It names a `SQLITE_IOERR_AUTH`, which the VFS returns only
+/// for a refusal ([`crate::error::classify`]), until the next refusal, so a commit another
+/// connection logs before the refused one's host classifies its error leaves it in place. It
+/// stands in `status().refused` until a commit is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub(crate) what: WriteRefusal,
+    /// No commit was logged since.
+    pub(crate) standing: bool,
 }
 
 /// The snapshot thread's window: while it is open no commit is logged, so the snapshot's
@@ -145,6 +159,21 @@ impl Commit {
     /// (a rollback journal mode, `journal_mode=MEMORY` or `OFF`) would bypass the log.
     pub(crate) fn db_write_allowed(&self) -> bool {
         self.checkpoint.is_some() || (self.exclusive != 0 && self.wal_open > 0)
+    }
+
+    /// The refusal `status().refused` reports: the latest, until a commit is logged.
+    pub(crate) fn standing_refusal(&self) -> Option<&WriteRefusal> {
+        self.refusal
+            .as_ref()
+            .filter(|r| r.standing)
+            .map(|r| &r.what)
+    }
+
+    /// A commit was logged: the latest refusal leaves status, and still names its error.
+    pub(crate) fn lift_refusal(&mut self) {
+        if let Some(r) = &mut self.refusal {
+            r.standing = false;
+        }
     }
 }
 
@@ -246,6 +275,9 @@ struct Registry {
     readers: HashMap<String, Arc<Binding>>,
     /// By db file path, both roles.
     paths: HashMap<String, Arc<Binding>>,
+    /// Bindings that left `paths` for a new open, by db file path, while connections of theirs may
+    /// still be open: their statements fail with the reset they left on ([`failure_state`]).
+    left: HashMap<String, Weak<Binding>>,
     /// Opens in progress, by canonical stream name and role.
     opens: HashMap<OpenKey, OpenEntry>,
     /// Opens that resolved and whose binding one caller is registering ([`register`]): another
@@ -326,6 +358,30 @@ pub(crate) fn lookup(path: &str) -> Option<Arc<Binding>> {
 pub(crate) fn bound(path: &str) -> Result<Arc<Binding>, Error> {
     let full = full_pathname(path)?;
     lookup(&full).ok_or(Error::NotBound { path: full })
+}
+
+/// What the database at `path` (any spelling of the db file's path) says about a statement's I/O
+/// error ([`crate::error::classify`]): [`failure_state_at`] its full path. `None` for a path no
+/// binding of the process has.
+pub(crate) fn failure_state(path: &str) -> Option<FailureState> {
+    failure_state_at(&full_pathname(path).ok()?)
+}
+
+/// What the database at full path `full` says about a statement's I/O error: the binding's, or
+/// one's that left the registry for a new open while its connections stayed open.
+pub(crate) fn failure_state_at(full: &str) -> Option<FailureState> {
+    let b = {
+        let reg = registry();
+        reg.paths
+            .get(full)
+            .cloned()
+            .or_else(|| reg.left.get(full).and_then(Weak::upgrade))
+    }?;
+    let refused = b.lock().refusal.as_ref().map(|r| r.what.clone());
+    Some(FailureState {
+        reset: b.reset_kind(),
+        refused,
+    })
 }
 
 /// The binding of driver binding `id`, for events.
@@ -480,6 +536,8 @@ fn claim(
             }
             reg.bindings(of).remove(name);
             reg.paths.remove(&b.path);
+            reg.left.retain(|_, gone| gone.strong_count() > 0);
+            reg.left.insert(b.path.clone(), Arc::downgrade(&b));
         }
     }
     match reg.opens.get_mut(key) {

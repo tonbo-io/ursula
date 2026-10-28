@@ -96,6 +96,7 @@ use crate::config::fail_sync;
 use crate::db::Binding;
 use crate::db::Commit;
 use crate::db::LogRefused;
+use crate::db::Refusal;
 use crate::db::Window;
 use crate::db::lookup;
 use crate::driver::Connected;
@@ -665,16 +666,19 @@ unsafe fn x_read(
 }
 
 /// Fails the write transaction alone, nothing of it logged: `SQLITE_IOERR_AUTH`, and the refusal
-/// stays in status until a commit is logged.
+/// stays in status until a commit is logged, and names the error until the next refusal.
 fn refuse(b: &Binding, c: &mut Commit, refusal: WriteRefusal) -> c_int {
-    if c.refused.as_ref() != Some(&refusal) {
+    if c.standing_refusal() != Some(&refusal) {
         log::emit(Level::Warn, "write_refused", &[
             ("file", &b.path),
             ("kind", &refusal.kind().as_str()),
             ("reason", &refusal),
         ]);
     }
-    c.refused = Some(refusal);
+    c.refusal = Some(Refusal {
+        what: refusal,
+        standing: true,
+    });
     ffi::SQLITE_IOERR_AUTH
 }
 
@@ -1011,7 +1015,7 @@ unsafe fn commit(
         b.reset(ResetKind::Internal, &"the driver thread is gone");
         return ffi::SQLITE_IOERR_WRITE;
     }
-    c.refused = None;
+    c.lift_refusal();
     let writer = c.writer;
     // SAFETY: the writer is the open main db handle of this transaction's connection.
     if let Some(Role::Main { state, .. }) = unsafe { ext(handle_at(writer)) }.map(|e| &e.role) {

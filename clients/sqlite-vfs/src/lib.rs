@@ -45,12 +45,19 @@
 //!   failed once it claimed the stream they do until the stream is deleted or recreated.
 //! * `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
 //!   `ursula_set_token(path, token)`.
+//! * `SELECT ursula_classify(message, errcode, path)` says what a failure a host met is: `{kind,
+//!   action, class, message, fix, request_id}` for a SQL function's error, or for a statement's
+//!   I/O error on the database at `path`, and `null` for SQLite's own errors.
 //!
 //! A write refused at admission (`backlog_full`), one the extension does not capture
 //! (`unsupported`) or a commit above the commit limit (`too_large`) fails its transaction alone with
 //! `SQLITE_IOERR_AUTH`. A reset (another owner, an unconfirmed commit, a failed fsync) fails every
 //! later statement of the database: `SQLITE_IOERR_READ` for a read, `SQLITE_IOERR_WRITE` for a
-//! write. Every SQL function's error reads `<function>: <kind>: <message>`.
+//! write. Every SQL function's error reads `<function>: <kind>: <message>`, which names the kind
+//! alone. Wherever else a kind is named (events, status, `ursula_cancel`, `ursula_classify`), its
+//! action (`retry`, `reopen`, `stop`, `fix`) and its class (`write_refused`, `reset`,
+//! `unavailable`, `setup`), the error a host throws, are named beside it, and a reset or a failed
+//! `synced()` carries the message a host shows for it.
 //!
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`, `URSULA_VFS_MAX_COMMIT_BYTES`.
@@ -87,8 +94,9 @@
 //! - `db`: bound databases (their commit-path state) and the process-wide registry.
 //! - `driver`: the process-wide driver of the replicators and opens: a deterministic core and its
 //!   runtime (a driver thread and blocking HTTP workers).
-//! - `error`: the kinds and actions callers outside the extension see (`ErrorKind`, `Action`), and
-//!   the SQL functions' error type.
+//! - `error`: the kinds, actions and classes callers outside the extension see (`ErrorKind`,
+//!   `Action`, `ErrorClass`), the one classification of a failure a host met (`classify`), and the
+//!   SQL functions' error type.
 //! - `extension`: the entry point, the SQLite version gate and the SQL functions.
 //! - `generation`: the canonical stream path, a stream's locked root directory and its reader
 //!   directories, and the generations in them (`gen-<id32>` directories).
