@@ -1809,19 +1809,25 @@ keeps only a host's glue:
 - It calls `tonbo_resolve` with timeout 0, waits for its `resolved` event on the pump
   ([Pump](#pump)), and calls again with the same arguments to take the outcome, as `open` waits for
   `ursula_open`. The options are `api_key`, `api_origin` and `auth_origin` from `apiKey`,
-  `apiOrigin` and `authOrigin`, `own_token` when the open has a `token`, and a `timeout_ms` of a
-  day, so the open's signal (30 s by default) governs: when it fires, `ursula_cancel` gives the
-  resolve up and reports what it came to, the last condition included.
-- An error's message is the extension's report without the `tonbo_resolve: ` prefix. The kinds of
-  `TonboError` carry the report's fix and request id as `fix` and `requestId`: a cancel reports them
-  as fields, and an error the call threw has the fix after the last `. ` outside a shell word in
-  single quotes. The other kinds take the root entry's classes, as `ursula_open`'s do.
+  `apiOrigin` and `authOrigin`, each refused `invalid_argument` unless it is a string, `own_token`
+  when the open has a `token`, and a `timeout_ms` of a day, so the open's signal (30 s by default)
+  governs: when it fires, `ursula_cancel` gives the resolve up and reports what it came to, the
+  last condition included. Every other way out but the outcome, such as a pump that failed for
+  good, cancels the resolve too.
+- Concurrent calls with the same arguments on a thread share one resolve and its outcome, as
+  concurrent opens share one bind. A call whose shared resolve was given up at another call's
+  signal resolves anew.
+- A failure is the outcome's `error`, `{kind, action, class, message, fix, request_id}`, as a
+  cancel reports it, so nothing parses a message. Its kinds of `TonboError` carry `fix` and
+  `request_id` as `fix` and `requestId`, and the message is the extension's. The other kinds take
+  the root entry's class their `class` names, as `ursula_open`'s do.
 - Without a `token` the key's Streams tokens serve the open: the resolve returns once the extension
   holds the first one, so a key the token endpoint refuses fails the resolve, and `resolveDatabase`
-  hands out `token: undefined`. It then clears the token set (`ursula_set_token` with an empty
-  token) and stops the thread's token provider ([Tokens](#tokens)), so the key's tokens, or
-  `URSULA_VFS_TOKEN_FILE`'s, serve every Streams request of the process. With a `token`, the resolve
-  hands it out as given.
+  hands out `token: undefined`. When the answer says the key's tokens serve (`key_tokens`), the
+  extension cleared the token set, and the entry stops the thread's token provider
+  ([Tokens](#tokens)) and withdraws a token it set since, so the key's tokens serve every Streams
+  request of the process. With a `token`, or with `URSULA_VFS_TOKEN_FILE`, the token set stays, and
+  the resolve hands the `token` out as given.
 
 The `/tonbo/pi` entry (`tonbo-pi.ts`) is that composition for Pi: its
 `openUrsulaPiStorage(nameOrUrl, options)` is `resolveDatabase` followed by the `/pi` entry's
@@ -1857,23 +1863,27 @@ only Pi users install, and `/pi` knows nothing of Tonbo. It adds no logic: the r
 - The Streams tokens are the key's, which the extension exchanges at `{auth origin}/api/iam/token`
   with `{"audience":"https://streams.tonbo.dev"}` and refreshes ([Transport](#transport)). They are
   attached only to a stream URL that is `https://`, or `http://` to a loopback host: any other fails
-  `invalid_url`. A `401` or `403` there fails `invalid_api_key`. The process holds one key, so an
-  open with a second key fails `invalid_argument` while the first may serve. An explicit `token`, or
-  `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key. The
-  extension reads the file only while no open of the process has set a token.
+  `invalid_url`. A `401` or `403` there fails `invalid_api_key`. The process holds one key for
+  Streams tokens: once it held a token, an open whose key would fetch them fails `invalid_argument`
+  with a second key while any database of the process may send requests, and for 60 s after a
+  resolve was handed the first key's token. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves
+  Streams requests instead, and then a URL needs no key, and a key only looks the name up, so it is
+  never refused. The extension reads the file only while no open of the process has set a token.
 - Origins are `https://`, or `http://` to a loopback host. `TONBO_API_ORIGIN` and
   `TONBO_AUTH_ORIGIN` set them when the options do not.
 - Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key` and
   `database_not_found`, action `fix`, with `fix` (the variable or command, which ends the message)
   and the API's `requestId`. No message carries a key or a token. An empty name fails
-  `UrsulaSetupError` `invalid_name`, an `apiKey` option that cannot be sent `invalid_argument`, and
-  a login file that cannot be read `local_setup`.
+  `UrsulaSetupError` `invalid_name`, an `apiKey` option that cannot be sent, or an `apiKey`,
+  `apiOrigin` or `authOrigin` that is not a string, `invalid_argument`, and a login file that cannot
+  be read `local_setup`.
 
 The resolve is the extension's: `tonbo_resolve(name_or_url, options_json, timeout_ms)` (`tonbo.rs`)
 applies the rules above in one implementation for every host of its SQL functions, the `/tonbo`
-entry included, so a host carries none of its own. Only `extension.rs` calls into the `tonbo`
-module, and `status.rs` and `error.rs` render what it returns: the open, the registry and the driver
-never do.
+entry included, so a host carries none of its own: it keeps only the glue of waiting, joining its
+own concurrent calls, and stopping a token source of its own once the key's tokens serve. Only
+`extension.rs` calls into the `tonbo` module, `status.rs` renders what it returns and `error.rs`
+names its kinds: the open, the registry and the driver never do.
 
 - `options_json` holds `api_key`, `api_origin`, `auth_origin`, `own_token`, `timeout_ms` and
   `agent` (accepted, not sent). The key sources, the login file and the origins are as above, with
@@ -1889,44 +1899,53 @@ never do.
 - The lookup is as above: the `exchange_required` exchange and the Management API token held per
   key, the backoff from 250 ms to 2 s, `Retry-After` in whole seconds and never below the backoff,
   and no redirect followed. Its requests go out on the agent of appends and reads
-  ([Transport](#transport)), so they trust the same roots and take the same proxy. Each request, the
-  Management API token's exchange included, is bounded by the time the call has left and by the
-  agent's 10 s, so a request that gets no answer is retried. A refusal and a status outside the
-  contract keep the answer's `code`, `detail` and request id, the token endpoint's too.
+  ([Transport](#transport)), so they trust the same roots and take the same proxy. Each request,
+  the Management API token's exchange included, gets the time the call has left, at most the
+  agent's 10 s: a request on a connection a device dropped without telling either end, or to an
+  API that never answers, fails `unreachable` and goes again after the backoff on another
+  connection, and a request in flight when the resolve is cancelled ends within that time. A
+  refusal and a status outside the contract keep the answer's `code`, `detail` and request id, the
+  token endpoint's too.
 - Unless `own_token` is set or `URSULA_VFS_TOKEN_FILE` serves the Streams requests, the key becomes
   the process's key source ([Transport](#transport)), exchanged at `{auth origin}/api/iam/token` for
   the audience `https://streams.tonbo.dev`, and the call returns only once it holds the first token.
-  A key the token endpoint refuses fails there with `invalid_api_key`, before any open. The process
-  holds one key, so another one fails `invalid_argument` while the first may serve. A cancel ends
-  the waits at once, the one for the token with the call's claim on the key, and a request in flight
-  within its 10 s. The stream URL must be one `ursula_open` takes, by the open's own check, or the
-  call fails `invalid_url` before any request: a URL given before the lookup, a URL looked up before
-  the token. With a Streams token for the key it must also be `https://`, or `http://` to a loopback
-  host. With `own_token`, a URL needs no key and the call sends nothing.
-- It returns `{done: true, url, name}`, `name` `null` for a URL. With `timeout_ms` 0 it returns
+  A key the token endpoint refuses fails there with `invalid_api_key`, before any open. Then the call
+  clears the token set (`ursula_set_token`, an open's `token`), so the key's tokens serve every
+  request of the process, and answers `key_tokens: true`. The process holds one key, so another one
+  fails `invalid_argument` while the first may serve. A key that only looks a name up (`own_token`,
+  the token file) is never refused. A cancel ends the waits at once, the one for the token with the
+  call's claim on the key. The stream URL must be one `ursula_open` takes, by the open's own check,
+  or the call fails `invalid_url` before any request: a URL given before the lookup, a URL looked up
+  before the token. With a Streams token for the key it must also be `https://`, or `http://` to a
+  loopback host. With `own_token`, a URL needs no key and the call sends nothing.
+- It returns `{done: true, url, name, key_tokens}`, `name` `null` for a URL, and `{done: true,
+  error: {kind, action, class, message, fix, request_id}}` for a failure, the fields a cancel
+  reports. Only a malformed `timeout_ms` fails the SQL call itself. With `timeout_ms` 0 it returns
   `{done: false, request}` at once and resolves on a thread of its own, for the option `timeout_ms`
   (30 s by default). A `resolved` event (`{event, request, ok}`) ends every resolve, one given up
-  included, and a call with the same arguments then takes the outcome, the answer or the error. A
+  included, and a call with the same arguments then takes the outcome, the answer or the failure. A
   timeout too large for the clock waits a year.
 - Calls with the same arguments join one resolve (`tonbo/requests.rs`, a pure table, as opens count
   theirs). The resolve goes on until the latest deadline of the calls that joined it: a blocking
   call's `timeout_ms`, or the option for a call that returned at once. Every blocking call that
-  joined takes its outcome, and so does a call that returned at once and comes back. A blocking call
-  that finds an outcome owed to a call that returned at once starts another resolve, whose outcome
-  that call is owed instead. A blocking call whose time runs out leaves the resolve to the other
-  calls it owes, and gives it up only as the last. `ursula_cancel(request)` gives it up for the host
-  that cancels: it goes on while a blocking call waits for it, and otherwise ends. The cancel
-  reports what the resolve came to: `null` for an answer, the error it ended with, or `cancelled`
-  with the last condition, as `{kind, action, class, message, fix, request_id}`. A call that gives
-  up names what the resolve waited for then, the lookup or the Streams token, with the last
-  condition met while waiting for it. A call that finds the resolve it waited for given up starts
-  another and names its request.
+  joined takes its outcome. The calls that returned at once count as one host's, since the table
+  cannot tell a host that calls again from another one: the first of them that comes back takes the
+  outcome, so a host joins its own concurrent calls. A blocking call that finds an outcome owed to a
+  call that returned at once starts another resolve, whose outcome that call is owed instead. A
+  blocking call whose time runs out leaves the resolve to the other calls it owes, and gives it up
+  only as the last. `ursula_cancel(request)` gives it up for the host that cancels: it goes on while
+  a blocking call waits for it, and otherwise ends. The cancel reports what the resolve came to:
+  `null` for an answer, the failure it ended with, or `cancelled` with the last condition, as
+  `{kind, action, class, message, fix, request_id}`. A call that gives up names what the resolve
+  waited for then, the lookup or the Streams token, with the last condition met while waiting for
+  it. A call that finds the resolve it waited for given up starts another and names its request.
 - An outcome goes only to calls made before it arrived, and leaves with the last of them, with two
   exceptions. A call made while blocking calls are still to take it takes it with them, and a call
   that returned at once is then owed it no more. A call that returned at once and neither came back
   nor cancelled leaves its outcome for the next such call, for a minute.
-- Errors read `tonbo_resolve: <kind>: <what> (request <id>). <fix>`: the request id when the Tonbo
-  API answered with one, the fix when there is something to run or set. The kinds are the four of
+- A failure's message reads `<kind>: <what> (request <id>). <fix>`: the request id when the Tonbo
+  API answered with one, the fix when there is something to run or set, both also as fields. The
+  kinds are the four of
   `TonboError`, `invalid_name`, `invalid_argument`, `invalid_url`, `local_setup` and `internal`, and
   the last condition (`unreachable`, `unavailable` or `rate_limited`, else `cancelled`) when the time
   ran out. Messages and fixes name options in words every host's spelling of them fits ("the API
@@ -1939,12 +1958,21 @@ stands in for the Management API and the token endpoint as their contracts docum
 serves databases whose URLs are streams of the suite's server. The credentials cases are the
 contract's own usable and unusable examples. The process holds one key, so the tests that fetch a
 Streams token in the suite's process share one key, after "a key that gets no Streams token", whose
-keys give way to it, and the others give the Streams requests a token of their own.
+keys give way to it, and the others give the Streams requests a token of their own. The tests
+therefore run in the file's order.
 `URSULA_VFS_TOKEN_FILE` runs in a process of its own (test/tonbo-child.ts), on a stream and cache
 root of its own with a token no other test uses, where no open set a token first, and the gate
 shows every request carried the file's token. `resolveDatabase` runs with `openUrsulaPiStorage`:
 the gate shows the Pi storage's stream requests carried the key's Streams token, not the token an
-earlier open set, and at its signal the resolve is given up with the last condition it met. "opens
+earlier open set, and at its signal the resolve is given up with the last condition it met. "stops
+this thread's token provider once the key's tokens serve, and the provider's database then carries
+the key's token" shows the provider is never called again, "shares one resolve among a thread's
+concurrent calls with the same arguments" counts one lookup, and "refuses a second key for Streams
+tokens while the first was just handed out" fails `UrsulaSetupError` `invalid_argument`. "gives
+each lookup request 10 s at most, so one the API never answers goes again, and the signal cancels
+one in flight" runs against a server that accepts requests and never answers: the second request
+goes after 10 s, the open fails `unreachable` at its signal, and the request in flight then ends
+within its 10 s. "opens
 Pi storage by name in one call for Harness.open, whose close closes it, and its Streams requests
 carry the token exchanged for the key" runs the `/tonbo/pi` entry under Pi's `Harness`, and its
 binding retires once `harness.close` returned. "the extension's tonbo_resolve" runs `tonbo_resolve`
@@ -1988,8 +2016,9 @@ returns at once.
 - `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)` (of an open or a
   resolve), `ursula_set_token(path, token)`.
 - `tonbo_resolve(name_or_url, options_json, timeout_ms)`: a Tonbo database's stream URL by name
-  ([Tonbo](#tonbo)), returning `{done, url, name}` or `{done: false, request}`. Its `resolved` event
-  says a call with the same arguments takes the outcome.
+  ([Tonbo](#tonbo)), returning `{done, url, name, key_tokens}`, a failure as `{done: true, error}`,
+  or `{done: false, request}`. Its `resolved` event says a call with the same arguments takes the
+  outcome.
 
 The extension refuses to load into SQLite older than 3.50.4, one without WAL, or one lacking a
 routine the extension needs. Every such refusal reads `sqlite-ursula-vfs needs ...`, the prefix a
@@ -2072,9 +2101,9 @@ meanwhile. So the last open that names a token sets it.
   another function only names the function the next call runs, and shares the token held and the
   call in flight. An open with a string stops the source on its thread: the call in flight is
   abandoned (its `signal` fires), and the opens waiting go on under the string. An open without
-  `token` changes nothing. A `/tonbo` resolve whose key serves the Streams requests stops the source
-  on its thread the same way, and clears the token set, so the key's tokens serve
-  ([Tonbo](#tonbo)).
+  `token` changes nothing. A `/tonbo` resolve whose key serves the Streams requests (`key_tokens`)
+  clears the token set in the extension, and stops the source on its thread the same way, which
+  withdraws a token the source set since, so the key's tokens serve ([Tonbo](#tonbo)).
 - An open asks the source for a token before its first request. A valid token held serves at
   once, so a connection on a bound binding needs no network, and a refresh that is due runs in the
   background. An expired one serves only while the provider fails (a call failed since the last

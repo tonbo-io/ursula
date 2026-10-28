@@ -1,9 +1,9 @@
 //! Tonbo databases by name (design: Tonbo): `tonbo_resolve(name_or_url, options_json, timeout_ms)`
 //! turns the name of a database of a Tonbo account into its stream URL, with the account's API
 //! key, and fetches the first Streams token for the key before it returns, so a host opens the URL
-//! with `ursula_open` next. Only `extension` calls into this module, and `status` and `error`
-//! render what it returns: the open, the registry and the driver know nothing of Tonbo, and a host
-//! that never calls `tonbo_resolve` never runs it.
+//! with `ursula_open` next. Only `extension` calls into this module, `status` renders what it
+//! returns and `error` names its kinds: the open, the registry and the driver know nothing of
+//! Tonbo, and a host that never calls `tonbo_resolve` never runs it.
 //!
 //! - A name is anything without a scheme (`https://...`): an empty one fails `invalid_name`. A URL
 //!   is taken as it is, and no lookup runs. A stream URL `ursula_open` would refuse fails
@@ -25,25 +25,34 @@
 //!   time runs out. The Streams token is the process's key source (`auth`): the key goes to
 //!   `{auth origin}/api/iam/token` with the audience [`STREAMS_AUDIENCE`], and its tokens are
 //!   refreshed in the background while requests may carry them. They go only to a stream URL that
-//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Every wait is
-//!   bounded by the time the resolve has left, and every request by that and the agent's 10 s. A
-//!   cancel ends the waits at once, and a request in flight within its 10 s.
+//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Once the key
+//!   holds its first token, the resolve clears the token set (`ursula_set_token`, an open's
+//!   `token`), so the key's tokens serve every request of the process from then on, and its answer
+//!   says so (`key_tokens`).
+//! - Every wait is bounded by the time the resolve has left and ends at once at a cancel. Every
+//!   request gets that time too, at most 10 s (`lookup`): a request in flight at a cancel ends
+//!   within them, and one the API never answers fails as unreachable and goes again.
 //! - A resolve goes on for the time of the latest call that joined it, and a call that gives up
 //!   on it reports what it waited for last: the lookup, or the Streams token.
 //! - With `timeout_ms` 0 the call returns `{done: false, request}` at once, and the resolve goes on
 //!   on a thread of its own, for `timeout_ms` of the options (30 s by default). Its end is a
 //!   `resolved` event (`ursula_events`), always, after which the host calls again with the same
-//!   arguments and takes the outcome: the answer, or the error. Calls with the same arguments
-//!   join one resolve, and `ursula_cancel(request)` gives it up for the host that cancels
-//!   (`requests` says which call takes what). A call that finds its resolve given up starts one,
-//!   with another request to wait for.
+//!   arguments and takes the outcome: the answer, or the failure. Blocking calls with the same
+//!   arguments join one resolve, and so does a host's call that returns at once: the calls that
+//!   return at once count as one host's, whose first call back takes the outcome, so a host joins
+//!   its own concurrent calls. `ursula_cancel(request)` gives the resolve up for the host that
+//!   cancels (`requests` says which call takes what). A call that finds its resolve given up
+//!   starts one, with another request to wait for.
 //! - A timeout too large for the clock waits a year: a host's "forever".
 //!
-//! Every failure is a [`TonboError`], reported as [`TonboError::report`] writes it: `<kind>:
-//! <what>`, then ` (request <id>)` for the Tonbo API's request id when an answer failed, then
-//! `. <fix>` when there is something to run or set. Messages name options in words every host's
+//! Every failure is a [`TonboError`], which the call returns as its outcome, `{done: true, error:
+//! {kind, action, class, message, fix, request_id}}`, the fields `ursula_cancel` reports, so a
+//! host reads them and parses no message. The message is what [`TonboError::report`] writes:
+//! `<kind>: <what>`, then ` (request <id>)` for the Tonbo API's request id when an answer failed,
+//! then `. <fix>` when there is something to run or set. Messages name options in words every host's
 //! spelling of them fits ("the API key option"): only a malformed `options_json` names its
-//! members. No message carries a key or a token, and nothing here logs.
+//! members. No message carries a key or a token, and nothing here logs. Only a malformed argument
+//! of the call itself (a `timeout_ms` that is not a count) fails the SQL call.
 //!
 //! Module map:
 //!
@@ -111,11 +120,15 @@ const CANCEL_REPORT_MS: u64 = 1_000;
 /// The longest wait, a year: a timeout too large for the clock waits this long.
 const FOREVER: Duration = Duration::from_secs(31_536_000);
 
-/// What a resolve hands out: the stream URL, and the database's name when it was looked up.
+/// What a resolve hands out: the stream URL, the database's name when it was looked up, and
+/// whether the key's Streams tokens serve the process's requests from then on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resolved {
     pub(crate) url: String,
     pub(crate) name: Option<String>,
+    /// The resolve made the key the source of the process's Streams tokens and cleared the token
+    /// set: a host stops any token source of its own that would set one again.
+    pub(crate) key_tokens: bool,
 }
 
 /// What `tonbo_resolve` came to.
@@ -626,11 +639,19 @@ impl Plan {
             // Checked when planned.
             Target::Url(url) => (url.clone(), None),
         };
+        let key_tokens = self.streams.is_some();
         if let Some(key) = &self.streams {
             until.waits_for(Subject::Token(url.clone()));
             streams_token(key, &self.auth, &url, until)?;
+            // The key's tokens serve every request of the process from now on: a token an
+            // earlier open set would go on serving in their place.
+            crate::auth::set_token(None);
         }
-        Ok(Resolved { url, name })
+        Ok(Resolved {
+            url,
+            name,
+            key_tokens,
+        })
     }
 }
 

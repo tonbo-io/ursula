@@ -2,24 +2,26 @@
 // key. The extension's `tonbo_resolve` does the work, in one implementation for every host: it
 // finds the key, looks the name up in the Management API and, unless the open brings a token of its
 // own, makes the key the process's source of Streams tokens, which it exchanges and refreshes
-// itself, and holds the first one before it answers. This entry calls it without blocking (timeout
-// 0, then its `resolved` event through the pump, as `open` waits for `ursula_open`) and turns its
-// errors into the package's classes. `resolveDatabase` is that resolve on its own: the stream URL
-// and the `token` to open it with, which `open` passes to the root entry's `open` and a caller of
-// another opener, such as the `/pi` entry's `openUrsulaPiStorage`, passes to that.
+// itself, holds the first one before it answers, and clears the token set. This entry calls it
+// without blocking (timeout 0, then its `resolved` event through the pump, as `open` waits for
+// `ursula_open`), joins this thread's concurrent resolves of the same arguments, and turns the
+// failure the extension reports as fields into the package's classes. `resolveDatabase` is that
+// resolve on its own: the stream URL and the `token` to open it with, which `open` passes to the
+// root entry's `open` and a caller of another opener, such as the `/pi` entry's
+// `openUrsulaPiStorage`, passes to that.
 //
 // - The key: the `apiKey` option, else TONBO_API_KEY, else the file `tonbo login` writes (the
 //   Tonbo CLI's credentials contract, version 1), as the extension reads them.
 // - An explicit `token` serves the Streams requests instead of the key's tokens (`own_token`), and
 //   so does URSULA_VFS_TOKEN_FILE, which the extension reads.
-// - Without a `token`, the key's tokens (or the token file's) serve every Streams request of the
-//   process from the resolve on: a token an earlier open set stops serving, and this thread's token
-//   provider stops (token.ts).
+// - When the key's tokens serve (`key_tokens` in the answer), they serve every Streams request of
+//   the process from the resolve on: the extension cleared the token an earlier open set, and this
+//   thread's token provider stops (token.ts).
 //
 // Nothing here logs, and no error message carries a key or a token.
-import { DEFAULT_OPEN_MS, reasonOf } from "./abort.ts";
+import { DEFAULT_OPEN_MS, raced, reasonOf } from "./abort.ts";
 import { call } from "./control.ts";
-import { errorOf, type TonboKind, UrsulaError, UrsulaUnavailableError } from "./errors.ts";
+import { type Described, errorOf, type TonboKind, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { type OpenOptions, open as openStream, type UrsulaDatabase } from "./index.ts";
 import { pump } from "./pump.ts";
 import { type TokenProvider, useKeyTokens } from "./token.ts";
@@ -46,10 +48,8 @@ export type { BearerToken, TokenProvider } from "./token.ts";
 const EXTENSION_RESOLVE_MS = 24 * 60 * 60 * 1000;
 /** The kinds a {@link TonboError} carries. */
 const TONBO_KINDS: ReadonlySet<string> = new Set<TonboKind>(["missing_credentials", "credentials_refused", "invalid_api_key", "database_not_found"]);
-/** `tonbo_resolve`'s error: `tonbo_resolve: <kind>: <what>[ (request <id>)][. <fix>]`. */
-const RESOLVE_ERROR = /^tonbo_resolve: ([a-z_]+): /;
-/** A report's request id: ` (request <id>)` at its end. */
-const REQUEST_ID = / \(request ([^\s()]+)\)$/;
+/** The options that name a Tonbo API key or origin: each a string when given. */
+const STRING_OPTIONS = ["apiKey", "apiOrigin", "authOrigin"] as const;
 
 /**
  * A Tonbo API key or login the open cannot use, or a database the account does not have. `kind` names
@@ -105,17 +105,27 @@ export interface ResolvedDatabase {
 	readonly token: string | TokenProvider | undefined;
 }
 
-/** `tonbo_resolve`'s answer. */
-type Resolution = { done: true; url: string; name: string | null } | { done: false; request: number };
-
-/** What a resolve failed with, as `ursula_cancel` reports it, or as read from `tonbo_resolve`'s error. */
-interface Report {
-	readonly kind: string;
+/** What a resolve failed with, as `tonbo_resolve` and `ursula_cancel` report it. */
+interface Report extends Described {
 	/** `<kind>: <what>[ (request <id>)][. <fix>]`. */
 	readonly message: string;
 	readonly fix: string | null;
 	readonly request_id: string | null;
 }
+
+/** A resolve's answer: the stream URL, and whether the key's Streams tokens serve from now on. */
+interface Answer {
+	readonly url: string;
+	readonly key_tokens: boolean;
+}
+
+/** `tonbo_resolve`'s answer. */
+type Resolution = ({ done: true } & Answer) | { done: true; error: Report } | { done: false; request: number };
+
+/** The resolves in flight on this thread, by their arguments: concurrent calls share one and its outcome. */
+const inflight = new Map<string, Promise<Answer>>();
+/** Errors of a resolve given up at its own caller's signal: a call that shared it resolves anew. */
+const byAbort = new WeakSet<object>();
 
 /**
  * Opens the Tonbo database `nameOrUrl` names, as the root entry's `open` does, and returns its
@@ -124,9 +134,10 @@ interface Report {
  *
  * Streams requests carry tokens exchanged for the key, which the extension keeps fresh in the
  * background, unless `token` or URSULA_VFS_TOKEN_FILE gives one: then no key is needed for a URL.
- * The process holds one key: another one fails `invalid_argument` while the first may serve. A
- * database still being created is waited for. The signal (30 s by default) bounds the whole open,
- * the lookup included.
+ * The process holds one key for Streams tokens: once it held one, another key that would fetch
+ * them fails `invalid_argument` while any database of the process may send requests, and for 60 s
+ * after a resolve was handed its token. A database still being created is waited for. The signal
+ * (30 s by default) bounds the whole open, the lookup included.
  *
  * Throws {@link TonboError} for a key or database to fix, {@link UrsulaUnavailableError} when the
  * signal fired while the Tonbo API did not answer (`unreachable`, `unavailable` or `rate_limited`,
@@ -153,9 +164,10 @@ export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = 
  * becomes the process's source of Streams tokens, which the extension exchanges and keeps fresh, and
  * the resolve returns once it holds the first one: a key the token endpoint refuses fails here, and
  * the `token` handed out is `undefined`, since the key's tokens serve the open. From then on they
- * serve every Streams request of the process: a token an earlier open set no longer does, and this
- * thread's token provider stops. A `token` is handed out as it was given, and then a URL needs no key
- * and the resolve sends nothing. The signal (30 s by default) bounds the resolve.
+ * serve every Streams request of the process: the extension cleared the token an earlier open set,
+ * and this thread's token provider stops. A `token` is handed out as it was given, and then a URL
+ * needs no key and the resolve sends nothing. Concurrent calls with the same arguments on a thread
+ * share one resolve. The signal (30 s by default) bounds the resolve.
  *
  * Throws as {@link open} does before the open of the stream: {@link TonboError} for a key or
  * database to fix, {@link UrsulaUnavailableError} when the signal fired while the Tonbo API did not
@@ -163,80 +175,101 @@ export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = 
  */
 export async function resolveDatabase(nameOrUrl: string | URL, options: TonboResolveOptions = {}): Promise<ResolvedDatabase> {
 	const { apiKey, apiOrigin, authOrigin, token } = options;
+	for (const name of STRING_OPTIONS) {
+		const value: unknown = options[name];
+		// Never the value itself: it may be a key.
+		if (value !== undefined && typeof value !== "string") throw new UrsulaSetupError(`invalid_argument: ${name} must be a string, not ${value === null ? "null" : typeof value}`, "invalid_argument");
+	}
 	const until = options.signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
 	// `undefined` members are left out: the extension's defaults apply.
 	const settings = JSON.stringify({ api_key: apiKey, api_origin: apiOrigin, auth_origin: authOrigin, own_token: token !== undefined, timeout_ms: EXTENSION_RESOLVE_MS });
-	const { url } = await resolved(String(nameOrUrl), settings, until);
-	if (token === undefined) useKeyTokens();
+	const { url, key_tokens } = await joined(String(nameOrUrl), settings, until);
+	if (key_tokens) useKeyTokens();
 	return { url, token };
+}
+
+/**
+ * The resolve of `target` with `settings`: the one this thread has in flight for them, whose outcome
+ * this call shares, or a new one. A call whose resolve was given up at another call's signal
+ * resolves anew.
+ */
+async function joined(target: string, settings: string, until: AbortSignal): Promise<Answer> {
+	const key = `${target}\n${settings}`;
+	for (;;) {
+		if (until.aborted) throw cancelled(target, until);
+		const shared = inflight.get(key);
+		if (shared !== undefined) {
+			try {
+				return await raced(shared, until);
+			} catch (error) {
+				if (until.aborted) throw cancelled(target, until);
+				if (byAbort.has(error as object)) continue;
+				throw error;
+			}
+		}
+		const resolve = resolved(target, settings, until);
+		inflight.set(key, resolve);
+		try {
+			return await resolve;
+		} finally {
+			if (inflight.get(key) === resolve) inflight.delete(key);
+		}
+	}
 }
 
 /**
  * `tonbo_resolve(target, settings, 0)` until it answers: the call returns at once, the pump wakes
  * this one at the resolve's `resolved` event, and a call with the same arguments then takes the
  * outcome, or names another resolve to wait for when the one it waited for was given up. `until`
- * firing cancels the resolve.
+ * firing cancels the resolve, and so does every other way out but its outcome, such as a pump that
+ * failed for good: no resolve this call started outlives it.
  */
-async function resolved(target: string, settings: string, until: AbortSignal): Promise<{ url: string }> {
-	for (;;) {
-		if (until.aborted) throw cancelled(target, until);
-		// Started before the call, so its events cursor precedes the request.
-		const events = pump();
-		const answer = resolveOnce(target, settings);
-		if (answer.done) return answer;
-		try {
-			await events.completed(answer.request, until);
-		} catch {
-			throw giveUp(target, answer.request, until);
-		}
-	}
-}
-
-/** One call of `tonbo_resolve` with timeout 0: its answer, or its error as the package's. */
-function resolveOnce(target: string, settings: string): Resolution {
+async function resolved(target: string, settings: string, until: AbortSignal): Promise<Answer> {
+	/** The resolve this call waits for, which the call cancels unless it took the outcome. */
+	let waiting: number | undefined;
 	try {
-		return call<Resolution>("SELECT tonbo_resolve(?, ?, 0)", target, settings);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "";
-		const named = RESOLVE_ERROR.exec(message);
-		if (named === null) throw error;
-		throw errorOfReport(readReport(named[1] as string, message.slice("tonbo_resolve: ".length)), error);
-	}
-}
-
-/**
- * The report `message` of `kind` (`<kind>: <what>[ (request <id>)][. <fix>]`) as `ursula_cancel`
- * gives its fields. Only a {@link TonboError}'s kinds read the fix, which every one of them has:
- * it follows the last `. ` outside a shell word in single quotes, which a fix may quote a path in.
- */
-function readReport(kind: string, message: string): Report {
-	let head = message;
-	let fix: string | null = null;
-	if (TONBO_KINDS.has(kind)) {
-		let quoted = false;
-		for (let i = message.length - 1; i > kind.length + 2; i -= 1) {
-			const c = message[i];
-			if (c === "'") quoted = !quoted;
-			else if (!quoted && c === " " && message[i - 1] === ".") {
-				head = message.slice(0, i - 1);
-				fix = message.slice(i + 1);
-				break;
+		for (;;) {
+			if (until.aborted) {
+				const request = waiting;
+				waiting = undefined;
+				throw marked(request === undefined ? cancelled(target, until) : giveUp(target, request, until));
+			}
+			// Started before the call, so its events cursor precedes the request.
+			const events = pump();
+			const answer = call<Resolution>("SELECT tonbo_resolve(?, ?, 0)", target, settings);
+			if (answer.done) {
+				waiting = undefined;
+				if ("error" in answer) throw errorOfReport(answer.error, undefined);
+				return answer;
+			}
+			waiting = answer.request;
+			try {
+				await events.completed(answer.request, until);
+			} catch {
+				waiting = undefined;
+				throw marked(giveUp(target, answer.request, until));
 			}
 		}
+	} finally {
+		if (waiting !== undefined) abandon(waiting);
 	}
-	return { kind, message, fix, request_id: REQUEST_ID.exec(head)?.[1] ?? null };
+}
+
+/** `error`, which a resolve met at its own caller's signal. */
+function marked<E extends object>(error: E): E {
+	byAbort.add(error);
+	return error;
 }
 
 /** The package's error for what a resolve failed with: a {@link TonboError} for its kinds, the root entry's class otherwise. */
 function errorOfReport(report: Report, cause: unknown): UrsulaError {
 	const { kind, message, fix } = report;
-	if (!TONBO_KINDS.has(kind)) return errorOf(kind, message, cause, false);
+	if (!TONBO_KINDS.has(kind)) return errorOf(report, message, cause);
+	// The message is `<kind>: <what>[ (request <id>)][. <fix>]`, its fields given: `what` is what is left.
 	const requestId = report.request_id ?? undefined;
 	const request = requestId === undefined ? "" : ` (request ${requestId})`;
-	const end = fix === null ? message.length : message.length - `. ${fix}`.length;
-	let what = message.slice(`${kind}: `.length, end);
-	if (request !== "" && what.endsWith(request)) what = what.slice(0, what.length - request.length);
-	return new TonboError(what, kind as TonboKind, fix ?? "", requestId, cause);
+	const end = message.length - (fix === null ? 0 : `. ${fix}`.length) - request.length;
+	return new TonboError(message.slice(`${kind}: `.length, end), kind as TonboKind, fix ?? "", requestId, cause);
 }
 
 /** The signal fired: cancels resolve `request`, and the error is what it came to, the last condition it met, or `cancelled`. */
@@ -249,6 +282,15 @@ function giveUp(target: string, request: number, signal: AbortSignal): UrsulaErr
 	}
 	if (ended === null || ended.kind === "cancelled") return cancelled(target, signal);
 	return errorOfReport(ended, signal.reason);
+}
+
+/** The call left its resolve `request` for another reason than the signal: it is cancelled, and what it came to is dropped. */
+function abandon(request: number): void {
+	try {
+		call("SELECT ursula_cancel(?)", request);
+	} catch {
+		// It ended and its outcome was taken meanwhile.
+	}
 }
 
 /** The resolve of `target` gave up at `signal` before it met any condition. */

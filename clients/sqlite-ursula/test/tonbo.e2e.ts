@@ -5,7 +5,9 @@
 // entry resolves through the extension's `tonbo_resolve`, and the process holds one API key for
 // Streams tokens: the tests that fetch one in this process share `KEY`, after the ones whose key
 // gets none, which give way to it, and the others give the Streams requests a token of their own.
-// Each test waits until the bindings it opened retired. `resolveDatabase` runs with the `/pi`
+// Each test waits until the bindings it opened retired. The tests depend on their order, which is
+// the file's (vitest runs a file's tests in sequence): "a key that gets no Streams token" must run
+// before any test that fetches KEY's tokens, so never shuffle this file. `resolveDatabase` runs with the `/pi`
 // entry's `openUrsulaPiStorage`, the opener it exists for, and the `/tonbo/pi` entry runs both in one
 // call under Pi's own Harness. `tonbo_resolve` runs on its own against the same stand-in too, as
 // other hosts of its SQL functions call it: on this thread with `timeout_ms` 0 and its `resolved`
@@ -15,7 +17,7 @@
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -25,7 +27,7 @@ import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
-import { open as openByName, type ResolvedDatabase, resolveDatabase, TonboError, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
+import { open as openByName, type ResolvedDatabase, resolveDatabase, TonboError, type TonboResolveOptions, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
 import { openUrsulaPiStorage as openPiByName, TonboError as TonboPiError } from "../src/tonbo-pi.ts";
 import { ext, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
 import { type FixtureDatabase, TonboApi } from "./tonbo-api.ts";
@@ -150,6 +152,26 @@ async function bystander(status: number, headers: Record<string, string> = {}): 
 	return { origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, hits, stop };
 }
 
+/** A server that accepts every request, records each as `METHOD path`, and never answers: `connections` counts the ones still open. */
+async function silent(): Promise<{ origin: string; hits: string[]; connections: () => number; stop: () => Promise<void> }> {
+	const hits: string[] = [];
+	const sockets = new Set<Socket>();
+	const server = createServer((req) => {
+		hits.push(`${req.method} ${req.url}`);
+		req.resume();
+	});
+	server.on("connection", (socket: Socket) => {
+		sockets.add(socket);
+		socket.once("close", () => sockets.delete(socket));
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const stop = async (): Promise<void> => {
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+	};
+	return { origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, hits, connections: () => sockets.size, stop };
+}
+
 /** The error an open rejects with: a {@link UrsulaSetupError} `invalid_argument` whose message ends with `fix`. */
 async function invalidArgument(promise: Promise<unknown>, fix: string): Promise<UrsulaSetupError> {
 	const error = await rejection(promise);
@@ -190,7 +212,7 @@ describe("a key that gets no Streams token", () => {
 		const d = database("ext-nostreams");
 		const message = await resolveError(tonboResolve(d.name, { api_key: "tbo_nostreams" }), "invalid_api_key", "Pass a valid API key");
 		// The token endpoint's problem details: its code and request id.
-		expect(message).toMatch(/^tonbo_resolve: invalid_api_key: the Tonbo token endpoint refused the API key from the API key option \(unauthenticated\) \(request req-\d+\)\. Pass a valid API key$/);
+		expect(message).toMatch(/^invalid_api_key: the Tonbo token endpoint refused the API key from the API key option \(unauthenticated\) \(request req-\d+\)\. Pass a valid API key$/);
 		expect(api.of("management")).toMatchObject([{ name: d.name, authorization: "Bearer tbo_nostreams" }]);
 		expect(api.of("token")).toMatchObject([{ authorization: "Bearer tbo_nostreams", audience: STREAMS_AUDIENCE }]);
 	});
@@ -405,6 +427,22 @@ describe("open by name", () => {
 		expect(api.seen).toEqual([]);
 	});
 
+	// The request the API never answers: before the 10 s limit, it held the resolve until the signal.
+	it("gives each lookup request 10 s at most, so one the API never answers goes again, and the signal cancels one in flight", async () => {
+		const d = database("tonbo-silent");
+		const quiet = await silent();
+		const error = await rejection(open(d.name, { dir: freshDir(), apiKey: "tbo_silent", token: "explicit-silent", apiOrigin: quiet.origin, signal: AbortSignal.timeout(12_000) }));
+		// The first request failed after 10 s and the lookup went again: the second was in flight at the signal.
+		expect(error).toBeInstanceOf(UrsulaUnavailableError);
+		expect(error).toMatchObject({ kind: "unreachable", action: "retry" });
+		expect(quiet.hits).toEqual([`GET /v1/databases/${d.name}`, `GET /v1/databases/${d.name}`]);
+		// The cancelled resolve's request ends within its 10 s, and none goes after it.
+		await until(() => quiet.connections() === 0, "the request in flight ended");
+		expect(quiet.hits).toHaveLength(2);
+		await quiet.stop();
+		expect(api.seen).toEqual([]);
+	});
+
 	it("lets an explicit token serve the Streams requests", async () => {
 		const d = database("tonbo-explicit");
 		const db = await open(d.name, { dir: freshDir(), apiKey: "tbo_explicit", token: "explicit-1" });
@@ -503,6 +541,60 @@ describe("resolveDatabase", () => {
 		expect(api.of("management")).toHaveLength(1);
 	});
 
+	it("stops this thread's token provider once the key's tokens serve, and the provider's database then carries the key's token", async () => {
+		const before = database("tonbo-pi-provider");
+		let calls = 0;
+		const provider = async (): Promise<{ token: string; expiresAt: number }> => {
+			calls += 1;
+			return { token: `provider-${calls}`, expiresAt: Date.now() + 2_000 };
+		};
+		const db = await open(before.name, { dir: freshDir(), apiKey: "tbo_provider", token: provider });
+		expect(calls).toBe(1);
+		const d = database("tonbo-pi-after-provider");
+		expect(await resolveDatabase(d.name, { apiKey: KEY })).toEqual({ url: d.url, token: undefined });
+		const called = calls;
+		// Its next refresh was due within 1.6 s of its token: it never runs.
+		await new Promise((r) => setTimeout(r, 2_500));
+		expect(calls).toBe(called);
+		db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		await db.synced();
+		const issued = keyToken();
+		const sent = await sentTokens(before.path);
+		if (sent !== undefined) expect(sent.at(-1)?.authorization).toBe(`Bearer ${issued}`);
+		db.close();
+	});
+
+	it("shares one resolve among a thread's concurrent calls with the same arguments", async () => {
+		const d = database("tonbo-pi-joined", "creating", { activeAfter: 2 });
+		const [a, b] = await Promise.all([resolveDatabase(d.name, { apiKey: KEY }), resolveDatabase(d.name, { apiKey: KEY })]);
+		expect(a).toEqual({ url: d.url, token: undefined });
+		expect(b).toEqual(a);
+		// One resolve: `creating` twice, then active.
+		expect(api.of("management")).toHaveLength(3);
+	});
+
+	it("refuses a second key for Streams tokens while the first was just handed out, and lets it look a name up for a token of the caller's own", async () => {
+		const d = database("tonbo-pi-second");
+		expect(await resolveDatabase(d.name, { apiKey: KEY })).toEqual({ url: d.url, token: undefined });
+		const second = await rejection(resolveDatabase(d.name, { apiKey: "tbo_second" }));
+		expect(second).toBeInstanceOf(UrsulaSetupError);
+		expect(second).toMatchObject({ kind: "invalid_argument", action: "fix" });
+		expect((second as Error).message).toContain("one key per process");
+		expect(api.of("token").some((s) => s.authorization === "Bearer tbo_second")).toBe(false);
+		expect(await resolveDatabase(d.name, { apiKey: "tbo_second", token: "explicit-second" })).toEqual({ url: d.url, token: "explicit-second" });
+	});
+
+	it("refuses an apiKey, apiOrigin or authOrigin that is not a string, null included, before any request", async () => {
+		const d = database("tonbo-pi-options");
+		for (const options of [{ apiKey: null }, { apiKey: 7 }, { apiOrigin: null }, { authOrigin: {} }]) {
+			const error = await rejection(resolveDatabase(d.name, options as unknown as TonboResolveOptions));
+			expect(error).toBeInstanceOf(UrsulaSetupError);
+			expect(error).toMatchObject({ kind: "invalid_argument", action: "fix" });
+			expect((error as Error).message).toMatch(new RegExp(`^invalid_argument: ${Object.keys(options)[0]} must be a string, not `));
+		}
+		expect(api.seen).toEqual([]);
+	});
+
 	// A key the token endpoint refuses fails the resolve itself: "a key that gets no Streams token".
 	it("fails as open does: missing_credentials, database_not_found, invalid_url, and at its signal the last condition the resolve met", async () => {
 		const d = database("tonbo-pi-errors");
@@ -570,11 +662,13 @@ function raw<T>(sql: string, ...args: (string | number)[]): T {
 	return JSON.parse(Object.values(row)[0] as string) as T;
 }
 
-/** `tonbo_resolve`'s answer. */
+/** `tonbo_resolve`'s answer: the URL, a failure, or a request to wait for. */
 interface Resolution {
 	readonly done: boolean;
 	readonly url?: string;
 	readonly name?: string | null;
+	readonly key_tokens?: boolean;
+	readonly error?: CancelReport;
 	readonly request?: number;
 }
 
@@ -605,8 +699,8 @@ async function resolvedEvent(cursor: number, request: number | undefined): Promi
 /**
  * The extension's `tonbo_resolve(nameOrUrl, options, 0)`, as a host that must not block calls it: it
  * returns at once, the test waits for its `resolved` event (the stand-in answers on this thread
- * meanwhile), and a call with the same arguments takes the outcome, the answer or the extension's
- * error, or names another request to wait for when the one it waited for was given up.
+ * meanwhile), and a call with the same arguments takes the outcome, the answer or the failure, or
+ * names another request to wait for when the one it waited for was given up.
  */
 async function tonboResolve(nameOrUrl: string, options: Record<string, unknown> = {}): Promise<Resolution> {
 	const json = JSON.stringify(options);
@@ -619,7 +713,7 @@ async function tonboResolve(nameOrUrl: string, options: Record<string, unknown> 
 	return pending;
 }
 
-/** What a blocking `tonbo_resolve` in a worker thread of this process came to: its answer, or its error's message. */
+/** What a blocking `tonbo_resolve` in a worker thread of this process came to: its answer, or the message of an error the call threw. */
 interface Blocked {
 	readonly answer?: Resolution;
 	readonly error?: string;
@@ -658,7 +752,7 @@ async function until(ready: () => boolean, what: string): Promise<void> {
 	}
 }
 
-/** What `ursula_cancel` of a resolve reports it ended with. */
+/** What a resolve failed with, as `tonbo_resolve`'s `error` and `ursula_cancel` report it. */
 interface CancelReport {
 	readonly kind: string;
 	readonly action: string;
@@ -668,14 +762,22 @@ interface CancelReport {
 	readonly request_id: string | null;
 }
 
-/** The extension's error `promise` rejects with: `tonbo_resolve: <kind>: ...`, ending with `. <fix>` when one is given. */
-async function resolveError(promise: Promise<unknown>, kind: string, fix?: string): Promise<string> {
-	const error = await rejection(promise);
-	expect(error).toBeInstanceOf(Error);
-	const message = (error as Error).message;
-	expect(message.startsWith(`tonbo_resolve: ${kind}: `), message).toBe(true);
-	if (fix !== undefined) expect(message.endsWith(`. ${fix}`), message).toBe(true);
-	return message;
+/**
+ * The failure `resolution` came to, `{done: true, error}`, of `kind`, whose message ends with `. <fix>`
+ * when a fix is given and whose `fix` is it: the message.
+ */
+async function resolveError(resolution: Promise<Resolution>, kind: string, fix?: string): Promise<string> {
+	const { done, error } = await resolution;
+	expect(done).toBe(true);
+	expect(error, "the resolve did not fail").toBeDefined();
+	const report = error as CancelReport;
+	expect(report.kind).toBe(kind);
+	expect(report.message.startsWith(`${kind}: `), report.message).toBe(true);
+	if (fix !== undefined) {
+		expect(report.fix).toBe(fix);
+		expect(report.message.endsWith(`. ${fix}`), report.message).toBe(true);
+	}
+	return report.message;
 }
 
 // The extension's own resolution, as hosts of its SQL functions call it. The tests that fetch a
@@ -685,14 +787,14 @@ async function resolveError(promise: Promise<unknown>, kind: string, fix?: strin
 describe("the extension's tonbo_resolve", () => {
 	it("resolves a name with the key and holds the key's Streams token when it returns, and refuses another key meanwhile", async () => {
 		const d = database("ext-name");
-		expect(await tonboResolve(d.name, { api_key: KEY })).toEqual({ done: true, url: d.url, name: d.name });
+		expect(await tonboResolve(d.name, { api_key: KEY })).toEqual({ done: true, url: d.url, name: d.name, key_tokens: true });
 		expect(api.of("management")).toMatchObject([{ name: d.name, authorization: `Bearer ${KEY}` }]);
 		// The token earlier tests fetched for the key serves while it is fresh.
 		const exchanged = api.of("token").length;
 		expect(exchanged).toBeLessThanOrEqual(1);
 		expect(api.of("token").every((s) => s.authorization === `Bearer ${KEY}` && s.audience === STREAMS_AUDIENCE)).toBe(true);
 		// A URL looks nothing up, and the token held serves at once.
-		expect(await tonboResolve(d.url, { api_key: KEY })).toEqual({ done: true, url: d.url, name: null });
+		expect(await tonboResolve(d.url, { api_key: KEY })).toEqual({ done: true, url: d.url, name: null, key_tokens: true });
 		expect(api.of("management")).toHaveLength(1);
 		expect(api.of("token")).toHaveLength(exchanged);
 		// One key per process: another is refused while a host may open with this one's token.
@@ -700,7 +802,7 @@ describe("the extension's tonbo_resolve", () => {
 		expect(other).toContain("another API key");
 		expect(api.of("token")).toHaveLength(exchanged);
 		// A URL with a token of the host's own needs no key and sends nothing.
-		expect(raw<Resolution>("SELECT tonbo_resolve(?, ?, 0)", d.url, JSON.stringify({ own_token: true }))).toEqual({ done: true, url: d.url, name: null });
+		expect(raw<Resolution>("SELECT tonbo_resolve(?, ?, 0)", d.url, JSON.stringify({ own_token: true }))).toEqual({ done: true, url: d.url, name: null, key_tokens: false });
 		expect(api.seen).toHaveLength(1 + exchanged);
 	});
 
@@ -710,7 +812,7 @@ describe("the extension's tonbo_resolve", () => {
 		const elsewhere = await bystander(200);
 		api.tokenEndpoint = `${elsewhere.origin}/api/iam/token`;
 		const options = { api_key: "agent_ext", own_token: true };
-		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name });
+		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name, key_tokens: false });
 		expect(elsewhere.hits).toEqual([]);
 		await elsewhere.stop();
 		const exchanged = (): string[] => api.of("token").map((s) => s.issued as string);
@@ -775,7 +877,7 @@ describe("the extension's tonbo_resolve", () => {
 	it("maps 404 and a database being deleted to database_not_found, and 401 and 403 to invalid_api_key, with the API's request id", async () => {
 		const options = { api_key: "tbo_answers", own_token: true };
 		const missing = await resolveError(tonboResolve("ext-nope", options), "database_not_found", "Run: tonbo database create ext-nope");
-		expect(missing).toMatch(/^tonbo_resolve: database_not_found: database "ext-nope" not found \(request req-\d+\)\. Run: tonbo database create ext-nope$/);
+		expect(missing).toMatch(/^database_not_found: database "ext-nope" not found \(request req-\d+\)\. Run: tonbo database create ext-nope$/);
 		for (const state of ["deleting", "deleted"] as const) {
 			const d = database(`ext-${state}`, state);
 			await resolveError(tonboResolve(d.name, options), "database_not_found", `Run: tonbo database create ${d.name}`);
@@ -877,7 +979,7 @@ describe("the extension's tonbo_resolve", () => {
 		expect(first.done).toBe(false);
 		const a = blockingResolve(d.name, options, 20_000);
 		const b = blockingResolve(d.name, options, 20_000);
-		const answer = { done: true, url: d.url, name: d.name };
+		const answer = { done: true, url: d.url, name: d.name, key_tokens: false };
 		expect(await a.done).toEqual({ answer });
 		expect(await b.done).toEqual({ answer });
 		expect(await resolvedEvent(cursor, first.request)).toEqual({ event: "resolved", request: first.request, ok: true });
@@ -898,9 +1000,13 @@ describe("the extension's tonbo_resolve", () => {
 		const first = raw<Resolution>("SELECT tonbo_resolve(?, ?, 0)", d.name, json);
 		const blocked = await blockingResolve(d.name, options, 200).done;
 		// It gives up after its time and the grace, with the condition the resolve met last.
-		expect(blocked.error).toBe(`tonbo_resolve: unavailable: the lookup of database "${d.name}" gave up when its time ran out: database "${d.name}" is creating`);
+		expect(blocked.answer?.error).toMatchObject({
+			kind: "unavailable",
+			action: "retry",
+			message: `unavailable: the lookup of database "${d.name}" gave up when its time ran out: database "${d.name}" is creating`,
+		});
 		expect(await resolvedEvent(cursor, first.request)).toEqual({ event: "resolved", request: first.request, ok: true });
-		expect(raw<Resolution>("SELECT tonbo_resolve(?, ?, 0)", d.name, json)).toEqual({ done: true, url: d.url, name: d.name });
+		expect(raw<Resolution>("SELECT tonbo_resolve(?, ?, 0)", d.name, json)).toEqual({ done: true, url: d.url, name: d.name, key_tokens: false });
 		expect(api.of("management")).toHaveLength(6);
 	});
 
@@ -929,7 +1035,7 @@ describe("the extension's tonbo_resolve", () => {
 		expect(again.request).not.toBe(first.request);
 		expect(() => raw("SELECT ursula_cancel(?)", first.request as number)).toThrow(/^ursula_cancel: not_bound: the request \d+ is not an open or a resolve in progress$/);
 		(api.databases.get(d.name) as FixtureDatabase).state = "active";
-		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name });
+		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name, key_tokens: false });
 	});
 
 	it("goes on with a resolve a blocking call waits for when another call cancels, and reports what an ended one came to", async () => {
@@ -943,7 +1049,7 @@ describe("the extension's tonbo_resolve", () => {
 		const report = raw<CancelReport>("SELECT ursula_cancel(?)", first.request as number);
 		expect(report).toMatchObject({ kind: "unavailable", action: "retry", fix: null, request_id: null });
 		expect(report.message).toContain("gave up when it was cancelled");
-		expect(await blocked.done).toEqual({ answer: { done: true, url: d.url, name: d.name } });
+		expect(await blocked.done).toEqual({ answer: { done: true, url: d.url, name: d.name, key_tokens: false } });
 		expect(api.of("management")).toHaveLength(6);
 		// Ended before the cancel: the failure it ended with, or null for an answer.
 		const cursor = eventCursor();
@@ -958,7 +1064,7 @@ describe("the extension's tonbo_resolve", () => {
 		expect(raw<CancelReport | null>("SELECT ursula_cancel(?)", found.request as number)).toBeNull();
 		// The cancel took the outcome: the next call looks the name up again.
 		api.reset();
-		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name });
+		expect(await tonboResolve(d.name, options)).toEqual({ done: true, url: d.url, name: d.name, key_tokens: false });
 		expect(api.of("management")).toHaveLength(1);
 	});
 
@@ -975,7 +1081,7 @@ describe("the extension's tonbo_resolve", () => {
 		});
 		const code = await new Promise((resolve) => proc.once("exit", resolve));
 		expect(code).toBe(0);
-		expect(JSON.parse(out)).toEqual({ resolved: { done: true, url: d.url, name: d.name }, synced: true });
+		expect(JSON.parse(out)).toEqual({ resolved: { done: true, url: d.url, name: d.name, key_tokens: true }, synced: true });
 		expect(api.of("management")).toMatchObject([{ name: d.name, authorization: "Bearer tbo_child" }]);
 		const exchanges = api.of("token");
 		expect(exchanges).toMatchObject([{ authorization: "Bearer tbo_child", audience: STREAMS_AUDIENCE }]);

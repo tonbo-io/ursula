@@ -11,7 +11,8 @@
 // the waiting opens go on under the string.
 //
 // A Tonbo API key's tokens, which the extension exchanges and refreshes itself (the `/tonbo` entry),
-// take over the same way: `useKeyTokens` stops the provider and clears the token set.
+// take over the same way: the extension clears the token set, and `useKeyTokens` stops the provider
+// and withdraws a token it set since.
 //
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
@@ -394,10 +395,11 @@ export function useStringToken(token: string): void {
 
 /**
  * The `/tonbo` entry's resolve made a Tonbo API key the process's source of Streams tokens, which the
- * extension exchanges and refreshes: requests carry them from now on (or URSULA_VFS_TOKEN_FILE's),
- * so this thread's provider stops and the token set is cleared.
+ * extension exchanges and refreshes, and cleared the token set: requests carry the key's tokens from
+ * now on, so this thread's provider stops, and a token it set since the resolve is withdrawn.
  */
 export function useKeyTokens(): void {
-	if (source.provider !== undefined) source.stop("an open with a Tonbo API key replaced it");
+	if (source.provider === undefined) return;
+	source.stop("an open with a Tonbo API key replaced it");
 	call("SELECT ursula_set_token('', '')");
 }
