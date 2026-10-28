@@ -1135,17 +1135,16 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			expect(files).not.toContain("db-shm");
 			// One CLAIM frame more, at the crashed binding's epoch + 1.
 			expect(await claims(o.s.path)).toEqual([...before, own + 1]);
-			// Every commit the crashed process logged, in a fresh build.
-			expect(await fromStream(o.url, "SELECT n FROM counter")).toEqual([{ n: 2 }]);
-			expect(await fromStream(o.url, "SELECT count(*) AS c FROM t")).toEqual([{ c: 6 }]);
 			// The application's reopen claims above the drain and resumes with nothing pending.
 			const reopened = new Child(o.url, o.dir, o.env);
 			await reopened.opened();
 			expect((await statusOf(reopened)).commits.pending_bytes).toBe(0);
-			await reopened.exec("INSERT INTO counter VALUES (3)");
 			await synced(reopened);
 			await closeAndRetire(reopened);
-			expect((await claims(o.s.path)).at(-1)).toBe(own + 2);
+			expect(await claims(o.s.path)).toEqual([...before, own + 1, own + 2]);
+			// Every commit the crashed process logged, in a fresh build (itself a takeover).
+			expect(await fromStream(o.url, "SELECT n FROM counter")).toEqual([{ n: 2 }]);
+			expect(await fromStream(o.url, "SELECT count(*) AS c FROM t")).toEqual([{ c: 6 }]);
 			// A drained root drains again cheaply: clean, not opened.
 			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "clean", kind: null, unacknowledged_bytes: 0 });
 		});
