@@ -12,11 +12,12 @@
 //! [`requests_may_go_out`]) or an import ([`importing`]) may send requests and the key's token is
 //! the one they carry, or a host waits for the key's token. A `401` to its token ([`refused`])
 //! brings the refresh forward. The process holds one key: another one is refused while a host
-//! waits for the key's token or holds a [`KeyClaim`] of it (until its open is asked for), and
-//! while requests may go out that can carry its token, since they would all carry the other key's
-//! tokens from then on. A key whose exchanges never gave a token, or were refused for good, gives
-//! way. Nothing that reads a file or writes a log runs under the key's lock. Neither the key nor a
-//! token is ever logged or returned.
+//! waits for the key's token, for [`HANDED_OUT_HOLD_MS`] after a host was handed it (its open is
+//! asked for meanwhile), and while requests may go out that can carry its token, since they would
+//! all carry the other key's tokens from then on. A key whose exchanges never gave a token, or
+//! were refused, gives way, and the key in its place carries its last token until a token of its
+//! own arrives. Nothing that reads a file or writes a log runs under the key's lock. Neither the
+//! key nor a token is ever logged or returned.
 //!
 //! Module map:
 //!
@@ -211,31 +212,41 @@ pub(crate) fn status() -> TokenStatus {
     TokenStatus { source, key }
 }
 
+/// How long another key is refused after [`use_key`] handed a host the key's token: the host's
+/// open is asked for within it, and from then on requests may go out carrying the key's token,
+/// which keeps another key out as long as they may. A host that never opens holds the key no
+/// longer than this.
+const HANDED_OUT_HOLD_MS: u64 = 60_000;
+
 /// The process's key and its schedule.
 struct KeySource {
     key: Key,
     schedule: Schedule,
     /// Hosts waiting in [`use_key`] for its token: the source is active while one does.
     waiters: usize,
-    /// Hosts that use the key and have not opened with it yet: each waiter, and each
-    /// [`KeyClaim`] handed out and not dropped.
-    claims: usize,
+    /// Until when (on [`clock_ms`]) a host handed the key's token may yet ask for its open.
+    held_until_ms: u64,
 }
 
 impl KeySource {
-    fn new(key: Key, now_ms: u64) -> Self {
+    /// `key`, in place of the key `previous` scheduled, if any: it carries the last token of that
+    /// key until its own first one ([`Schedule::after`]).
+    fn new(key: Key, previous: Option<&Schedule>, now_ms: u64) -> Self {
         Self {
             key,
-            schedule: Schedule::new(now_ms),
+            schedule: previous.map_or_else(
+                || Schedule::new(now_ms),
+                |previous| Schedule::after(previous, now_ms),
+            ),
             waiters: 0,
-            claims: 0,
+            held_until_ms: 0,
         }
     }
 
-    /// How the key is in use, for [`admit`], where `requests_out` says whether an open, a bound
-    /// database or an import may send requests ([`requests_out`]).
-    fn usage(&self, requests_out: bool) -> Use {
-        if self.claims > 0 {
+    /// How the key is in use at `now_ms`, for [`admit`], where `requests_out` says whether an
+    /// open, a bound database or an import may send requests ([`requests_out`]).
+    fn usage(&self, requests_out: bool, now_ms: u64) -> Use {
+        if self.waiters > 0 || now_ms < self.held_until_ms {
             Use::Claimed
         } else if requests_out && self.schedule.serves() {
             Use::Carried
@@ -347,7 +358,7 @@ pub(crate) fn refused(token: &str) {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum KeyError {
     #[error(transparent)]
-    Refused(#[from] KeyRefusal),
+    Invalid(#[from] KeyRefusal),
     /// Another key, while a host is about to open with this one or requests may carry its
     /// tokens.
     #[error(
@@ -367,7 +378,7 @@ pub(crate) enum KeyError {
     },
     #[error("the token refresher thread could not be started")]
     NoRefresher(#[source] std::io::Error),
-    /// The refresher stopped on a panic while the host waited; the next use starts another.
+    /// The refresher stopped on a panic while the host waited. The next use starts another.
     #[error("the token refresher thread stopped")]
     RefresherStopped,
 }
@@ -383,7 +394,7 @@ impl KeyError {
     )]
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
-            KeyError::Refused(_) | KeyError::AnotherKey => ErrorKind::InvalidArgument,
+            KeyError::Invalid(_) | KeyError::AnotherKey => ErrorKind::InvalidArgument,
             KeyError::Exchange(e) => e.kind(),
             KeyError::TimedOut { last, .. } => last
                 .as_ref()
@@ -396,12 +407,12 @@ impl KeyError {
 /// How the key held is in use, for [`admit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Use {
-    /// A host waits for its token, or holds one ([`KeyClaim`]) and has not opened with it yet.
+    /// A host waits for its token, or was handed one less than [`HANDED_OUT_HOLD_MS`] ago.
     Claimed,
-    /// An open, a bound database or an import may send requests, and the key holds a token they
-    /// can carry: one not refused for good.
+    /// An open, a bound database or an import may send requests, and the key holds a token of
+    /// its own they can carry: its exchanges were not refused.
     Carried,
-    /// Neither: no request can carry its token, so another key may take its place.
+    /// Neither: no request can carry a token of it, so another key may take its place.
     Idle,
 }
 
@@ -424,29 +435,13 @@ fn admit(held: Option<(&Key, Use)>, next: &Key) -> Admit {
     }
 }
 
-/// A host's hold on the process's key, from [`use_key`] handing it a token until the host's open
-/// is asked for: another key is refused while it lives, so the open carries this key's tokens.
-/// Dropping it ends the hold.
-#[derive(Debug)]
-#[must_use = "the hold on the key ends when the claim is dropped"]
-pub(crate) struct KeyClaim(());
-
-impl Drop for KeyClaim {
-    fn drop(&mut self) {
-        if let Some(k) = lock(&KEY).as_mut() {
-            k.claims = k.claims.saturating_sub(1);
-        }
-        KEY_CHANGED.notify_all();
-    }
-}
-
 /// Makes `secret`, exchanged at `endpoint` for tokens of `audience`, the process's key, and waits
 /// at most `timeout` for a token of it that has not expired and was not refused. A token held
 /// serves at once. A key whose exchange is refused fails at once, and other failures are retried
 /// on the key's schedule until the time runs out. Another key than the one held fails while a
-/// host waits for the held key's token or holds a [`KeyClaim`] of it, or while an open, a bound
-/// database or an import may send requests carrying its token. The claim returned holds the key
-/// until the host's open is asked for.
+/// host waits for the held key's token or was handed it less than [`HANDED_OUT_HOLD_MS`] ago, or
+/// while an open, a bound database or an import may send requests carrying its token. The host
+/// asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open carries this key's tokens.
 #[cfg_attr(
     not(test),
     expect(
@@ -459,29 +454,34 @@ pub(crate) fn use_key(
     endpoint: &str,
     audience: Option<&str>,
     timeout: Duration,
-) -> Result<KeyClaim, KeyError> {
+) -> Result<(), KeyError> {
     let key = Key::new(secret, endpoint, audience)?;
     start_refresher()?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let deadline = clock_ms().saturating_add(timeout_ms);
     let mut held = lock(&KEY);
-    let usage = held.as_ref().map(|k| (&k.key, k.usage(requests_out())));
+    let usage = held
+        .as_ref()
+        .map(|k| (&k.key, k.usage(requests_out(), clock_ms())));
     match admit(usage, &key) {
         Admit::Refuse => return Err(KeyError::AnotherKey),
         Admit::Same => {}
-        Admit::Replace => *held = Some(KeySource::new(key.clone(), clock_ms())),
+        Admit::Replace => {
+            let previous = held.as_ref().map(|k| &k.schedule);
+            let next = KeySource::new(key.clone(), previous, clock_ms());
+            *held = Some(next);
+        }
     }
     let mut since = 0;
     if let Some(k) = held.as_mut() {
         k.schedule.wanted(clock_ms());
         k.waiters = k.waiters.saturating_add(1);
-        k.claims = k.claims.saturating_add(1);
         since = k.schedule.ended();
     }
     KEY_CHANGED.notify_all();
     let outcome = loop {
         let now = clock_ms();
-        // The key cannot be replaced while this host claims it.
+        // The key cannot be replaced while this host waits for it.
         let Some(k) = held.as_ref().filter(|k| k.key == key) else {
             break Err(KeyError::AnotherKey);
         };
@@ -507,13 +507,21 @@ pub(crate) fn use_key(
     };
     if let Some(k) = held.as_mut().filter(|k| k.key == key) {
         k.waiters = k.waiters.saturating_sub(1);
-        if outcome.is_err() {
-            k.claims = k.claims.saturating_sub(1);
+        if outcome.is_ok() {
+            let until = clock_ms().saturating_add(HANDED_OUT_HOLD_MS);
+            k.held_until_ms = k.held_until_ms.max(until);
         }
     }
     drop(held);
     KEY_CHANGED.notify_all();
-    outcome.map(|()| KeyClaim(()))
+    outcome
+}
+
+/// Forgets the process's key, so that a test that gave the process one leaves none behind.
+#[cfg(test)]
+pub(crate) fn forget_key() {
+    *lock(&KEY) = None;
+    KEY_CHANGED.notify_all();
 }
 
 /// Starts the refresher thread unless it runs, outside [`KEY`]'s lock.
@@ -554,6 +562,10 @@ fn run_refresher() {
 /// that reads a file or writes a log runs under the lock.
 fn refresh() {
     let mut held = lock(&KEY);
+    // A refresher that stopped may have left an exchange out that never ends.
+    if let Some(k) = held.as_mut() {
+        k.schedule.resume(clock_ms());
+    }
     loop {
         let now = clock_ms();
         let (key, deadline) = match held.as_mut() {
@@ -577,12 +589,16 @@ fn refresh() {
         let jitter = jitter();
         held = lock(&KEY);
         // A key replaced meanwhile drops the outcome: the new key's schedule starts afresh.
-        let (changed, first_failure, kept_previous) = match held.as_mut().filter(|k| k.key == key) {
+        let (changed, logged, kept_previous) = match held.as_mut().filter(|k| k.key == key) {
             Some(k) => {
+                let before = k.schedule.view(clock_ms());
                 let changed = k.schedule.exchanged(outcome, clock_ms(), jitter);
-                let view = k.schedule.view(clock_ms());
-                let first = view.error.filter(|_| view.failures == 1);
-                (changed, first, k.schedule.token().is_some())
+                let after = k.schedule.view(clock_ms());
+                (
+                    changed,
+                    report(&before, after),
+                    k.schedule.token().is_some(),
+                )
             }
             None => (false, None, false),
         };
@@ -591,17 +607,46 @@ fn refresh() {
         let serving = key_serves();
         drop(held);
         KEY_CHANGED.notify_all();
-        if let Some(e) = first_failure {
-            log::emit(Level::Warn, "token_exchange_failed", &[
+        match logged {
+            Some(Report::Failed(e)) => log::emit(Level::Warn, "token_exchange_failed", &[
                 ("kind", &e.kind().as_str()),
                 ("error", &e),
+                ("permanent", &e.permanent()),
                 ("kept_previous", &kept_previous),
-            ]);
+            ]),
+            Some(Report::Recovered { failures }) => {
+                log::emit(Level::Info, "token_exchange_recovered", &[(
+                    "failures", &failures,
+                )]);
+            }
+            None => {}
         }
         if changed && serving {
             crate::driver::runtime::token_changed();
         }
         held = lock(&KEY);
+    }
+}
+
+/// What an exchange's end gives the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Report {
+    /// The first failure of a run, or the first in it another try is unlikely to fix: the one a
+    /// reader acts on.
+    Failed(ExchangeError),
+    /// A token after `failures` failed exchanges in a row.
+    Recovered { failures: u32 },
+}
+
+/// What the log says of an exchange that moved the key's schedule from `before` to `after`.
+fn report(before: &KeyView, after: KeyView) -> Option<Report> {
+    match (&before.error, after.error) {
+        (None, Some(e)) => Some(Report::Failed(e)),
+        (Some(was), Some(e)) if e.permanent() && !was.permanent() => Some(Report::Failed(e)),
+        (Some(_), Some(_)) | (None, None) => None,
+        (Some(_), None) => Some(Report::Recovered {
+            failures: before.failures,
+        }),
     }
 }
 
@@ -717,8 +762,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::Admit;
+    use super::HANDED_OUT_HOLD_MS;
     use super::KeyError;
     use super::KeySource;
+    use super::KeyState;
+    use super::KeyView;
+    use super::Report;
     use super::Use;
     use super::active;
     use super::admit;
@@ -731,13 +780,15 @@ mod tests {
     use super::key::Schedule;
     use super::lend;
     use super::put_back;
+    use super::report;
     use super::usable;
     use crate::error::ErrorKind;
 
     // One key per process: the key held serves on. Another is refused while a host waits for
-    // the held key's token or is about to open with it, and while requests may go out that can
-    // carry its token, since they would all carry the other key's tokens from then on. A key
-    // that never got a token, or whose exchanges were refused for good, gives way.
+    // the held key's token or was handed it within the hold, and while requests may go out that
+    // can carry its token, since they would all carry the other key's tokens from then on. A key
+    // that never got a token of its own, or whose exchanges were refused, gives way, and the key
+    // in its place carries its last token.
     #[test]
     fn another_key_is_refused_while_requests_may_go_out() {
         let key = |secret: &str, audience: &str| {
@@ -774,30 +825,77 @@ mod tests {
         assert!(failing.start(70_000, true));
         let down = Err(ExchangeError::Unavailable { status: 503 });
         assert!(!failing.exchanged(down, 70_000, jitter));
-        let usage = |schedule: &Schedule, claims: usize, requests_out: bool| {
-            let source = KeySource {
-                key: held.clone(),
-                schedule: schedule.clone(),
-                waiters: 0,
-                claims,
-            };
-            source.usage(requests_out)
+        let source = |schedule: &Schedule, waiters: usize, held_until_ms: u64| KeySource {
+            key: held.clone(),
+            schedule: schedule.clone(),
+            waiters,
+            held_until_ms,
         };
-        assert_eq!(usage(&served, 0, true), Use::Carried);
+        let usage = |schedule: &Schedule, requests_out: bool| {
+            source(schedule, 0, 0).usage(requests_out, 80_000)
+        };
+        assert_eq!(usage(&served, true), Use::Carried);
+        assert_eq!(usage(&failing, true), Use::Carried, "its last token serves");
+        assert_eq!(usage(&served, false), Use::Idle);
+        assert_eq!(usage(&pending, true), Use::Idle, "never got a token");
+        assert_eq!(usage(&refused, true), Use::Idle, "refused");
         assert_eq!(
-            usage(&failing, 0, true),
-            Use::Carried,
-            "its last token serves"
-        );
-        assert_eq!(usage(&served, 0, false), Use::Idle);
-        assert_eq!(usage(&pending, 0, true), Use::Idle, "never got a token");
-        assert_eq!(usage(&refused, 0, true), Use::Idle, "refused for good");
-        assert_eq!(
-            usage(&pending, 1, false),
+            source(&pending, 1, 0).usage(false, 80_000),
             Use::Claimed,
-            "a host waits or holds it"
+            "a host waits"
         );
-        assert_eq!(usage(&refused, 1, true), Use::Claimed);
+        let until = 80_000_u64.saturating_add(HANDED_OUT_HOLD_MS);
+        let handed_out = source(&refused, 0, until);
+        assert_eq!(handed_out.usage(true, 80_000), Use::Claimed, "handed out");
+        assert_eq!(
+            handed_out.usage(true, until),
+            Use::Idle,
+            "a host that never opened holds it no longer"
+        );
+        assert_eq!(
+            source(&served, 0, 1).usage(true, 80_000),
+            Use::Carried,
+            "the open asked for within the hold carries it on"
+        );
+
+        // The key in place of a refused one carries its last token, never as valid or its own.
+        let next = KeySource::new(other.clone(), Some(&refused), 80_000);
+        assert_eq!(next.schedule.token(), Some("t1"));
+        assert!(!next.schedule.valid(80_000));
+        assert_eq!(next.usage(true, 80_000), Use::Idle);
+        let first = KeySource::new(other, None, 80_000);
+        assert_eq!(first.schedule.token(), None);
+    }
+
+    // The log reports a run's first failure, the first failure in it another try is unlikely to
+    // fix, and the token that ends it.
+    #[test]
+    fn the_log_reports_a_runs_start_its_turn_to_permanent_and_its_end() {
+        let view = |failures: u32, error: Option<ExchangeError>| KeyView {
+            state: KeyState::Failing,
+            expires_in_ms: None,
+            refresh_in_ms: None,
+            failures,
+            error,
+        };
+        let down = || Some(ExchangeError::Unavailable { status: 503 });
+        let refused = || Some(ExchangeError::Refused { status: 401 });
+        assert_eq!(
+            report(&view(0, None), view(1, down())),
+            Some(Report::Failed(ExchangeError::Unavailable { status: 503 }))
+        );
+        assert_eq!(report(&view(1, down()), view(2, down())), None);
+        assert_eq!(
+            report(&view(2, down()), view(3, refused())),
+            Some(Report::Failed(ExchangeError::Refused { status: 401 }))
+        );
+        assert_eq!(report(&view(3, refused()), view(4, refused())), None);
+        assert_eq!(report(&view(4, refused()), view(5, down())), None);
+        assert_eq!(
+            report(&view(5, down()), view(0, None)),
+            Some(Report::Recovered { failures: 5 })
+        );
+        assert_eq!(report(&view(0, None), view(0, None)), None);
     }
 
     // A key's exchanges go out while a host waits for its token, or while requests may go out

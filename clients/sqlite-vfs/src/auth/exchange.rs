@@ -1,9 +1,8 @@
 //! One exchange of an API key for a bearer token: a `POST` to the token endpoint with the key as
 //! its bearer token and `{"audience": ...}` (or `{}` without an audience) as its body, answered
 //! with `{"access_token": ..., "expires_in": <seconds>}` and any other members, which are skipped.
-//! It goes out on the agent of appends and
-//! reads (`transport::http::agent`), so it trusts the same roots (`URSULA_VFS_CA_FILE`), takes
-//! the same proxy and follows no redirect.
+//! It goes out on the agent of appends and reads (`transport::http::agent`), so it trusts the same
+//! roots (`URSULA_VFS_CA_FILE`), takes the same proxy and follows no redirect.
 //!
 //! Neither the key nor a token is ever printed: [`Secret`] and [`Exchanged`] print redacted, and
 //! no error carries either.
@@ -104,7 +103,9 @@ impl fmt::Debug for Exchanged {
 /// Why an exchange gave no token. None carries the key or a token.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ExchangeError {
-    /// No answer: the request failed before one, or its body broke off.
+    /// No answer: the request failed before one, or its body broke off. The reason is the
+    /// transport error's text, as in `wire::NoAnswer`: the schedule keeps the last failure and
+    /// status shows it, so the error is cloned and compared, which `ureq::Error` is not.
     #[error("the token endpoint did not answer: {reason}")]
     Unreachable { reason: String },
     /// `401` or `403`: the key was refused.
@@ -148,8 +149,8 @@ impl ExchangeError {
         }
     }
 
-    /// Whether trying again cannot help until the key or the endpoint changes: a refused key, an
-    /// answer the exchange cannot use, or a failure inside the extension.
+    /// Whether trying again is unlikely to help until the key or the endpoint changes: a refused
+    /// key, a status the exchange cannot use, or a panic inside the exchange.
     pub(crate) fn permanent(&self) -> bool {
         matches!(
             self,
@@ -201,7 +202,8 @@ pub(crate) fn exchange(key: &Key) -> Result<Exchanged, ExchangeError> {
     answer(status, retry_after_ms, &body)
 }
 
-/// What the endpoint's answer `status` with `body` gives; `retry_after_ms` is its `Retry-After`.
+/// What the endpoint's answer `status` with `body` gives, where `retry_after_ms` is its
+/// `Retry-After`.
 pub(crate) fn answer(
     status: u16,
     retry_after_ms: Option<u64>,
@@ -253,7 +255,7 @@ mod tests {
     use super::answer;
     use crate::error::ErrorKind;
 
-    // A token answer gives the token and its lifetime in ms; anything else gives no token.
+    // A token answer gives the token and its lifetime in ms. Anything else gives no token.
     #[test]
     fn a_token_answer_gives_the_token_and_its_lifetime() {
         let ok = |token: &str, lifetime_ms| {
@@ -310,7 +312,7 @@ mod tests {
         }
     }
 
-    // A refused key, a passing failure and an answer the exchange cannot use are told apart, and
+    // A refused key, a passing failure and a status the exchange cannot use are told apart, and
     // only the first and the last are permanent.
     #[test]
     fn failures_are_classified_by_status() {
@@ -354,12 +356,12 @@ mod tests {
     #[test]
     fn a_key_goes_only_to_a_confidential_endpoint_and_never_prints() {
         let key = Key::new(
-            " tbo_secret\n",
+            " k_secret\n",
             "https://auth.example/api/iam/token",
             Some("aud"),
         )
         .unwrap();
-        assert!(!format!("{key:?}").contains("tbo_secret"));
+        assert!(!format!("{key:?}").contains("k_secret"));
         for endpoint in [
             "http://127.0.0.1:9/token",
             "http://localhost/token",

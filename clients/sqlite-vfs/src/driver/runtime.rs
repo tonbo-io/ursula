@@ -16,9 +16,9 @@
 //! `ursula_set_token` at once, from the token file when a read finds a new token in it, a
 //! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while requests
 //! carry the file's token and an open or a writer may send them, and from an API key's refresher
-//! when an exchange hands out a new token. The driver tells `auth` whether an open or a binding may
-//! send requests ([`crate::auth::requests_may_go_out`]), from when an open is asked for: the key is
-//! exchanged only then.
+//! when an exchange hands out a new token. The process's driver tells `auth` whether an open or a
+//! binding may send requests ([`crate::auth::requests_may_go_out`]), from when an open is asked
+//! for: the key is exchanged only then.
 //!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
@@ -216,6 +216,20 @@ pub(crate) struct Driver {
     shared: Arc<Shared>,
     next_id: AtomicU64,
     thread: Option<JoinHandle<()>>,
+    role: Role,
+}
+
+/// Whether a driver is the process's ([`driver`]). Only that one tells `auth` whether requests
+/// may go out ([`auth::requests_may_go_out`]), since the process's token is for its requests. A
+/// driver a test starts of its own leaves it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Process,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drivers tests start of their own")
+    )]
+    OwnTest,
 }
 
 /// The process driver.
@@ -228,7 +242,7 @@ pub(crate) fn driver() -> &'static Driver {
         crate::db::expect_started("driver");
         let transports: Transports =
             Arc::new(|url: &str| Arc::new(HttpTransport::new(url)) as Arc<dyn Transport>);
-        Driver::start(transports, seed())
+        Driver::launch(transports, seed(), Role::Process)
     })
 }
 
@@ -258,8 +272,14 @@ fn seed() -> [u8; 32] {
 }
 
 impl Driver {
-    /// Starts the driver thread.
+    /// Starts a driver of a test's own, beside the process's.
+    #[cfg(test)]
     pub(crate) fn start(transports: Transports, seed: [u8; 32]) -> Self {
+        Self::launch(transports, seed, Role::OwnTest)
+    }
+
+    /// Starts the driver thread.
+    fn launch(transports: Transports, seed: [u8; 32], role: Role) -> Self {
         let (commands, inbox) = mpsc::channel::<Command>();
         let shared = Arc::new(Shared {
             state: Mutex::new(Published::default()),
@@ -277,7 +297,7 @@ impl Driver {
                     lanes: HashMap::new(),
                     handles: Vec::new(),
                 };
-                run(Core::new(seed), &inbox, &mut threads, &published);
+                run(Core::new(seed), &inbox, &mut threads, &published, role);
                 threads.join();
             });
         // Without its thread the driver's inbox is gone, so every call answers `DriverGone`.
@@ -294,6 +314,7 @@ impl Driver {
             shared,
             next_id: AtomicU64::new(1),
             thread,
+            role,
         }
     }
 
@@ -310,10 +331,12 @@ impl Driver {
         let open = OpenId(self.id());
         {
             // Requests may go out from the moment the open is asked for, before the driver
-            // thread takes it: a key a host claimed for it is in use from then on.
+            // thread takes it: the key a host was handed for it is in use from then on.
             let mut state = self.shared.lock();
             state.pending.insert(open);
-            auth::requests_may_go_out(true);
+            if self.role == Role::Process {
+                auth::requests_may_go_out(true);
+            }
         }
         self.command(Command::Open { open, spec })?;
         Ok(open)
@@ -662,7 +685,13 @@ fn lost() -> Exchange {
 }
 
 /// The driver thread's loop.
-fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, shared: &Shared) {
+fn run(
+    mut core: Core,
+    inbox: &mpsc::Receiver<Command>,
+    threads: &mut Threads,
+    shared: &Shared,
+    role: Role,
+) {
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut cursor = 0;
@@ -672,7 +701,7 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
         // A key's exchanges run only while an open or a binding may send requests: an open counts
         // from when it was asked for ([`Driver::open`]) until its outcome is published. Both say
         // so under the shared lock, so an open asked for meanwhile is never undone here.
-        {
+        if role == Role::Process {
             let state = shared.lock();
             auth::requests_may_go_out(core.requesting() || !state.pending.is_empty());
         }
