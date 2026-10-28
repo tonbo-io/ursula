@@ -183,13 +183,23 @@ jobs:
           cargo clippy --locked --release --all-targets -- -D warnings
           cargo test --locked --release
 
-  # ursula-vfs-host as a host ships it (design: Hosts): x64 Linux with musl, linked statically, so
-  # it runs on any x64 Linux whatever its C library. Built in Alpine with the repository's
-  # toolchain, then run once outside it.
+  # ursula-vfs-host as a host ships it (design: Hosts): Linux with musl on x64 and arm64, linked
+  # statically, so it runs on any Linux of that architecture whatever its C library. Built natively
+  # in Alpine with the repository's toolchain, then run once outside it.
   sqlite-vfs-host-musl:
-    name: sqlite-vfs host tool (x64 musl, static)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    name: sqlite-vfs host tool (${{ matrix.arch }} musl, static)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || format(matrix.runs-on, github.run_id) }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            hosted: ubuntu-24.04
+            runs-on: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
+          - arch: arm64
+            hosted: ubuntu-24.04-arm
+            runs-on: runs-on={0}/cpu=8/ram=32/family=m8g+m7g/image=ubuntu24-full-arm64/extras=s3-cache
     steps:
       # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
       - name: Use the RunsOn cache

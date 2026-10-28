@@ -1963,9 +1963,9 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs`, `sqlite-vfs-macos`: clippy and the extension's unit tests, the proptests among them
   (the replicator world, the log codec, materialization, the frame and snapshot codecs), on Linux
   and macOS.
-- `sqlite-vfs-host-musl`: `ursula-vfs-host` built for x64 Linux with musl and linked statically,
-  as a host ships it, and run as root against the compiled-in host directory, `inspect` and
-  `hold`.
+- `sqlite-vfs-host-musl`: `ursula-vfs-host` built for x64 and arm64 Linux with musl and linked
+  statically, as a host ships it, and run as root against the compiled-in host directory, `inspect`
+  and `hold`, on each architecture natively.
 - `sqlite-vfs-e2e`: every e2e suite against the model server (`E2E_SERVER=model`) on Node 22.19.0
   and Node 22, and Pi conformance on the oldest supported Pi.
 - `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store (with `test/history-real.e2e.ts`) and three nodes behind the gateway with no cold tier (with `test/failover.e2e.ts`). Both report, without asserting, the open time of a fresh build, a stale catch-up and a stale rebuild from `test/stale.e2e.ts` in the job summary, at 1 MiB and, on one node, 16 MiB. That suite prints its seed, and `STALE_SEED` replays it.
