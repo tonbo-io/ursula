@@ -37,7 +37,7 @@ use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::mark;
 use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
-use crate::db::failure_state;
+use crate::db::failure_state_at;
 use crate::db::for_tests;
 use crate::db::for_tests_with_limit;
 use crate::db::reader_for_tests;
@@ -749,8 +749,7 @@ fn a_wal_write_without_the_write_lock_is_unsupported() {
     assert!(b.reset_kind().is_none());
     assert!(
         b.lock()
-            .refused
-            .as_ref()
+            .standing_refusal()
             .is_some_and(|r| r.kind().as_str() == "unsupported")
     );
     let write_lock = ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_EXCLUSIVE;
@@ -811,15 +810,16 @@ fn a_commit_above_the_limit_fails_alone_with_nothing_logged() {
     assert_eq!(write(w, &[3u8; PAGE], page), ffi::SQLITE_IOERR_AUTH);
     assert!(b.reset_kind().is_none());
     assert_eq!(
-        b.lock().refused.as_ref().map(|r| r.kind().as_str()),
+        b.lock().standing_refusal().map(|r| r.kind().as_str()),
         Some("too_large")
     );
-    // A commit another connection logs before the refused one's host classifies its error clears
+    // A commit another connection logs before the refused one's host classifies its error lifts
     // status's refusal, not the one that names the SQLITE_IOERR_AUTH.
     let registered = registered_for_tests(&b);
-    b.lock().refused = None;
+    b.lock().lift_refusal();
+    assert_eq!(b.lock().standing_refusal(), None);
     assert_eq!(
-        failure_state(&b.path)
+        failure_state_at(&b.path)
             .and_then(|state| state.refused)
             .map(|r| r.kind().as_str()),
         Some("too_large")

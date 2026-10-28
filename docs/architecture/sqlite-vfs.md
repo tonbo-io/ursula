@@ -1597,7 +1597,7 @@ and status field that names a kind names its action and class beside it. A reset
 shows, which ends with what to do. The package picks the error by class (`errors.ts` `errorOf`)
 and takes the action and message as the extension gives them. Errors the package itself makes (an
 invalid argument, a cancelled open) take their class's default action, which repeats
-`ErrorKind::action`. `loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a
+`ErrorKind::action`, and `test/core.e2e.ts` checks it against the extension for every kind. `loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a
 library older than the package fails there with `UrsulaSetupError` (`local_setup`).
 
 | class (`class`) | thrown by | kinds |
@@ -1626,7 +1626,9 @@ extension's (a constraint, a syntax error, an I/O error of a database used throu
   only for a refusal. That refusal stays until the next one, so a commit another connection logs
   before the host classifies leaves it in place, while `status().refused` clears at the next
   logged commit. The message then says what was refused and what to do. A reset database's
-  connections keep this after a reopen bound the stream anew.
+  connections keep this after a reopen bound the stream anew. A `SQLITE_IOERR_AUTH` that a
+  database used through `ATTACH DATABASE` raised reads as the last write the database at `path`
+  refused, however old, and as `null` only while that database refused none.
 - `message` is the error's message, the SQL function's own for its errors. `fix` and `request_id`
   are `null` for every failure of the extension.
 
@@ -1636,7 +1638,8 @@ Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`,
 `a_statement_of_a_reset_database_fails_with_its_reset`,
 `a_refused_write_is_the_last_one_its_database_refused`,
 `an_io_error_the_database_does_not_name_stays_sqlites`, `test/core.e2e.ts` "loads into the running
-SQLite and registers the 0.8 functions only", "resets a database another process took over: 266
+SQLite and registers the 0.8 functions only", "names every kind of the extension with the error and
+the action the package's own errors default to", "resets a database another process took over: 266
 for reads, 778 for writes, a fenced event", "refuses a write in EXCLUSIVE locking mode alone, as
 unsupported", `test/reopen.e2e.ts` "succeeds after a fenced reset: the old read keeps its snapshot,
 its new statements fail, the new database commits", `test/open.e2e.ts`

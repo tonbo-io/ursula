@@ -88,38 +88,60 @@ pub(crate) enum ErrorKind {
     Internal,
 }
 
-impl ErrorKind {
-    /// The stable token.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            ErrorKind::BacklogFull => "backlog_full",
-            ErrorKind::Unsupported => "unsupported",
-            ErrorKind::TooLarge => "too_large",
-            ErrorKind::Reset(kind) => kind.kind(),
-            ErrorKind::InvalidArgument => "invalid_argument",
-            ErrorKind::InvalidUrl => "invalid_url",
-            ErrorKind::NotFound => "not_found",
-            ErrorKind::InUse => "in_use",
-            ErrorKind::BoundElsewhere => "bound_elsewhere",
-            ErrorKind::LocalSetup => "local_setup",
-            ErrorKind::StreamFormat => "stream_format",
-            ErrorKind::NoServerIdentity => "no_server_identity",
-            ErrorKind::ProtocolMismatch => "protocol_mismatch",
-            ErrorKind::WrongCluster => "wrong_cluster",
-            ErrorKind::StreamState => "stream_state",
-            ErrorKind::ClaimRaces => "claim_races",
-            ErrorKind::Unreachable => "unreachable",
-            ErrorKind::Unavailable => "unavailable",
-            ErrorKind::RateLimited => "rate_limited",
-            ErrorKind::Unauthorized => "unauthorized",
-            ErrorKind::PaymentRequired => "payment_required",
-            ErrorKind::Forbidden => "forbidden",
-            ErrorKind::Cancelled => "cancelled",
-            ErrorKind::NotBound => "not_bound",
-            ErrorKind::Internal => "internal",
-        }
-    }
+/// [`ErrorKind::as_str`] and its inverse [`ErrorKind::parse`] from one list of the kinds that are no
+/// reset (a reset's token is its [`ResetKind::kind`]): a kind added without its token fails to build
+/// `as_str`, and a token listed twice fails the lint of an unreachable pattern in `parse`.
+macro_rules! kind_tokens {
+    ($($kind:ident => $token:literal,)*) => {
+        impl ErrorKind {
+            /// The stable token.
+            pub(crate) fn as_str(self) -> &'static str {
+                match self {
+                    ErrorKind::Reset(kind) => kind.kind(),
+                    $(ErrorKind::$kind => $token,)*
+                }
+            }
 
+            /// The kind of `token`. `stream_state` and `internal` read as the kinds that are no
+            /// reset, whose class and action are the same as their resets' at every [`Surface`].
+            fn parse(token: &str) -> Option<ErrorKind> {
+                match token {
+                    $($token => Some(ErrorKind::$kind),)*
+                    token => ResetKind::from_kind(token).map(ErrorKind::Reset),
+                }
+            }
+        }
+    };
+}
+
+kind_tokens! {
+    BacklogFull => "backlog_full",
+    Unsupported => "unsupported",
+    TooLarge => "too_large",
+    InvalidArgument => "invalid_argument",
+    InvalidUrl => "invalid_url",
+    NotFound => "not_found",
+    InUse => "in_use",
+    BoundElsewhere => "bound_elsewhere",
+    LocalSetup => "local_setup",
+    StreamFormat => "stream_format",
+    NoServerIdentity => "no_server_identity",
+    ProtocolMismatch => "protocol_mismatch",
+    WrongCluster => "wrong_cluster",
+    StreamState => "stream_state",
+    ClaimRaces => "claim_races",
+    Unreachable => "unreachable",
+    Unavailable => "unavailable",
+    RateLimited => "rate_limited",
+    Unauthorized => "unauthorized",
+    PaymentRequired => "payment_required",
+    Forbidden => "forbidden",
+    Cancelled => "cancelled",
+    NotBound => "not_bound",
+    Internal => "internal",
+}
+
+impl ErrorKind {
     /// What a caller does about an error of this kind.
     pub(crate) fn action(self) -> Action {
         match self {
@@ -238,47 +260,7 @@ impl ErrorKind {
             | ErrorKind::NotBound => ErrorClass::Setup,
         }
     }
-
-    /// The kind of `token`. `stream_state` and `internal` read as the kinds that are no reset,
-    /// whose class and action are the same as their resets' at every [`Surface`].
-    fn parse(token: &str) -> Option<ErrorKind> {
-        TOKENS.iter().copied().find(|kind| kind.as_str() == token)
-    }
 }
-
-/// Every kind with a token of its own, for [`ErrorKind::parse`]. The tests' `token_index`, a match
-/// over every kind, keeps it whole: a kind added without its token here fails to build there.
-const TOKENS: [ErrorKind; 29] = [
-    ErrorKind::BacklogFull,
-    ErrorKind::Unsupported,
-    ErrorKind::TooLarge,
-    ErrorKind::InvalidArgument,
-    ErrorKind::InvalidUrl,
-    ErrorKind::NotFound,
-    ErrorKind::InUse,
-    ErrorKind::BoundElsewhere,
-    ErrorKind::LocalSetup,
-    ErrorKind::StreamFormat,
-    ErrorKind::NoServerIdentity,
-    ErrorKind::ProtocolMismatch,
-    ErrorKind::WrongCluster,
-    ErrorKind::StreamState,
-    ErrorKind::ClaimRaces,
-    ErrorKind::Unreachable,
-    ErrorKind::Unavailable,
-    ErrorKind::RateLimited,
-    ErrorKind::Unauthorized,
-    ErrorKind::PaymentRequired,
-    ErrorKind::Forbidden,
-    ErrorKind::Cancelled,
-    ErrorKind::NotBound,
-    ErrorKind::Internal,
-    ErrorKind::Reset(ResetKind::Fenced),
-    ErrorKind::Reset(ResetKind::Stale),
-    ErrorKind::Reset(ResetKind::Rewound),
-    ErrorKind::Reset(ResetKind::Deleted),
-    ErrorKind::Reset(ResetKind::LocalDamage),
-];
 
 /// What [`classify`] made of a failure: the kind, what to do, the error to throw and its message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,7 +274,7 @@ pub(crate) struct Classified {
 }
 
 /// What a bound database says about a statement's I/O error: its reset, else the last write it
-/// refused, which only the next refusal replaces (`Commit::last_refusal`).
+/// refused, which only the next refusal replaces (`Commit::refusal`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FailureState {
     pub(crate) reset: Option<ResetKind>,
@@ -606,7 +588,6 @@ mod tests {
     use super::ErrorKind;
     use super::FailureState;
     use super::Surface;
-    use super::TOKENS;
     use super::WriteRefusal;
     use super::classify;
     use super::reset_action;
@@ -624,51 +605,13 @@ mod tests {
         .map(|c| (c.kind, c.action, c.class))
     }
 
-    /// The place of `kind`'s token in [`TOKENS`]. A match over every kind, so a kind added to
-    /// [`ErrorKind`] or [`ResetKind`] fails to build here until it has a token there. A reset of
-    /// `stream_state` or `internal` reads as the kind that is no reset.
-    fn token_index(kind: ErrorKind) -> usize {
-        match kind {
-            ErrorKind::BacklogFull => 0,
-            ErrorKind::Unsupported => 1,
-            ErrorKind::TooLarge => 2,
-            ErrorKind::InvalidArgument => 3,
-            ErrorKind::InvalidUrl => 4,
-            ErrorKind::NotFound => 5,
-            ErrorKind::InUse => 6,
-            ErrorKind::BoundElsewhere => 7,
-            ErrorKind::LocalSetup => 8,
-            ErrorKind::StreamFormat => 9,
-            ErrorKind::NoServerIdentity => 10,
-            ErrorKind::ProtocolMismatch => 11,
-            ErrorKind::WrongCluster => 12,
-            ErrorKind::StreamState | ErrorKind::Reset(ResetKind::StreamState) => 13,
-            ErrorKind::ClaimRaces => 14,
-            ErrorKind::Unreachable => 15,
-            ErrorKind::Unavailable => 16,
-            ErrorKind::RateLimited => 17,
-            ErrorKind::Unauthorized => 18,
-            ErrorKind::PaymentRequired => 19,
-            ErrorKind::Forbidden => 20,
-            ErrorKind::Cancelled => 21,
-            ErrorKind::NotBound => 22,
-            ErrorKind::Internal | ErrorKind::Reset(ResetKind::Internal) => 23,
-            ErrorKind::Reset(ResetKind::Fenced) => 24,
-            ErrorKind::Reset(ResetKind::Stale) => 25,
-            ErrorKind::Reset(ResetKind::Rewound) => 26,
-            ErrorKind::Reset(ResetKind::Deleted) => 27,
-            ErrorKind::Reset(ResetKind::LocalDamage) => 28,
-        }
-    }
-
-    // Every kind has its token in TOKENS, and every token reads back as a kind with the same
-    // token, action and class, so a host learns from a SQL function's error what the extension
-    // meant by it.
+    // Every kind's token reads back as a kind with the same token, action and class, so a host
+    // learns from a SQL function's error what the extension meant by it. The kinds that are no
+    // reset read back by construction (`kind_tokens!`), and so does every reset's token
+    // (`reset_tokens!`): this checks that `stream_state` and `internal`, which read as the kinds
+    // that are no reset, mean the same as their resets, and that no other reset's token is taken.
     #[test]
     fn every_kind_reads_back_from_its_token() {
-        for (at, kind) in TOKENS.iter().copied().enumerate() {
-            assert_eq!(token_index(kind), at, "{}", kind.as_str());
-        }
         let resets = [
             ResetKind::Fenced,
             ResetKind::Stale,
@@ -678,12 +621,13 @@ mod tests {
             ResetKind::StreamState,
             ResetKind::Internal,
         ];
-        for kind in TOKENS
-            .iter()
-            .copied()
-            .chain(resets.into_iter().map(ErrorKind::Reset))
-        {
-            assert_eq!(TOKENS[token_index(kind)].as_str(), kind.as_str());
+        let others = [
+            ErrorKind::BacklogFull,
+            ErrorKind::StreamState,
+            ErrorKind::Internal,
+            ErrorKind::NotBound,
+        ];
+        for kind in resets.into_iter().map(ErrorKind::Reset).chain(others) {
             let read = ErrorKind::parse(kind.as_str()).unwrap();
             assert_eq!(read.as_str(), kind.as_str());
             assert_eq!(read.action(), kind.action(), "{}", kind.as_str());
@@ -695,6 +639,15 @@ mod tests {
                     kind.as_str()
                 );
             }
+        }
+        for reset in resets {
+            let read = ErrorKind::parse(reset.kind());
+            let expected = match reset {
+                ResetKind::StreamState => ErrorKind::StreamState,
+                ResetKind::Internal => ErrorKind::Internal,
+                other => ErrorKind::Reset(other),
+            };
+            assert_eq!(read, Some(expected), "{}", reset.kind());
         }
         assert_eq!(ErrorKind::parse("no_such_kind"), None);
     }

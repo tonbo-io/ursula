@@ -8,7 +8,7 @@
 // the package or the application makes (an invalid argument, a cancelled open, a failed pump
 // worker, a token provider's) takes its constructor's default action, which its class's
 // documentation lists. Those defaults repeat the extension's table, clients/sqlite-vfs/src/error.rs
-// `ErrorKind::action`, and must match it.
+// `ErrorKind::action`, and test/core.e2e.ts checks them against it for every kind the extension has.
 
 /** SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function. */
 export const SQLITE_ERROR = 1;

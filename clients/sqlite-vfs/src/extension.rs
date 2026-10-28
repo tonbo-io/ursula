@@ -277,7 +277,7 @@ unsafe fn fn_events(
 }
 
 /// `ursula_cancel(request)`: gives up an open in progress, and returns what it ended with
-/// (`{kind, action, message}`: the last condition it met, or `cancelled` when it met none), or
+/// (`{kind, action, class, message}`: the last condition it met, or `cancelled` when it met none), or
 /// `null` when it had bound already.
 unsafe fn fn_cancel(
     ctx: *mut ffi::sqlite3_context,

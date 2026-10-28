@@ -122,15 +122,22 @@ pub(crate) struct Commit {
     /// The last commit SQLite published (PHASETWO), and the last BASE record written.
     pub(crate) confirmed: Position,
     pub(crate) based: Position,
-    /// The latest write refused, until a commit is logged: `status().refused`.
-    pub(crate) refused: Option<WriteRefusal>,
-    /// The latest write refused, until the next refusal: what names a `SQLITE_IOERR_AUTH`, which
-    /// the VFS returns only for a refusal ([`crate::error::classify`]). A commit another connection
-    /// logs before the refused one's host classifies its error leaves it in place.
-    pub(crate) last_refusal: Option<WriteRefusal>,
+    /// The latest write refused, until the next refusal.
+    pub(crate) refusal: Option<Refusal>,
     /// The snapshot thread's window (design: Snapshots).
     pub(crate) window: Window,
     pub(crate) stats: Stats,
+}
+
+/// The latest write a binding refused. It names a `SQLITE_IOERR_AUTH`, which the VFS returns only
+/// for a refusal ([`crate::error::classify`]), until the next refusal, so a commit another
+/// connection logs before the refused one's host classifies its error leaves it in place. It
+/// stands in `status().refused` until a commit is logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub(crate) what: WriteRefusal,
+    /// No commit was logged since.
+    pub(crate) standing: bool,
 }
 
 /// The snapshot thread's window: while it is open no commit is logged, so the snapshot's
@@ -152,6 +159,21 @@ impl Commit {
     /// (a rollback journal mode, `journal_mode=MEMORY` or `OFF`) would bypass the log.
     pub(crate) fn db_write_allowed(&self) -> bool {
         self.checkpoint.is_some() || (self.exclusive != 0 && self.wal_open > 0)
+    }
+
+    /// The refusal `status().refused` reports: the latest, until a commit is logged.
+    pub(crate) fn standing_refusal(&self) -> Option<&WriteRefusal> {
+        self.refusal
+            .as_ref()
+            .filter(|r| r.standing)
+            .map(|r| &r.what)
+    }
+
+    /// A commit was logged: the latest refusal leaves status, and still names its error.
+    pub(crate) fn lift_refusal(&mut self) {
+        if let Some(r) = &mut self.refusal {
+            r.standing = false;
+        }
     }
 }
 
@@ -339,18 +361,23 @@ pub(crate) fn bound(path: &str) -> Result<Arc<Binding>, Error> {
 }
 
 /// What the database at `path` (any spelling of the db file's path) says about a statement's I/O
-/// error ([`crate::error::classify`]): the binding's, or one's that left the registry for a new
-/// open while its connections stayed open. `None` for a path no binding of the process has.
+/// error ([`crate::error::classify`]): [`failure_state_at`] its full path. `None` for a path no
+/// binding of the process has.
 pub(crate) fn failure_state(path: &str) -> Option<FailureState> {
-    let full = full_pathname(path).ok()?;
+    failure_state_at(&full_pathname(path).ok()?)
+}
+
+/// What the database at full path `full` says about a statement's I/O error: the binding's, or
+/// one's that left the registry for a new open while its connections stayed open.
+pub(crate) fn failure_state_at(full: &str) -> Option<FailureState> {
     let b = {
         let reg = registry();
         reg.paths
-            .get(&full)
+            .get(full)
             .cloned()
-            .or_else(|| reg.left.get(&full).and_then(Weak::upgrade))
+            .or_else(|| reg.left.get(full).and_then(Weak::upgrade))
     }?;
-    let refused = b.lock().last_refusal.clone();
+    let refused = b.lock().refusal.as_ref().map(|r| r.what.clone());
     Some(FailureState {
         reset: b.reset_kind(),
         refused,

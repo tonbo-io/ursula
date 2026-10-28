@@ -86,7 +86,7 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     let logged = h.last_commit();
     let (confirmed, refused) = {
         let c = b.lock();
-        (c.confirmed, c.refused.clone())
+        (c.confirmed, c.standing_refusal().cloned())
     };
     let commits = object(&[
         ("logged", logged.0.to_string()),

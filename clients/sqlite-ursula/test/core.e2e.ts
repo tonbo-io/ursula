@@ -4,6 +4,7 @@
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { type Described, errorOf, SQLITE_ERROR, type UrsulaError, UrsulaResetError, UrsulaSetupError, UrsulaUnavailableError, UrsulaWriteRefusedError } from "../src/errors.ts";
 import { loadUrsulaVfs } from "../src/index.ts";
 import { Child, directUrl, fault, fromStream, frames, freshDir, killChildren, onModel, type Opened, stream } from "./kit.ts";
 
@@ -117,6 +118,56 @@ describe("the 0.8 core on node:sqlite", () => {
 		plain.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (42)");
 		expect(plain.prepare("SELECT x FROM t").get()).toEqual({ x: 42 });
 		plain.close();
+	});
+
+	it("names every kind of the extension with the error and the action the package's own errors default to", () => {
+		// The package's own errors of these kinds (a cancelled open, a failed pump worker, an invalid
+		// argument) take their constructor's default action: it must be the extension's, and the
+		// class the extension names must pick that constructor. `ursula_status` fails a bound
+		// database, `ursula_open` an open, where `stream_state` and `internal` are setup errors.
+		const made: [fn: "status" | "open", error: UrsulaError][] = [
+			["status", new UrsulaWriteRefusedError("", "backlog_full", undefined)],
+			["status", new UrsulaWriteRefusedError("", "unsupported", undefined)],
+			["status", new UrsulaWriteRefusedError("", "too_large", undefined)],
+			["status", new UrsulaResetError("", "fenced")],
+			["status", new UrsulaResetError("", "stale")],
+			["status", new UrsulaResetError("", "rewound")],
+			["status", new UrsulaResetError("", "deleted")],
+			["status", new UrsulaResetError("", "local_damage")],
+			["status", new UrsulaResetError("", "stream_state")],
+			["status", new UrsulaResetError("", "internal")],
+			["open", new UrsulaUnavailableError("", "unreachable")],
+			["open", new UrsulaUnavailableError("", "unavailable")],
+			["open", new UrsulaUnavailableError("", "rate_limited")],
+			["open", new UrsulaUnavailableError("", "unauthorized")],
+			["open", new UrsulaUnavailableError("", "payment_required")],
+			["open", new UrsulaUnavailableError("", "forbidden")],
+			["open", new UrsulaUnavailableError("", "cancelled")],
+			["open", new UrsulaSetupError("", "invalid_argument")],
+			["open", new UrsulaSetupError("", "invalid_url")],
+			["open", new UrsulaSetupError("", "not_found")],
+			["open", new UrsulaSetupError("", "in_use")],
+			["open", new UrsulaSetupError("", "bound_elsewhere")],
+			["open", new UrsulaSetupError("", "local_setup")],
+			["open", new UrsulaSetupError("", "stream_format")],
+			["open", new UrsulaSetupError("", "no_server_identity")],
+			["open", new UrsulaSetupError("", "protocol_mismatch")],
+			["open", new UrsulaSetupError("", "wrong_cluster")],
+			["open", new UrsulaSetupError("", "stream_state")],
+			["open", new UrsulaSetupError("", "claim_races")],
+			["open", new UrsulaSetupError("", "not_bound")],
+			["open", new UrsulaSetupError("", "internal")],
+		];
+		for (const [fn, error] of made) {
+			const message = `ursula_${fn}: ${error.kind}: x`;
+			const classified = classify(message, SQLITE_ERROR);
+			expect(classified, message).not.toBeNull();
+			const named = classified as unknown as Described;
+			expect({ kind: named.kind, action: named.action }, message).toEqual({ kind: error.kind, action: error.action });
+			expect(errorOf(named, message, undefined).constructor, message).toBe(error.constructor);
+		}
+		// `invalid_name` is the `/tonbo` entry's own: the extension has no such kind.
+		expect(classify("ursula_open: invalid_name: x", SQLITE_ERROR)).toBeNull();
 	});
 
 	it("commits locally, confirms each commit, and synced() waits for the stream to hold them", async () => {
