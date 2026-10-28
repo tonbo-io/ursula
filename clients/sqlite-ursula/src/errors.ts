@@ -35,9 +35,14 @@ export type UrsulaErrorAction = "retry" | "reopen" | "stop" | "fix";
 export type WriteRefusedKind = "backlog_full" | "unsupported" | "too_large";
 /** The kinds of an {@link UrsulaResetError} (design: Resets). */
 export type ResetKind = "fenced" | "stale" | "rewound" | "deleted" | "local_damage" | "stream_state" | "internal";
-/** The kinds of an {@link UrsulaUnavailableError}: the last condition the open met, or `cancelled` when its signal fired first. */
-export type UnavailableKind = "unreachable" | "unavailable" | "rate_limited" | "unauthorized" | "payment_required" | "forbidden" | "wrong_cluster" | "cancelled";
-/** The kinds of an {@link UrsulaSetupError}. */
+/**
+ * The kinds of an {@link UrsulaUnavailableError}: the last condition the open met, or `cancelled` when
+ * its signal fired first. An open whose last condition was `wrong_cluster`, `no_server_identity` or
+ * `protocol_mismatch` throws an {@link UrsulaSetupError} of that kind instead. A bound database
+ * reports them as `status().replication.condition`.
+ */
+export type UnavailableKind = "unreachable" | "unavailable" | "rate_limited" | "unauthorized" | "payment_required" | "forbidden" | "cancelled";
+/** The kinds of an {@link UrsulaSetupError}. `invalid_name` is the `/tonbo` entry's, for an empty database name. */
 export type SetupKind =
 	| "invalid_argument"
 	| "invalid_url"
@@ -181,7 +186,10 @@ export class UrsulaUnavailableError extends UrsulaError {
 	}
 }
 
-/** `open()` cannot succeed as asked: its message says what to change. `in_use` and `claim_races` say `retry`. */
+/**
+ * `open()` cannot succeed as asked: its message says what to change. Every kind says `fix`, except
+ * `in_use` and `claim_races`, which say `retry`, and `internal`, which says `reopen`.
+ */
 export class UrsulaSetupError extends UrsulaError {
 	declare readonly kind: SetupKind;
 	constructor(message: string, kind: SetupKind, cause?: unknown) {
