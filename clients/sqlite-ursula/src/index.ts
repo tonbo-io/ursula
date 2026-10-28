@@ -19,12 +19,13 @@
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
 // - token.ts: the bearer token, a string or the latest from a provider, refreshed ahead of expiry
-//   and after a 401.
+//   and after a 401, until a Tonbo API key's tokens take over.
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
 // - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key, or
-//   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes.
+//   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes,
+//   through the extension's `tonbo_resolve`.
 // - tonbo-pi.ts: the `/tonbo/pi` entry, which opens Pi storage on a Tonbo database by name: the
 //   `/tonbo` entry's resolve, then the `/pi` entry's open.
 import type { DatabaseSyncOptions } from "node:sqlite";
@@ -235,7 +236,7 @@ async function bind(stream: string, dir: string | undefined, json: string, until
 		}
 		if (opened.done) return opened;
 		try {
-			await events.opened(opened.request, until);
+			await events.completed(opened.request, until);
 		} catch {
 			throw giveUp(stream, opened.request, until);
 		}

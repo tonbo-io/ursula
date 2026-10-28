@@ -10,6 +10,9 @@
 // function only names the function the next call runs. An open with a string stops the provider:
 // the waiting opens go on under the string.
 //
+// A Tonbo API key's tokens, which the extension exchanges and refreshes itself (the `/tonbo` entry),
+// take over the same way: `useKeyTokens` stops the provider and clears the token set.
+//
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
 // which the caller awaits. It stops once no binding the thread opened is bound, whatever token its
@@ -54,11 +57,11 @@ const MAX_RETRY_MS = 30_000;
 /** The shortest token lifetime the package takes, and the earliest refresh after a token arrived. */
 const MIN_REFRESH_MS = 1_000;
 /** The longest delay a timer takes. A refresh further out runs then. */
-export const MAX_TIMER_MS = 2_147_483_647;
+const MAX_TIMER_MS = 2_147_483_647;
 /** The earliest `expiresAt` read as milliseconds since the epoch (2001-09-09): below it, it is seconds. */
 const MIN_EPOCH_MS = 1e12;
 /** A token as `Authorization: Bearer` carries it (clients/sqlite-vfs/src/auth.rs `usable`). */
-export const USABLE = /^[\x21-\x7e]+$/;
+const USABLE = /^[\x21-\x7e]+$/;
 
 /** A refresh is due after 70 to 80% of the token's lifetime, at least {@link MIN_REFRESH_MS}: never after it expired, since a shorter lifetime is refused. */
 const refreshAfter = (lifetime: number): number => Math.max(MIN_REFRESH_MS, lifetime * (0.7 + 0.1 * Math.random()));
@@ -387,4 +390,14 @@ function refusedWith(error: unknown, token: string | undefined): unknown {
 export function useStringToken(token: string): void {
 	if (source.provider !== undefined) source.stop("an open with a string token replaced it");
 	apply(token);
+}
+
+/**
+ * The `/tonbo` entry's resolve made a Tonbo API key the process's source of Streams tokens, which the
+ * extension exchanges and refreshes: requests carry them from now on (or URSULA_VFS_TOKEN_FILE's),
+ * so this thread's provider stops and the token set is cleared.
+ */
+export function useKeyTokens(): void {
+	if (source.provider !== undefined) source.stop("an open with a Tonbo API key replaced it");
+	call("SELECT ursula_set_token('', '')");
 }

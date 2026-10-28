@@ -1,7 +1,7 @@
 // `@tonbo/sqlite-ursula/tonbo/pi` (design: Tonbo): Pi Durable's storage on a Tonbo database opened
 // by name, in one call. It is the `/tonbo` entry's `resolveDatabase` followed by the `/pi` entry's
-// `openUrsulaPiStorage`, so the key sources, the lookup and the Streams token provider stay in
-// tonbo.ts and the Pi adapter in pi.ts. An entry of its own, since `/tonbo` must not import
+// `openUrsulaPiStorage`, so the resolve stays in tonbo.ts (over the extension's `tonbo_resolve`) and
+// the Pi adapter in pi.ts. An entry of its own, since `/tonbo` must not import
 // `@earendil-works/pi-durable`, an optional peer dependency only Pi users install.
 import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { DEFAULT_OPEN_MS } from "./abort.ts";
@@ -24,8 +24,8 @@ export type TonboPiStorageOptions = UrsulaPiStorageOptions & Pick<TonboResolveOp
 /**
  * Pi Durable's official node SqliteStorage on the Tonbo database `nameOrUrl` names: resolves it as
  * the `/tonbo` entry's `resolveDatabase` does, then opens it with the `/pi` entry's
- * `openUrsulaPiStorage`, whose open keeps the Streams tokens exchanged for the key fresh. Hand the
- * storage to `Harness.open`, whose `close` closes it.
+ * `openUrsulaPiStorage`. The extension keeps the Streams tokens exchanged for the key fresh. Hand
+ * the storage to `Harness.open`, whose `close` closes it.
  *
  * The key is `apiKey`, else TONBO_API_KEY, else the key `tonbo login` saved. A URL (`https://...`)
  * skips the lookup. A missing `dir` names the root entry's default cache root. The signal (30 s by

@@ -1797,66 +1797,83 @@ storage goes on (Pi up to 1.1)", "throws a reset as the UrsulaResetError itself,
 
 ### Tonbo
 
-`open(nameOrUrl, options)` of the `/tonbo` entry (`tonbo.ts`) opens a database of a Tonbo account
-by name with a Tonbo API key, then calls `open` with the stream URL and a token provider. It only
-resolves the URL and the Streams token: everything after is the root entry's open. That resolution
-is `resolveDatabase(nameOrUrl, options)`, exported on its own: it returns `{ url, token }`, and
-`open` is it followed by the root entry's open, so the key sources, the lookup and the provider have
-one implementation. A caller of another opener, such as `openUrsulaPiStorage`, passes both to it,
-and that open calls the provider.
+`open(nameOrUrl, options)` of the `/tonbo` entry (`tonbo.ts`) opens a database of a Tonbo account by
+name with a Tonbo API key, then calls `open` with the stream URL. It only resolves the URL and the
+Streams token: everything after is the root entry's open. That resolution is
+`resolveDatabase(nameOrUrl, options)`, exported on its own: it returns `{ url, token }`, and `open`
+is it followed by the root entry's open. A caller of another opener, such as `openUrsulaPiStorage`,
+passes both to it. The resolve is the extension's `tonbo_resolve` (below), so the key sources, the
+login file, the lookup and the Streams tokens have one implementation for every host, and `tonbo.ts`
+keeps only a host's glue:
 
-The `/tonbo/pi` entry (`tonbo-pi.ts`) is that composition for Pi: its `openUrsulaPiStorage(nameOrUrl,
-options)` is `resolveDatabase` followed by the `/pi` entry's `openUrsulaPiStorage`, under one signal
-(30 s by default) for both, so `Harness.open(await openUrsulaPiStorage("harness-1"), ...)` persists a
-Pi harness in one line. It is an entry of its own because `/tonbo` must not import
-`@earendil-works/pi-durable`, an optional peer only Pi users install, and `/pi` knows nothing of
-Tonbo. It adds no logic: name resolution, the key sources and the provider stay in `tonbo.ts`, and
-the adapter in `pi.ts`. Pi's `Harness.close` closes the storage it was opened with (Pi 1.0 to 1.3:
-`Session.close` calls `Storage.close`, and `SqliteStorage.close` the driver's `close`, which the
-adapter wraps), so the caller keeps no reference for the close.
+- It calls `tonbo_resolve` with timeout 0, waits for its `resolved` event on the pump
+  ([Pump](#pump)), and calls again with the same arguments to take the outcome, as `open` waits for
+  `ursula_open`. The options are `api_key`, `api_origin` and `auth_origin` from `apiKey`,
+  `apiOrigin` and `authOrigin`, `own_token` when the open has a `token`, and a `timeout_ms` of a
+  day, so the open's signal (30 s by default) governs: when it fires, `ursula_cancel` gives the
+  resolve up and reports what it came to, the last condition included.
+- An error's message is the extension's report without the `tonbo_resolve: ` prefix. The kinds of
+  `TonboError` carry the report's fix and request id as `fix` and `requestId`: a cancel reports them
+  as fields, and an error the call threw has the fix after the last `. ` outside a shell word in
+  single quotes. The other kinds take the root entry's classes, as `ursula_open`'s do.
+- Without a `token` the key's Streams tokens serve the open: the resolve returns once the extension
+  holds the first one, so a key the token endpoint refuses fails the resolve, and `resolveDatabase`
+  hands out `token: undefined`. It then clears the token set (`ursula_set_token` with an empty
+  token) and stops the thread's token provider ([Tokens](#tokens)), so the key's tokens, or
+  `URSULA_VFS_TOKEN_FILE`'s, serve every Streams request of the process. With a `token`, the resolve
+  hands it out as given.
+
+The `/tonbo/pi` entry (`tonbo-pi.ts`) is that composition for Pi: its
+`openUrsulaPiStorage(nameOrUrl, options)` is `resolveDatabase` followed by the `/pi` entry's
+`openUrsulaPiStorage`, under one signal (30 s by default) for both, so
+`Harness.open(await openUrsulaPiStorage("harness-1"), ...)` persists a Pi harness in one line. It is
+an entry of its own because `/tonbo` must not import `@earendil-works/pi-durable`, an optional peer
+only Pi users install, and `/pi` knows nothing of Tonbo. It adds no logic: the resolve stays in
+`tonbo.ts`, and the adapter in `pi.ts`. Pi's `Harness.close` closes the storage it was opened with
+(Pi 1.0 to 1.3: `Session.close` calls `Storage.close`, and `SqliteStorage.close` the driver's
+`close`, which the adapter wraps), so the caller keeps no reference for the close.
 
 - The key is the `apiKey` option, else `TONBO_API_KEY`, else the login `tonbo login` saves (the
-  Tonbo CLI's credentials contract, version 1): `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`,
-  `{version, account_id, key_id, key, expires_at}`. A symlink, a non-regular file or a file with a
-  group or other permission bit is refused (`credentials_refused`) and never read, with no other
-  source tried. The file is opened with `O_NOFOLLOW` and checked again on the descriptor. A login of
-  another version or schema, or one whose `expires_at` has passed, fails `invalid_api_key`.
+  Tonbo CLI's credentials contract, version 1):
+  `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`, `{version, account_id, key_id, key,
+  expires_at}`. A symlink, a non-regular file or a file with a group or other permission bit is
+  refused (`credentials_refused`) and never read, with no other source tried. The file is opened
+  with `O_NOFOLLOW` and checked again on the descriptor. A login of another version or schema, or
+  one whose `expires_at` has passed, fails `invalid_api_key`.
 - A name is looked up with `GET {api origin}/v1/databases/{name}`, the key as the bearer token. A
   `401` with `exchange_required` exchanges the key at the token endpoint with no audience and sends
-  the lookup again once with that token, which is kept per key until 30 s before it expires. A
-  `401` to a held token exchanges again and retries once. The key goes only to the two configured
-  origins, never to an endpoint an answer names, and no redirect is followed (`redirect: "manual"`,
-  a 3xx fails `invalid_argument`). A Streams token never goes to the Management API.
+  the lookup again once with that token, which is kept per key until 30 s before it expires. A `401`
+  to a held token exchanges again and retries once. The key goes only to the two configured origins,
+  never to an endpoint an answer names, and no redirect is followed (a 3xx fails
+  `invalid_argument`). A Streams token never goes to the Management API.
 - An `active` database opens its `url`. `creating`, or a state the package does not know, is looked
   up again with backoff. `deleting` and `deleted` fail `database_not_found`, as `404` does. `401`
   fails `invalid_api_key`, as `403` does with a message that the key cannot read the database. `429`
   waits for `Retry-After` but never less than the backoff, and `408`, `5xx` and network failures
   back off from 250 ms up to 2 s, until the open's signal fires: then `UrsulaUnavailableError` with
-  the last condition. A `200` whose body holds no database, or at the token endpoint no token,
-  is retried as `unavailable`. An `active` database without a `url`, and any other status, fail
-  `invalid_argument` naming the option and variable of that origin.
-- The Streams token comes from the provider each open passes, a closure over that open's key, its
-  source and the auth origin. The process holds one token whichever function minted it, so later
-  opens reuse it and the next refresh runs the last open's provider ([Tokens](#tokens)). It is
-  attached only to a stream URL that is `https://`, or `http://` to a loopback host: any other
-  fails `invalid_url`. One token per process means one key per process: an open with a second key
-  reuses the first key's token until the next refresh exchanges the second. It posts
-  `{"audience":"https://streams.tonbo.dev"}` to `{auth origin}/api/iam/token`. A `401` or `403`
-  there throws `invalid_api_key`, which fails for good. An explicit `token`, or
+  the last condition the resolve met. A `200` whose body holds no database, or at the token endpoint
+  no token, is retried as `unavailable`. An `active` database without a `url`, and any other status,
+  fail `invalid_argument` naming the option and variable of that origin.
+- The Streams tokens are the key's, which the extension exchanges at `{auth origin}/api/iam/token`
+  with `{"audience":"https://streams.tonbo.dev"}` and refreshes ([Transport](#transport)). They are
+  attached only to a stream URL that is `https://`, or `http://` to a loopback host: any other fails
+  `invalid_url`. A `401` or `403` there fails `invalid_api_key`. The process holds one key, so an
+  open with a second key fails `invalid_argument` while the first may serve. An explicit `token`, or
   `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key. The
   extension reads the file only while no open of the process has set a token.
 - Origins are `https://`, or `http://` to a loopback host. `TONBO_API_ORIGIN` and
   `TONBO_AUTH_ORIGIN` set them when the options do not.
-- Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key`
-  and `database_not_found`, action `fix`, with `fix` (the variable or command, which ends the
-  message) and the API's `requestId`. No message carries a key or a token. An empty name fails
+- Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key` and
+  `database_not_found`, action `fix`, with `fix` (the variable or command, which ends the message)
+  and the API's `requestId`. No message carries a key or a token. An empty name fails
   `UrsulaSetupError` `invalid_name`, an `apiKey` option that cannot be sent `invalid_argument`, and
   a login file that cannot be read `local_setup`.
 
-The extension resolves a name too, for hosts of its SQL functions: `tonbo_resolve(name_or_url,
-options_json, timeout_ms)` (`tonbo.rs`) applies the rules above in one implementation, so a host
-carries none of its own. Only `extension.rs` calls into the `tonbo` module, and `status.rs` and
-`error.rs` render what it returns: the open, the registry and the driver never do.
+The resolve is the extension's: `tonbo_resolve(name_or_url, options_json, timeout_ms)` (`tonbo.rs`)
+applies the rules above in one implementation for every host of its SQL functions, the `/tonbo`
+entry included, so a host carries none of its own. Only `extension.rs` calls into the `tonbo`
+module, and `status.rs` and `error.rs` render what it returns: the open, the registry and the driver
+never do.
 
 - `options_json` holds `api_key`, `api_origin`, `auth_origin`, `own_token`, `timeout_ms` and
   `agent` (accepted, not sent). The key sources, the login file and the origins are as above, with
@@ -1920,16 +1937,19 @@ carries none of its own. Only `extension.rs` calls into the `tonbo` module, and 
 Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
 stands in for the Management API and the token endpoint as their contracts document them, and
 serves databases whose URLs are streams of the suite's server. The credentials cases are the
-contract's own usable and unusable examples. Each test waits until its bindings retired, so the
-next starts with no token held. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
-(test/tonbo-child.ts), on a stream and cache root of its own with a token no other test uses, where
-no open set a token first, and the gate shows every request carried the file's token.
-`resolveDatabase` runs with `openUrsulaPiStorage`: the gate shows the Pi storage's stream requests
-carried the token the provider exchanged for the key. "opens Pi storage by name in one call for
-Harness.open, whose close closes it, and its Streams requests carry the token exchanged for the key"
-runs the `/tonbo/pi` entry under Pi's `Harness`, and its binding retires once `harness.close`
-returned. "the extension's tonbo_resolve" runs `tonbo_resolve` against the same stand-in, with
-`timeout_ms` 0 and its `resolved` event, and blocking in a process of its own
+contract's own usable and unusable examples. The process holds one key, so the tests that fetch a
+Streams token in the suite's process share one key, after "a key that gets no Streams token", whose
+keys give way to it, and the others give the Streams requests a token of their own.
+`URSULA_VFS_TOKEN_FILE` runs in a process of its own (test/tonbo-child.ts), on a stream and cache
+root of its own with a token no other test uses, where no open set a token first, and the gate
+shows every request carried the file's token. `resolveDatabase` runs with `openUrsulaPiStorage`:
+the gate shows the Pi storage's stream requests carried the key's Streams token, not the token an
+earlier open set, and at its signal the resolve is given up with the last condition it met. "opens
+Pi storage by name in one call for Harness.open, whose close closes it, and its Streams requests
+carry the token exchanged for the key" runs the `/tonbo/pi` entry under Pi's `Harness`, and its
+binding retires once `harness.close` returned. "the extension's tonbo_resolve" runs `tonbo_resolve`
+against the same stand-in, with `timeout_ms` 0 and its `resolved` event, and blocking in a process
+of its own
 (test/tonbo-resolve-child.ts) whose stream requests, the gate shows, carry the Streams token the
 call fetched. Worker threads of the suite's process make blocking calls that join the resolves of
 the test's thread: "joins the calls with the same arguments, blocking or not, into one resolve, and
@@ -1937,8 +1957,7 @@ each takes its answer", "leaves a resolve another call is owed when a blocking c
 out, and the other call takes its answer", "gives a resolve up when the call that cancels was the
 last one owed it, still ends it with its resolved event, and a call after it starts anew" and "goes
 on with a resolve a blocking call waits for when another call cancels, and reports what an ended
-one came to". The tests that fetch a Streams token in the suite's process share one key, after the
-one whose key the token endpoint refuses. The request table's rules run in `tonbo/requests.rs`
+one came to". The request table's rules run in `tonbo/requests.rs`
 `every_blocking_call_takes_the_one_outcome`,
 `a_blocking_timeout_gives_up_only_a_resolve_no_other_call_wants`,
 `a_cancel_leaves_a_resolve_a_blocking_call_waits_for`, `an_outcome_goes_only_to_calls_owed_it` and
@@ -2029,11 +2048,11 @@ anything is sent".
 ### Pump
 
 Main-thread calls into the extension return at once (timeout 0). The package starts one unref'd
-worker per JavaScript thread that uses it. The worker loads the extension the process already
-holds, shares its registry, and loops on `SELECT ursula_events(cursor, 1000)`, posting events that
-resolve `synced()`, complete `open()` and fire `reset` listeners. No native addon is needed. What
-still blocks is what blocks plain SQLite: local I/O and the busy handler. `importSqlite` blocks its
-thread for at most its timeout.
+worker per JavaScript thread that uses it. The worker loads the extension the process already holds,
+shares its registry, and loops on `SELECT ursula_events(cursor, 1000)`, posting events that resolve
+`synced()`, complete `open()` and the `/tonbo` entry's resolve, and fire `reset` listeners. No
+native addon is needed. What still blocks is what blocks plain SQLite: local I/O and the busy
+handler. `importSqlite` blocks its thread for at most its timeout.
 
 Tests: `test/synced.e2e.ts` "waits without blocking the event loop while the stream holds its
 answer back", "asks again for what a gap in the events may have dropped", "keeps the process alive
@@ -2053,7 +2072,9 @@ meanwhile. So the last open that names a token sets it.
   another function only names the function the next call runs, and shares the token held and the
   call in flight. An open with a string stops the source on its thread: the call in flight is
   abandoned (its `signal` fires), and the opens waiting go on under the string. An open without
-  `token` changes nothing.
+  `token` changes nothing. A `/tonbo` resolve whose key serves the Streams requests stops the source
+  on its thread the same way, and clears the token set, so the key's tokens serve
+  ([Tonbo](#tonbo)).
 - An open asks the source for a token before its first request. A valid token held serves at
   once, so a connection on a bound binding needs no network, and a refresh that is due runs in the
   background. An expired one serves only while the provider fails (a call failed since the last
