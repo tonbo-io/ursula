@@ -64,8 +64,9 @@
 //! A host reads every root of the recorded directories, and checks every open root lock, with
 //! [`inspection::inspect`], which the `ursula-vfs-host` binary runs. While a host holds the host
 //! directory's `hold` file ([`hold::take`], `ursula-vfs-host hold`), a write transaction of an
-//! owner binding waits before it takes the WAL write lock, for at most 60 s, so the logs drain:
-//! it stalls, and never fails with `SQLITE_BUSY`.
+//! owner binding waits before it takes the WAL write lock, for at most 60 s, so the logs drain.
+//! The wait itself returns no `SQLITE_BUSY` and calls no busy handler; afterwards the request
+//! meets what other writers did meanwhile, as a slow transaction would.
 //!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves

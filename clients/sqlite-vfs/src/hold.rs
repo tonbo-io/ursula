@@ -10,8 +10,10 @@
 //! `write_hold_expired` and sets a latch, under which a request that finds the hold taken goes on
 //! at once, until a try finds it free. Any other error goes on, logged once
 //! (`write_hold_failed`). The file is opened at the process's first request that may wait, and the
-//! outcome, a file or none, is kept for the life of the process. SQLite sees a write transaction
-//! that took longer, never `SQLITE_BUSY`.
+//! outcome, a file or none, is kept for the life of the process. The wait itself returns no
+//! `SQLITE_BUSY` and calls no busy handler; afterwards the request meets what other writers did
+//! meanwhile, as a slow transaction would (`SQLITE_BUSY_SNAPSHOT` for a deferred transaction whose
+//! snapshot a commit overtook).
 //!
 //! The host's side, [`take`], is what `ursula-vfs-host hold` runs: an exclusive `flock` on the
 //! file, held until it is dropped or the process exits.
@@ -50,6 +52,12 @@ pub enum HoldError {
         #[source]
         source: std::io::Error,
     },
+    #[error("stat {}: {source}", .path.display())]
+    Stat {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// A FIFO, a socket, a device or a directory in place of the lock file.
     #[error("{} is not a regular file", .path.display())]
     NotAFile { path: PathBuf },
@@ -74,22 +82,11 @@ pub fn take(dir: Option<&Path>) -> Result<Held, HoldError> {
     match file.metadata() {
         Ok(meta) if meta.is_file() => {}
         Ok(_) => return Err(HoldError::NotAFile { path }),
-        Err(source) => return Err(HoldError::Open { path, source }),
+        Err(source) => return Err(HoldError::Stat { path, source }),
     }
     file.lock()
         .map_err(|source| HoldError::Lock { path, source })?;
     Ok(Held { _file: file })
-}
-
-/// What a write transaction's wait at the hold ended with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Waited {
-    /// No host held the file, or it released it.
-    Free,
-    /// The valve fired: 60 s passed, or had passed before and the hold is still taken.
-    Expired,
-    /// The file could not be tried.
-    Failed,
 }
 
 /// The hold as this process waits at it: the host's lock file, opened read-only.
@@ -118,7 +115,7 @@ impl Hold {
     }
 
     /// Waits while the host holds the file, at most until the valve fires.
-    pub(crate) fn wait(&self) -> Waited {
+    pub(crate) fn wait(&self) {
         let started = Instant::now();
         loop {
             match self.file.try_lock_shared() {
@@ -127,11 +124,11 @@ impl Hold {
                         self.fail(&e);
                     }
                     self.expired.store(false, Ordering::Relaxed);
-                    return Waited::Free;
+                    return;
                 }
                 Err(TryLockError::WouldBlock) => {
                     if self.expired.load(Ordering::Relaxed) {
-                        return Waited::Expired;
+                        return;
                     }
                     let waited = started.elapsed();
                     if waited >= self.limit {
@@ -141,13 +138,13 @@ impl Hold {
                                 ("waited_ms", &waited.as_millis()),
                             ]);
                         }
-                        return Waited::Expired;
+                        return;
                     }
                     std::thread::sleep(self.poll);
                 }
                 Err(TryLockError::Error(e)) => {
                     self.fail(&e);
-                    return Waited::Failed;
+                    return;
                 }
             }
         }

@@ -44,10 +44,11 @@
 //   with no error, and the root drains to clean within 1.5 s. Meanwhile reads, `synced()`, a
 //   snapshot and a FULL checkpoint go on. After the release the commits resume.
 // - H10: the host's sequence with SIGSTOP as the freeze (hold, until-clean, freeze, sync, inspect)
-//   proves clean, with at most the one commit whose transaction began before the hold. A
-//   transaction that took the write lock before the hold and commits after the until-clean, with
-//   the stream refused, shows its bytes in the proof, and a second round after a thaw reports
-//   clean.
+//   proves clean, with at most the one commit whose transaction began before the hold, and a fresh
+//   build of the stream after a SIGKILL holds every commit the writer made. A transaction that
+//   took the write lock before the hold and commits after the until-clean, with the stream
+//   refused, shows its bytes in the proof, and a second round after a thaw reports clean, its
+//   commit in a fresh build.
 // - H11: with the stream blackholed, until-clean never reports clean and the proof reports the
 //   bytes. Once the stream answers they drain.
 import { blake3 } from "@noble/hashes/blake3.js";
@@ -59,7 +60,7 @@ import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { Child, directUrl, freshDir, gate, killChildren, onModel, stream } from "./kit.ts";
+import { Child, directUrl, freshDir, fromStream, gate, killChildren, onModel, stream } from "./kit.ts";
 
 afterEach(killChildren);
 
@@ -821,9 +822,9 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		}
 	}
 
-	/** An owner of a new stream in `dir`, behind the gate, with a writer thread committing every 5 ms. */
-	async function writing(label: string, dir: string, env: NodeJS.ProcessEnv): Promise<Child> {
-		const writer = new Child(`${front.url}${stream(label).path}`, dir, env);
+	/** An owner of the new stream `s` in `dir`, behind the gate, with a writer thread committing every 5 ms. */
+	async function writing(s: { path: string }, dir: string, env: NodeJS.ProcessEnv): Promise<Child> {
+		const writer = new Child(`${front.url}${s.path}`, dir, env);
 		await writer.opened();
 		await writer.exec("CREATE TABLE w(n INTEGER NOT NULL)");
 		expect((await writer.send({ writer: 5 })).ok).toBe(true);
@@ -844,7 +845,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 
 	it("H9: under the hold a writer stops within one transaction with no error and drains, while reads, synced(), a snapshot and a FULL checkpoint go on", async () => {
 		const { host, env } = holdDir();
-		const writer = await writing("host-h9", freshDir(), { ...env, URSULA_VFS_SNAPSHOT_DUE_BYTES: "1" });
+		const writer = await writing(stream("host-h9"), freshDir(), { ...env, URSULA_VFS_SNAPSHOT_DUE_BYTES: "1" });
 
 		const hold = await takeHold(host);
 		const heldAt = Date.now();
@@ -879,7 +880,8 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 
 	it("H10: hold, until-clean, freeze, sync and inspect prove clean, and a transaction that held the write lock before the hold takes a second round", async () => {
 		const first = holdDir();
-		const writer = await writing("host-h10", freshDir(), first.env);
+		const s = stream("host-h10");
+		const writer = await writing(s, freshDir(), first.env);
 		const hold = await takeHold(first.host);
 		const atHold = (await progress(writer)).committed;
 		const drained = await inspect(first.host, [writer.pid], { untilClean: 5_000 });
@@ -888,13 +890,18 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		expect(proven, JSON.stringify(proven)).toMatchObject({ complete: true, clean: true, unacknowledged_bytes: 0 });
 		expect(onlyRoot(proven).held).toBe(true);
 		// At most the one transaction that began before the hold committed after it.
-		expect((await progress(writer)).committed - atHold).toBeLessThanOrEqual(1);
-		await hold.release();
+		const { committed } = await progress(writer);
+		expect(committed - atHold).toBeLessThanOrEqual(1);
+		// Clean means the stream holds every commit the frozen writer made: a fresh build from it,
+		// with the writer gone as a snapshot leaves it, has them all.
 		await writer.stop("SIGKILL");
+		await hold.release();
+		expect(await fromStream(s.url, "SELECT count(*) AS n FROM w")).toEqual([{ n: committed }]);
 
 		// A transaction that holds the write lock when the host takes the hold commits once more.
 		const { host, env } = holdDir();
-		const owner = new Child(`${front.url}${stream("host-h10-open").path}`, freshDir(), env);
+		const open = stream("host-h10-open");
+		const owner = new Child(`${front.url}${open.path}`, freshDir(), env);
 		await owner.opened();
 		await owner.exec("CREATE TABLE t(x)");
 		await synced(owner);
@@ -912,9 +919,9 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		expect(await inspect(host, [owner.pid], { untilClean: 30_000 })).toMatchObject({ complete: true, clean: true });
 		const round2 = await proof(host, owner);
 		expect(round2, JSON.stringify(round2)).toMatchObject({ complete: true, clean: true });
+		await owner.stop("SIGKILL");
 		await second.release();
-		expect(await owner.rows("SELECT x FROM t")).toEqual([{ x: 1 }]);
-		await owner.stop();
+		expect(await fromStream(open.url, "SELECT x FROM t")).toEqual([{ x: 1 }]);
 	});
 
 	it("H11: with the stream unreachable until-clean never reports clean and the proof reports the bytes, which drain once it answers", async () => {

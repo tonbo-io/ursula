@@ -72,6 +72,8 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -143,9 +145,13 @@ const WINDOW_POLL: Duration = Duration::from_millis(100);
 thread_local! {
     /// The extension's private connection is opening on this thread (`opening_private`).
     static PRIVATE: Cell<bool> = const { Cell::new(false) };
-    /// The WAL write locks of bound databases this thread holds: a write transaction that holds
-    /// one never waits at the hold for another (design: Hosts).
-    static WRITE_LOCKS: Cell<u32> = const { Cell::new(0) };
+    /// The WAL write locks of bound databases taken on this thread and not yet released: a write
+    /// transaction that holds one never waits at the hold for another (design: Hosts). SQLite may
+    /// move a connection to another thread between taking a write lock and releasing it, so the
+    /// handle that took one keeps this counter (`Role::Main`'s `writing`) and releases it there,
+    /// on whatever thread. Read with `try_with`: SQLite may run on a thread whose thread-locals
+    /// are being destroyed, and a write there never waits.
+    static WRITE_LOCKS: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 }
 
 /// Runs `open`, the open of the extension's private connection (`host::Private`), so that it
@@ -211,13 +217,15 @@ fn uwal(name: &str, bound: impl FnOnce(&str) -> bool) -> Option<String> {
 
 enum Role {
     /// A main db handle: whose connection it is, where its commit stands, whether it holds an
-    /// EXCLUSIVE file lock, and the read-mark lock slots it holds shared (bit `i` for
-    /// `WAL_READ_LOCK(i)`).
+    /// EXCLUSIVE file lock, the read-mark lock slots it holds shared (bit `i` for
+    /// `WAL_READ_LOCK(i)`), and while it holds the WAL write lock, the `WRITE_LOCKS` counter of
+    /// the thread that took it.
     Main {
         holder: Holder,
         state: Cell<HandleState>,
         exclusive: Cell<bool>,
         marks: Cell<u8>,
+        writing: Cell<Option<Arc<AtomicU32>>>,
     },
     Wal,
 }
@@ -397,6 +405,7 @@ unsafe fn x_open(
                         state: Cell::new(HandleState::Idle),
                         exclusive: Cell::new(false),
                         marks: Cell::new(0),
+                        writing: Cell::new(None),
                     },
                 })
             }
@@ -560,6 +569,7 @@ unsafe fn take_ext(file: *mut ffi::sqlite3_file) -> Option<Box<Ext>> {
 /// connection ends its transaction (an undecided commit becomes unconfirmed) and releases its
 /// EXCLUSIVE lock, and after the last one the binding retires; a WAL handle is uncounted.
 fn closing(ext: &Ext, addr: usize) {
+    uncount_write(ext);
     let b = &ext.binding;
     match &ext.role {
         Role::Main {
@@ -1195,8 +1205,8 @@ unsafe fn x_shm_map(
 
 /// Whether a WAL write lock request on `ext`, a main db handle, waits at the hold first (design:
 /// Hosts): the host's connection to an owner binding, holding a read mark, so a write transaction
-/// (SQLite takes the write lock only with a read mark held), on a thread that holds no other
-/// bound database's write lock. A checkpoint of any mode and a wal-index recovery hold no read
+/// (SQLite takes the write lock only with a read mark held), on a thread that took no other bound
+/// database's write lock still held (`WRITE_LOCKS`). A checkpoint of any mode and a wal-index recovery hold no read
 /// mark when they ask for it, and the private connection and readers never wait.
 fn waits_at_hold(ext: &Ext) -> bool {
     matches!(
@@ -1207,7 +1217,34 @@ fn waits_at_hold(ext: &Ext) -> bool {
             ..
         } if marks.get() != 0
     ) && ext.binding.handle.role == crate::driver::Role::Owner
-        && WRITE_LOCKS.get() == 0
+        && WRITE_LOCKS
+            .try_with(|count| count.load(Ordering::Relaxed))
+            .is_ok_and(|held| held == 0)
+}
+
+/// Counts the WAL write lock `ext`, a main db handle, was granted on this thread's `WRITE_LOCKS`,
+/// and keeps that counter in the handle until the lock is released. A thread whose thread-locals
+/// are being destroyed counts nothing: it never waits at the hold again.
+fn count_write(ext: &Ext) {
+    if let Role::Main { writing, .. } = &ext.role {
+        let count = WRITE_LOCKS.try_with(Arc::clone).ok();
+        if let Some(count) = &count {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(stale) = writing.replace(count) {
+            stale.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Uncounts the WAL write lock `ext`, a main db handle, released (or held when it closes), on the
+/// counter of the thread that took it, whatever thread this is.
+fn uncount_write(ext: &Ext) {
+    if let Role::Main { writing, .. } = &ext.role
+        && let Some(count) = writing.take()
+    {
+        count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The read-mark lock slots among `n` slots from `offset`, as `Role::Main`'s `marks` has them.
@@ -1248,7 +1285,7 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
             }
             let rc = fwd!(file, xShmLock, offset, n, flags);
             if rc == OK {
-                WRITE_LOCKS.set(WRITE_LOCKS.get().saturating_add(1));
+                count_write(ext);
             }
             let call = if rc == OK {
                 Call::LockWrite
@@ -1273,7 +1310,7 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         }
         c.writer = 0;
         c.txn = None;
-        WRITE_LOCKS.set(WRITE_LOCKS.get().saturating_sub(1));
+        uncount_write(ext);
         return fwd!(file, xShmLock, offset, n, flags);
     }
     // SAFETY: the module contract.

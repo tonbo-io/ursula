@@ -88,6 +88,7 @@ fn file_held_by(
             state: Cell::new(HandleState::Idle),
             exclusive: Cell::new(false),
             marks: Cell::new(0),
+            writing: Cell::new(None),
         },
         None => Role::Wal,
     };
@@ -1008,4 +1009,55 @@ fn a_thread_holding_a_bound_write_lock_does_not_wait_for_another() {
     drop(unsafe { Box::from_raw(first.ext) });
     // SAFETY: as above.
     drop(unsafe { Box::from_raw(second.ext) });
+}
+
+// SQLite may move a connection to another thread between taking a write lock and releasing it: the
+// lock counts for the thread that took it until it is released, on whatever thread. A thread whose
+// write lock another thread released waits at its next write again, and the releasing thread keeps
+// the count of the write lock it holds itself, so it does not wait for another while it holds it.
+#[test]
+fn a_write_lock_released_on_another_thread_counts_for_the_thread_that_took_it() {
+    let dirs = [
+        TempDir::new("vfs-hold-moved-a"),
+        TempDir::new("vfs-hold-moved-b"),
+        TempDir::new("vfs-hold-moved-c"),
+    ];
+    let [a, b, c] = dirs.each_ref().map(|d| for_tests(d.path()));
+    let mut files = [&a, &b, &c].map(|x| file_of(x, true, &raw const STAND_IN));
+    let [f1, f2, f3] = files
+        .each_mut()
+        .map(|f| (&raw mut *f).cast::<ffi::sqlite3_file>());
+    for f in [f1, f2, f3] {
+        assert_eq!(shm_lock(f, 3, READ_MARK), ffi::SQLITE_OK);
+    }
+    let quick = Duration::from_secs(30);
+    // This thread takes the first write lock before the host takes the hold.
+    assert!(write_lock_takes(f1) < quick);
+    let (hold, host) = held_hold(dirs[0].path(), Duration::from_secs(60));
+    let [a1, a2, a3] = [f1, f2, f3].map(|f| f.expose_provenance());
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let [g1, g2, g3] =
+                [a1, a2, a3].map(std::ptr::with_exposed_provenance_mut::<ffi::sqlite3_file>);
+            // The other thread holds a write lock of its own, then releases the first.
+            assert!(write_lock_takes(g2) < quick);
+            assert_eq!(shm_lock(g1, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+            set_hold(Some(hold));
+            assert!(write_lock_takes(g3) < quick, "it still holds the second");
+            assert_eq!(shm_lock(g3, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+            assert_eq!(shm_lock(g2, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+            set_hold(None);
+        });
+    });
+    // This thread holds no write lock now, so its next write waits.
+    let release = release_after(host, Duration::from_millis(200));
+    assert!(write_lock_takes(f2) >= Duration::from_millis(150));
+    release.join().unwrap();
+    assert_eq!(shm_lock(f2, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert!(!hold.expired());
+    set_hold(None);
+    for f in files {
+        // SAFETY: the `Box`es `file_of` made, which nothing freed.
+        drop(unsafe { Box::from_raw(f.ext) });
+    }
 }

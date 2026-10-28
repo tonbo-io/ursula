@@ -28,7 +28,7 @@
 // timings are reported, never a failure. Prints one JSON summary, and appends a table to GITHUB_STEP_SUMMARY.
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -138,13 +138,15 @@ if (model === undefined) {
 	const r = await fetch(bucket, { method: "PUT" });
 	if (!r.ok && r.status !== 409) throw new Error(`create the bucket ${bucket}: ${r.status} ${await r.text()}`);
 }
+/** The host directory of BENCH_HOLD. */
+let holdHost: string | undefined;
 if (HOLD) {
 	// The hook is read only when the compiled-in host directory does not exist.
 	if (existsSync("/var/lib/sqlite-ursula/host")) throw new Error("BENCH_HOLD needs a host without /var/lib/sqlite-ursula/host");
-	const host = join(mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-host-")), "host");
-	mkdirSync(host);
-	writeFileSync(join(host, "hold"), "");
-	process.env.URSULA_VFS_HOST_DIR = host;
+	holdHost = join(realpathSync(mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-host-"))), "host");
+	mkdirSync(holdHost);
+	writeFileSync(join(holdHost, "hold"), "");
+	process.env.URSULA_VFS_HOST_DIR = holdHost;
 }
 const control = loadUrsulaVfs(ext);
 const vfsDb = await open(`${bucket}/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
@@ -163,6 +165,21 @@ for (let r = 0; r < ROUNDS; r++) {
 	hook.push(...stats().commits);
 }
 await vfsDb.synced({ signal: AbortSignal.timeout(60_000) });
+if (holdHost !== undefined) {
+	// The arm measured the hold path: the open recorded its cache directory in the host directory,
+	// and the extension holds `hold` open, which it opens at the first write that may wait and keeps
+	// (a file it cannot open logs `write_hold_failed` and is never waited at).
+	if (!readdirSync(holdHost).some((n) => n.startsWith("dir-"))) throw new Error(`BENCH_HOLD: the open recorded nothing in ${holdHost}`);
+	const holdFile = join(holdHost, "hold");
+	const held = readdirSync("/proc/self/fd").some((fd) => {
+		try {
+			return readlinkSync(join("/proc/self/fd", fd)) === holdFile;
+		} catch {
+			return false;
+		}
+	});
+	if (!held) throw new Error(`BENCH_HOLD: the extension did not open ${holdFile}: see write_hold_failed on stderr`);
+}
 // The synced() phase: one commit at a time, its synced() timed from COMMIT's return.
 const synced: number[] = [];
 for (let k = 0; k < SYNCED; k++) {
