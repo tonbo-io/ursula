@@ -3,12 +3,14 @@
 An open binds with ``ursula_open`` at timeout 0 and waits on the events thread while the bind
 goes on, as Node's does. The extension shares one bind between concurrent opens of a stream,
 from any thread. Its own deadline for the bind is far past ``timeout``, which governs the open: on
-the timeout, or on Ctrl-C or any other exception once the request is known, the open cancels the
-bind (``ursula_cancel``).
+the timeout, or on Ctrl-C or any other exception once a reply named the request, the open cancels
+the bind (``ursula_cancel``). A Ctrl-C inside the first ``ursula_open`` call, before its reply is
+read, can miss the cancel.
 
-``autocommit=False`` (Python 3.12 or newer) is refused. In that mode the connection is always in
-a transaction: CPython runs its own ROLLBACK after a refused COMMIT, which hides the refusal, and a
-connection kept open holds a read snapshot after any SELECT, which stops checkpoints of the WAL.
+``autocommit=False`` (Python 3.12 or newer) is refused, and so is setting it later. In that mode
+the connection is always in a transaction: CPython runs its own ROLLBACK after a refused COMMIT,
+which hides the refusal, and a connection kept open holds a read snapshot after any SELECT, which
+stops checkpoints of the WAL.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from ._args import flag
 from ._args import invalid
 from ._args import seconds
 from ._connection import UrsulaConnection
+from ._connection import autocommit_false
 from .errors import UrsulaError
 from .errors import UrsulaSetupError
 from .errors import UrsulaUnavailableError
@@ -139,11 +142,7 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
     for key in OWN.intersection(connect_kwargs):
         raise invalid(f"open() decides sqlite3.connect's {key}")
     if connect_kwargs.get("autocommit") is False:
-        raise invalid(
-            "autocommit=False keeps the connection in a transaction, where a refused COMMIT is "
-            "hidden by the ROLLBACK that follows it: use the default transaction control, "
-            "isolation_level=None, or autocommit=True"
-        )
+        raise autocommit_false()
     factory = connect_kwargs.pop("factory", UrsulaConnection)
     if not (isinstance(factory, type) and issubclass(factory, UrsulaConnection)):
         raise invalid(f"factory must be a subclass of UrsulaConnection, not {factory!r}")
@@ -161,12 +160,16 @@ def _bind(stream: str, root: str | None, options: str, timeout: float) -> dict[s
     """Binds ``stream``: ``ursula_open`` with timeout 0, waiting on the events thread while it goes
     on.
 
-    Any exception once the request is known (Ctrl-C included, which Python delivers right after
-    the call returns) cancels it, so no bind goes on to claim the stream after the open gave up.
+    Any exception once a reply named the request cancels it, in a later pass too (one a gap or a
+    lost events thread woke), so no bind goes on to claim the stream after the open gave up. A
+    Ctrl-C that lands inside the first ``ursula_open`` call, before its reply is read, can miss the
+    cancel: that bind then runs to the extension's own deadline.
     """
     deadline = time.monotonic() + timeout
+    # The request of the last reply that was not done: concurrent opens of a stream, and each pass
+    # of this one, share it until it resolves.
+    known: int | None = None
     while True:
-        opened: dict[str, Any] | None = None
         ev: _events.Events | None = None
         waiter = None
         try:
@@ -177,28 +180,28 @@ def _bind(stream: str, root: str | None, options: str, timeout: float) -> dict[s
                 opened = _control.call("SELECT ursula_open(?, ?, ?, 0)", stream, root, options)
                 if opened["done"]:
                     return opened
-                waiter = ev.wait_open(int(opened["request"]))
+                known = int(opened["request"])
+                waiter = ev.wait_open(known)
             left = deadline - time.monotonic()
             woke = left > 0 and waiter.wait(left)
         except BaseException as error:
-            if opened is not None and not opened["done"]:
-                request = int(opened["request"])
-                if ev is not None and waiter is not None:
-                    ev.forget_open(request, waiter)
-                _give_up(stream, request, timeout)
-                raise
             # Another thread's open of the stream, which this one shared, was cancelled.
             if (
                 isinstance(error, UrsulaUnavailableError)
                 and error.kind == "cancelled"
                 and time.monotonic() < deadline
             ):
+                known = None
                 continue
+            if known is not None:
+                if ev is not None and waiter is not None:
+                    ev.forget_open(known, waiter)
+                # One that resolved meanwhile is no longer a request: the cancel finds nothing.
+                _give_up(stream, known, timeout)
             raise
         if not woke:
-            request = int(opened["request"])
-            ev.forget_open(request, waiter)
-            raise _give_up(stream, request, timeout)
+            ev.forget_open(known, waiter)
+            raise _give_up(stream, known, timeout)
 
 
 def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:

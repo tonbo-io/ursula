@@ -465,7 +465,7 @@ jobs:
       - name: A uv-managed CPython on debian:trixie-slim hosts the wheel, as recipes/Dockerfile.uv installs it
         if: matrix.python == '3.14'
         env:
-          IMAGE: public.ecr.aws/docker/library/debian:trixie-slim
+          IMAGE: public.ecr.aws/docker/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
         run: |
           set -euo pipefail
           # The recipe's steps, with the runner's uv (the pinned 0.13.6, as the recipe's) and the

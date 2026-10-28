@@ -1884,10 +1884,10 @@ returns at once.
 - `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
   `ursula_set_token(path, token)`.
 
-The extension refuses to load into SQLite older than 3.50.4, or one without WAL. Every such
-refusal reads `sqlite-ursula-vfs needs ...`, the prefix a host matches to tell a SQLite the
-extension refuses from a library SQLite cannot load. In a child forked after its parent started
-the extension, every function fails `forked` ([Forks](#forks)).
+The extension refuses to load into SQLite older than 3.50.4, one without WAL, or one lacking a
+routine the extension needs. Every such refusal reads `sqlite-ursula-vfs needs ...`, the prefix a
+host matches to tell a SQLite the extension refuses from a library SQLite cannot load. In a child
+forked after its parent started the extension, every function fails `forked` ([Forks](#forks)).
 
 Tests: `test/core.e2e.ts` "loads into the running SQLite and registers the 0.8 functions only",
 `options.rs` `every_option`, `refusals_name_the_option`, `extension.rs` `the_floor_is_3_50_4`,
@@ -2038,26 +2038,27 @@ classes, whose class, kind and action come from `ursula_classify`.
   no library. `python -m sqlite_ursula` prints the same check.
 - **Connections.** `open` returns `UrsulaConnection`, a `sqlite3.Connection` subclass made by
   `sqlite3.connect(path, factory=..., timeout=busy_timeout, check_same_thread=False)`, read-only
-  through `file:<path>?mode=ro`. CPython's `execute*`, `commit` and `__exit__` call SQLite
-  directly, so the subclass overrides them with `cursor`, and its cursor overrides `execute*`,
-  `fetch*` and `__next__`. Each classifies its error and keeps the remembered-error rule of the
-  TypeScript `UrsulaDatabase` for SQL `ROLLBACK`. Refused writes and resets also derive from
+  through `file:<path>?mode=ro`. CPython's `execute*`, `commit` and `__exit__` call SQLite directly,
+  so the subclass overrides them with `cursor`, and its cursor overrides `execute*`, `fetch*` and
+  `__next__`. Each classifies its error and keeps the remembered-error rule of the TypeScript
+  `UrsulaDatabase` for SQL `ROLLBACK`. Refused writes and resets also derive from
   `sqlite3.OperationalError`, the error they replace. `open` refuses `autocommit=False`
-  (`invalid_argument`): in that mode the connection is always in a transaction, so CPython's own
-  ROLLBACK after a refused COMMIT would hide the refusal, and a connection kept open would hold a
-  read snapshot that stops checkpoints.
-- **Events.** One daemon thread, `sqlite-ursula-events`, applies the [Pump](#pump)'s rules: it
-  takes its cursor before any request or ticket is handed out, loops on
-  `ursula_events(cursor, 1000)` on its own connection, and applies each batch under the control
-  connection's lock. `ursula_open` and `ursula_synced` run at timeout 0 under the same lock, with
-  their request or ticket registered in that step. `synced(timeout)` covers the database at the
-  connection's path, the target `ursula_synced` takes, and waits on a `threading.Event`, which
-  Ctrl-C interrupts, and raises `TimeoutError` while replication goes on. An open past its
-  `timeout`, or interrupted by any exception once its request is known, Ctrl-C included, cancels
-  the request. Reset callbacks run on a thread of their own after the path's tickets were
-  rejected. A failed thread is replaced while tickets wait or connections are open, and the new
-  one starts with a gap: tickets asked for again and resets read from status. After three
-  failures in a row waits fail `internal`.
+  (`invalid_argument`), and so does the connection's `autocommit` setter: in that mode the
+  connection is always in a transaction, so CPython's own ROLLBACK after a refused COMMIT would hide
+  the refusal, and a connection kept open would hold a read snapshot that stops checkpoints.
+- **Events.** One daemon thread, `sqlite-ursula-events`, applies the [Pump](#pump)'s rules: it takes
+  its cursor before any request or ticket is handed out, loops on `ursula_events(cursor, 1000)` on
+  its own connection, and applies each batch under the control connection's lock. `ursula_open` and
+  `ursula_synced` run at timeout 0 under the same lock, with their request or ticket registered in
+  that step. `synced(timeout)` covers the database at the connection's path, the target
+  `ursula_synced` takes, and waits on a `threading.Event`, which Ctrl-C interrupts, and raises
+  `TimeoutError` while replication goes on. An open past its `timeout`, or interrupted by any
+  exception once a reply named its request, Ctrl-C included, cancels the request, in a later pass
+  too. A Ctrl-C inside the first `ursula_open` call, before its reply is read, can miss the cancel,
+  and that bind runs to the extension's own deadline. Reset callbacks run on a thread of their own
+  after the path's tickets were rejected. A failed thread is replaced while tickets wait or
+  connections are open, and the new one starts with a gap: tickets asked for again and resets read
+  from status. After three failures in a row waits fail `internal`.
 - **Forks.** `os.register_at_fork`, where the platform has it, marks a child forked after the
   parent started the extension (an open or an import). There `open`, `import_sqlite` and
   `set_token` raise `UrsulaSetupError` `forked` (`fix`), and so do the overridden calls of a

@@ -5,8 +5,10 @@ as a setup error or, past the timeout, as an unavailable one. Ctrl-C cancels an 
 
 from __future__ import annotations
 
+import math
 import signal
 import sqlite3
+import sys
 import threading
 import time
 
@@ -133,6 +135,9 @@ def test_refuses_what_it_cannot_take_as_a_setup_error_to_fix(stream, fresh):
         {"uri": True},
         # Always in a transaction, where CPython's ROLLBACK after a refused COMMIT hides it.
         {"autocommit": False},
+        # Past what a wait can take, not an OverflowError from deeper down.
+        {"timeout": math.inf},
+        {"timeout": 1e12},
     ):
         with pytest.raises(UrsulaSetupError) as invalid:
             sqlite_ursula.open(stream.url, dir=fresh(), **kwargs)
@@ -142,6 +147,23 @@ def test_refuses_what_it_cannot_take_as_a_setup_error_to_fix(stream, fresh):
     with pytest.raises(UrsulaSetupError) as both:
         sqlite_ursula.open(stream.url, dir=fresh(), read_only=True, recreate=True)
     assert (both.value.kind, both.value.action) == ("invalid_argument", "fix")
+
+    db = sqlite_ursula.open(stream.url, dir=fresh())
+    for wait in (math.inf, 1e12, -1):
+        with pytest.raises(UrsulaSetupError) as invalid:
+            db.synced(timeout=wait)
+        assert (invalid.value.kind, invalid.value.action) == ("invalid_argument", "fix"), wait
+    if sys.version_info >= (3, 12):
+        # Set after the open, autocommit=False is refused as it is as open()'s argument.
+        with pytest.raises(UrsulaSetupError) as later:
+            db.autocommit = False
+        assert (later.value.kind, later.value.action) == ("invalid_argument", "fix")
+        assert db.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
+        db.autocommit = True
+        assert db.autocommit is True
+        db.execute("CREATE TABLE t(x)")
+        assert not db.in_transaction
+    db.close()
 
 
 def test_reports_the_last_condition_the_open_met_when_its_timeout_passes(fresh):
@@ -156,11 +178,12 @@ def test_reports_the_last_condition_the_open_met_when_its_timeout_passes(fresh):
 
 def test_ctrl_c_cancels_an_open_and_the_stream_is_not_held(model, fresh):
     from conftest import new_stream
+    from conftest import request
 
     s = new_stream(model, "interrupted")
     root = fresh()
-    # The bind's answers are held back longer than the interrupt waits.
-    model.fault("delay 3000", 4)
+    # The bind's first request, its HEAD, is answered later than the interrupt comes.
+    model.fault("delay 3000", 1)
     main = threading.main_thread().ident
     assert main == threading.get_ident()
     timer = threading.Timer(0.3, signal.pthread_kill, (main, signal.SIGINT))
@@ -171,6 +194,9 @@ def test_ctrl_c_cancels_an_open_and_the_stream_is_not_held(model, fresh):
     assert time.monotonic() - started < 2.5
     timer.join()
     time.sleep(3.5)
+    # The cancelled bind never went on to create the stream, let alone claim it. A bind left
+    # running would have, and the reopen below would share it either way.
+    assert request("HEAD", s.url)[0] == 404
     db = sqlite_ursula.open(s.url, dir=root)
     db.execute("CREATE TABLE t(x)")
     db.commit()

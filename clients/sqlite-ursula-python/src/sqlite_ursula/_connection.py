@@ -16,7 +16,8 @@ run through ``execute`` that finds no transaction then succeeds, since nothing i
 back. Through ``executescript``, which may hold more statements after it, it raises the remembered
 error instead, and so does a ``ROLLBACK TO`` or ``RELEASE`` that finds no savepoint. The legacy
 ``rollback()`` method runs no ROLLBACK when no transaction is open. ``open()`` refuses
-``autocommit=False``, the mode in which the connection is always in a transaction (see ``_open``).
+``autocommit=False``, the mode in which the connection is always in a transaction (see ``_open``),
+and so does setting ``autocommit`` to ``False`` on a connection ``open()`` made.
 
 In a child forked after the parent made the connection, its overridden calls raise ``forked``,
 and ``close()`` does nothing: the file and its locks are the parent's. Its other methods
@@ -34,6 +35,7 @@ from typing import TypeVar
 
 from . import _control
 from . import _events
+from ._args import invalid
 from .errors import UrsulaError
 from .errors import UrsulaResetError
 from .errors import again
@@ -48,6 +50,19 @@ NO_TRANSACTION = "cannot rollback - no transaction is active"
 NO_SAVEPOINT = "no such savepoint: "
 
 T = TypeVar("T")
+
+#: ``sqlite3.Connection``'s ``autocommit`` attribute (Python 3.12 or newer), or ``None``.
+_AUTOCOMMIT: Any = vars(sqlite3.Connection).get("autocommit")
+
+
+def autocommit_false() -> UrsulaError:
+    """The refusal of ``autocommit=False``, as an ``open()`` argument or set later."""
+    return invalid(
+        "autocommit=False keeps the connection in a transaction, where a refused COMMIT is "
+        "hidden by the ROLLBACK that follows it: use the default transaction control, "
+        "isolation_level=None, or autocommit=True"
+    )
+
 
 ResetCallback = Callable[[UrsulaResetError], object]
 
@@ -127,6 +142,18 @@ class UrsulaConnection(sqlite3.Connection):
         self.path = path
         self._bound = True
         _events.track(self)
+
+    if _AUTOCOMMIT is not None:
+
+        @property
+        def autocommit(self) -> Any:
+            return _AUTOCOMMIT.__get__(self, type(self))
+
+        @autocommit.setter
+        def autocommit(self, value: Any) -> None:
+            if self._bound and value is False:
+                raise autocommit_false()
+            _AUTOCOMMIT.__set__(self, value)
 
     # The statements.
 

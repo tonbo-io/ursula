@@ -53,8 +53,9 @@ def generation() -> int:
 
 
 def forked_error() -> UrsulaSetupError:
-    """``forked``: what every call raises in a child forked after the parent started the
-    extension."""
+    """``forked``: what the guarded calls (``open``, ``import_sqlite``, ``set_token`` and the
+    overridden calls of an inherited connection) raise in a child forked after the parent started
+    the extension."""
     return UrsulaSetupError(
         "forked: this process forked after its parent opened an Ursula database, and the "
         "databases and the replication of the parent are not this process's: open databases "

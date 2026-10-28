@@ -76,7 +76,7 @@ Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose 
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported`, `too_large` |
 | `UrsulaResetError` | every statement after a reset, `synced()`, `on_reset` callbacks | `fenced` (`stop`), `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` past its timeout | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` |
-| `UrsulaSetupError` | `open()`, `import_sqlite()`, any call in a forked child | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |
+| `UrsulaSetupError` | `open()`, `import_sqlite()`, the calls the package guards in a forked child ([Forks](#forks)) | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |
 
 `UrsulaWriteRefusedError` and `UrsulaResetError` are also `sqlite3.OperationalError`, as the error they replace was, so existing `except sqlite3.OperationalError` clauses keep catching them, and `sqlite_errorcode` and `sqlite_errorname` are SQLite's. A transaction helper's `ROLLBACK` after one, which finds no transaction since SQLite rolled it back, does not hide it.
 

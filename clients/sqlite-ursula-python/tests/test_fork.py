@@ -1,8 +1,7 @@
 """Forks: a child forked after the parent opened a database raises ``forked`` from the package's
 calls and from the inherited connection's, whose ``close()`` closes nothing, while the parent goes
-on. A child
-forked before the parent started the extension opens databases as any process does: import at
-module level, open in the worker."""
+on. A child forked before the parent started the extension opens databases as any process does:
+import at module level, open in the worker."""
 
 from __future__ import annotations
 
@@ -68,8 +67,7 @@ def test_a_child_forked_after_an_open_raises_forked_and_the_parent_goes_on(strea
                 seen[name] = ["returned"]
             except UrsulaSetupError as e:
                 seen[name] = [e.kind, e.action]
-        # Closing the inherited connection touches nothing of the parent's, and neither does
-        # collecting it.
+        # Closing the inherited connection touches nothing of the parent's.
         db.close()
         seen["close"] = ["returned"]
         return seen
