@@ -411,8 +411,8 @@ impl BindingHandle {
         Ok(Arc::clone(self.salvage.get_or_init(|| listed)))
     }
 
-    /// Whether the binding is still provisional: opened on an unreachable stream, no claim of it
-    /// applied yet.
+    /// Whether the binding is still provisional: opened on an unreachable stream, or by a host's
+    /// drain, and no claim of it applied yet.
     pub(crate) fn provisional(&self) -> bool {
         self.provisional.load(Ordering::Acquire)
     }

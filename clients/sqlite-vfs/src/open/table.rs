@@ -88,15 +88,18 @@
 //! | any | `404` | refuse `not_found` |
 //! | any | another content type | refuse `stream_format` |
 //! | any | closed | refuse `stream_state` |
-//! | trusted, with a CLAIM record | `200`, any token | continue, on the log's token |
+//! | trusted, with a CLAIM record and commits after its latest ACK | `200`, any token | continue, on the log's token |
+//! | trusted, with a CLAIM record and nothing after its latest ACK | `200` | decline: nothing pending |
 //! | replaced | `200` | decline `replaced` |
 //! | none, trusted without a CLAIM record | `200` | decline: nothing to continue |
 //!
 //! Another token than the log's is the pre-check's HEAD's to decide, so the drain has no history
-//! rule of its own, and the stream's latest snapshot plays no part. When the drain's first HEAD
-//! got no answer with nothing sent, [`decide_drain_unreachable`] continues by the unreachable row
-//! and declines at once where an owner's open would wait. Every refusal and every decline keeps the
-//! local files and sends nothing but the HEAD.
+//! rule of its own, and the stream's latest snapshot plays no part. A generation with nothing after
+//! its latest ACK has nothing to send, so a claim would only open the pre-check's window, and its
+//! pre-check could re-key it: the drain declines it, and so never re-keys at its open. When the
+//! drain's first HEAD got no answer with nothing sent, [`decide_drain_unreachable`] continues by
+//! the unreachable row and declines at once where an owner's open would wait. Every refusal and
+//! every decline keeps the local files and sends nothing but the HEAD.
 
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
@@ -109,6 +112,7 @@ use super::OpenError;
 use super::StreamFormat;
 use super::StreamState;
 use crate::codec::frame::CONTENT_TYPE;
+use crate::error::ErrorKind;
 use crate::ids::Activation;
 use crate::replicator::answer::Unacked;
 use crate::replicator::answer::inherits;
@@ -276,15 +280,21 @@ pub(crate) enum Declined {
     /// continue.
     #[error("the root holds no claim to continue")]
     NoClaim,
+    /// A trusted generation whose log holds nothing after its latest ACK: there is nothing to
+    /// send, so a continuation claim would gain nothing.
+    #[error("the root holds no commit after its latest ACK")]
+    NothingPending,
 }
 
 impl Declined {
-    /// The token a drain reports: `replaced`, and `internal` for a root that holds no claim, which
-    /// cannot hold commits either (a generation logs a commit only after its claim).
+    /// The token a drain reports, from the existing token functions: `replaced`, and `internal`
+    /// for a root with no claim or nothing pending. Neither holds an unacknowledged commit (a
+    /// generation logs a commit only after its claim), so such a root changed since the drain read
+    /// it, and the drain's next read decides it.
     pub(crate) fn kind(self) -> &'static str {
         match self {
-            Self::Replaced => "replaced",
-            Self::NoClaim => "internal",
+            Self::Replaced => Reason::Replaced.as_str(),
+            Self::NoClaim | Self::NothingPending => ErrorKind::Internal.as_str(),
         }
     }
 }
@@ -310,7 +320,8 @@ pub(crate) enum DrainRow<L, R> {
 }
 
 /// The drain's rows (design: Pre-check), on the local generation the open found and the HEAD it
-/// got: the checks of every HEAD, then only a trusted generation with a CLAIM record continues.
+/// got: the checks of every HEAD, then only a trusted generation with a CLAIM record and commits
+/// after its latest ACK continues.
 pub(crate) fn decide_drain<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> DrainRow<L, R> {
     match check_head(&local, head, OnClosed::Refuse) {
         Ok(Some(_)) => drain_rows(local),
@@ -322,24 +333,37 @@ pub(crate) fn decide_drain<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> Drai
     }
 }
 
-/// The drain's unreachable rows: a trusted generation with a CLAIM record continues, as by the
-/// owner's unreachable row ([`decide_unreachable`]), and anything else declines at once, as it
-/// would once the stream answered.
+/// The drain's unreachable rows: a trusted generation with a CLAIM record and commits after its
+/// latest ACK continues, as by the owner's unreachable row ([`decide_unreachable`]), and anything
+/// else declines at once, as it would once the stream answered.
 pub(crate) fn decide_drain_unreachable<L, R>(local: Local<L, R>) -> DrainRow<L, R> {
     drain_rows(local)
 }
 
 /// What a drain does with the root once nothing refused the stream.
 fn drain_rows<L, R>(local: Local<L, R>) -> DrainRow<L, R> {
-    match decide_unreachable(local) {
-        UnreachableRow::Provisional { local, claim } => DrainRow::Continue { local, claim },
-        UnreachableRow::Wait { local } => {
-            let declined = match &local {
-                Local::Replaced(_) => Declined::Replaced,
-                Local::None | Local::Trusted(..) => Declined::NoClaim,
-            };
-            DrainRow::Decline { declined, local }
-        }
+    match local {
+        local @ Local::Trusted(
+            LocalSummary {
+                pending: Unacked::Nothing,
+                claim: Some(_),
+                ..
+            },
+            _,
+        ) => DrainRow::Decline {
+            declined: Declined::NothingPending,
+            local,
+        },
+        local => match decide_unreachable(local) {
+            UnreachableRow::Provisional { local, claim } => DrainRow::Continue { local, claim },
+            UnreachableRow::Wait { local } => {
+                let declined = match &local {
+                    Local::Replaced(_) => Declined::Replaced,
+                    Local::None | Local::Trusted(..) => Declined::NoClaim,
+                };
+                DrainRow::Decline { declined, local }
+            }
+        },
     }
 }
 
@@ -1314,9 +1338,9 @@ mod tests {
         );
     }
 
-    // A trusted generation with a CLAIM record continues its claim whatever the stream's token (the
-    // pre-check's HEAD decides another one) and its latest snapshot, with commits pending or not:
-    // a drain never builds, re-keys or salvages at its open.
+    // A trusted generation with a CLAIM record and commits after its latest ACK continues its claim
+    // whatever the stream's token (the pre-check's HEAD decides another one) and its latest
+    // snapshot, holding data or not: a drain never builds or salvages at its open.
     #[test]
     fn a_drain_continues_a_trusted_generation_with_a_claim_whatever_the_token() {
         let id = identity("cluster-a");
@@ -1328,9 +1352,8 @@ mod tests {
             stream(4, 0, None),
         ] {
             for found in [
-                local(1, 40),
                 trusted(1, 40, Unacked::Commits, true),
-                trusted(1, 0, Unacked::Nothing, false),
+                trusted(1, 0, Unacked::Commits, false),
             ] {
                 assert_eq!(
                     decide_drain(found, seen(&id, Some(&head))),
@@ -1342,9 +1365,11 @@ mod tests {
     }
 
     // What a drain cannot continue it declines, with nothing sent but the HEAD: a replaced
-    // generation (the next owner's open salvages it), none, or a trusted one with no CLAIM record.
+    // generation (the next owner's open salvages it), none, a trusted one with no CLAIM record, and
+    // one with nothing after its latest ACK, whatever the stream's token: with nothing to send, a
+    // drain never claims, and so never re-keys at its open.
     #[test]
-    fn a_drain_declines_a_replaced_generation_and_one_without_a_claim() {
+    fn a_drain_declines_a_replaced_generation_one_without_a_claim_and_one_with_nothing_pending() {
         let id = identity("cluster-a");
         let head = stream(1, 40, None);
         assert_eq!(
@@ -1354,7 +1379,11 @@ mod tests {
                 local: REPLACED
             }
         );
-        for found in [NONE, unclaimed(local(1, 40))] {
+        for found in [
+            NONE,
+            unclaimed(local(1, 40)),
+            unclaimed(trusted(1, 40, Unacked::Commits, true)),
+        ] {
             assert_eq!(
                 decide_drain(found.clone(), seen(&id, Some(&head))),
                 DrainRow::Decline {
@@ -1363,19 +1392,39 @@ mod tests {
                 }
             );
         }
+        for head in [
+            head,
+            stream(2, 50, Some((1, 40))),
+            with_snapshot(stream(1, 80, None), 60),
+        ] {
+            for found in [local(1, 40), trusted(1, 0, Unacked::Nothing, false)] {
+                assert_eq!(
+                    decide_drain(found.clone(), seen(&id, Some(&head))),
+                    DrainRow::Decline {
+                        declined: Declined::NothingPending,
+                        local: found
+                    },
+                    "{head:?}"
+                );
+            }
+        }
         assert_eq!(Declined::Replaced.kind(), "replaced");
         assert_eq!(Declined::NoClaim.kind(), "internal");
+        assert_eq!(Declined::NothingPending.kind(), "internal");
     }
 
     // Unreachable, a drain continues by the owner's provisional row, and declines at once where an
     // owner's open would wait for the stream.
     #[test]
     fn an_unreachable_drain_continues_a_claim_and_declines_anything_else_at_once() {
-        assert_eq!(decide_drain_unreachable(local(1, 40)), continues());
         assert_eq!(
             decide_drain_unreachable(trusted(1, 40, Unacked::Commits, true)),
             continues()
         );
+        assert_eq!(decide_drain_unreachable(local(1, 40)), DrainRow::Decline {
+            declined: Declined::NothingPending,
+            local: local(1, 40)
+        });
         assert_eq!(decide_drain_unreachable(REPLACED), DrainRow::Decline {
             declined: Declined::Replaced,
             local: REPLACED

@@ -247,7 +247,7 @@ pub(crate) enum Condition {
 }
 
 impl Condition {
-    /// The stable token (design: Answers, Status): status reports it, and so does a host's drain.
+    /// The stable token (design: Answers, Status), which status reports.
     pub(crate) fn token(&self) -> &'static str {
         match self {
             Self::Retrying => "retrying",

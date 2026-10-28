@@ -6697,38 +6697,39 @@ fn a_drain_handed_back_at_bind_retires_with_an_exact_ack() {
     }
 }
 
-/// A root whose log holds nothing after its latest ACK by the time the drain binds retires at
-/// once when given back, its pre-check still out: no claim goes out, and nothing is logged.
+/// A root whose log holds nothing after its latest ACK by the time the drain opens it has nothing
+/// to send: the drain declines it with nothing sent but its HEAD, so it claims nothing and opens no
+/// pre-check window. Under a history that inherits the root, where an owner's open would re-key
+/// it, the log still names its own token: a drain never re-keys at its open.
 #[test]
-fn a_drain_whose_root_holds_nothing_at_bind_retires_without_a_claim() {
-    let dir = TempDir::new("driver-drain-nothing");
-    let mut w = World::new();
-    let (generation, _, _) = crashed_owner(&mut w, dir.path(), 1);
-    let records = log_records(&generation);
-    let c = w.core();
-    // Only the open's HEAD is answered: the pre-check waits.
-    let heads = Rc::new(Cell::new(0u32));
-    let counted = Rc::clone(&heads);
-    w.hold_sends = Some(Box::new(move |_| {
-        counted.set(counted.get() + 1);
-        counted.get() > 1
-    }));
-    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
-    hand_back(&mut w, c, &bound);
-    assert!(retired(&w, c, &bound));
-    assert!(!bound.handle.holds_root());
-    w.release_sends();
-    w.run_for(10_000);
-    assert!(claimed(&w, c).is_empty(), "{:?}", claimed(&w, c));
-    let after = log_records(&generation);
-    assert!(
-        after
-            .iter()
-            .skip(records.len())
-            .all(|r| !matches!(r, RecordBody::Claim { .. })),
-        "{after:?}"
-    );
-    assert!(w.resets(c).is_empty());
+fn a_drain_of_a_root_with_nothing_after_its_ack_declines_with_nothing_sent_but_its_head() {
+    for history in [false, true] {
+        let dir = TempDir::new("driver-drain-nothing");
+        let mut w = World::new();
+        let (generation, _, _) = crashed_owner(&mut w, dir.path(), 1);
+        assert!(unacknowledged(&generation).0.is_empty());
+        if history {
+            w.server.history_event(HistoryEvent::NewHistory).unwrap();
+        }
+        let records = log_records(&generation);
+        let tokens = segment_tokens(&generation);
+        let c = w.core();
+        let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
+        assert!(
+            matches!(*e, OpenError::Declined(Declined::NothingPending)),
+            "history {history}: {e}"
+        );
+        assert_eq!(methods(&w, c), vec![Method::Head], "history {history}");
+        assert_eq!(segment_tokens(&generation), tokens, "history {history}");
+        let after = log_records(&generation);
+        assert!(
+            after
+                .iter()
+                .skip(records.len())
+                .all(|r| !matches!(r, RecordBody::Claim { .. })),
+            "history {history}: {after:?}"
+        );
+    }
 }
 
 /// The bind starts the hand-out timer, which finds the binding given back and changes nothing:
@@ -6880,20 +6881,34 @@ fn a_drain_repeat_of_an_unapplied_claim_can_fence_a_claim_made_within_its_pre_ch
 }
 
 /// What a drain cannot continue it refuses or declines with nothing sent but its HEAD, the local
-/// files as they were: a deleted stream (never created again), a replaced db file (reachable, or
-/// unreachable at once instead of at the deadline) and a root another process holds.
+/// files as they were: a missing stream over a root an owner's open would create it over (a
+/// replaced db file, or no generation), which a drain never creates, a replaced db file
+/// (reachable, or unreachable at once instead of at the deadline) and a root another process
+/// holds.
 #[test]
 fn a_drain_refuses_or_declines_with_nothing_sent_but_its_head() {
     let dir = TempDir::new("driver-drain-deleted");
     let mut w = World::new();
     let (generation, _, _) = orphan(&mut w, dir.path(), 1, false);
+    std::fs::write(generation.join("db"), &sqlite(Box::new([0; 4096]))[..]).unwrap();
+    let before = files(&generation);
     w.server.delete(PATH).unwrap();
     let c = w.core();
     let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
     assert!(matches!(*e, OpenError::NotFound), "{e}");
     assert_eq!(methods(&w, c), vec![Method::Head]);
-    assert!(w.server.frames(PATH).is_none(), "never created");
-    assert_eq!(unacknowledged(&generation).0.len(), 1);
+    assert!(w.server.token(PATH).is_none(), "never created");
+    assert_eq!(files(&generation), before);
+    assert!(!stream_root(dir.path()).join("salvage").exists());
+
+    let dir = TempDir::new("driver-drain-missing");
+    let mut w = World::new();
+    let c = w.core();
+    let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
+    assert!(matches!(*e, OpenError::NotFound), "{e}");
+    assert_eq!(methods(&w, c), vec![Method::Head]);
+    assert!(w.server.token(PATH).is_none(), "never created");
+    assert!(!has_generation(dir.path()));
 
     for down in [false, true] {
         let dir = TempDir::new("driver-drain-replaced");
@@ -6943,4 +6958,45 @@ fn a_drain_of_an_unreachable_stream_continues_once_it_answers() {
     assert_eq!(claimed(&w, c), vec![own, epoch(own.get() + 1)]);
     assert_eq!(w.stream_commits(), vec![x]);
     assert!(unacknowledged(&generation).0.is_empty());
+}
+
+/// The stream was deleted and created again: a history that does not inherit the root, where an
+/// owner's open would salvage the generation and build. The drain binds provisionally on the log's
+/// token, its pre-check's HEAD names the other token, and it resets `rewound` with nothing sent
+/// but its HEADs and reads. The generation's files stay as the open's materialization left them,
+/// and nothing is salvaged: the next owner's open salvages them.
+#[test]
+fn a_drain_of_a_stream_deleted_and_created_again_resets_rewound_with_nothing_sent() {
+    let dir = TempDir::new("driver-drain-recreated");
+    let mut w = World::new();
+    let (generation, _, x) = orphan(&mut w, dir.path(), 1, false);
+    w.server.delete(PATH).unwrap();
+    // A first drain, refused `not_found`, materializes the generation, so its files are compared
+    // from here on.
+    let first = w.core();
+    let e = kind(w.open_result(first, drain_spec(dir.path(), 2)));
+    assert!(matches!(*e, OpenError::NotFound), "{e}");
+    w.crash(first);
+    let before = files(&generation);
+    create(&mut w.server);
+    let c = w.core();
+    let bound = w.open_result(c, drain_spec(dir.path(), 3)).unwrap();
+    assert!(bound.handle.provisional());
+    assert_eq!(bound.handle.generation.dir, generation);
+    hand_back(&mut w, c, &bound);
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Rewound]);
+    assert!(claimed(&w, c).is_empty(), "{:?}", claimed(&w, c));
+    assert!(
+        methods(&w, c)
+            .iter()
+            .all(|m| matches!(m, Method::Head | Method::Get)),
+        "{:?}",
+        methods(&w, c)
+    );
+    assert!(!bound.handle.holds_root());
+    assert!(!w.stream_commits().contains(&x));
+    assert_eq!(files(&generation), before);
+    assert_eq!(unacknowledged(&generation).0.len(), 1);
+    assert!(!stream_root(dir.path()).join("salvage").exists());
 }

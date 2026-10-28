@@ -26,10 +26,11 @@
 //!   that the core has not heard of yet, then shares the stream's root while a reset binding's
 //!   connections hold it, and its first disk job copies the generation they hold (design:
 //!   Materialize).
-//! - A provisional open (design: Open; the stream unreachable, a trusted generation with a CLAIM
-//!   record) binds at once and resolves before any answer. Its replicator claims only once the
-//!   stream answered and a pre-check found nothing foreign (design: Pre-check). Commits log and
-//!   wait, and so does `synced()`. The binding is live once its claim applies and its reconcile
+//! - A provisional open (design: Open; a trusted generation with a CLAIM record, the stream
+//!   unreachable, or a host's drain of it whether the stream answers or not) binds at once and
+//!   resolves before any answer of its pre-check. Its replicator claims only once the stream
+//!   answered and a pre-check found nothing foreign (design: Pre-check). Commits log and wait, and
+//!   so does `synced()`. The binding is live once its claim applies and its reconcile
 //!   completes ([`Action::Bound`]), and resets `fenced` or `stale` when another owner moved the
 //!   stream meanwhile.
 //!
