@@ -10,6 +10,7 @@ use super::PassError;
 use super::Reason;
 use super::Shape;
 use super::Strict;
+use super::alive;
 use super::check_host_dir;
 use super::effective_uid;
 use super::holds_write_lock;
@@ -150,6 +151,17 @@ fn root_names_and_lock_paths_have_one_grammar() {
         lock_path(format!("/c/{ROOT}/{trash}/lock (deleted)").as_bytes()),
         LockPath::No
     );
+    // `reader-trash-<32 hex>` is also the root of a stream whose label is `reader-trash`: outside a
+    // directory with a root's name it is a root's lock by its name.
+    for root in [
+        format!("/home/app/.cache/sqlite-ursula/0.8/{trash}/lock"),
+        format!("/{trash}/lock (deleted)"),
+    ] {
+        assert_eq!(lock_path(root.as_bytes()), LockPath::Root, "{root}");
+    }
+    // A reader's directory outside a directory with a root's name, as in a renamed root: a root's
+    // only when held.
+    assert_eq!(lock_path(b"/c/notes-old/reader-3/lock"), LockPath::Unnamed);
     assert_eq!(
         lock_path(format!("/c/{ROOT}/lock2").as_bytes()),
         LockPath::No
@@ -173,10 +185,11 @@ fn root_names_and_lock_paths_have_one_grammar() {
     assert!(holds_write_lock(&fdinfo(
         "lock:\t1: FLOCK  ADVISORY  WRITE 4242 00:2f:1234 0 EOF\n"
     )));
-    assert!(holds_write_lock(&fdinfo(
+    // Every root lock is an `flock`: a record lock, as dpkg's, is not one.
+    assert!(!holds_write_lock(&fdinfo(
         "lock:\t1: POSIX  ADVISORY  WRITE 4242 00:2f:1234 0 EOF\n"
     )));
-    assert!(holds_write_lock(&fdinfo(
+    assert!(!holds_write_lock(&fdinfo(
         "lock:\t1: OFDLCK ADVISORY  WRITE -1 00:2f:1234 0 EOF\n"
     )));
     assert!(!holds_write_lock(&fdinfo(
@@ -302,6 +315,16 @@ fn what_the_pass_cannot_read_makes_it_incomplete() {
     );
     assert!(seen.to_json().contains("\"state\":\"unreadable\""));
     assert!(seen.to_json().contains("\"unacknowledged_bytes\":null"));
+    // A root that stays unreadable ends a wait for a clean result at once.
+    let started = std::time::Instant::now();
+    let seen = inspect(&Inspect {
+        dir: Some(h.host.clone()),
+        pids: Some(Vec::new()),
+        until_clean: Some(std::time::Duration::from_secs(60)),
+        ..Inspect::default()
+    });
+    assert_eq!(seen.reason(), Some(Reason::Unreadable));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
 
     fs::write(h.host.join("stray"), b"").unwrap();
     let seen = h.inspect(Vec::new());
@@ -363,6 +386,37 @@ fn a_spent_budget_stops_the_pass() {
     });
     assert_eq!(seen.reason(), Some(Reason::Budget));
     assert!(seen.to_json().contains("\"incomplete\":\"budget\""));
+    // A pass out of budget ends a wait for a clean result at once.
+    let started = std::time::Instant::now();
+    let seen = inspect(&Inspect {
+        dir: Some(h.host.clone()),
+        pids: Some(Vec::new()),
+        budget: Some(std::time::Duration::ZERO),
+        until_clean: Some(std::time::Duration::from_secs(60)),
+        ..Inspect::default()
+    });
+    assert_eq!(seen.reason(), Some(Reason::Budget));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+// A process `--pid` names that exited is skipped, and one that is alive while `/proc` hides it
+// (`hidepid`) is not: `kill(pid, 0)` tells them apart.
+#[test]
+fn an_exited_process_is_skipped_and_a_live_one_is_alive() {
+    assert!(alive(std::process::id()));
+    assert!(!alive(0));
+    assert!(!alive(u32::MAX));
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let exited = child.id();
+    child.wait().unwrap();
+    assert!(!alive(exited));
+    let h = Host::new("inspect-exited", &[commit(1, 10)]);
+    if fs::read_dir("/proc/self/fd").is_err() {
+        // No `/proc`: the lock check fails whatever the pids.
+        return;
+    }
+    let seen = h.inspect(vec![exited]);
+    assert_eq!(seen.reason(), None, "{}", seen.to_json());
 }
 
 // The lock check: a lock this process holds open is the lock of a root the pass read, wherever it

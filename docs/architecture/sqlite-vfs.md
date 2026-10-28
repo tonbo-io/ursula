@@ -1263,16 +1263,26 @@ it as root, so that it can read every root and every process's descriptors. One 
    `/proc/<pid>/task/<tid>/fd` once its first thread exited, that may be a root's lock must be the
    lock (device and inode) of a root the pass read, which then shows `held`. A file named `lock`,
    deleted or not, may be a root's when its directory is named `<label>-<32 hex>`, or when the
-   process holds an exclusive `flock` or record lock on it (the `lock:` lines of
-   `/proc/<pid>/fdinfo/<n>`), since a root's directory may have been renamed to any name. Any
-   other is an unread lock: a root moved, renamed, deleted or hidden under a live process, a root
-   in another mount namespace, or a running copy of any release since 0.8, whatever it recorded.
-   A lock in a reader directory (`reader-<n>`, or `reader-trash-<32 hex>` while a cleanup deletes
-   it) is skipped, since readers hold no commit and record nothing: a root renamed to a reader
-   directory's name is not seen. `--pid` limits the check to the processes it names. Without
-   `--pid` the inspector must run as root, since another user sees some processes as absent
-   (`hidepid`) or cannot read their descriptors, and with either it needs a `/proc` in which it
-   can list its own descriptors: otherwise the pass is incomplete (`unread_lock`).
+   process holds an exclusive `flock` on it (the `lock:` lines of `/proc/<pid>/fdinfo/<n>`),
+   since a root's directory may have been renamed to any name. Every release since 0.8 takes a
+   root's lock with `flock`, so a record lock (`fcntl`, as dpkg holds `/var/lib/dpkg/lock`) is
+   not one, while any other process holding an exclusive `flock` on a file named `lock` makes the
+   pass incomplete. Any other is an unread lock: a root moved, renamed, deleted or hidden under a
+   live process, a root in another mount namespace, or a running copy of any release since 0.8,
+   whatever it recorded. A lock in a reader directory is skipped, since readers hold no commit
+   and record nothing. A reader directory is a reader's name (`reader-<n>`, or
+   `reader-trash-<32 hex>` while a cleanup deletes it) inside a directory named
+   `<label>-<32 hex>`, as it sits in its root. `reader-trash-<32 hex>` is also the root of a
+   stream whose label is `reader-trash`, which is checked as a root like any other. A root
+   renamed to a reader's name inside a directory with a root's name, or one in a cache directory
+   whose own name has a root's grammar, is not seen. The descriptors of a process are those its
+   first thread lists, or each thread's once the first exited, so a thread that unshared its
+   descriptor table (`unshare(CLONE_FILES)`) while the first runs is not read. `--pid` limits the
+   check to the processes it names, and a named process that is alive while `/proc` does not
+   show it (`hidepid`, told apart from an exited one by `kill(pid, 0)`) makes the pass
+   incomplete. Without `--pid` the inspector must run as root, since another user sees some
+   processes as absent or cannot read their descriptors, and with either it needs a `/proc` in
+   which it can list its own descriptors: otherwise the pass is incomplete (`unread_lock`).
 
 ```json
 {"v":1,"dir":"/var/lib/sqlite-ursula/host","complete":true,"clean":false,"incomplete":null,
@@ -1306,9 +1316,11 @@ it as root, so that it can read every root and every process's descriptors. One 
   record's name holds no record of this line, null for a name of no record.
 - `--until-clean MS` reads again every 50 ms, rereading only the roots whose files changed, until
   the result is clean or incomplete or MS have passed. A root whose read failed while its files
-  changed, as a drain trims and rolls its log, is read again rather than ending the wait.
-- `--budget-ms` bounds a pass, and stops it in the middle of a segment, at its next read of at
-  most 64 KiB. It does not bound an open or a read the kernel blocks, such as a FIFO planted in
+  changed, as a drain trims and rolls its log, is read again rather than ending the wait. Any
+  other incomplete result, a root that stays unreadable or a spent budget, ends it at once.
+- `--budget-ms` bounds a pass. It stops it at the next entry of a directory it lists for roots or
+  for a root's fingerprint, at the next descriptor of a process, or in the middle of a segment at
+  its next read of at most 64 KiB. It does not bound an open or a read the kernel blocks, such as a FIFO planted in
   place of a segment or a hung mount, so a host also bounds the inspector's run time and treats a
   timeout as incomplete.
 - The binary exits 0 when it printed a result and 2 on a usage error. Paths may be any bytes. The

@@ -24,9 +24,11 @@
 //! 4. The lock check: every open file of a live process (`/proc/<pid>/fd`, or the descriptors of
 //!    its threads once its first thread exited) that may be a root's `lock` must be the lock of
 //!    a root this pass read, whatever path the process opened it by. A file named `lock` may be
-//!    a root's when its directory has a root's name, or when the process holds an exclusive lock
-//!    on it (`/proc/<pid>/fdinfo`), since a root's directory may have been renamed. A reader
-//!    directory's lock is not one: readers hold no commit. Any other is an unread lock.
+//!    a root's when its directory has a root's name, or when the process holds an exclusive
+//!    `flock` on it (`/proc/<pid>/fdinfo`), since a root's directory may have been renamed. A
+//!    reader directory's lock is not one (a reader's name in a directory with a root's name):
+//!    readers hold no commit. Any other is an unread lock, and so is a process `--pid` names that
+//!    is alive while `/proc` hides it.
 //!
 //! A pass that cannot do one of these is incomplete, and says why with one reason, the first that
 //! applies of `host_dir`, `unrecognized`, `unread_lock`, `unreadable` and `budget`.
@@ -139,6 +141,8 @@ enum PassError {
     },
     #[error("the process table: {} names no effective uid", .path.display())]
     NoUid { path: PathBuf },
+    #[error("the process table: process {pid} is alive and /proc does not show it")]
+    Hidden { pid: u32 },
     #[error(
         "the process table: uid {euid} cannot read every process's open files, so the check of every process needs root"
     )]
@@ -155,6 +159,7 @@ impl PassError {
             | PassError::HostDirMoved { .. } => Reason::HostDir,
             PassError::ProcessTable { .. }
             | PassError::NoUid { .. }
+            | PassError::Hidden { .. }
             | PassError::NotRoot { .. } => Reason::UnreadLock,
             PassError::Budget { .. } => Reason::Budget,
         }
@@ -407,9 +412,10 @@ impl Inspection {
 
     /// Whether it is incomplete only for roots whose files changed while they were read: an
     /// `--until-clean` pass before the freeze reads them again, as the drain it waits for trims
-    /// and rolls their logs.
+    /// and rolls their logs. Any other reason, the budget included, ends the wait at once.
     fn settling(&self) -> bool {
         self.reason() == Some(Reason::Unreadable)
+            && self.errors.is_empty()
             && self
                 .dirs
                 .iter()
@@ -599,7 +605,13 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
                 if !seen.insert(real.clone()) {
                     continue;
                 }
-                list_roots(&real)
+                match list_roots(&real, deadline) {
+                    Ok(listed) => listed,
+                    Err(Stopped) => {
+                        stopped = true;
+                        break 'dirs;
+                    }
+                }
             }
             Err(e) if not_there(&e) => {
                 if !seen.insert(path.clone()) {
@@ -626,7 +638,13 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
                 stopped = true;
                 break 'dirs;
             }
-            let print = fingerprint(&root);
+            let print = match fingerprint(&root, deadline) {
+                Ok(print) => print,
+                Err(Stopped) => {
+                    stopped = true;
+                    break 'dirs;
+                }
+            };
             let read = match (&print, cache.roots.remove(&root)) {
                 (Some(print), Some((before, read))) if *print == before => read,
                 _ => match read_root(&root, print.as_ref(), deadline) {
@@ -880,31 +898,37 @@ fn no_root(e: &std::io::Error) -> bool {
 }
 
 /// The roots in the directory whose real path is `dir`: its subdirectories with a root's name,
-/// by name.
-fn list_roots(dir: &Path) -> (DirState, Vec<(String, PathBuf)>) {
+/// by name, or [`Stopped`] when the pass ran past `deadline` while listing it.
+fn list_roots(
+    dir: &Path,
+    deadline: Deadline,
+) -> Result<(DirState, Vec<(String, PathBuf)>), Stopped> {
     let unlistable = |op, path: &Path, source| {
-        (
+        Ok((
             DirState::Unlistable(DirError {
                 op,
                 path: path.to_owned(),
                 source,
             }),
             Vec::new(),
-        )
+        ))
     };
     match fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return (DirState::Absent, Vec::new()),
-        Err(e) if not_there(&e) => return (DirState::Absent, Vec::new()),
+        Ok(_) => return Ok((DirState::Absent, Vec::new())),
+        Err(e) if not_there(&e) => return Ok((DirState::Absent, Vec::new())),
         Err(e) => return unlistable("stat", dir, e),
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if not_there(&e) => return (DirState::Absent, Vec::new()),
+        Err(e) if not_there(&e) => return Ok((DirState::Absent, Vec::new())),
         Err(e) => return unlistable("list", dir, e),
     };
     let mut roots = Vec::new();
     for entry in entries {
+        if deadline.passed() {
+            return Err(Stopped);
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => return unlistable("list", dir, e),
@@ -927,7 +951,7 @@ fn list_roots(dir: &Path) -> (DirState, Vec<(String, PathBuf)>) {
         }
     }
     roots.sort();
-    (DirState::Present, roots)
+    Ok((DirState::Present, roots))
 }
 
 /// What the root `root` holds, `before` its fingerprint ahead of the read, or [`Stopped`] when
@@ -954,7 +978,13 @@ fn read_root(
         Ok(Some(state)) => state,
         Err(RootError::Log(LogError::Stopped { .. })) => return Err(Stopped),
         Err(error) => {
-            let changed = before.is_none_or(|before| fingerprint(root).as_ref() != Some(before));
+            // A fingerprint that cannot be taken before the read nor after it is no change: the
+            // root stays unreadable, and a wait for it ends at once.
+            let changed = match (before, fingerprint(root, deadline)?) {
+                (Some(before), Some(after)) => *before != after,
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
             RootState::Unreadable { error, changed }
         }
     };
@@ -1011,40 +1041,67 @@ fn pending(root: &Path, deadline: Deadline) -> Result<Option<RootState>, RootErr
     }))
 }
 
-/// The root `root`'s fingerprint, `None` when a part of it cannot be listed (it is read again).
-fn fingerprint(root: &Path) -> Option<Fingerprint> {
+/// The root `root`'s fingerprint, `None` when a part of it cannot be listed (it is read again),
+/// or [`Stopped`] when the pass ran past `deadline` while taking it.
+fn fingerprint(root: &Path, deadline: Deadline) -> Result<Option<Fingerprint>, Stopped> {
     let mut print = Vec::new();
-    let mut add = |dir: &Path| -> Option<Vec<PathBuf>> {
-        let mut dirs = Vec::new();
-        for entry in fs::read_dir(dir).ok()? {
-            let path = entry.ok()?.path();
-            let meta = fs::symlink_metadata(&path).ok()?;
-            if meta.is_dir() {
-                dirs.push(path.clone());
-            }
-            print.push((
-                path,
-                meta.ino(),
-                meta.len(),
-                meta.mtime(),
-                meta.mtime_nsec(),
-            ));
-        }
-        Some(dirs)
+    let Some(dirs) = add_names(root, deadline, &mut print)? else {
+        return Ok(None);
     };
-    for dir in add(root)? {
+    for dir in dirs {
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if name == salvage::DIR {
-            add(&dir)?;
-        } else if name.starts_with("gen-") {
-            let log = dir.join("log");
-            if log.exists() {
-                add(&log)?;
-            }
+        let (salvages, logged) = (name == salvage::DIR, name.starts_with("gen-"));
+        let listed = if salvages {
+            Some(dir)
+        } else if logged {
+            Some(dir.join("log")).filter(|log| log.exists())
+        } else {
+            None
+        };
+        if let Some(listed) = listed
+            && add_names(&listed, deadline, &mut print)?.is_none()
+        {
+            return Ok(None);
         }
     }
     print.sort();
-    Some(print)
+    Ok(Some(print))
+}
+
+/// Adds every name in `dir` to `print`, with its inode, size and modification time, and returns
+/// its subdirectories: `None` when it cannot be listed, [`Stopped`] past `deadline`.
+fn add_names(
+    dir: &Path,
+    deadline: Deadline,
+    print: &mut Fingerprint,
+) -> Result<Option<Vec<PathBuf>>, Stopped> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        if deadline.passed() {
+            return Err(Stopped);
+        }
+        let Ok(entry) = entry else {
+            return Ok(None);
+        };
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return Ok(None);
+        };
+        if meta.is_dir() {
+            dirs.push(path.clone());
+        }
+        print.push((
+            path,
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ));
+    }
+    Ok(Some(dirs))
 }
 
 /// An open file of a live process that may be a root's lock.
@@ -1068,7 +1125,12 @@ fn table(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> PassEr
 /// Every open file of a live process among `pids` (every process when `None`) that may be a
 /// root's lock ([`lock_path`]), or `None` when the pass ran past `deadline`. A process that exits
 /// meanwhile is skipped. A process table, or a process's descriptors, that cannot be read fail,
-/// and so does the check of every process when this one is not root's.
+/// and so do a live process `/proc` hides (`hidepid`) and the check of every process when this
+/// one is not root's.
+///
+/// The descriptors of a process are those its first thread lists, or those of each of its
+/// threads once the first exited. A thread that unshared its descriptor table
+/// (`unshare(CLONE_FILES)`) while the first thread runs is not read.
 fn open_locks(
     pids: Option<&[u32]>,
     deadline: Deadline,
@@ -1105,9 +1167,13 @@ fn open_locks(
             return Ok(None);
         }
         let process = proc.join(pid.to_string());
-        // Exited, or never there.
-        let Some(listed) = descriptors(&process, pid, &mut locks)? else {
-            continue;
+        let listed = match descriptors(&process, pid, deadline, &mut locks)? {
+            Fds::Listed(listed) => listed,
+            Fds::Stopped => return Ok(None),
+            // Hidden from this process (`hidepid`): its open files are not read.
+            Fds::Gone if alive(pid) => return Err(PassError::Hidden { pid }),
+            // Exited, or never there.
+            Fds::Gone => continue,
         };
         if listed > 0 {
             continue;
@@ -1126,28 +1192,44 @@ fn open_locks(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(e) => return Err(table("list", &tasks)(e)),
             };
-            descriptors(&task, pid, &mut locks)?;
+            if matches!(descriptors(&task, pid, deadline, &mut locks)?, Fds::Stopped) {
+                return Ok(None);
+            }
         }
     }
     Ok(Some(locks))
 }
 
+/// What [`descriptors`] listed of a process or a thread.
+#[derive(Debug, Clone, Copy)]
+enum Fds {
+    /// Its `/proc` directory is not there: it exited, or `/proc` hides it.
+    Gone,
+    /// It lists this many descriptors.
+    Listed(usize),
+    /// The pass ran past its deadline.
+    Stopped,
+}
+
 /// Adds every open file of the process `pid`, or of one of its threads, whose `/proc` directory
-/// is `dir` and that may be a root's lock ([`lock_path`]) to `locks`. Returns how many
-/// descriptors it lists, `None` when it exited.
+/// is `dir` and that may be a root's lock ([`lock_path`]) to `locks`.
 fn descriptors(
     dir: &Path,
     pid: u32,
+    deadline: Deadline,
     locks: &mut Vec<OpenLock>,
-) -> Result<Option<usize>, PassError> {
+) -> Result<Fds, PassError> {
     let fds = dir.join("fd");
     let entries = match fs::read_dir(&fds) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Fds::Gone),
         Err(e) => return Err(table("list", &fds)(e)),
     };
     let mut listed = 0usize;
     for entry in entries {
+        if deadline.passed() {
+            return Ok(Fds::Stopped);
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -1186,16 +1268,35 @@ fn descriptors(
             Err(e) => return Err(table("stat", &fd)(e)),
         }
     }
-    Ok(Some(listed))
+    Ok(Fds::Listed(listed))
+}
+
+/// Whether the process `pid` is alive, as `kill(pid, 0)` tells: it is unless no process has that
+/// id (`ESRCH`). A process another user owns is alive (`EPERM`).
+#[expect(
+    unsafe_code,
+    reason = "probing a process with signal 0 has no safe std API"
+)]
+fn alive(pid: u32) -> bool {
+    // 0 names this process's group, and an id above `pid_t`'s range no process.
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 sends nothing and touches no memory of ours.
+    let probed = unsafe { libc::kill(pid, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// What the path a `/proc/<pid>/fd` entry names says of the file being a root's lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockPath {
-    /// Not a file named `lock`, or the lock of a reader directory (`reader-<n>`, or
-    /// `reader-trash-<32 hex>` while a cleanup deletes it): readers hold no commit.
+    /// Not a file named `lock`, or the lock of a reader directory: a reader's name (`reader-<n>`,
+    /// or `reader-trash-<32 hex>` while a cleanup deletes it) in a directory with a root's name,
+    /// as a reader directory sits in its root. Readers hold no commit.
     No,
-    /// `<label>-<32 hex>/lock`, with or without ` (deleted)`: a root's lock by its name.
+    /// `<label>-<32 hex>/lock`, with or without ` (deleted)`: a root's lock by its name. A root's
+    /// name may also be a reader's (`reader-trash-<32 hex>` is the root of a stream whose label
+    /// is `reader-trash`), so it is a root's unless its directory has a root's name.
     Root,
     /// Another file named `lock`: a root's when the process holds an exclusive lock on it
     /// ([`holds_write_lock`]), since a root's directory may have been renamed.
@@ -1211,16 +1312,23 @@ fn lock_path(target: &[u8]) -> LockPath {
     else {
         return LockPath::No;
     };
-    let name = dir.rsplit(|&b| b == b'/').next().unwrap_or_default();
-    match std::str::from_utf8(name) {
-        Ok(name) if generation::is_reader_name(name) => LockPath::No,
-        Ok(name) if generation::is_root_name(name) => LockPath::Root,
-        _ => LockPath::Unnamed,
+    let mut names = dir.rsplit(|&b| b == b'/');
+    let name = names.next().unwrap_or_default();
+    let parent = names.next().unwrap_or_default();
+    let has =
+        |bytes: &[u8], grammar: fn(&str) -> bool| std::str::from_utf8(bytes).is_ok_and(grammar);
+    if has(name, generation::is_reader_name) && has(parent, generation::is_root_name) {
+        LockPath::No
+    } else if has(name, generation::is_root_name) {
+        LockPath::Root
+    } else {
+        LockPath::Unnamed
     }
 }
 
-/// Whether `fdinfo`, a `/proc/<pid>/fdinfo/<n>`, shows an exclusive lock held through that open
-/// file: a `lock:` line of an `flock` or a record lock for writing, as a root's lock is held.
+/// Whether `fdinfo`, a `/proc/<pid>/fdinfo/<n>`, shows an exclusive `flock` held through that
+/// open file (a `lock:` line of an `FLOCK` for writing), as every release since 0.8 holds a
+/// root's lock. A record lock (`fcntl`), as dpkg holds `/var/lib/dpkg/lock`, is not one.
 fn holds_write_lock(fdinfo: &str) -> bool {
     fdinfo
         .lines()
@@ -1230,7 +1338,7 @@ fn holds_write_lock(fdinfo: &str) -> bool {
             let mut words = lock.split_whitespace().skip(1);
             matches!(
                 (words.next(), words.next(), words.next()),
-                (Some("FLOCK" | "POSIX" | "OFDLCK"), Some(_), Some("WRITE"))
+                (Some("FLOCK"), Some(_), Some("WRITE"))
             )
         })
 }
