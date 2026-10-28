@@ -52,7 +52,8 @@ fn number<T: std::str::FromStr>(flag: &'static str, value: OsString) -> Result<T
     };
     match value.to_str().map(str::parse) {
         Some(Ok(n)) => Ok(n),
-        Some(Err(_not_a_number)) | None => Err(usage(value)),
+        Some(Err(_not_a_number)) => Err(usage(value)),
+        None => Err(usage(value)),
     }
 }
 
