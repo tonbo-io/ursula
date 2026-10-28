@@ -61,6 +61,8 @@
 //!
 //! An owner `ursula_open` records its cache directory in the host directory, when there is one,
 //! before it claims anything, and fails `local_setup` when it cannot (`hostdir`, design: Hosts).
+//! A host reads every root of the recorded directories, and checks every open root lock, with
+//! [`inspection::inspect`], which the `ursula-vfs-host` binary runs.
 //!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
@@ -93,6 +95,8 @@
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
 //! - `hostdir`: the host directory, where an owner open records its cache directory for a host
 //!   that snapshots or moves the process.
+//! - [`inspection`]: a host's read of every recorded root and every open root lock: the
+//!   unacknowledged bytes on disk, and whether the read is complete.
 //! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
@@ -132,6 +136,7 @@ mod host;
 mod hostdir;
 pub mod ids;
 mod import;
+pub mod inspection;
 mod json;
 mod log;
 mod materialize;

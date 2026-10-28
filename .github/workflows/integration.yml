@@ -148,13 +148,14 @@ jobs:
           cargo build --locked --release --features model --bin ursula-vfs-model
           ldd target/release/libsqlite_ursula_vfs.so
 
-      - name: Upload the extension and the model server
+      - name: Upload the extension, the model server and the host tool
         uses: actions/upload-artifact@v6
         with:
           name: sqlite-ursula-vfs
           path: |
             clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so
             clients/sqlite-vfs/target/release/ursula-vfs-model
+            clients/sqlite-vfs/target/release/ursula-vfs-host
           if-no-files-found: error
           retention-days: 1
 
@@ -181,6 +182,93 @@ jobs:
           cd clients/sqlite-vfs
           cargo clippy --locked --release --all-targets -- -D warnings
           cargo test --locked --release
+
+  # ursula-vfs-host as a host ships it (design: Hosts): x64 Linux with musl, linked statically, so
+  # it runs on any x64 Linux whatever its C library. Built in Alpine with the repository's
+  # toolchain, then run once outside it.
+  sqlite-vfs-host-musl:
+    name: sqlite-vfs host tool (x64 musl, static)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 30
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build ursula-vfs-host in Alpine
+        env:
+          IMAGE: public.ecr.aws/docker/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          # The musl target links statically by default. As in npm-publish.yml, libsqlite3-sys must
+          # not probe a system libsqlite3.
+          docker run --rm -v "$PWD:/src" -w /src/clients/sqlite-vfs \
+            -e SQLITE3_LIB_DIR=/nonexistent -e CARGO_TERM_COLOR -e TOOLCHAIN="$toolchain" \
+            "$IMAGE" sh -euxc '
+              apk add --no-cache curl gcc musl-dev
+              (cd / && curl --proto "=https" --tlsv1.2 --retry 5 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$TOOLCHAIN")
+              "$HOME/.cargo/bin/cargo" +"$TOOLCHAIN" build --locked --release --bin ursula-vfs-host
+            '
+
+      - name: Check that it is static and runs
+        run: |
+          set -euo pipefail
+          bin=clients/sqlite-vfs/target/release/ursula-vfs-host
+          file "$bin"
+          if readelf -d "$bin" | grep NEEDED; then
+            echo "::error::ursula-vfs-host needs shared libraries"
+            exit 1
+          fi
+          out=$("$bin" inspect --dir "$RUNNER_TEMP/no-host-dir" --pid $$)
+          echo "$out"
+          python3 -c '
+          import json, sys
+          r = json.loads(sys.argv[1])
+          assert r["v"] == 1 and r["complete"] is False and r["incomplete"] == "host_dir", r
+          ' "$out"
+          status=0
+          "$bin" inspect --budget-ms soon || status=$?
+          test "$status" -eq 2
+
+      # The compiled-in host directory's checks (design: Hosts), as root, the way a host runs it.
+      - name: Check the compiled-in host directory as root
+        run: |
+          set -euo pipefail
+          bin=clients/sqlite-vfs/target/release/ursula-vfs-host
+          expect() {
+            python3 -c '
+          import json, sys
+          r, want = json.loads(sys.argv[1]), sys.argv[2]
+          if want == "clean":
+              assert r["complete"] is True and r["clean"] is True and r["incomplete"] is None, r
+          else:
+              assert r["complete"] is False and r["incomplete"] == want, r
+          ' "$1" "$2"
+          }
+          sudo install -d -o root -g root -m 0755 /var/lib/sqlite-ursula
+          sudo install -d -o root -g root -m 1777 /var/lib/sqlite-ursula/host
+          out=$(sudo "$bin" inspect --pid $$)
+          expect "$out" clean
+          python3 -c 'import json, sys; assert json.loads(sys.argv[1])["dir"] == "/var/lib/sqlite-ursula/host"' "$out"
+          # The same directory through another spelling is checked as strictly.
+          expect "$(sudo "$bin" inspect --dir /var/lib/sqlite-ursula/../sqlite-ursula/host --pid $$)" clean
+          sudo chmod 0777 /var/lib/sqlite-ursula/host
+          expect "$(sudo "$bin" inspect --dir /var/lib/sqlite-ursula/../sqlite-ursula/host --pid $$)" host_dir
+          sudo chmod 1777 /var/lib/sqlite-ursula/host
+          sudo chmod 0775 /var/lib/sqlite-ursula
+          expect "$(sudo "$bin" inspect --pid $$)" host_dir
+          sudo chmod 0755 /var/lib/sqlite-ursula
+          sudo touch /var/lib/sqlite-ursula/host/stray
+          expect "$(sudo "$bin" inspect --pid $$)" unrecognized
+          sudo rm /var/lib/sqlite-ursula/host/stray
+          # The check of every process needs root.
+          expect "$("$bin" inspect)" unread_lock
+          sudo rm -rf /var/lib/sqlite-ursula
 
   sqlite-vfs-e2e:
     name: sqlite-vfs e2e (model server, Node ${{ matrix.node }})
@@ -218,12 +306,12 @@ jobs:
       - name: e2e (the core through its SQL functions, open, synced, resets, worker threads, Pi, crashes, outages)
         timeout-minutes: 20
         run: |
-          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model" "$RUNNER_TEMP/vfs/ursula-vfs-host"
           cd clients/sqlite-ursula
           npm ci
           npm run typecheck
           npm run build
-          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" URSULA_VFS_HOST="$RUNNER_TEMP/vfs/ursula-vfs-host" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
 
       # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
       # optional peer dependency, ">=oldest <first-unsupported", and the step above tests the version
@@ -341,11 +429,11 @@ jobs:
           # No S3 here: one node keeps an in-memory cold store, three run with no cold tier.
           URSULA_COLD: ${{ matrix.nodes == '3' && 'none' || 'memory' }}
         run: |
-          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula" "$RUNNER_TEMP/vfs/ursula-vfs-host"
           cd clients/sqlite-ursula
           npm ci
           npm run build
-          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" URSULA_VFS_HOST="$RUNNER_TEMP/vfs/ursula-vfs-host" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
 
       - name: Upload the server logs
         if: failure()

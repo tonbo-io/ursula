@@ -48,6 +48,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
@@ -62,6 +63,7 @@ use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
 use crate::codec::segment::Skip;
+use crate::codec::segment::Source;
 use crate::codec::segment::Step as ReadStep;
 use crate::codec::segment::Tail;
 use crate::codec::segment::Whole;
@@ -154,6 +156,9 @@ pub(crate) enum LogError {
     },
     #[error("log {}: refused after a failed cut", .dir.display())]
     Broken { dir: PathBuf },
+    /// The read's [`Fold`]'s deadline passed before the end of the log ([`Fold::deadline`]).
+    #[error("log {}: the read stopped before the end of the log", .dir.display())]
+    Stopped { dir: PathBuf },
 }
 
 /// A record of the log.
@@ -316,13 +321,45 @@ fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// A segment [`Reader`]'s failure, of the segment at `path`.
-fn segment_error(path: &Path, e: ReadError<std::io::Error>) -> LogError {
+/// A segment file [`Log::read`] reads, until the read's deadline ([`Fold::deadline`]): every read
+/// of its next bytes, at most a buffer's worth ([`crate::codec::segment::BUFFER`]), fails once the
+/// deadline passed, so even a read in the middle of one long record stops.
+#[derive(Debug)]
+struct Timed {
+    file: File,
+    deadline: Option<Instant>,
+}
+
+/// Why a [`Timed`] read failed.
+#[derive(Debug, thiserror::Error)]
+enum TimedError {
+    #[error(transparent)]
+    Io(std::io::Error),
+    #[error("the read's deadline passed")]
+    Stopped,
+}
+
+impl Source for Timed {
+    type Error = TimedError;
+
+    fn read_some(&mut self, out: &mut [u8]) -> Result<usize, TimedError> {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(TimedError::Stopped);
+        }
+        self.file.read_some(out).map_err(TimedError::Io)
+    }
+}
+
+/// A segment [`Reader`]'s failure, of the segment at `path` in the log `dir`.
+fn segment_error(dir: &Path, path: &Path, e: ReadError<TimedError>) -> LogError {
     match e {
-        ReadError::Source(source) => LogError::Io {
+        ReadError::Source(TimedError::Io(source)) => LogError::Io {
             op: "read",
             path: path.to_owned(),
             source,
+        },
+        ReadError::Source(TimedError::Stopped) => LogError::Stopped {
+            dir: dir.to_owned(),
         },
         ReadError::Segment(source) => LogError::Segment {
             path: path.to_owned(),
@@ -333,7 +370,7 @@ fn segment_error(path: &Path, e: ReadError<std::io::Error>) -> LogError {
 
 /// Reads the rest of a segment whose records are not wanted, so it fails where a scan of the
 /// whole segment fails.
-fn drain(reader: &mut Reader<File>) -> Result<(), ReadError<std::io::Error>> {
+fn drain(reader: &mut Reader<Timed>) -> Result<(), ReadError<TimedError>> {
     while let ReadStep::Record(_) = reader.next(&mut Skip)? {}
     Ok(())
 }
@@ -369,6 +406,12 @@ pub(crate) trait Fold {
     /// segment's header with the carried-over fields brought to the end of the log, and `cut`
     /// where the valid log ends before the bytes on disk do, if it does.
     fn end(&mut self, state: &SegmentHeader, cut: Option<&Cut>);
+
+    /// When the read stops, failing [`LogError::Stopped`] at its next read of a segment's bytes:
+    /// a host's read that ran out of time. The open never stops.
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// The [`Keep`] [`Log::read`] reads COMMIT records with: the commit id each frame names, read as
@@ -438,6 +481,114 @@ impl Fold for Records {
             .any(|r| matches!(r.body, RecordBody::Commit { .. }));
         let min = state.base.min(state.acked);
         self.records.retain(|r| r.position > min);
+    }
+}
+
+/// Keeps a COMMIT frame's length and none of its bytes.
+#[derive(Debug, Default)]
+pub(crate) struct Length(u32);
+
+impl Keep for Length {
+    type Kept = u32;
+
+    fn start(&mut self, len: u32) {
+        self.0 = len;
+    }
+
+    fn piece(&mut self, _bytes: &[u8]) {}
+
+    fn finish(&mut self) -> u32 {
+        self.0
+    }
+}
+
+/// A host's fold over [`Log::read`] (design: Hosts): the position and frame length of each of the
+/// generation's own COMMIT records above the latest ACK, dropped as later ACKs come, so it keeps no
+/// frame and 16 bytes per pending commit. At the end it holds what [`Recovered::pending`] holds,
+/// unless an ACK went below an earlier one and brought back a commit the fold had dropped: a second
+/// read [`Unacknowledged::above`] the latest ACK then keeps exactly those. It stops the read once
+/// its deadline passes ([`Fold::deadline`]).
+#[derive(Debug, Default)]
+pub(crate) struct Unacknowledged {
+    commits: Vec<(Position, u64)>,
+    /// Drop only the commits at or below this position, not those at or below each ACK.
+    floor: Option<Position>,
+    /// The highest position an ACK dropped.
+    dropped: Option<Position>,
+    /// At the end of the log: whether a lower ACK brought back a commit an earlier one dropped,
+    /// which the fold no longer has.
+    lowered: bool,
+    /// The state at the end of the log, once the read ended.
+    state: Option<SegmentHeader>,
+    deadline: Option<Instant>,
+}
+
+impl Fold for Unacknowledged {
+    type Frames = Length;
+
+    fn record(&mut self, position: Position, body: RecordBody<Logged<u32>>, state: &SegmentHeader) {
+        if let RecordBody::Commit { frame } = &body
+            && !foreign(frame.id, state.lineage)
+        {
+            self.commits.push((position, u64::from(frame.kept)));
+        }
+        self.drop_through(state.acked);
+    }
+
+    fn cut(&mut self, from: Position) {
+        self.commits.retain(|(p, _)| *p < from);
+    }
+
+    fn end(&mut self, state: &SegmentHeader, _cut: Option<&Cut>) {
+        self.drop_through(state.acked);
+        self.lowered = self.dropped.is_some_and(|d| d > state.acked);
+        self.state = Some(state.clone());
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
+impl Unacknowledged {
+    /// A fold that stops the read at `deadline`, when there is one.
+    pub(crate) fn until(deadline: Option<Instant>) -> Unacknowledged {
+        Unacknowledged {
+            deadline,
+            ..Unacknowledged::default()
+        }
+    }
+
+    /// A fold for a second read of a log whose ACKs went below an earlier one: it keeps every own
+    /// commit above `floor`, the latest ACK the first read found.
+    pub(crate) fn above(floor: Position, deadline: Option<Instant>) -> Unacknowledged {
+        Unacknowledged {
+            floor: Some(floor),
+            deadline,
+            ..Unacknowledged::default()
+        }
+    }
+
+    fn drop_through(&mut self, acked: Position) {
+        let through = self.floor.unwrap_or(acked);
+        for (p, _) in self.commits.iter().filter(|(p, _)| *p <= through) {
+            self.dropped = self.dropped.max(Some(*p));
+        }
+        self.commits.retain(|(p, _)| *p > through);
+    }
+
+    /// The state at the end of the log, once the read ended.
+    pub(crate) fn state(&self) -> Option<&SegmentHeader> {
+        self.state.as_ref()
+    }
+
+    /// The pending commits once the read ended: `None` before, when a lower ACK brought back a
+    /// commit an earlier one dropped, or when a read [`Unacknowledged::above`] a floor found
+    /// another latest ACK (the log changed between the reads).
+    pub(crate) fn pending(&self) -> Option<&[(Position, u64)]> {
+        let state = self.state.as_ref()?;
+        let exact = !self.lowered && self.floor.is_none_or(|f| f == state.acked);
+        exact.then_some(self.commits.as_slice())
     }
 }
 
@@ -632,7 +783,8 @@ impl Log {
                 continue;
             }
             let file = File::open(&segment.path).map_err(io("open", &segment.path))?;
-            let mut reader = match Reader::new(file) {
+            let deadline = fold.deadline();
+            let mut reader = match Reader::new(Timed { file, deadline }) {
                 Ok(reader) => reader,
                 // The first segment's header is the log's identity, and any header of another
                 // format or version is a refusal, never a cut.
@@ -651,7 +803,7 @@ impl Log {
                     removed.push(segment);
                     continue;
                 }
-                Err(e) => return Err(segment_error(&segment.path, e)),
+                Err(e) => return Err(segment_error(dir, &segment.path, e)),
             };
             let header = reader.header().clone();
             if let Some(first) = &state {
@@ -676,7 +828,7 @@ impl Log {
                     // the whole segment.
                     return Err(match drain(&mut reader) {
                         Ok(()) => mismatch,
-                        Err(e) => segment_error(&segment.path, e),
+                        Err(e) => segment_error(dir, &segment.path, e),
                     });
                 }
             }
@@ -689,7 +841,7 @@ impl Log {
             let tail = loop {
                 let r = match reader
                     .next(&mut frames)
-                    .map_err(|e| segment_error(&segment.path, e))?
+                    .map_err(|e| segment_error(dir, &segment.path, e))?
                 {
                     ReadStep::Record(r) => r,
                     ReadStep::End(tail) => break tail,
