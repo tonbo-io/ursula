@@ -131,6 +131,27 @@ fn a_second_lock_on_the_root_is_in_use() {
     Root::lock(dir.path(), &p).unwrap();
 }
 
+// A flock belongs to the open file, which a child the host spawns shares until its exec (and a
+// child forked without one keeps). A dropped root releases its lock while another descriptor of
+// that open file lives, so the next open takes the root, or the same reader directory, at once.
+#[test]
+fn a_dropped_root_is_unlocked_while_another_descriptor_of_its_lock_lives() {
+    let dir = TempDir::new("gen-lock-shared");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    // What a child being spawned holds: another descriptor of the root's open lock file.
+    let shared = root._lock.file.try_clone().unwrap();
+    drop(root);
+    let root = Root::lock(dir.path(), &p).unwrap();
+
+    let reader = Root::reader(dir.path(), &p).unwrap();
+    let shared_reader = reader._lock.file.try_clone().unwrap();
+    drop(reader);
+    let again = Root::reader(dir.path(), &p).unwrap();
+    assert_eq!(again.path(), root.path().join("reader-0"));
+    drop((shared, shared_reader));
+}
+
 // A reader locks the first free `reader-<n>/` of the root, beside the owner's lock, and its
 // generations stay there: the owner's open never sees them.
 #[test]

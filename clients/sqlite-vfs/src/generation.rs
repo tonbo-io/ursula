@@ -380,10 +380,13 @@ fn clean_readers(root: &Path, keep: &Path) {
             continue;
         }
         let lock_path = path.join(LOCK);
-        let Ok(lock) = File::open(&lock_path) else {
+        let Ok(file) = File::open(&lock_path) else {
             continue;
         };
-        if lock.try_lock().is_err() || !names(&lock, &lock_path) {
+        let Ok(lock) = Flock::try_take(file, &lock_path) else {
+            continue;
+        };
+        if !names(&lock.file, &lock_path) {
             continue;
         }
         let Ok(id) = GenId::random() else {
@@ -532,9 +535,52 @@ impl Dir {
 pub(crate) struct Root {
     dir: PathBuf,
     /// Holds the flock until the root drops.
-    _lock: File,
+    _lock: Flock,
     /// The generations bindings of this process hold, by id.
     holds: Mutex<Vec<Weak<GenId>>>,
+}
+
+/// An exclusive flock on an open lock file, released when dropped.
+///
+/// A flock belongs to the open file, not to one descriptor of it. A child the host process spawns
+/// shares every open file of the process until its exec closes them, and a child forked without
+/// an exec keeps sharing them. Closing the file alone would leave the lock held while such a child
+/// lives, and the next open of the root would be `in_use`. The drop unlocks it first, which
+/// releases it for every descriptor of the open file. Only the process that took the lock unlocks
+/// it: a child forked with it in its memory closes its descriptor and leaves the lock to its
+/// parent.
+#[derive(Debug)]
+struct Flock {
+    file: File,
+    path: PathBuf,
+    /// The process that took the lock.
+    pid: u32,
+}
+
+impl Flock {
+    /// Takes the lock on `file`, the lock file at `path`, without waiting.
+    fn try_take(file: File, path: &Path) -> Result<Flock, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Flock {
+            file,
+            path: path.to_owned(),
+            pid: std::process::id(),
+        })
+    }
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        if std::process::id() != self.pid {
+            return;
+        }
+        if let Err(error) = self.file.unlock() {
+            crate::log::emit(crate::log::Level::Warn, "unlock_failed", &[
+                ("path", &self.path.display()),
+                ("error", &error),
+            ]);
+        }
+    }
 }
 
 /// A binding's hold on its generation, released when dropped: while one lives, [`Root::held`]
@@ -577,9 +623,8 @@ impl Root {
     /// directory counts as in use, and the caller moves on.
     fn lock_dir(root: PathBuf) -> Result<Root, GenerationError> {
         let path = root.join(LOCK);
-        let lock = Self::open_lock(&root, &path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match Flock::try_take(Self::open_lock(&root, &path)?, &path) {
+            Ok(lock) => lock,
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(GenerationError::InUse { root });
             }
@@ -590,8 +635,8 @@ impl Root {
                     source,
                 });
             }
-        }
-        let held = lock.metadata().map_err(io("stat", &path))?;
+        };
+        let held = lock.file.metadata().map_err(io("stat", &path))?;
         match fs::metadata(&path) {
             Ok(named) if named.dev() == held.dev() && named.ino() == held.ino() => {}
             Ok(_) => return Err(GenerationError::InUse { root }),

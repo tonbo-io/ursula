@@ -691,9 +691,17 @@ directory and return the db path.
   runs after the open finished them, and building over a superseded one would leave it named by
   nobody.
 - A superseded generation is renamed to `.trash` before it is deleted.
+- The `lock` of a root or a reader directory is unlocked when the last binding or open of it in
+  the process is gone, before the file is closed. A flock belongs to the open file, which a child
+  the host spawns shares until its exec, and a child forked without one keeps. Closing alone would
+  leave the lock held while such a child lives, and a reopen right after a close would be
+  `in_use`. Only the process that took the lock unlocks it, so a forked child that drops its copy
+  of a root never unlocks its parent's.
 
 Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
-`a_second_lock_on_the_root_is_in_use`, `a_built_generation_becomes_current_once_published`,
+`a_second_lock_on_the_root_is_in_use`,
+`a_dropped_root_is_unlocked_while_another_descriptor_of_its_lock_lives`,
+`a_built_generation_becomes_current_once_published`,
 `a_crash_after_each_publish_step_converges_to_one_generation`,
 `a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step`,
 `two_directories_of_one_lineage_resolve_by_supersedes`,
