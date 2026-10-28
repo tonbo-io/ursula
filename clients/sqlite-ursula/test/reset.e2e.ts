@@ -78,7 +78,7 @@ describe("resets", () => {
 		expect(write).toBeInstanceOf(UrsulaResetError);
 		expect(write).toMatchObject({ kind: "fenced", errcode: 266 });
 		expect(await rejection(owner.synced())).toMatchObject({ kind: "fenced" });
-		expect(owner.status().reset).toEqual({ kind: "fenced", action: "stop", class: "reset" });
+		expect(owner.status().reset).toMatchObject({ kind: "fenced", action: "stop", class: "reset" });
 
 		await taker.exec("INSERT INTO t VALUES (3)");
 		await taker.stop();

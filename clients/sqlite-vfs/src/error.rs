@@ -153,7 +153,8 @@ impl ErrorKind {
 }
 
 impl Action {
-    /// What to do, in words, for an error whose own message (SQLite's) says nothing.
+    /// What to do, in words: the end of each message the extension writes for a host about a
+    /// reset or a failed `synced()`, which every host shows as its error's message.
     pub(crate) fn advice(self) -> &'static str {
         match self {
             Action::Retry => "try again later.",
@@ -245,7 +246,8 @@ impl ErrorKind {
     }
 }
 
-/// Every kind with a token of its own, for [`ErrorKind::parse`].
+/// Every kind with a token of its own, for [`ErrorKind::parse`]. The tests' `token_index`, a match
+/// over every kind, keeps it whole: a kind added without its token here fails to build there.
 const TOKENS: [ErrorKind; 29] = [
     ErrorKind::BacklogFull,
     ErrorKind::Unsupported,
@@ -290,7 +292,7 @@ pub(crate) struct Classified {
 }
 
 /// What a bound database says about a statement's I/O error: its reset, else the last write it
-/// refused.
+/// refused, which only the next refusal replaces (`Commit::last_refusal`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FailureState {
     pub(crate) reset: Option<ResetKind>,
@@ -324,7 +326,6 @@ pub(crate) fn classify(
     let state = state()?;
     if let Some(reset) = state.reset {
         let kind = ErrorKind::Reset(reset);
-        let action = kind.action();
         let what = match errcode {
             code if code == i64::from(ffi::SQLITE_IOERR_WRITE) => "write",
             code if code == i64::from(ffi::SQLITE_IOERR_READ) => "read",
@@ -332,13 +333,9 @@ pub(crate) fn classify(
         };
         return Some(Classified {
             kind,
-            action,
+            action: kind.action(),
             class: kind.class(Surface::Bound),
-            message: format!(
-                "{what} refused, the database was reset ({}): {}",
-                kind.as_str(),
-                action.advice()
-            ),
+            message: format!("{what} refused, {}", reset_message(reset)),
         });
     }
     let refused = state
@@ -378,6 +375,26 @@ fn function_failure(message: &str) -> Option<Classified> {
         class,
         message: message.to_owned(),
     })
+}
+
+/// What a host says of a reset of `kind`, with what to do: the `message` of a `reset` event and of
+/// `status().reset`, the error `synced()` and the `reset` listeners get.
+pub(crate) fn reset_message(kind: ResetKind) -> String {
+    format!(
+        "the database was reset ({}): {}",
+        kind.kind(),
+        reset_action(kind).advice()
+    )
+}
+
+/// What a host says of a `synced()` that failed with `kind`, with what to do: the `message` of a
+/// `sync_failed` event.
+pub(crate) fn sync_failed_message(kind: ErrorKind) -> String {
+    format!(
+        "synced() failed: {}: {}",
+        kind.as_str(),
+        kind.action().advice()
+    )
 }
 
 /// The action of a reset (design: Resets).
@@ -518,7 +535,7 @@ impl WriteRefusal {
     fn advice(&self) -> &'static str {
         match self {
             WriteRefusal::BacklogFull { .. } => {
-                "Nothing was committed: await synced(), then run the transaction again."
+                "Nothing was committed: wait for synced(), then run the transaction again."
             }
             WriteRefusal::TooLarge { .. } => {
                 "Nothing was committed: split the transaction, or raise \
@@ -607,10 +624,51 @@ mod tests {
         .map(|c| (c.kind, c.action, c.class))
     }
 
-    // Every token reads back as a kind with the same token, action and class, so a host learns
-    // from a SQL function's error what the extension meant by it.
+    /// The place of `kind`'s token in [`TOKENS`]. A match over every kind, so a kind added to
+    /// [`ErrorKind`] or [`ResetKind`] fails to build here until it has a token there. A reset of
+    /// `stream_state` or `internal` reads as the kind that is no reset.
+    fn token_index(kind: ErrorKind) -> usize {
+        match kind {
+            ErrorKind::BacklogFull => 0,
+            ErrorKind::Unsupported => 1,
+            ErrorKind::TooLarge => 2,
+            ErrorKind::InvalidArgument => 3,
+            ErrorKind::InvalidUrl => 4,
+            ErrorKind::NotFound => 5,
+            ErrorKind::InUse => 6,
+            ErrorKind::BoundElsewhere => 7,
+            ErrorKind::LocalSetup => 8,
+            ErrorKind::StreamFormat => 9,
+            ErrorKind::NoServerIdentity => 10,
+            ErrorKind::ProtocolMismatch => 11,
+            ErrorKind::WrongCluster => 12,
+            ErrorKind::StreamState | ErrorKind::Reset(ResetKind::StreamState) => 13,
+            ErrorKind::ClaimRaces => 14,
+            ErrorKind::Unreachable => 15,
+            ErrorKind::Unavailable => 16,
+            ErrorKind::RateLimited => 17,
+            ErrorKind::Unauthorized => 18,
+            ErrorKind::PaymentRequired => 19,
+            ErrorKind::Forbidden => 20,
+            ErrorKind::Cancelled => 21,
+            ErrorKind::NotBound => 22,
+            ErrorKind::Internal | ErrorKind::Reset(ResetKind::Internal) => 23,
+            ErrorKind::Reset(ResetKind::Fenced) => 24,
+            ErrorKind::Reset(ResetKind::Stale) => 25,
+            ErrorKind::Reset(ResetKind::Rewound) => 26,
+            ErrorKind::Reset(ResetKind::Deleted) => 27,
+            ErrorKind::Reset(ResetKind::LocalDamage) => 28,
+        }
+    }
+
+    // Every kind has its token in TOKENS, and every token reads back as a kind with the same
+    // token, action and class, so a host learns from a SQL function's error what the extension
+    // meant by it.
     #[test]
     fn every_kind_reads_back_from_its_token() {
+        for (at, kind) in TOKENS.iter().copied().enumerate() {
+            assert_eq!(token_index(kind), at, "{}", kind.as_str());
+        }
         let resets = [
             ResetKind::Fenced,
             ResetKind::Stale,
@@ -625,6 +683,7 @@ mod tests {
             .copied()
             .chain(resets.into_iter().map(ErrorKind::Reset))
         {
+            assert_eq!(TOKENS[token_index(kind)].as_str(), kind.as_str());
             let read = ErrorKind::parse(kind.as_str()).unwrap();
             assert_eq!(read.as_str(), kind.as_str());
             assert_eq!(read.action(), kind.action(), "{}", kind.as_str());
@@ -810,7 +869,7 @@ mod tests {
                 action: Action::Retry,
                 class: ErrorClass::WriteRefused,
                 message: "backlog_full: 10 bytes logged and not acknowledged, at most 5. Nothing \
-                          was committed: await synced(), then run the transaction again."
+                          was committed: wait for synced(), then run the transaction again."
                     .to_owned(),
             })
         );

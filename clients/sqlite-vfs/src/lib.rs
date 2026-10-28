@@ -53,9 +53,11 @@
 //! (`unsupported`) or a commit above the commit limit (`too_large`) fails its transaction alone with
 //! `SQLITE_IOERR_AUTH`. A reset (another owner, an unconfirmed commit, a failed fsync) fails every
 //! later statement of the database: `SQLITE_IOERR_READ` for a read, `SQLITE_IOERR_WRITE` for a
-//! write. Every SQL function's error reads `<function>: <kind>: <message>`. Wherever a kind is
-//! named (errors, events, status), its action (`retry`, `reopen`, `stop`, `fix`) and its class
-//! (`write_refused`, `reset`, `unavailable`, `setup`), the error a host throws, are named beside it.
+//! write. Every SQL function's error reads `<function>: <kind>: <message>`, which names the kind
+//! alone. Wherever else a kind is named (events, status, `ursula_cancel`, `ursula_classify`), its
+//! action (`retry`, `reopen`, `stop`, `fix`) and its class (`write_refused`, `reset`,
+//! `unavailable`, `setup`), the error a host throws, are named beside it, and a reset or a failed
+//! `synced()` carries the message a host shows for it.
 //!
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`, `URSULA_VFS_MAX_COMMIT_BYTES`.

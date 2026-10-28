@@ -665,7 +665,7 @@ unsafe fn x_read(
 }
 
 /// Fails the write transaction alone, nothing of it logged: `SQLITE_IOERR_AUTH`, and the refusal
-/// stays in status until a commit is logged.
+/// stays in status until a commit is logged, and names the error until the next refusal.
 fn refuse(b: &Binding, c: &mut Commit, refusal: WriteRefusal) -> c_int {
     if c.refused.as_ref() != Some(&refusal) {
         log::emit(Level::Warn, "write_refused", &[
@@ -674,6 +674,7 @@ fn refuse(b: &Binding, c: &mut Commit, refusal: WriteRefusal) -> c_int {
             ("reason", &refusal),
         ]);
     }
+    c.last_refusal = Some(refusal.clone());
     c.refused = Some(refusal);
     ffi::SQLITE_IOERR_AUTH
 }

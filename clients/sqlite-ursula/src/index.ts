@@ -31,7 +31,7 @@ import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
 import { DEFAULT_OPEN_MS, raced, reasonOf } from "./abort.ts";
-import { errorOf, type Named, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
+import { type Described, errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
 import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
 
@@ -244,9 +244,9 @@ async function bind(stream: string, dir: string | undefined, json: string, until
 
 /** The signal fired: cancels `request`, and the error is the last condition it met, or `cancelled`. */
 function giveUp(stream: string, request: number, signal: AbortSignal): UrsulaError {
-	let ended: (Named & { message: string }) | null = null;
+	let ended: Described | null = null;
 	try {
-		ended = call<(Named & { message: string }) | null>("SELECT ursula_cancel(?)", request);
+		ended = call<Described | null>("SELECT ursula_cancel(?)", request);
 	} catch {
 		// It resolved meanwhile and its result was taken.
 	}

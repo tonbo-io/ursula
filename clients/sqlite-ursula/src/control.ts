@@ -3,26 +3,44 @@
 // thread, the pump's worker) loads the library the process already holds: the registry of bound
 // databases and the replication driver are the process's, shared by all of them.
 import { DatabaseSync, type StatementSync } from "node:sqlite";
-import { errcode, errorOf, findWrapped, type Named, UrsulaError } from "./errors.ts";
+import { type Described, errcode, errorOf, findWrapped, UrsulaError, UrsulaSetupError } from "./errors.ts";
 import { prebuiltExtension } from "./platform.ts";
 
 let control: DatabaseSync | undefined;
 let library: string | undefined;
-/** `ursula_classify` on the control connection, prepared once. */
+/** `ursula_classify` on the control connection, prepared when the library loads. */
 let classifier: StatementSync | undefined;
 
 /**
  * Loads the extension once per thread and returns the thread's control connection. The library is
  * `path`, else SQLITE_URSULA_VFS when set, else the prebuilt one for this platform
- * (`@tonbo/sqlite-ursula-<platform>`, an optional dependency).
+ * (`@tonbo/sqlite-ursula-<platform>`, an optional dependency). A library without `ursula_classify`,
+ * which says which failure is which error, is older than this package: it fails here, with an
+ * {@link UrsulaSetupError} (`local_setup`), rather than leave every failure unclassified.
  */
 export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSync {
 	if (control !== undefined) return control;
 	const chosen = path === undefined || path.length === 0 ? prebuiltExtension() : path;
 	const db = new DatabaseSync(":memory:", { allowExtension: true });
-	db.loadExtension(chosen);
+	let prepared: StatementSync;
+	try {
+		db.loadExtension(chosen);
+		try {
+			prepared = db.prepare("SELECT ursula_classify(?, ?, ?)");
+		} catch (error) {
+			throw new UrsulaSetupError(
+				`local_setup: the sqlite-ursula extension at ${chosen} has no ursula_classify: it is older than this package, so load the library of the package's own version`,
+				"local_setup",
+				error,
+			);
+		}
+	} catch (error) {
+		db.close();
+		throw error;
+	}
 	control = db;
 	library = chosen;
+	classifier = prepared;
 	return db;
 }
 
@@ -50,11 +68,6 @@ function parsed<T>(row: Record<string, unknown>): T {
 	return (typeof text === "string" && text.length > 0 ? JSON.parse(text) : undefined) as T;
 }
 
-/** What `ursula_classify` says of a failure. */
-interface Classified extends Named {
-	readonly message: string;
-}
-
 /**
  * What to throw for `error`, which a statement or an Ursula SQL function threw: the
  * {@link UrsulaError} of what the extension's `ursula_classify` makes of it, and `error` itself,
@@ -65,11 +78,10 @@ interface Classified extends Named {
 export function classify(error: unknown, path?: string): unknown {
 	if (error instanceof UrsulaError) return error;
 	const code = errcode(error);
-	if (control === undefined || code === undefined || !(error instanceof Error)) return error;
-	let named: Classified | null | undefined;
+	if (classifier === undefined || code === undefined || !(error instanceof Error)) return error;
+	let named: Described | null | undefined;
 	try {
-		classifier ??= control.prepare("SELECT ursula_classify(?, ?, ?)");
-		named = parsed<Classified | null | undefined>(classifier.get(error.message, code, path ?? null) as Record<string, unknown>);
+		named = parsed<Described | null | undefined>(classifier.get(error.message, code, path ?? null) as Record<string, unknown>);
 	} catch {
 		return error;
 	}

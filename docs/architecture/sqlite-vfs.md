@@ -1592,8 +1592,13 @@ rejects, the listeners run, statements throw".
 Four classes with `kind`, `action` (`retry`, `reopen`, `stop`, `fix`), `message` and `cause`.
 Callers branch on `action`. The extension says which failure is which error: `ursula_classify`
 (`error.rs` `classify`) maps a failure a host met to its kind, action and class, and every event
-and status field that names a kind names its action and class beside it. The package picks the
-error by class (`errors.ts` `errorOf`) and takes the action as the extension gives it.
+and status field that names a kind names its action and class beside it. A reset (its event,
+`status().reset`) and a failed `synced()` (its `sync_failed` event) also carry the message a host
+shows, which ends with what to do. The package picks the error by class (`errors.ts` `errorOf`)
+and takes the action and message as the extension gives them. Errors the package itself makes (an
+invalid argument, a cancelled open) take their class's default action, which repeats
+`ErrorKind::action`. `loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a
+library older than the package fails there with `UrsulaSetupError` (`local_setup`).
 
 | class (`class`) | thrown by | kinds |
 | --- | --- | --- |
@@ -1617,9 +1622,11 @@ extension's (a constraint, a syntax error, an I/O error of a database used throu
   resets of a bound database. An `ursula_import` that met a stream not answering as it must says
   `fix`, since it may have claimed the stream.
 - A statement's I/O error says nothing, so the state of the database at `path` names it: its reset
-  for any I/O error, else its last refused write for `SQLITE_IOERR_AUTH`. The message then says
-  what was refused and what to do. A reset database's connections keep this after a reopen bound
-  the stream anew.
+  for any I/O error, else its last refused write for `SQLITE_IOERR_AUTH`, which the VFS returns
+  only for a refusal. That refusal stays until the next one, so a commit another connection logs
+  before the host classifies leaves it in place, while `status().refused` clears at the next
+  logged commit. The message then says what was refused and what to do. A reset database's
+  connections keep this after a reopen bound the stream anew.
 - `message` is the error's message, the SQL function's own for its errors. `fix` and `request_id`
   are `null` for every failure of the extension.
 
@@ -1897,7 +1904,7 @@ since neither e2e server checks tokens.
   "snapshot": { "offset": 1048576, "age_ms": 1000, "failures": 0, "error": null, "log_bytes": 123, "due_bytes": 8388608 },
   "refused": null,                  // the last write refused with nothing committed: { kind, action, class, message }
   "salvage": [],                    // { dir, reason, time, incarnation, stream_incarnation, acknowledged_position, unacknowledged, plain }
-  "reset": null                     // { kind, action, class }
+  "reset": null                     // { kind, action, class, message }
 }
 ```
 

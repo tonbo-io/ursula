@@ -145,6 +145,13 @@ for await (const line of createInterface({ input: process.stdin })) {
 			process.exit(0);
 		}
 	} catch (error) {
-		say({ ...failure(error), classified: classified(error, cmd.conn === 3 ? reopened?.path : opened.path) });
+		// A failure to classify is reported, so the test sees it instead of a child that died.
+		let named;
+		try {
+			named = classified(error, pathOf(cmd));
+		} catch (failed) {
+			named = { error: String(failed) };
+		}
+		say({ ...failure(error), classified: named });
 	}
 }

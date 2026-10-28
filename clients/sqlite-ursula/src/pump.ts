@@ -18,7 +18,7 @@
 // exit with the wait unresolved.
 import { Worker } from "node:worker_threads";
 import { call, loadedLibrary } from "./control.ts";
-import { advice, errorOf, type Named, type ResetKind, UrsulaResetError, type UrsulaErrorAction, UrsulaSetupError } from "./errors.ts";
+import { type Described, errorOf, type ResetKind, UrsulaResetError, type UrsulaErrorAction, UrsulaSetupError } from "./errors.ts";
 
 /** A database whose `reset` listeners the pump fires: `UrsulaDatabase`. */
 export interface ResetTarget {
@@ -34,8 +34,8 @@ export interface ResetTarget {
 export type PumpEvent =
 	| { event: "opened"; request: number; ok: boolean }
 	| { event: "synced"; path: string | null; through: number }
-	| ({ event: "sync_failed"; ticket: number } & Named)
-	| ({ event: "reset"; path: string | null } & Named)
+	| ({ event: "sync_failed"; ticket: number } & Described)
+	| ({ event: "reset"; path: string | null } & Described)
 	| { event: "gap"; dropped: number }
 	| { event: "condition"; path: string | null; condition: string | null }
 	| { event: "acked" | "retired"; path: string | null };
@@ -46,11 +46,9 @@ interface Ticket {
 	reject(error: unknown): void;
 }
 
-/** The error of the reset the extension `named` (a `reset` event, `status().reset`), for `synced()` and the listeners. */
-export const resetError = (named: Named): UrsulaResetError => {
-	const action = named.action as UrsulaErrorAction;
-	return new UrsulaResetError(`the database was reset (${named.kind}): ${advice(action)}`, named.kind as ResetKind, undefined, action);
-};
+/** The error of the reset the extension `named` (a `reset` event, `status().reset`), with its message, for `synced()` and the listeners. */
+export const resetError = (named: Described): UrsulaResetError =>
+	new UrsulaResetError(named.message, named.kind as ResetKind, undefined, named.action as UrsulaErrorAction);
 
 /**
  * The open databases of this thread by bound path, whose listeners the pump fires. Held weakly: a
@@ -279,7 +277,7 @@ class Pump {
 				case "sync_failed": {
 					const t = tickets.get(event.ticket);
 					tickets.delete(event.ticket);
-					t?.reject(errorOf(event, `synced() failed: ${event.kind}: ${advice(event.action as UrsulaErrorAction)}`, undefined));
+					t?.reject(errorOf(event, event.message, undefined));
 					break;
 				}
 				case "reset":
@@ -302,7 +300,7 @@ class Pump {
 	}
 
 	/** A reset of `path` (null: a binding the process no longer has): its pending `synced()` calls reject, then its listeners run. */
-	#reset(path: string | null, named: Named): void {
+	#reset(path: string | null, named: Described): void {
 		const hit: [ResetTarget, UrsulaResetError][] = [];
 		if (path === null) {
 			for (const target of live()) {

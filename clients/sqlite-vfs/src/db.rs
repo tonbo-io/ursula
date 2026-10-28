@@ -122,8 +122,12 @@ pub(crate) struct Commit {
     /// The last commit SQLite published (PHASETWO), and the last BASE record written.
     pub(crate) confirmed: Position,
     pub(crate) based: Position,
-    /// The latest write refused, until a commit is logged.
+    /// The latest write refused, until a commit is logged: `status().refused`.
     pub(crate) refused: Option<WriteRefusal>,
+    /// The latest write refused, until the next refusal: what names a `SQLITE_IOERR_AUTH`, which
+    /// the VFS returns only for a refusal ([`crate::error::classify`]). A commit another connection
+    /// logs before the refused one's host classifies its error leaves it in place.
+    pub(crate) last_refusal: Option<WriteRefusal>,
     /// The snapshot thread's window (design: Snapshots).
     pub(crate) window: Window,
     pub(crate) stats: Stats,
@@ -346,7 +350,7 @@ pub(crate) fn failure_state(path: &str) -> Option<FailureState> {
             .cloned()
             .or_else(|| reg.left.get(&full).and_then(Weak::upgrade))
     }?;
-    let refused = b.lock().refused.clone();
+    let refused = b.lock().last_refusal.clone();
     Some(FailureState {
         reset: b.reset_kind(),
         refused,

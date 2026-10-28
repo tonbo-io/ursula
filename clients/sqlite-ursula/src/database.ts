@@ -136,8 +136,8 @@ export interface UrsulaStatus {
 	 * `manifest.json`.
 	 */
 	readonly salvage: readonly UrsulaSalvage[];
-	/** The reset, once one happened. `class` is `reset`. */
-	readonly reset: { readonly kind: string; readonly action: string; readonly class: string } | null;
+	/** The reset, once one happened. `class` is `reset`, and `message` says what happened and what to do. */
+	readonly reset: { readonly kind: string; readonly action: string; readonly class: string; readonly message: string } | null;
 }
 
 /**

@@ -12,6 +12,8 @@ use crate::error::Classified;
 use crate::error::Error;
 use crate::error::ErrorKind;
 use crate::error::Surface;
+use crate::error::reset_message;
+use crate::error::sync_failed_message;
 use crate::ids::Position;
 use crate::json;
 use crate::json::null;
@@ -158,7 +160,10 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
         )])
     });
     let reset_json = reset.map_or_else(null, |kind| {
-        with_kind(&[], ErrorKind::Reset(kind), Surface::Bound, &[])
+        with_kind(&[], ErrorKind::Reset(kind), Surface::Bound, &[(
+            "message",
+            json_str(&reset_message(kind)),
+        )])
     });
     let salvage: Vec<String> = h.salvage()?.iter().map(salvaged_json).collect();
     let lineage: String = h
@@ -368,7 +373,7 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                 &[("event", json_str("reset")), ("path", path(*binding))],
                 ErrorKind::Reset(*cause),
                 Surface::Bound,
-                &[],
+                &[("message", json_str(&reset_message(*cause)))],
             ),
             DriverEvent::Synced { binding, through } => object(&[
                 ("event", json_str("synced")),
@@ -388,7 +393,7 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                     ],
                     kind,
                     Surface::Bound,
-                    &[],
+                    &[("message", json_str(&sync_failed_message(kind)))],
                 )
             }
             DriverEvent::Retired { binding } => {
@@ -462,7 +467,8 @@ mod tests {
     }
 
     // Events of a binding the process no longer has carry a null path. Resets, failed tickets and
-    // failed opens name their kind, action and class, a `stream_state` an open's setup error.
+    // failed opens name their kind, action and class, a `stream_state` an open's setup error, and
+    // the message a host shows for them.
     #[test]
     fn events_render_as_one_object() {
         let id = BindingId(u64::MAX);
@@ -496,10 +502,15 @@ mod tests {
             json,
             concat!(
                 r#"{"cursor":9,"events":["#,
-                r#"{"event":"reset","path":null,"kind":"fenced","action":"stop","class":"reset"},"#,
+                r#"{"event":"reset","path":null,"kind":"fenced","action":"stop","class":"reset","#,
+                r#""message":"the database was reset (fenced): another owner took the stream over: "#,
+                r#"stop using this database, and never reopen it in a loop."},"#,
                 r#"{"event":"condition","path":null,"condition":"retrying"},"#,
-                r#"{"event":"sync_failed","ticket":4,"kind":"fenced","action":"stop","class":"reset"},"#,
-                r#"{"event":"sync_failed","ticket":5,"kind":"not_bound","action":"fix","class":"setup"},"#,
+                r#"{"event":"sync_failed","ticket":4,"kind":"fenced","action":"stop","class":"reset","#,
+                r#""message":"synced() failed: fenced: another owner took the stream over: stop "#,
+                r#"using this database, and never reopen it in a loop."},"#,
+                r#"{"event":"sync_failed","ticket":5,"kind":"not_bound","action":"fix","class":"setup","#,
+                r#""message":"synced() failed: not_bound: fix the cause, then open() the database again."},"#,
                 r#"{"event":"opened","request":6,"ok":false,"error":{"kind":"stream_state","action":"fix","class":"setup","message":"stream_state: NotSqlite"}},"#,
                 r#"{"event":"gap","dropped":2}]}"#
             )

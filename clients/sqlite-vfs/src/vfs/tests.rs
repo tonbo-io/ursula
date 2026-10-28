@@ -37,6 +37,7 @@ use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::mark;
 use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
+use crate::db::failure_state;
 use crate::db::for_tests;
 use crate::db::for_tests_with_limit;
 use crate::db::reader_for_tests;
@@ -813,6 +814,17 @@ fn a_commit_above_the_limit_fails_alone_with_nothing_logged() {
         b.lock().refused.as_ref().map(|r| r.kind().as_str()),
         Some("too_large")
     );
+    // A commit another connection logs before the refused one's host classifies its error clears
+    // status's refusal, not the one that names the SQLITE_IOERR_AUTH.
+    let registered = registered_for_tests(&b);
+    b.lock().refused = None;
+    assert_eq!(
+        failure_state(&b.path)
+            .and_then(|state| state.refused)
+            .map(|r| r.kind().as_str()),
+        Some("too_large")
+    );
+    drop(registered);
     assert_eq!(b.handle.pending_bytes(), 0);
     assert_eq!(b.handle.log().unwrap().next_position(), next);
     // SAFETY: the `Box`es `file_of` made, which nothing freed.

@@ -1,9 +1,14 @@
 // The errors the package throws (design: Errors), and the one constructor of the error of a failure
 // the extension classified (`errorOf`). Which failure is which error is the extension's to say
-// (`ursula_classify`, control.ts `classify`): its kind, action and class. Shared by the root entry
-// and the Pi adapter (pi.ts). The error classes and the types of their fields are public. A
-// constructor's default action, which its class's documentation lists, serves an error the
-// application makes, such as a token provider's: the package passes the extension's.
+// (`ursula_classify`, control.ts `classify`): its kind, action and class, and for a reset or a
+// failed `synced()` its message too. Shared by the root entry and the Pi adapter (pi.ts). The error
+// classes and the types of their fields are public.
+//
+// Only an error that comes from the extension takes the extension's action (`errorOf`). An error
+// the package or the application makes (an invalid argument, a cancelled open, a failed pump
+// worker, a token provider's) takes its constructor's default action, which its class's
+// documentation lists. Those defaults repeat the extension's table, clients/sqlite-vfs/src/error.rs
+// `ErrorKind::action`, and must match it.
 
 /** SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function. */
 export const SQLITE_ERROR = 1;
@@ -71,6 +76,14 @@ export interface Named {
 	readonly kind: string;
 	readonly action: string;
 	readonly class: string;
+}
+
+/**
+ * A failure the extension names with the message a host shows for it: `ursula_classify`'s result,
+ * `ursula_cancel`'s, a `reset` or `sync_failed` event, `status().reset`.
+ */
+export interface Described extends Named {
+	readonly message: string;
 }
 
 /**
@@ -173,20 +186,6 @@ export function errorOf(named: Named, message: string, cause: unknown): UrsulaEr
 			return new UrsulaUnavailableError(message, named.kind as UnavailableKind, cause, action);
 		default:
 			return new UrsulaSetupError(message, named.kind as SetupKind, cause, action);
-	}
-}
-
-/** What to do, in words, for an error whose own message (SQLite's) says nothing. */
-export function advice(action: UrsulaErrorAction): string {
-	switch (action) {
-		case "retry":
-			return "try again later.";
-		case "reopen":
-			return "close every connection of the database and open() it again.";
-		case "stop":
-			return "another owner took the stream over: stop using this database, and never reopen it in a loop.";
-		case "fix":
-			return "fix the cause, then open() the database again.";
 	}
 }
 

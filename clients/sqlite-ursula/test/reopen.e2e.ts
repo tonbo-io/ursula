@@ -58,7 +58,7 @@ async function damaged(url: string, dir: string, env: NodeJS.ProcessEnv = {}): P
 	const commit = await child.send({ exec: "BEGIN; INSERT INTO t VALUES (1); INSERT INTO other.u VALUES (1); COMMIT" });
 	expect(commit.ok).toBe(false);
 	const st = (await child.send({ status: true })).status as { reset: unknown };
-	expect(st.reset).toEqual({ kind: "local_damage", action: "reopen", class: "reset" });
+	expect(st.reset).toMatchObject({ kind: "local_damage", action: "reopen", class: "reset" });
 	return child;
 }
 

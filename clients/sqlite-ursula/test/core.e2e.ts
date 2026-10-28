@@ -21,7 +21,7 @@ interface Status {
 	replication: { state: string; condition: string | null };
 	snapshot: { offset: number | null; age_ms: number | null; failures: number; error: string | null; log_bytes: number; due_bytes: number };
 	refused: { kind: string; action: string; class: string; message: string } | null;
-	reset: { kind: string; action: string; class: string } | null;
+	reset: { kind: string; action: string; class: string; message: string } | null;
 }
 
 /** One SQL function's JSON result on the control connection. */
@@ -238,9 +238,14 @@ describe("the 0.8 core on node:sqlite", () => {
 		expect(read).toMatchObject({ ok: false, errcode: SQLITE_IOERR_READ, classified: { kind: "fenced", action: "stop", class: "reset" } });
 		expect((read.classified as { message: string }).message).toMatch(/^read refused, the database was reset \(fenced\): /);
 		const st = (await owner.send({ status: true })).status as Status;
-		expect(st.reset).toEqual({ kind: "fenced", action: "stop", class: "reset" });
+		expect(st.reset).toEqual({
+			kind: "fenced",
+			action: "stop",
+			class: "reset",
+			message: "the database was reset (fenced): another owner took the stream over: stop using this database, and never reopen it in a loop.",
+		});
 		const events = (await owner.send({ events: true })).events as Record<string, unknown>[];
-		expect(events).toContainEqual(expect.objectContaining({ event: "reset", kind: "fenced", action: "stop", class: "reset" }));
+		expect(events).toContainEqual(expect.objectContaining({ event: "reset", kind: "fenced", action: "stop", class: "reset", message: st.reset?.message }));
 		await taker.exec("INSERT INTO t VALUES (4)");
 		expect((await taker.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
 		await taker.stop();
@@ -306,7 +311,7 @@ describe("the 0.8 core on node:sqlite", () => {
 			const commit = await failing.send({ exec: "BEGIN; INSERT INTO t VALUES (1); INSERT INTO other.u VALUES (1); COMMIT" });
 			expect(commit.ok).toBe(false);
 			const st = (await failing.send({ status: true })).status as Status;
-			expect(st.reset).toEqual({ kind: "local_damage", action: "reopen", class: "reset" });
+			expect(st.reset).toMatchObject({ kind: "local_damage", action: "reopen", class: "reset" });
 			expect(await failing.send({ all: "SELECT x FROM t" })).toMatchObject({ ok: false, errcode: SQLITE_IOERR_READ });
 			await failing.stop();
 			const reopened = new Child(s.url, dir);
