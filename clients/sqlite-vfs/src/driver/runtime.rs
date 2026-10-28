@@ -218,9 +218,11 @@ pub(crate) struct Driver {
 /// The process driver.
 static DRIVER: OnceLock<Driver> = OnceLock::new();
 
-/// The process driver, over HTTP, started on first use.
+/// The process driver, over HTTP, started on first use, with the fork guard ([`crate::fork`])
+/// watching from before its thread starts.
 pub(crate) fn driver() -> &'static Driver {
     DRIVER.get_or_init(|| {
+        crate::fork::watch();
         let transports: Transports =
             Arc::new(|url: &str| Arc::new(HttpTransport::new(url)) as Arc<dyn Transport>);
         Driver::start(transports, seed())

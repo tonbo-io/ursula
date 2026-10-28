@@ -27,6 +27,7 @@
 //! share while it is bound: a reader sees the stream as of the open that bound it, and the first
 //! read-only open after it retired catches up again.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -338,6 +339,25 @@ fn registry() -> MutexGuard<'static, Registry> {
     registry_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+thread_local! {
+    /// The registry, held by the thread that forks from just before the fork to just after it, on
+    /// both sides (design: Forks).
+    static FORKING: Cell<Option<MutexGuard<'static, Registry>>> = const { Cell::new(None) };
+}
+
+/// Before a fork, on the thread that forks: takes the registry, so no other thread holds it at
+/// the fork and the child gets it whole ([`crate::fork`]). A thread whose thread-locals are being
+/// destroyed forks without it.
+pub(crate) fn hold_for_fork() {
+    let held = registry();
+    drop(FORKING.try_with(move |slot| slot.replace(Some(held))));
+}
+
+/// After a fork, in the parent and in the child: lets go of the registry [`hold_for_fork`] took.
+pub(crate) fn release_after_fork() {
+    drop(FORKING.try_with(Cell::take));
 }
 
 /// Signalled when a registration ends.
@@ -860,6 +880,12 @@ pub(crate) fn registered_for_tests(b: &Arc<Binding>) -> impl Drop {
     }
     registry().paths.insert(b.path.clone(), Arc::clone(b));
     Registered(b.path.clone())
+}
+
+/// The registry, locked by this thread until the guard drops: another thread's fork waits for it.
+#[cfg(test)]
+pub(crate) fn registry_locked_for_tests() -> impl Drop {
+    registry()
 }
 
 #[cfg(test)]

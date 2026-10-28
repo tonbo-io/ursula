@@ -75,6 +75,11 @@
 //! The wait itself returns no `SQLITE_BUSY` and calls no busy handler; afterwards the request
 //! meets what other writers did meanwhile, as a slow transaction would.
 //!
+//! A child forked after the extension started its driver inherits its bindings without the threads
+//! that serve them: there every SQL function and every I/O on a file of a bound database fails
+//! `forked` (`fix`: open after the fork), closing such a file touches nothing the parent holds, and
+//! files of no bound database pass through (`fork`, design: Forks).
+//!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
 //! retention one snapshot behind. Builds install the latest snapshot, then read the tail.
@@ -98,6 +103,8 @@
 //!   `Action`, `ErrorClass`), the one classification of a failure a host met (`classify`), and the
 //!   SQL functions' error type.
 //! - `extension`: the entry point, the SQLite version gate and the SQL functions.
+//! - `fork`: the fork guard: a child forked after the driver started fails `forked` instead of
+//!   using the parent's bindings.
 //! - `generation`: the canonical stream path, a stream's locked root directory and its reader
 //!   directories, and the generations in them (`gen-<id32>` directories).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
@@ -144,6 +151,7 @@ mod db;
 mod driver;
 mod error;
 mod extension;
+mod fork;
 mod generation;
 mod guard;
 pub mod hold;

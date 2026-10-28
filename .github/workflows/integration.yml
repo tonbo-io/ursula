@@ -355,6 +355,40 @@ jobs:
           npm run typecheck
           E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
 
+  # The fork guard (design: Forks) in a host that forks: CPython's sqlite3 with the extension
+  # loaded, against the model server. A uv-managed CPython, whose SQLite is new enough and loads
+  # extensions.
+  sqlite-vfs-fork:
+    name: sqlite-vfs fork guard (CPython host, model server)
+    needs: [sqlite-vfs]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 15
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Download the extension and the model server
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: Fork a CPython host before and after the driver started
+        timeout-minutes: 5
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
+          SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" \
+            uv run --no-project --python 3.13 clients/sqlite-vfs/e2e/fork.py
+
   # The release `ursula` for the e2e against the real server, cached by the inputs that build it so
   # a PR that touches only the extension or the package does not rebuild it. Bump the key's version
   # (v1) when the build command below changes.

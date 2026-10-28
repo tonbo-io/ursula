@@ -373,7 +373,8 @@ unsafe fn fn_classify(
 
 /// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
 /// panic in it ends the call with an error instead of unwinding into SQLite, which aborts the host
-/// process.
+/// process. In a child forked after the driver started it fails `forked` without running (design:
+/// Forks).
 macro_rules! sql_entry {
     ($entry:ident => $body:ident, $name:literal) => {
         unsafe extern "C" fn $entry(
@@ -381,6 +382,11 @@ macro_rules! sql_entry {
             argc: c_int,
             argv: *mut *mut ffi::sqlite3_value,
         ) {
+            if crate::fork::forked() {
+                // SAFETY: SQLite calls the function with its context.
+                unsafe { result(ctx, $name, Err(&Error::Forked)) };
+                return;
+            }
             contain(
                 $name,
                 || {
@@ -636,6 +642,7 @@ mod tests {
     use super::MIN_SQLITE;
     use super::function_error;
     use super::version;
+    use crate::error::Action;
     use crate::error::Error;
     use crate::import::ImportError;
     use crate::open::OpenError;
@@ -661,6 +668,17 @@ mod tests {
             }),
             "ursula_import: invalid_argument: timeout_ms: give it a positive timeout"
         );
+    }
+
+    // In a forked child every SQL function fails `forked`, to be fixed by opening after the fork.
+    #[test]
+    fn a_function_in_a_forked_child_fails_forked() {
+        assert_eq!(
+            function_error("ursula_synced", &Error::Forked),
+            "ursula_synced: forked: the process forked after the extension started its driver: \
+             open databases after the fork"
+        );
+        assert_eq!(Error::Forked.kind().action(), Action::Fix);
     }
 
     // The floor is Node 22.19.0's SQLite.
