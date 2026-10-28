@@ -202,6 +202,35 @@ const storage = await openUrsulaPiStorage("https://ursula.example.com/pi/harness
 
 `@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.4.0`, and npm refuses the install with `ERESOLVE` outside it.
 
+## Tonbo databases
+
+`@tonbo/sqlite-ursula/tonbo` opens a database of a Tonbo account by name, with a Tonbo API key, and keeps the stream's tokens fresh:
+
+```ts
+import { open } from "@tonbo/sqlite-ursula/tonbo";
+
+const db = await open("notes"); // or the database's https:// URL, which skips the lookup
+```
+
+`open(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the options of the root entry's `open` and returns the same `UrsulaDatabase`. Its signal (30 s by default) also bounds the lookup.
+
+- **The key.** `apiKey`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`. The login file must be a regular file with no group or other permission bit (mode `0600`). A symlink, a non-regular file or a file open to others is refused with `credentials_refused` and never read, and no other source is tried. An expired login, or one of another version, fails with `invalid_api_key`.
+- **The lookup.** `GET https://api.tonbo.dev/v1/databases/{name}` with the key as the bearer token returns the database's stream URL. A key the API answers with `exchange_required` is exchanged at the token endpoint with no audience first, and that token is kept until it expires. A database still being created is waited for. A `429` is retried after its `Retry-After`, and a `5xx` or a network failure after a backoff.
+- **Streams tokens.** Requests to the stream carry tokens exchanged for the key at `POST https://tonbo.dev/api/iam/token` with the audience `https://streams.tonbo.dev`, through a token provider (see [TLS and tokens](#tls-and-tokens)). Later opens reuse the token the process holds, and the next refresh runs the last open's provider. They go only to a stream URL that is `https://`, or `http://` to a loopback host, and any other fails with `invalid_url`. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves them instead, and then opening a URL needs no key. The extension reads the file only while no open of the process has set a token.
+- **One key per process.** The process carries one token, whichever key it was exchanged for. An open with a second key reuses the token held, and the next refresh exchanges the second key. An open with a string `token` replaces it. Either way one account's token serves every database, and the other account's databases fail with `unauthorized` or `forbidden`.
+- **Origins.** `apiOrigin` or `TONBO_API_ORIGIN` names another Management API, and `authOrigin` or `TONBO_AUTH_ORIGIN` another token endpoint origin. Each must be `https://`, or `http://` to a loopback host. The key goes to these two origins only, redirects are never followed, and a Streams token never goes to the Management API. An answer outside the APIs' contracts, such as a `404` from a wrong origin, fails with `invalid_argument` and names the option and variable to check. No key or token is logged.
+
+Errors are `TonboError`, an `UrsulaError` with action `fix`, whose `fix` field names the variable to set or the command to run, and whose `requestId` is the API's:
+
+| kind | when | fix |
+| --- | --- | --- |
+| `missing_credentials` | no key from any source | `Set TONBO_API_KEY, or run: tonbo login` |
+| `credentials_refused` | the login file is a symlink, not a regular file, or open to others | `Run: chmod 600 <path>`, or replace the file |
+| `invalid_api_key` | the key was refused (`401`), cannot read the database (`403`), or the login expired | a valid `apiKey` or `TONBO_API_KEY`, or `Run: tonbo login`, and for a `403`, `Use an API key that can read database "<name>"` |
+| `database_not_found` | no database of that name in the key's account (`404`), or it is being deleted | `Run: tonbo database create <name>` |
+
+When the signal fires while the Tonbo API does not answer, or the database is still being created, `open` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`). Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
+
 ## Other hosts
 
 Any SQLite host can load the extension and call its SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats`, `ursula_set_token` and `ursula_import`. `ursula_open(url, dir, options_json, timeout_ms)` returns the path of the local file, which connections then open with plain SQLite. A host opens a reader's path with `SQLITE_OPEN_READONLY`. Errors read `<function>: <kind>: <message>`. The extension refuses to load into SQLite older than 3.50.4.

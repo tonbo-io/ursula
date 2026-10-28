@@ -54,11 +54,11 @@ const MAX_RETRY_MS = 30_000;
 /** The shortest token lifetime the package takes, and the earliest refresh after a token arrived. */
 const MIN_REFRESH_MS = 1_000;
 /** The longest delay a timer takes. A refresh further out runs then. */
-const MAX_TIMER_MS = 2_147_483_647;
+export const MAX_TIMER_MS = 2_147_483_647;
 /** The earliest `expiresAt` read as milliseconds since the epoch (2001-09-09): below it, it is seconds. */
 const MIN_EPOCH_MS = 1e12;
 /** A token as `Authorization: Bearer` carries it (clients/sqlite-vfs/src/auth.rs `usable`). */
-const USABLE = /^[\x21-\x7e]+$/;
+export const USABLE = /^[\x21-\x7e]+$/;
 
 /** A refresh is due after 70 to 80% of the token's lifetime, at least {@link MIN_REFRESH_MS}: never after it expired, since a shorter lifetime is refused. */
 const refreshAfter = (lifetime: number): number => Math.max(MIN_REFRESH_MS, lifetime * (0.7 + 0.1 * Math.random()));

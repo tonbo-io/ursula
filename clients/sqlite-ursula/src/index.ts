@@ -22,10 +22,11 @@
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
+// - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
-import { raced, reasonOf } from "./abort.ts";
+import { DEFAULT_OPEN_MS, raced, reasonOf } from "./abort.ts";
 import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
 import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
@@ -95,8 +96,6 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 /** `ursula_open`'s answer. */
 type Opened = ({ done: true } & Binding) | { done: false; request: number };
 
-/** How long an open may take without a signal. */
-const DEFAULT_OPEN_MS = 30_000;
 /** The extension's own deadline for an open: far past any signal, which governs the open. */
 const EXTENSION_OPEN_MS = 24 * 60 * 60 * 1000;
 /** node:sqlite's busy `timeout` unless the caller passes one: the connections of a binding share its files. */

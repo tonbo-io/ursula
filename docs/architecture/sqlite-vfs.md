@@ -7,7 +7,8 @@ durable once the stream acknowledges it, and `await db.synced()` is the output g
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
 `clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
-event pump, `gate`, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The server
+event pump, `gate`, the Pi Durable adapter in the `/pi` entry, Tonbo's open by name in the `/tonbo`
+entry, the e2e suites and the benchmark). The server
 contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
 docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
@@ -1434,6 +1435,55 @@ backlog (Pi 1.2 on)", "throws backlog_full as Pi's StorageRejected, nothing comm
 storage goes on (Pi up to 1.1)", "throws a reset as the UrsulaResetError itself, and closes",
 "waits for synced() on close, at most closeTimeoutMs", and Pi's storage conformance suite in
 `test/conformance.e2e.ts`, run in CI on Pi 1.0.0 and the newest supported Pi.
+
+### Tonbo
+
+`open(nameOrUrl, options)` of the `/tonbo` entry (`tonbo.ts`) opens a database of a Tonbo account
+by name with a Tonbo API key, then calls `open` with the stream URL and a token provider. It only
+resolves the URL and the Streams token: everything after is the root entry's open.
+
+- The key is the `apiKey` option, else `TONBO_API_KEY`, else the login `tonbo login` saves (the
+  Tonbo CLI's credentials contract, version 1): `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`,
+  `{version, account_id, key_id, key, expires_at}`. A symlink, a non-regular file or a file with a
+  group or other permission bit is refused (`credentials_refused`) and never read, with no other
+  source tried. The file is opened with `O_NOFOLLOW` and checked again on the descriptor. A login of
+  another version or schema, or one whose `expires_at` has passed, fails `invalid_api_key`.
+- A name is looked up with `GET {api origin}/v1/databases/{name}`, the key as the bearer token. A
+  `401` with `exchange_required` exchanges the key at the token endpoint with no audience and sends
+  the lookup again once with that token, which is kept per key until 30 s before it expires. A
+  `401` to a held token exchanges again and retries once. The key goes only to the two configured
+  origins, never to an endpoint an answer names, and no redirect is followed (`redirect: "manual"`,
+  a 3xx fails `invalid_argument`). A Streams token never goes to the Management API.
+- An `active` database opens its `url`. `creating`, or a state the package does not know, is looked
+  up again with backoff. `deleting` and `deleted` fail `database_not_found`, as `404` does. `401`
+  fails `invalid_api_key`, as `403` does with a message that the key cannot read the database. `429`
+  waits for `Retry-After` but never less than the backoff, and `408`, `5xx` and network failures
+  back off from 250 ms up to 2 s, until the open's signal fires: then `UrsulaUnavailableError` with
+  the last condition. An `active` database without a `url`, and any other status, fail
+  `invalid_argument` naming the option and variable of that origin.
+- The Streams token comes from the provider each open passes, a closure over that open's key, its
+  source and the auth origin. The process holds one token whichever function minted it, so later
+  opens reuse it and the next refresh runs the last open's provider ([Tokens](#tokens)). It is
+  attached only to a stream URL that is `https://`, or `http://` to a loopback host: any other
+  fails `invalid_url`. One token per process means one key per process: an open with a second key
+  reuses the first key's token until the next refresh exchanges the second. It posts
+  `{"audience":"https://streams.tonbo.dev"}` to `{auth origin}/api/iam/token`. A `401` or `403`
+  there throws `invalid_api_key`, which fails for good. An explicit `token`, or
+  `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead, and then a URL needs no key. The
+  extension reads the file only while no open of the process has set a token.
+- Origins are `https://`, or `http://` to a loopback host. `TONBO_API_ORIGIN` and
+  `TONBO_AUTH_ORIGIN` set them when the options do not.
+- Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key`
+  and `database_not_found`, action `fix`, with `fix` (the variable or command, which ends the
+  message) and the API's `requestId`. No message carries a key or a token.
+
+Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
+stands in for the Management API and the token endpoint as their contracts document them, and
+serves databases whose URLs are streams of the suite's server. The credentials cases are the
+contract's own usable and unusable examples. Each test waits until its bindings retired, so the
+next starts with no token held. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
+(test/tonbo-child.ts), on a stream and cache root of its own with a token no other test uses, where
+no open set a token first, and the gate shows every request carried the file's token.
 
 ### SQL functions
 

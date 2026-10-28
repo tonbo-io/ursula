@@ -55,7 +55,13 @@ export type SetupKind =
 	| "not_bound"
 	| "internal";
 
-export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind;
+/**
+ * The kinds of the `/tonbo` entry's `TonboError` (tonbo.ts): a Tonbo API key that is missing, refused
+ * or unusable, a login file the package refuses to read, or a database the account does not have.
+ */
+export type TonboKind = "missing_credentials" | "credentials_refused" | "invalid_api_key" | "database_not_found";
+
+export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind | TonboKind;
 
 const WRITE_REFUSED_KINDS: ReadonlySet<string> = new Set<WriteRefusedKind>(["backlog_full", "unsupported", "too_large"]);
 const RESET_KINDS: ReadonlySet<string> = new Set<ResetKind>(["fenced", "stale", "rewound", "deleted", "local_damage", "stream_state", "internal"]);
@@ -93,16 +99,20 @@ const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaEr
 	["protocol_mismatch", "fix"],
 	["not_bound", "fix"],
 	["bound_elsewhere", "fix"],
+	["missing_credentials", "fix"],
+	["credentials_refused", "fix"],
+	["invalid_api_key", "fix"],
+	["database_not_found", "fix"],
 ]);
 
 /** The action of `kind`, `fix` for a kind this package does not know (a newer extension's). */
 export const actionOf = (kind: string): UrsulaErrorAction => ACTIONS.get(kind) ?? "fix";
 
 /**
- * A failure of the extension: the base class of the four the package throws. `kind` names what
- * failed and `action` what to do ({@link UrsulaErrorAction}): branch on `action`. `cause` is the error
- * the failure surfaced as, usually SQLite's, and when it is SQLite's its `code`, `errcode` and
- * `errstr` are copied, so code that reads them keeps working.
+ * A failure of the extension or of an open: the base class of every error the package throws.
+ * `kind` names what failed and `action` what to do ({@link UrsulaErrorAction}): branch on `action`.
+ * `cause` is the error the failure surfaced as, usually SQLite's, and when it is SQLite's its
+ * `code`, `errcode` and `errstr` are copied, so code that reads them keeps working.
  */
 export class UrsulaError extends Error {
 	readonly kind: UrsulaErrorKind;
