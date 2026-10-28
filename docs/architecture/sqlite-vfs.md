@@ -1499,7 +1499,10 @@ fork handlers (`pthread_atfork`) when it loads, and before every fork the thread
 the registry and the list of shared wal-index regions, and lets both go after it, in the parent and
 in the child. So the child gets both whole and unlocked, and a start falls wholly before the fork
 or after it, since a start marks the process under the registry. A child forked before the start
-has nothing to guard and opens its databases as any process does.
+has nothing to guard and opens its databases as any process does. The driver, the HTTP agents and
+the import's watchdog thread each check that the process started when they are made, and the first
+made before the start logs `fork_guard_unstarted` once: a SQL function that makes them without
+starting the process would leave a later child reusing them.
 
 SQLite's own state is not guarded. Its mutexes, the memory statistics mutex included, may be held
 by the snapshot thread at the fork, so a child may block in SQLite, on any database. With that
@@ -1513,7 +1516,7 @@ registry as it starts, and the child refusing to open the database's db file, WA
 `clients/sqlite-vfs`, which forks a CPython host with the extension loaded: a child forked before
 the start opens and syncs its own database, one forked after an import fails `forked`, and one
 forked after an open, while a write transaction with frames in the WAL is open, gets `forked` from
-all eight functions and an I/O error from every statement of the inherited connection, says
+all eight functions and an I/O error from a read and a write of the inherited connection, says
 `forked` once on stderr, cannot open the bound database, uses another database, and rolls back and
 closes the inherited connections. The parent then commits that transaction, passes an integrity
 check, syncs and reopens its rows.

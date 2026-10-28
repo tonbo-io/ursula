@@ -10,6 +10,7 @@ use std::ptr::NonNull;
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -1371,15 +1372,19 @@ fn a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_
     };
     held_rx.recv().unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let registry_holder = std::thread::spawn(move || {
-        let locked = registry_locked_for_tests();
-        locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        drop(locked);
-    });
+    let released = Arc::new(AtomicBool::new(false));
+    let registry_holder = {
+        let released = Arc::clone(&released);
+        std::thread::spawn(move || {
+            let locked = registry_locked_for_tests();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            released.store(true, Ordering::Release);
+            drop(locked);
+        })
+    };
     locked_rx.recv().unwrap();
 
-    let forking = Instant::now();
     // SAFETY: the child runs only `forked_child_checks` and ends with `_exit`.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
@@ -1387,9 +1392,17 @@ fn a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_
         // A child that hangs is ended by SIGALRM, which the parent sees.
         // SAFETY: a plain libc call.
         unsafe { libc::alarm(20) };
-        exit_with(|| forked_child_checks(&b, m, w, p));
+        exit_with(|| {
+            let mut checks = forked_child_checks(&b, m, w, p);
+            // The child's memory is the parent's as of the fork, which came after `prepare` took
+            // the registry, so after the holder let it go.
+            checks.push((
+                "the fork waited for the registry",
+                released.load(Ordering::Acquire),
+            ));
+            checks
+        });
     }
-    let waited = forking.elapsed();
     done_tx.send(()).unwrap();
     state_holder.join().unwrap();
     registry_holder.join().unwrap();
@@ -1406,11 +1419,6 @@ fn a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_
         0,
         "a check of the forked child failed: its stderr names it"
     );
-    assert!(
-        waited >= Duration::from_millis(100),
-        "the fork waited for the registry: {waited:?}"
-    );
-
     assert!(!crate::fork::forked());
     assert_eq!(shm_lock(m, 3, READ_MARK), ffi::SQLITE_OK);
     assert_eq!(write(p, &[2u8; 16], 0), ffi::SQLITE_OK);

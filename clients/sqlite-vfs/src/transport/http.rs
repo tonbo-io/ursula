@@ -247,7 +247,10 @@ pub(crate) const USER_AGENT: &str = concat!("sqlite-ursula-vfs/", env!("CARGO_PK
 /// stays well below that.
 pub(crate) fn agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| new_agent(Duration::from_secs(10), idle_age()))
+    A.get_or_init(|| {
+        crate::db::expect_started("agent");
+        new_agent(Duration::from_secs(10), idle_age())
+    })
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends. One snapshot's requests
@@ -257,6 +260,7 @@ pub(crate) fn agent() -> &'static ureq::Agent {
 pub(crate) fn bulk_agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
     A.get_or_init(|| {
+        crate::db::expect_started("bulk_agent");
         new_agent(
             Duration::from_secs(120),
             idle_age().min(Duration::from_secs(15)),

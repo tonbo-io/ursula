@@ -176,14 +176,24 @@ extern "C" fn parent() {
     drop(lock(&HELD).0.take());
 }
 
-/// After a fork, in the child, its only thread: makes every shared region private, marks the child
-/// forked if the process had started, then lets both go.
+/// After a fork, in the child, its only thread: makes every shared region private, once each,
+/// marks the child forked if the process had started, then lets both go. In a child of a forked
+/// process the listed regions are private already (or inaccessible, when [`private`] could not
+/// copy one), so it makes none of them private again.
 extern "C" fn child() {
     let held = lock(&HELD).0.take();
     if let Some(held) = &held {
-        for range in held.shared.values().flatten() {
-            // SAFETY: a listed range is mapped, and this is the child's only thread.
-            unsafe { private(*range) };
+        if !forked() {
+            let listed = || held.shared.values().flatten();
+            for (i, range) in listed().enumerate() {
+                // The handles of one database map the same regions: each is copied once, without
+                // allocating in the child.
+                if listed().take(i).any(|earlier| earlier == range) {
+                    continue;
+                }
+                // SAFETY: a listed range is mapped, and this is the child's only thread.
+                unsafe { private(*range) };
+            }
         }
         if held.registry.started() {
             FORKED.store(true, Ordering::Release);

@@ -40,6 +40,8 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -351,6 +353,22 @@ fn registry() -> MutexGuard<'static, Registry> {
 /// it, or after it, and the child is `forked`.
 pub(crate) fn start_process() {
     registry().started = true;
+    STARTED.store(true, Ordering::Release);
+}
+
+/// [`start_process`] ran, read without the registry: [`expect_started`] runs where the registry may
+/// already be held, as `driver()` is first reached under it.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// A safety net for the start rule (design: Forks): `what` (the driver, an HTTP agent, a thread)
+/// lives on in the process, so the SQL function that makes it marks the process started first. If
+/// one did not, a child forked later would reuse it instead of failing `forked`: the first such
+/// make logs `fork_guard_unstarted` once.
+pub(crate) fn expect_started(what: &'static str) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !STARTED.load(Ordering::Acquire) && !SAID.swap(true, Ordering::AcqRel) {
+        log::emit(Level::Warn, "fork_guard_unstarted", &[("what", &what)]);
+    }
 }
 
 /// The registry, held across a fork by the thread that forks ([`crate::fork`]).
