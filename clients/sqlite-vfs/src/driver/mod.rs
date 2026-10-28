@@ -730,13 +730,6 @@ impl BindingHandle {
     /// it retired cleanly, after its exact ACK is fsynced, or once it reset and its last connection
     /// closed, after its latest ACK: a host's drain waits for this, not for [`Life::Retired`],
     /// which a clean retire marks before that ACK is written.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only a host's drain waits for the release, and no command runs one yet"
-        )
-    )]
     pub(crate) fn holds_root(&self) -> bool {
         self.root
             .lock()

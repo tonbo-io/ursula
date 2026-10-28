@@ -39,6 +39,31 @@
 //   scanned directory, its bytes counted. While it runs, its root shows `held`, and without the scan
 //   its lock is unread. It runs on the 0.11 line only: a later line's server refuses a 0.11 copy.
 //
+// The host's drain, `ursula-vfs-host drain` (design: Hosts, Draining), through test/gate.mjs, with
+// the children's URSULA_VFS_HOST_DIR, and each result checked by the rules a host checks it by:
+// - H16: a crash at `logged:2` with the stream refused leaves an orphan, which a drain reports
+//   `drained`, its first bytes the inspection's, and the inspection is clean. The stream gained one
+//   CLAIM frame, at the epoch of the log's latest claim + 1, and holds every commit in a fresh
+//   build. With URSULA_VFS_SNAPSHOT_DUE_BYTES=1 the snapshot is unchanged and the root holds no
+//   `db-uwal` or `db-shm`: no snapshot thread and no connection ran. The application's reopen claims
+//   at + 2 with nothing pending, and a second drain finds the root clean.
+// - H17: after another cache root's takeover, idle or committing, the orphan is `pending`,
+//   `fenced`, `later: no`, with the stream's frames, the other process and the orphan's bytes
+//   unchanged. The negative control: the application's own reopen of the orphan fences the other.
+// - H18: a misrouted origin (`wrong_cluster`, fix), a deleted stream (`not_found`, no, still
+//   missing), a deleted and recreated one (`rewound`, no, then salvaged by an application open), a
+//   root a live process holds (`in_use`, yes) and a renamed root (`misnamed`, no). No claim goes
+//   out.
+// - H19: a wrong token file is `unauthorized` (fix) within the budget, and the right one, or one
+//   written during the drain, drains.
+// - H20: with the stream blackholed (`later: yes`) or refused (`retrying`), a drain of 1000 ms
+//   prints within 1250 ms. A SIGKILL during the continuation leaves the bytes counted, and the next
+//   drain drains.
+// - H21: under the hold a drain drains, an inspection with its pid sees the root held, and after
+//   its exit the root is clean and not held.
+// - H22: of two orphans of one stream in two cache roots, in either scan order, the later claimant
+//   drains and the older is fenced.
+//
 // The hold, `ursula-vfs-host hold`, which takes the host directory's `hold` file exclusively:
 // - H9: a writer thread that commits every 5 ms with busy_timeout 0 stops within one transaction,
 //   with no error, and the root drains to clean within 1.5 s. Meanwhile reads, `synced()`, a
@@ -60,7 +85,7 @@ import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { Child, directUrl, freshDir, fromStream, gate, killChildren, onModel, stream } from "./kit.ts";
+import { Child, directUrl, freshDir, fromStream, gate, head, killChildren, modelServer, onModel, ownedFrames, stream } from "./kit.ts";
 
 afterEach(killChildren);
 
@@ -453,6 +478,85 @@ async function closedOwner(url: string, dir: string, env: NodeJS.ProcessEnv, wor
 	await child.opened();
 	await work(child);
 	await closeAndRetire(child);
+}
+
+/** A root as `ursula-vfs-host drain` reports it. */
+interface DrainedRoot {
+	id: string;
+	root: string;
+	stream: string | null;
+	cluster: string | null;
+	uid: number | null;
+	outcome: "drained" | "clean" | "pending" | "unreadable";
+	kind: string | null;
+	later: "yes" | "fix" | "no" | null;
+	before_bytes: number | null;
+	unacknowledged_bytes: number | null;
+	commits: number | null;
+	salvaged: number | null;
+	error: string | null;
+}
+
+/** What `ursula-vfs-host drain` prints. */
+interface Drained {
+	v: number;
+	origin: string;
+	uid: number | null;
+	dir: string | null;
+	roots: DrainedRoot[];
+	error: string | null;
+}
+
+const DRAINED_KEYS = ["v", "origin", "uid", "dir", "roots", "error"];
+const DRAINED_ROOT_KEYS = ["id", "root", "stream", "cluster", "uid", "outcome", "kind", "later", "before_bytes", "unacknowledged_bytes", "commits", "salvaged", "error"];
+
+/** The one line `ursula-vfs-host drain` printed, checked by the rules a host checks it by. */
+function drainedLine(stdout: string): Drained {
+	const lines = stdout.split("\n");
+	expect(lines, stdout).toHaveLength(2);
+	expect(lines[1]).toBe("");
+	const drained = JSON.parse(lines[0] as string) as Drained;
+	expect(Object.keys(drained)).toEqual(DRAINED_KEYS);
+	expect(drained.v).toBe(1);
+	const resolved = new Set<string>();
+	for (const r of drained.roots) {
+		const at = JSON.stringify(r);
+		expect(Object.keys(r), at).toEqual(DRAINED_ROOT_KEYS);
+		expect(r.id, at).toMatch(/^[a-z0-9_-]{1,64}-[0-9a-f]{32}$/);
+		switch (r.outcome) {
+			case "drained":
+				expect(r, at).toMatchObject({ kind: null, later: null, unacknowledged_bytes: 0, uid: drained.uid });
+				expect(r.before_bytes, at).toBeGreaterThan(0);
+				break;
+			case "clean":
+				expect(r, at).toMatchObject({ kind: null, later: null, unacknowledged_bytes: 0 });
+				break;
+			case "pending":
+				expect(r.kind, at).not.toBeNull();
+				expect(["yes", "fix", "no"], at).toContain(r.later);
+				expect(r.unacknowledged_bytes, at).toBeGreaterThan(0);
+				break;
+			case "unreadable":
+				expect(r, at).toMatchObject({ kind: null, later: null, unacknowledged_bytes: null, commits: null, salvaged: null });
+				expect(r.error, at).not.toBeNull();
+				break;
+			default:
+				throw new Error(`an outcome outside v1: ${at}`);
+		}
+		if (r.before_bytes === null) expect(r.outcome, at).toBe("unreadable");
+		if (r.kind === "not_owner") expect(r.uid, at).not.toBe(drained.uid);
+		// One entry per resolved root.
+		const real = existsSync(r.root) ? realpathSync(r.root) : r.root;
+		expect(resolved.has(real), at).toBe(false);
+		resolved.add(real);
+	}
+	return drained;
+}
+
+/** Deletes the stream at `path`: the model's control route, or a DELETE at the server. */
+async function deleteStream(path: string): Promise<void> {
+	const r = onModel() ? await fetch(`${directUrl()}/__model/delete?path=${path}`, { method: "POST" }) : await fetch(`${directUrl()}${path}`, { method: "DELETE" });
+	expect(r.ok, `${r.status} ${await r.text()}`).toBe(true);
 }
 
 describe("the host's inspection (ursula-vfs-host inspect)", () => {
@@ -945,6 +1049,307 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		expect(await inspect(host, [owner.pid], { untilClean: 60_000 })).toMatchObject({ complete: true, clean: true });
 		await hold.release();
 		await owner.stop();
+	});
+
+	describe("the host's drain (ursula-vfs-host drain)", () => {
+		afterEach(async () => {
+			await route(directUrl());
+			await requireToken(null);
+		});
+
+		/** Sends the gate's requests to `url`. */
+		async function route(url: string): Promise<void> {
+			const r = await fetch(`${front.control}/target`, { method: "PUT", body: JSON.stringify({ url }) });
+			expect(r.status, await r.text()).toBe(204);
+		}
+
+		/** Makes the gate answer `401` to every request without `token` (`null`: none required). */
+		async function requireToken(token: string | null): Promise<void> {
+			const r = await fetch(`${front.control}/auth`, { method: "PUT", body: JSON.stringify({ token }) });
+			expect(r.status, await r.text()).toBe(204);
+		}
+
+		/** Holds back the answer of the gate's next `times` POSTs for `ms`. */
+		async function delayPosts(ms: number, times = 1): Promise<void> {
+			const r = await fetch(`${front.control}/faults?times=${times}&method=POST`, { method: "POST", body: `delay ${ms}` });
+			expect(r.status, await r.text()).toBe(204);
+		}
+
+		/** An orphan of the new stream `label` in a fresh cache root recorded in a fresh host directory: a crash at `logged:2` with the stream refused. */
+		async function orphan(label: string, host = hostDir()): Promise<{ s: { path: string }; url: string; dir: string; host: string; env: NodeJS.ProcessEnv; root: InspectedRoot }> {
+			const dir = freshDir();
+			const s = stream(label);
+			const url = `${front.url}${s.path}`;
+			await crashTables(url, dir, host.env);
+			await mode("refuse");
+			await crash(url, dir, host.env, "logged:2");
+			await mode("forward");
+			const root = onlyRoot(await inspect(host.host, [process.pid]));
+			expect(root).toMatchObject({ state: "pending", held: false });
+			expect(root.unacknowledged_bytes).toBeGreaterThan(0);
+			return { s, url, dir, ...host, root };
+		}
+
+		/** The claim epochs the stream at `path` holds, in order. */
+		async function claims(path: string): Promise<number[]> {
+			return (await ownedFrames(path)).flatMap((f) => (f.kind === "claim" ? [f.epoch] : []));
+		}
+
+		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget: its result, checked by the output's rules, and how long it ran. */
+		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string } = {}): Promise<{ drained: Drained; ms: number }> {
+			const args = ["drain", "--origin", options.origin ?? front.url, "--budget-ms", String(options.budgetMs ?? 20_000), ...(options.scans ?? []).flatMap((s) => ["--scan", s])];
+			const started = Date.now();
+			const { stdout } = await run(hostBin(), args, { env: { ...process.env, ...env } });
+			const ms = Date.now() - started;
+			return { drained: drainedLine(stdout), ms };
+		}
+
+		/** The one root a drain reports. */
+		function onlyDrained(drained: Drained): DrainedRoot {
+			expect(drained.roots, JSON.stringify(drained)).toHaveLength(1);
+			return drained.roots[0] as DrainedRoot;
+		}
+
+		/** The status of the database of `c`. */
+		async function statusOf(c: Child): Promise<{ state: string; commits: { pending_bytes: number } }> {
+			return (await c.send({ status: true })).status as { state: string; commits: { pending_bytes: number } };
+		}
+
+		it("H16: an orphan drains with one continuation claim, no connection and no snapshot, and the application resumes above it", async () => {
+			const o = await orphan("host-h16");
+			const before = await claims(o.s.path);
+			const own = before.at(-1) as number;
+			const snapshot = (await head(o.s.path)).snapshot;
+			const { drained } = await drain({ ...o.env, URSULA_VFS_SNAPSHOT_DUE_BYTES: "1" });
+			expect(drained).toMatchObject({ origin: front.url, dir: o.host, error: null });
+			const root = onlyDrained(drained);
+			expect(root, JSON.stringify(drained)).toMatchObject({ outcome: "drained", stream: o.s.path, before_bytes: o.root.unacknowledged_bytes, unacknowledged_bytes: 0, id: o.root.id, root: o.root.root });
+			const after = await inspect(o.host, [process.pid]);
+			expect(after, JSON.stringify(after)).toMatchObject({ complete: true, clean: true });
+			expect(onlyRoot(after)).toMatchObject({ state: "clean", held: false });
+			// No connection and no snapshot thread ran in the drain.
+			expect((await head(o.s.path)).snapshot).toBe(snapshot);
+			const generation = readdirSync(o.root.root).find((n) => /^gen-[0-9a-f]{32}$/.test(n)) as string;
+			const files = readdirSync(join(o.root.root, generation));
+			expect(files).not.toContain("db-uwal");
+			expect(files).not.toContain("db-shm");
+			// One CLAIM frame more, at the crashed binding's epoch + 1.
+			expect(await claims(o.s.path)).toEqual([...before, own + 1]);
+			// Every commit the crashed process logged, in a fresh build.
+			expect(await fromStream(o.url, "SELECT n FROM counter")).toEqual([{ n: 2 }]);
+			expect(await fromStream(o.url, "SELECT count(*) AS c FROM t")).toEqual([{ c: 6 }]);
+			// The application's reopen claims above the drain and resumes with nothing pending.
+			const reopened = new Child(o.url, o.dir, o.env);
+			await reopened.opened();
+			expect((await statusOf(reopened)).commits.pending_bytes).toBe(0);
+			await reopened.exec("INSERT INTO counter VALUES (3)");
+			await synced(reopened);
+			await closeAndRetire(reopened);
+			expect((await claims(o.s.path)).at(-1)).toBe(own + 2);
+			// A drained root drains again cheaply: clean, not opened.
+			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "clean", kind: null, unacknowledged_bytes: 0 });
+		});
+
+		for (const commits of [false, true]) {
+			it(`H17: the drain fences no owner it can see: another cache root's takeover that ${commits ? "commits" : "stays idle"} leaves the orphan pending, fenced`, async () => {
+				const o = await orphan(`host-h17-${commits ? "writing" : "idle"}`);
+				// Another process takes the stream over from another cache root, recorded nowhere.
+				const other = new Child(o.url, freshDir());
+				await other.opened();
+				if (commits) {
+					await other.exec("INSERT INTO counter VALUES (10)");
+					await synced(other);
+				}
+				const frames = await ownedFrames(o.s.path);
+				const { drained } = await drain(o.env);
+				const root = onlyDrained(drained);
+				expect(root, JSON.stringify(drained)).toMatchObject({ outcome: "pending", kind: "fenced", later: "no", unacknowledged_bytes: o.root.unacknowledged_bytes });
+				expect(await ownedFrames(o.s.path)).toEqual(frames);
+				expect(onlyRoot(await inspect(o.host, [process.pid]))).toMatchObject({ state: "pending", unacknowledged_bytes: o.root.unacknowledged_bytes });
+				// The other process was never fenced.
+				expect((await statusOf(other)).state).not.toBe("reset");
+				await other.exec("INSERT INTO counter VALUES (11)");
+				await synced(other);
+				expect((await statusOf(other)).state).not.toBe("reset");
+
+				// The negative control: the application's own reopen of the orphan is a takeover, and fences the other process.
+				const reopened = new Child(o.url, o.dir, o.env);
+				await reopened.opened();
+				await synced(reopened);
+				await other.send({ exec: "INSERT INTO counter VALUES (12)" });
+				await other.send({ synced: 10_000 });
+				await until("the other process is fenced", 20_000, async () => (await statusOf(other)).state === "reset");
+				await reopened.stop();
+				await other.stop();
+			});
+		}
+
+		it("H18: a misrouted origin, a deleted stream, a recreated stream, a held root and a renamed root are refused before any claim", async () => {
+			// (a) Another deployment answers the origin: wrong_cluster, before any claim.
+			const a = await orphan("host-h18-cluster");
+			const claimsA = await claims(a.s.path);
+			const elsewhere = await modelServer("drain-elsewhere", 33);
+			try {
+				await route(elsewhere.url);
+				const root = onlyDrained((await drain(a.env)).drained);
+				expect(root).toMatchObject({ outcome: "pending", kind: "wrong_cluster", later: "fix", unacknowledged_bytes: a.root.unacknowledged_bytes });
+				expect((await fetch(`${elsewhere.url}${a.s.path}`, { method: "HEAD" })).status).toBe(404);
+			} finally {
+				await route(directUrl());
+				await elsewhere.stop();
+			}
+			expect(await claims(a.s.path)).toEqual(claimsA);
+
+			// (b) A deleted stream: not_found, and the drain never creates it.
+			const b = await orphan("host-h18-deleted");
+			await deleteStream(b.s.path);
+			expect(onlyDrained((await drain(b.env)).drained)).toMatchObject({ outcome: "pending", kind: "not_found", later: "no", unacknowledged_bytes: b.root.unacknowledged_bytes });
+			expect(await headStatus(b.s.path)).toBe(404);
+
+			// (c) A stream deleted and created again: rewound, nothing sent, and the next application open salvages the commits.
+			const c = await orphan("host-h18-recreated");
+			await deleteStream(c.s.path);
+			await ownerCommits(c.url, freshDir(), {});
+			const recreated = await ownedFrames(c.s.path);
+			expect(onlyDrained((await drain(c.env)).drained)).toMatchObject({ outcome: "pending", kind: "rewound", later: "no", unacknowledged_bytes: c.root.unacknowledged_bytes });
+			expect(await ownedFrames(c.s.path)).toEqual(recreated);
+			expect(onlyRoot(await inspect(c.host, [process.pid]))).toMatchObject({ state: "pending", unacknowledged_bytes: c.root.unacknowledged_bytes, salvaged: c.root.salvaged });
+			const salvaging = new Child(c.url, c.dir, c.env);
+			await salvaging.opened();
+			await closeAndRetire(salvaging);
+			const salvaged = onlyRoot(await inspect(c.host, [process.pid], { untilClean: 5_000 }));
+			expect(salvaged).toMatchObject({ state: "clean" });
+			expect(salvaged.salvaged).toBeGreaterThan(c.root.salvaged ?? 0);
+
+			// (d) A root a live process holds: in_use, which passes.
+			const d = await orphan("host-h18-held");
+			const claimsD = await claims(d.s.path);
+			await mode("refuse");
+			const holder = new Child(d.url, d.dir, d.env);
+			expect((await holder.opened()).state).toBe("provisional");
+			expect(onlyDrained((await drain(d.env)).drained)).toMatchObject({ outcome: "pending", kind: "in_use", later: "yes", unacknowledged_bytes: d.root.unacknowledged_bytes });
+			await holder.stop("SIGKILL");
+			await mode("forward");
+			expect(await claims(d.s.path)).toEqual(claimsD);
+
+			// (e) A renamed root: misnamed, and the inspection reads it as before.
+			const e = await orphan("host-h18-renamed");
+			const claimsE = await claims(e.s.path);
+			const moved = join(e.dir, `renamed-${"0".repeat(32)}`);
+			renameSync(e.root.root, moved);
+			const renamed = onlyDrained((await drain(e.env)).drained);
+			expect(renamed).toMatchObject({ outcome: "pending", kind: "misnamed", later: "no", root: moved, unacknowledged_bytes: e.root.unacknowledged_bytes });
+			expect(onlyRoot(await inspect(e.host, [process.pid]))).toMatchObject({ root: moved, state: "pending", unacknowledged_bytes: e.root.unacknowledged_bytes });
+			expect(await claims(e.s.path)).toEqual(claimsE);
+		});
+
+		it("H19: the drain takes its token from URSULA_VFS_TOKEN_FILE: a wrong one is unauthorized, the right one, or one written during the drain, drains", async () => {
+			const first = await orphan("host-h19-file");
+			const second = await orphan("host-h19-replaced");
+			const tokens = freshDir();
+			const wrong = join(tokens, "wrong");
+			writeFileSync(wrong, "drain-wrong-token\n");
+			const right = join(tokens, "right");
+			writeFileSync(right, "drain-right-token\n");
+			await requireToken("drain-right-token");
+
+			const refused = await drain({ ...first.env, URSULA_VFS_TOKEN_FILE: wrong }, { budgetMs: 3_000 });
+			expect(onlyDrained(refused.drained)).toMatchObject({ outcome: "pending", kind: "unauthorized", later: "fix", unacknowledged_bytes: first.root.unacknowledged_bytes });
+			expect(refused.ms).toBeLessThan(3_250);
+			expect(onlyDrained((await drain({ ...first.env, URSULA_VFS_TOKEN_FILE: right })).drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+
+			const changing = join(tokens, "changing");
+			writeFileSync(changing, "drain-wrong-token\n");
+			const draining = drain({ ...second.env, URSULA_VFS_TOKEN_FILE: changing });
+			await sleep(1_500);
+			writeFileSync(changing, "drain-right-token\n");
+			expect(onlyDrained((await draining).drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+		});
+
+		for (const gateMode of ["blackhole", "refuse"] as const) {
+			it(`H20: with the stream ${gateMode === "blackhole" ? "blackholed" : "refused"}, a drain of 1000 ms prints within 1250 ms, pending, and a later drain may drain it`, async () => {
+				const o = await orphan(`host-h20-${gateMode}`);
+				await mode(gateMode);
+				const { drained, ms } = await drain(o.env, { budgetMs: 1_000 });
+				expect(ms).toBeLessThan(1_250);
+				const root = onlyDrained(drained);
+				expect(root, JSON.stringify(drained)).toMatchObject({ outcome: "pending", later: "yes", unacknowledged_bytes: o.root.unacknowledged_bytes });
+				// Refused, nothing went out: the open bound provisionally and its pre-check retries.
+				if (gateMode === "refuse") expect(root.kind).toBe("retrying");
+				await mode("forward");
+				expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "drained" });
+			});
+		}
+
+		it("H20: a drain killed during its continuation leaves bytes the inspection counts, and the next drain drains them", async () => {
+			const o = await orphan("host-h20-kill");
+			// The repeat of the log's claim goes out, and its answer is held back.
+			await delayPosts(3_000);
+			const killed = spawn(hostBin(), ["drain", "--origin", front.url, "--budget-ms", "20000"], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, ...o.env } });
+			const exited = new Promise<NodeJS.Signals | null>((r) => killed.once("exit", (_code, signal) => r(signal)));
+			let printed = "";
+			killed.stdout?.on("data", (chunk: Buffer) => {
+				printed += chunk.toString();
+			});
+			await sleep(1_000);
+			killed.kill("SIGKILL");
+			expect(await exited).toBe("SIGKILL");
+			expect(printed).toBe("");
+			const left = onlyRoot(await inspect(o.host, [process.pid]));
+			expect(left).toMatchObject({ state: "pending", held: false });
+			expect(left.unacknowledged_bytes).toBeGreaterThanOrEqual(o.root.unacknowledged_bytes as number);
+			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+			expect(await inspect(o.host, [process.pid])).toMatchObject({ complete: true, clean: true });
+		});
+
+		it("H21: under the hold a drain drains, an inspection with its pid sees the root it holds, and after its exit the root is clean and not held", async () => {
+			const o = await orphan("host-h21", holdDir());
+			const hold = await takeHold(o.host);
+			// The claims' answers are held back, so the drain holds the root for a while.
+			await delayPosts(1_500, 2);
+			const proc = spawn(hostBin(), ["drain", "--origin", front.url, "--budget-ms", "20000"], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, ...o.env } });
+			let printed = "";
+			proc.stdout?.on("data", (chunk: Buffer) => {
+				printed += chunk.toString();
+			});
+			const exited = new Promise<number | null>((r) => proc.once("exit", (code) => r(code)));
+			const pid = proc.pid as number;
+			await until("the drain holds the root", 10_000, async () => onlyRoot(await inspect(o.host, [pid])).held === true);
+			expect(await exited).toBe(0);
+			expect(onlyDrained(drainedLine(printed))).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+			const after = await inspect(o.host, [process.pid]);
+			expect(after, JSON.stringify(after)).toMatchObject({ complete: true, clean: true });
+			expect(onlyRoot(after)).toMatchObject({ state: "clean", held: false });
+			await hold.release();
+		});
+
+		for (const order of ["older first", "later first"] as const) {
+			it(`H22: of two orphans of one stream in two cache roots (${order}), the later claimant drains and the older is fenced`, async () => {
+				// No host directory: the scans' order is the listing's.
+				const s = stream(`host-h22-${order.replace(" ", "-")}`);
+				const url = `${front.url}${s.path}`;
+				const older = freshDir();
+				await crashTables(url, older, {});
+				await mode("refuse");
+				await crash(url, older, {}, "logged:2");
+				await mode("forward");
+				const later = freshDir();
+				const claimant = new Child(url, later);
+				await claimant.opened();
+				await mode("refuse");
+				await claimant.exec("INSERT INTO t(i, pad) VALUES (100, x'00'); INSERT INTO t(i, pad) VALUES (101, x'01')");
+				await claimant.stop("SIGKILL");
+				await mode("forward");
+				const scans = order === "older first" ? [older, later] : [later, older];
+				const { drained } = await drain({}, { scans });
+				expect(drained.dir).toBeNull();
+				expect(drained.roots, JSON.stringify(drained)).toHaveLength(2);
+				const of = (dir: string): DrainedRoot => drained.roots.find((r) => r.root.startsWith(dir)) as DrainedRoot;
+				expect(of(later), JSON.stringify(drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+				expect(of(older), JSON.stringify(drained)).toMatchObject({ outcome: "pending", kind: "fenced", later: "no" });
+				expect(await fromStream(s.url, "SELECT count(*) AS c FROM t WHERE i >= 100")).toEqual([{ c: 2 }]);
+			});
+		}
 	});
 
 	// The npm copy is 0.11.0: a server or model of a later line refuses it (`protocol_mismatch`),

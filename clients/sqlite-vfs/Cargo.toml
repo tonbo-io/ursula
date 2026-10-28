@@ -31,7 +31,8 @@ name = "ursula-vfs-model"
 path = "src/bin/ursula_vfs_model.rs"
 required-features = ["model"]
 
-# A host's inspection of the roots on its disk (design: Hosts). It never loads SQLite.
+# A host's tool for the roots on its disk (design: Hosts): `inspect`, `hold` and `drain`. It never
+# loads SQLite.
 [[bin]]
 name = "ursula-vfs-host"
 path = "src/bin/ursula_vfs_host.rs"

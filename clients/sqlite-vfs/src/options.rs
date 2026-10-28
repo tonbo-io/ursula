@@ -34,13 +34,6 @@ pub(crate) enum OwnerMode {
     /// continues the claim the root's log holds, behind the pre-check (design: Pre-check), and
     /// never takes the stream over, creates it or builds a generation. `options_json` never asks
     /// for it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only a host's drain opens with it, and no command runs one yet"
-        )
-    )]
     Drain,
 }
 

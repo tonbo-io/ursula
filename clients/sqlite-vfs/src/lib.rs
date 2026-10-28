@@ -84,6 +84,11 @@
 //! The wait itself returns no `SQLITE_BUSY` and calls no busy handler; afterwards the request
 //! meets what other writers did meanwhile, as a slow transaction would.
 //!
+//! A host drains the orphans on its disk, the roots no process holds that still hold commits the
+//! stream has not acknowledged, with [`drain::drain`], which `ursula-vfs-host drain` runs. Its open
+//! only continues a root's own claim behind the pre-check and never takes the stream over, and it
+//! opens no connection, so it loads no SQLite.
+//!
 //! A child forked after its parent started the extension (its first `ursula_open`, `ursula_events`
 //! or `ursula_import`) inherits what the extension made without the threads that serve it: there
 //! every SQL function and every I/O on a file of a bound database fails `forked` (`fix`: open after
@@ -91,9 +96,10 @@
 //! databases are private copies, and files of no bound database pass through (`fork`, design:
 //! Forks).
 //!
-//! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
-//! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
-//! retention one snapshot behind. Builds install the latest snapshot, then read the tail.
+//! Each binding opened by a host of the SQL functions has a snapshot thread, and a drain's has
+//! none: past `max(db size, 8 MiB)` of acknowledged frame bytes it publishes a `USS3` snapshot
+//! keyed by its stream offset and digest, and moves retention one snapshot behind. Builds install
+//! the latest snapshot, then read the tail.
 //!
 //! Comments cite `design: <Heading>` for a heading of `docs/architecture/sqlite-vfs.md` and
 //! `extensions: <Heading>` for a heading of the extensions specification.
@@ -109,6 +115,8 @@
 //!   images at the commit point.
 //! - `config`: settings and test hooks from the environment.
 //! - `db`: bound databases (their commit-path state) and the process-wide registry.
+//! - [`drain`]: a host's drain of the orphan roots on its disk: the inspection's walk and read, an
+//!   open of each orphan that continues its own claim, and the outcome its bytes decide.
 //! - `driver`: the process-wide driver of the replicators and opens: a deterministic core and its
 //!   runtime (a driver thread and blocking HTTP workers).
 //! - `error`: the kinds, actions and classes callers outside the extension see (`ErrorKind`,
@@ -163,6 +171,7 @@ mod capture;
 pub mod codec;
 mod config;
 mod db;
+pub mod drain;
 mod driver;
 mod error;
 mod extension;
