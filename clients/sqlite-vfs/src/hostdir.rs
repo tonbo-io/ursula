@@ -66,8 +66,8 @@ pub(crate) const DEFAULT: &str = "/var/lib/sqlite-ursula/host";
 const RECORD: &str = "dir-";
 /// A temp file's name before `<pid>-<16 hex>`.
 const TMP: &str = ".tmp-";
-/// The host's lock file.
-const HOLD: &str = "hold";
+/// The host's lock file (`hold`, design: Hosts).
+pub(crate) const HOLD: &str = "hold";
 /// Names reserved for the host start so.
 const HOST: &str = "host";
 /// The most bytes of a record read back.
@@ -304,6 +304,19 @@ pub(crate) fn open_dir(host: &Path) -> std::io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(host)
+}
+
+/// Opens the host's lock file in the host directory `host` read-only: through the directory's
+/// descriptor, never through a link, and never blocking, so a FIFO in its place opens at once
+/// (`O_NONBLOCK`, which a regular file ignores) and the caller refuses it.
+pub(crate) fn open_hold(host: &Path) -> std::io::Result<File> {
+    let dir = open_dir(host)?;
+    at::open(
+        &dir,
+        HOLD,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
 }
 
 /// What a record's name holds.

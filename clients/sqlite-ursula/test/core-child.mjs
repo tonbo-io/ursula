@@ -13,6 +13,10 @@
 //   connection on what it bound -> {"ok": true, "opened"}.
 // `"conn": 2` runs `exec` or `all` on a second connection to the database, `"conn": 3` on the
 // reopened one, and `status` and `synced` with `"conn": 3` ask about the reopened database.
+//   {"writer": ms} starts a worker thread that commits one row to table `w` (which the caller
+//   created) on a connection of its own every `ms` milliseconds, busy_timeout 0, until the process
+//   exits -> {"ok": true}. {"progress": true} -> {"ok": true, "committed", "errors", "error"}: the
+//   writer's commits that returned, the ones that failed and the last failure.
 // argv[5], when given, is `ursula_open`'s options JSON (`{}` otherwise): with `read_only` the
 // connections open read-only, as the package's `open` opens them, except `"conn": 4`, a
 // connection that asks for read-write whatever the options say.
@@ -20,6 +24,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 
 const [ext, url, dir, options = "{}"] = process.argv.slice(2);
 const readOnly = JSON.parse(options).read_only === true;
@@ -52,6 +57,31 @@ const conn = (cmd) =>
 const pathOf = (cmd) => (cmd.conn === 3 ? reopened.path : opened.path);
 say({ ok: true, opened });
 
+/** The writer thread's counters: commits that returned, commits that failed. */
+const progress = new Int32Array(new SharedArrayBuffer(8));
+let writerError = null;
+// Runs on a thread of its own, so it may block in the VFS while this thread answers.
+const WRITER = `
+const { workerData, parentPort } = require("node:worker_threads");
+const { DatabaseSync } = require("node:sqlite");
+const { path, every, progress } = workerData;
+const counts = new Int32Array(progress);
+const pause = new Int32Array(new SharedArrayBuffer(4));
+const db = new DatabaseSync(path);
+db.exec("PRAGMA busy_timeout=0");
+const insert = db.prepare("INSERT INTO w(n) VALUES (?)");
+for (;;) {
+	try {
+		insert.run(Atomics.load(counts, 0) + 1);
+		Atomics.add(counts, 0, 1);
+	} catch (error) {
+		Atomics.add(counts, 1, 1);
+		parentPort.postMessage(String(error));
+	}
+	Atomics.wait(pause, 0, 0, every);
+}
+`;
+
 let cursor = 0;
 for await (const line of createInterface({ input: process.stdin })) {
 	const cmd = JSON.parse(line);
@@ -69,6 +99,15 @@ for await (const line of createInterface({ input: process.stdin })) {
 			reopened = call("SELECT ursula_open(?, ?, ?, 20000)", url, dir, options);
 			third = new DatabaseSync(reopened.path, { readOnly });
 			say({ ok: true, opened: reopened });
+		} else if (cmd.writer !== undefined) {
+			const worker = new Worker(WRITER, { eval: true, workerData: { path: opened.path, every: cmd.writer, progress: progress.buffer } });
+			worker.on("message", (m) => {
+				writerError = m;
+			});
+			worker.unref();
+			say({ ok: true });
+		} else if (cmd.progress) {
+			say({ ok: true, committed: Atomics.load(progress, 0), errors: Atomics.load(progress, 1), error: writerError });
 		} else if (cmd.events) {
 			const got = call("SELECT ursula_events(?, 0)", cursor);
 			cursor = got.cursor;

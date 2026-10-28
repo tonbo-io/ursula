@@ -698,6 +698,25 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
 /// [`for_tests`] with a commit limit of `max_commit_bytes`.
 #[cfg(test)]
 pub(crate) fn for_tests_with_limit(dir: &std::path::Path, max_commit_bytes: u64) -> Arc<Binding> {
+    bound_for_tests(dir, max_commit_bytes, crate::driver::Role::Owner)
+}
+
+/// [`for_tests`] as a reader's binding.
+#[cfg(test)]
+pub(crate) fn reader_for_tests(dir: &std::path::Path) -> Arc<Binding> {
+    bound_for_tests(
+        dir,
+        crate::capture::DEFAULT_MAX_COMMIT_BYTES,
+        crate::driver::Role::Reader,
+    )
+}
+
+#[cfg(test)]
+fn bound_for_tests(
+    dir: &std::path::Path,
+    max_commit_bytes: u64,
+    role: crate::driver::Role,
+) -> Arc<Binding> {
     use ursula_headers::Incarnation;
     use ursula_headers::Offset;
 
@@ -743,7 +762,7 @@ pub(crate) fn for_tests_with_limit(dir: &std::path::Path, max_commit_bytes: u64)
             attach: crate::driver::Attach::Resumed,
             provisional: false,
             dir: dir.to_owned(),
-            role: crate::driver::Role::Owner,
+            role,
             closed: false,
         },
         Arc::new(root),

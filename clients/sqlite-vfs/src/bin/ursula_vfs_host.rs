@@ -15,20 +15,34 @@
 //!   have passed, then print the last result.
 //! - `--budget-ms MS`: a pass that runs longer stops, incomplete (`budget`).
 //!
-//! It exits 0 when it printed a result and 2 on a usage error (1 when it could not write either).
+//! `ursula-vfs-host hold [--dir D]` takes the host directory's `hold` file exclusively, waiting
+//! for it as long as another process holds it, prints `held`, and holds it until its stdin closes:
+//! meanwhile write transactions of the extension wait before they start ([`hold::take`]). It never
+//! creates the file, which the host creates with the directory.
+//!
+//! It exits 0 when it printed a result (or held and released the hold), 2 on a usage error, and 1
+//! when it could not take the hold or write.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use sqlite_ursula_vfs::hold;
 use sqlite_ursula_vfs::inspection::Inspect;
 use sqlite_ursula_vfs::inspection::Inspection;
 use sqlite_ursula_vfs::inspection::inspect;
 
 const USAGE: &str = "usage: ursula-vfs-host inspect [--dir D] [--scan S]... [--pid P]... \
-                     [--until-clean MS] [--budget-ms MS]";
+                     [--until-clean MS] [--budget-ms MS]\n       ursula-vfs-host hold [--dir D]";
+
+/// What the command line asks for.
+enum Command {
+    Inspect(Inspect),
+    Hold { dir: Option<PathBuf> },
+}
 
 /// A command line that is not one `ursula-vfs-host` takes.
 #[derive(Debug, thiserror::Error)]
@@ -57,14 +71,29 @@ fn number<T: std::str::FromStr>(flag: &'static str, value: OsString) -> Result<T
     }
 }
 
-/// The inspection the arguments `args` ask for. A path may be any bytes, as a home directory
-/// taken from the password database may be.
-fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Inspect, Usage> {
+/// The command the arguments `args` ask for. A path may be any bytes, as a home directory taken
+/// from the password database may be.
+fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command, Usage> {
     match args.next() {
-        Some(command) if command == "inspect" => {}
-        Some(other) => return Err(Usage::Command(other.to_string_lossy().into_owned())),
-        None => return Err(Usage::NoCommand),
+        Some(command) if command == "inspect" => parse_inspect(args).map(Command::Inspect),
+        Some(command) if command == "hold" => parse_hold(args),
+        Some(other) => Err(Usage::Command(other.to_string_lossy().into_owned())),
+        None => Err(Usage::NoCommand),
     }
+}
+
+fn parse_hold(mut args: impl Iterator<Item = OsString>) -> Result<Command, Usage> {
+    let mut dir = None;
+    while let Some(flag) = args.next() {
+        match flag.to_str().unwrap_or_default() {
+            "--dir" => dir = Some(PathBuf::from(args.next().ok_or(Usage::Missing("--dir"))?)),
+            _ => return Err(Usage::Option(flag.to_string_lossy().into_owned())),
+        }
+    }
+    Ok(Command::Hold { dir })
+}
+
+fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<Inspect, Usage> {
     let mut request = Inspect::default();
     while let Some(flag) = args.next() {
         let mut value = |name: &'static str| args.next().ok_or(Usage::Missing(name));
@@ -95,9 +124,41 @@ fn print(inspection: &Inspection) -> std::io::Result<()> {
     stdout.flush()
 }
 
+/// Why `hold` failed.
+#[derive(Debug, thiserror::Error)]
+enum HoldFailed {
+    #[error(transparent)]
+    Take(#[from] hold::HoldError),
+    #[error("stdout: {0}")]
+    Stdout(#[source] std::io::Error),
+    #[error("stdin: {0}")]
+    Stdin(#[source] std::io::Error),
+}
+
+/// Takes the hold, prints `held`, and holds it until stdin closes.
+fn hold_until_stdin_closes(dir: Option<PathBuf>) -> Result<(), HoldFailed> {
+    let held = hold::take(dir.as_deref())?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "held")
+        .and_then(|()| stdout.flush())
+        .map_err(HoldFailed::Stdout)?;
+    let mut sink = [0u8; 4096];
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        match stdin.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(HoldFailed::Stdin(e)),
+        }
+    }
+    drop(held);
+    Ok(())
+}
+
 fn main() -> ExitCode {
-    let request = match parse(std::env::args_os().skip(1)) {
-        Ok(request) => request,
+    let command = match parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
         Err(usage) => {
             return match writeln!(std::io::stderr(), "ursula-vfs-host: {usage}\n{USAGE}") {
                 Ok(()) => ExitCode::from(2),
@@ -105,8 +166,17 @@ fn main() -> ExitCode {
             };
         }
     };
-    match print(&inspect(&request)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(_closed) => ExitCode::FAILURE,
+    match command {
+        Command::Inspect(request) => match print(&inspect(&request)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_closed) => ExitCode::FAILURE,
+        },
+        Command::Hold { dir } => match hold_until_stdin_closes(dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                if let Err(_closed) = writeln!(std::io::stderr(), "ursula-vfs-host hold: {e}") {}
+                ExitCode::FAILURE
+            }
+        },
     }
 }

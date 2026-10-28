@@ -62,7 +62,11 @@
 //! An owner `ursula_open` records its cache directory in the host directory, when there is one,
 //! before it claims anything, and fails `local_setup` when it cannot (`hostdir`, design: Hosts).
 //! A host reads every root of the recorded directories, and checks every open root lock, with
-//! [`inspection::inspect`], which the `ursula-vfs-host` binary runs.
+//! [`inspection::inspect`], which the `ursula-vfs-host` binary runs. While a host holds the host
+//! directory's `hold` file ([`hold::take`], `ursula-vfs-host hold`), a write transaction of an
+//! owner binding waits before it takes the WAL write lock, for at most 60 s, so the logs drain.
+//! The wait itself returns no `SQLITE_BUSY` and calls no busy handler; afterwards the request
+//! meets what other writers did meanwhile, as a slow transaction would.
 //!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
@@ -89,6 +93,8 @@
 //! - `generation`: the canonical stream path, a stream's locked root directory and its reader
 //!   directories, and the generations in them (`gen-<id32>` directories).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
+//! - [`hold`]: the host's hold on write transactions: the wait of a write transaction before its
+//!   WAL write lock while a host holds `<host dir>/hold`, and the host's exclusive lock on it.
 //! - `import`: `ursula_import`, a plain SQLite file imported as the first snapshot of a new
 //!   stream.
 //! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
@@ -132,6 +138,7 @@ mod error;
 mod extension;
 mod generation;
 mod guard;
+pub mod hold;
 mod host;
 mod hostdir;
 pub mod ids;

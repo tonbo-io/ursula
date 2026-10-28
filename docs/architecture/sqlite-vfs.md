@@ -1352,19 +1352,70 @@ it as root, so that it can read every root and every process's descriptors. One 
   its next read of at most 64 KiB. It does not bound an open or a read the kernel blocks, such as a FIFO planted in
   place of a segment or a hung mount, so a host also bounds the inspector's run time and treats a
   timeout as incomplete.
-- The binary exits 0 when it printed a result and 2 on a usage error. Paths may be any bytes. The
+- `inspect` exits 0 when it printed a result and 2 on a usage error. Paths may be any bytes. The
   JSON may only grow within a release line.
 
-A read proves nothing about commits made after it. A host freezes everything that may write a root,
-syncs the filesystems, then inspects once, and takes the snapshot only from a complete inspection
-with no unacknowledged byte. That holds when the host directory existed before any process that may
-load the extension ran on the disk, and every filesystem the workload wrote to is mounted at the
-path it was written through. A read while processes run can see a record being written as a torn
-tail, and call a root clean too early. What no read sees is a root no process holds whose cache
-directory is not at a recorded or scanned path in the inspector's view, as the extension does not
-see it either until the root is opened where it now is. A copy of the extension from before the host
-directory records nothing, so its roots are read only while it runs (the lock check) or in a
-directory the host scans.
+While a host holds `hold` in the host directory exclusively (`flock`), write transactions wait
+before they start, so the logs drain before the host freezes the workload. `ursula-vfs-host hold
+[--dir D]` (`hold::take`) takes it, waiting as long as another process holds it, prints `held`, and
+holds it until its stdin closes. Like `inspect`, it uses the compiled-in directory without `--dir`
+and never reads the test hook. It exits 0 once it released the hold, 1 when it cannot take the
+hold or write, and 2 on a usage error. It never creates the file: the host creates `hold` with the
+directory, before the workload starts, and never replaces it. Every user who may run the extension
+must be able to open `hold` read-only, as with a root-owned file of mode 0644: a process that
+cannot open it logs `write_hold_failed` once and never waits.
+
+The extension opens `hold` read-only at a process's first write transaction that may wait,
+through the host directory's descriptor, never through a link and never blocking, and keeps the
+outcome, a file or none, for the life of the process. A missing file is none, and so is one that
+cannot be opened or is not a regular file, logged (`write_hold_failed`).
+
+A write transaction waits in `xShmLock`, before SQLite's request for the WAL write lock goes on,
+when the request comes from the main db handle of a host connection to an owner binding, that
+handle holds a read mark, and the thread holds no other bound database's WAL write lock. SQLite
+asks for the write lock for a write transaction (a write statement, `BEGIN IMMEDIATE` or
+`EXCLUSIVE`) only with a read mark held, while a checkpoint of any mode and a wal-index recovery
+hold none, and a transaction that writes two attached databases never waits while it holds one's
+write lock. The private connection and readers never wait. The waiting thread holds its read mark,
+no binding mutex and no WAL write lock, so it never sits between a logged commit and its
+publication, and readers, checkpoints, `synced()`, status, opens and closes, the replicator, ACK,
+BASE and CLAIM records, trims and snapshots go on: they are the drain.
+
+The wait takes a shared `flock` on the file and releases it at once. While the host holds it, the
+wait tries again every 5 ms, for at most 60 s since the request began. Then the write goes on, the
+process logs `write_hold_expired` and sets a latch, under which a request that finds the hold taken
+goes on at once, until a try finds it free. Any other error goes on, logged once
+(`write_hold_failed`). The wait itself returns no `SQLITE_BUSY` and calls no busy handler.
+Afterwards the request meets what other writers did meanwhile, as a slow transaction would: a
+deferred transaction whose snapshot a commit overtook ends `SQLITE_BUSY_SNAPSHOT`, and the held
+writers of a database all go on at the release, so one with no busy timeout can see `SQLITE_BUSY`.
+The calling thread blocks: a synchronous host such as node:sqlite on Node's main thread stalls its
+event loop until the release or the 60 s. A RESTART or TRUNCATE checkpoint waits for the waiting
+thread's read mark as for any reader, or ends `SQLITE_BUSY` after its busy timeout. With a `hold`
+file a write transaction makes two `flock` calls, and without one it reads the outcome kept.
+
+The hold is advisory. A transaction that took the write lock before the host's lock commits once
+more, and so does one that holds another bound database's write lock. A write lock counts for the
+thread that took it until it is released, on whatever thread, so a connection that moves between
+threads is held as usual. A transaction that writes two attached databases and moves to another
+thread between its two write locks waits at the second while it holds the first, and the other
+writers of the first end `SQLITE_BUSY` after their busy timeout. A copy of the extension from before
+the hold, a SQLite built with `SQLITE_ENABLE_SETLK_TIMEOUT` (which can take the write lock before
+the read mark), and a writer whose 60 s ran out are not held. A host that keeps the hold longer than
+60 s while the workload runs lets the held writers go on.
+
+A read proves nothing about commits made after it. A host takes the hold, waits with `--until-clean`
+while the logs drain, freezes everything that may write a root, syncs the filesystems, then inspects
+once, and takes the snapshot only from a complete inspection with no unacknowledged byte. A commit
+that slipped past the hold shows in that inspection, and the host thaws with the hold kept, waits
+again and freezes for another round. The proof holds when the host directory existed before any
+process that may load the extension ran on the disk, and every filesystem the workload wrote to is
+mounted at the path it was written through. A read while processes run can see a record being
+written as a torn tail, and call a root clean too early. What no read sees is a root no process
+holds whose cache directory is not at a recorded or scanned path in the inspector's view, as the
+extension does not see it either until the root is opened where it now is. A copy of the extension
+from before the host directory records nothing, so its roots are read only while it runs (the lock
+check) or in a directory the host scans.
 
 Tests: `hostdir/tests.rs` `the_default_wins_whenever_lstat_finds_it`,
 `without_the_default_the_hook_decides`, `a_record_names_the_real_path_under_its_hash`,
@@ -1388,14 +1439,26 @@ crash at each step of the record). The inspection: `inspection/tests.rs`
 `a_root_that_cannot_be_looked_at_is_unreadable`, `the_check_of_every_process_needs_root`,
 `replog/tests.rs` `a_fold_past_its_deadline_stops_the_read` and the read's equivalence proptest,
 `test/host.e2e.ts` H6 to H8 and H13 to H15, and CI's `sqlite-vfs-host-musl`, which runs the static
-binary as root against the compiled-in directory. H6: after a crash at each step of the commit path
-and of a checkpoint (both checkpoint modes), of a re-key while bound and at open, of a publish that
-salvages, of a fresh open's first publish, of a trim and of an open's cut of a torn tail, the bytes
-read equal the `commits.pending_bytes` of a reopen with the stream refused, the salvaged commits
-are the same before and after the reopen, and the root drains to clean. The others: unreadable and
-unrecognized states, an inspection that changes no byte or name, an orphan drained by a reopen, an
-unread lock under a cache directory moved or deleted and under a root renamed out of its grammar,
-and a 0.11.0 copy's root read in a scanned directory.
+binary as root against the compiled-in directory, its `hold` included. H6: after a crash at each
+step of the commit path and of a checkpoint (both checkpoint modes), of a re-key while bound and at
+open, of a publish that salvages, of a fresh open's first publish, of a trim and of an open's cut of
+a torn tail, the bytes read equal the `commits.pending_bytes` of a reopen with the stream refused,
+the salvaged commits are the same before and after the reopen, and the root drains to clean. The
+others: unreadable and unrecognized states, an inspection that changes no byte or name, an orphan
+drained by a reopen, an unread lock under a cache directory moved or deleted and under a root
+renamed out of its grammar, and a 0.11.0 copy's root read in a scanned directory. The hold:
+`vfs/tests.rs` `a_write_transaction_waits_while_the_host_holds_the_hold`,
+`the_valve_lets_a_write_go_on_and_latches_until_the_hold_is_free`,
+`only_a_write_transaction_of_the_host_waits_at_the_hold`,
+`a_thread_holding_a_bound_write_lock_does_not_wait_for_another`,
+`a_write_lock_released_on_another_thread_counts_for_the_thread_that_took_it`, `test/host.e2e.ts` H9
+(a writer committing every 5 ms with `busy_timeout` 0 stops within one transaction with no error and
+drains to clean within 1.5 s, while reads, `synced()`, a snapshot and a FULL checkpoint go on, and
+resumes after the release), H10 (the host's sequence with SIGSTOP as the freeze proves clean and a
+fresh build of the stream holds every commit the writer made, and a transaction that held the write
+lock before the hold takes a second round), H11 (with the stream blackholed the bytes stay in the
+proof, and drain once it answers), and the `sqlite-vfs-perf` run with a `hold` file present, which
+checks that the extension opened it.
 
 ## API
 
@@ -1815,7 +1878,9 @@ since neither e2e server checks tokens.
   Events include `open`, `provisional`, `live`, `rekey`, `salvaged`, `reset`, `recut`, `log_cut`,
   `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`,
   `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`, `setting_adjusted`,
-  `host_dir_unreadable` (the host directory's path cannot be read, so it counts as absent) and
+  `host_dir_unreadable` (the host directory's path cannot be read, so it counts as absent),
+  `write_hold_expired` (a write transaction waited 60 s at the host's hold and went on),
+  `write_hold_failed` (the hold file could not be opened or tried, so writes do not wait) and
   `panic`.
 - Alert on a growing `commits.pending_bytes`, any `replication.condition` that stays, refused
   writes, any reset, and a `snapshot.log_bytes` that stays above a few times `due_bytes`.
@@ -1899,12 +1964,14 @@ What CI runs (`.github/workflows/integration.yml`):
   (the replicator world, the log codec, materialization, the frame and snapshot codecs), on Linux
   and macOS.
 - `sqlite-vfs-host-musl`: `ursula-vfs-host` built for x64 Linux with musl and linked statically,
-  as a host ships it, and run once.
+  as a host ships it, and run as root against the compiled-in host directory, `inspect` and
+  `hold`.
 - `sqlite-vfs-e2e`: every e2e suite against the model server (`E2E_SERVER=model`) on Node 22.19.0
   and Node 22, and Pi conformance on the oldest supported Pi.
 - `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store (with `test/history-real.e2e.ts`) and three nodes behind the gateway with no cold tier (with `test/failover.e2e.ts`). Both report, without asserting, the open time of a fresh build, a stale catch-up and a stale rebuild from `test/stale.e2e.ts` in the job summary, at 1 MiB and, on one node, 16 MiB. That suite prints its seed, and `STALE_SEED` replays it.
 - `sqlite-vfs-e2e-ursula-parts`: `test/parts.e2e.ts`, `test/import.e2e.ts` and the snapshot-parts cases of `test/core.e2e.ts` (`-t "in parts"`) against three nodes behind a gateway started with `--max-request-body-bytes 4194304` (`E2E_GATEWAY_MAX_REQUEST_BYTES`), with the CI S3 as the cold store (`.github/actions/ci-s3`: AWS S3 on same-repo pull requests and main, MinIO otherwise). The gateway lowers HEAD's `Ursula-Max-Request-Bytes` to 4 MiB and passes the node's `Ursula-Max-Snapshot-Bytes` through, and the test setup refuses to start unless HEAD shows both, so every snapshot above 4 MiB goes up in parts through the gateway and is read back in 4 MiB ranges. 4 MiB is also the client's batch cap, so PART runs keep their sizes. Of the sqlite-vfs e2e jobs, only it has `id-token: write`, and it installs the package with `npm ci --ignore-scripts`. A suite that needs three nodes, the gateway and a cold store joins this job through its `SUITES` list.
-- `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)). It fails when the VFS's
+- `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
+  with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
 - `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a 600 s outage, daily, on pushes
   to main that change `clients/sqlite-vfs` or `clients/sqlite-ursula`, and by hand. It does not run
@@ -1965,7 +2032,9 @@ The commit benchmark (`bench/commit.ts`) runs Pi-shaped transactions (an entry r
 and a head row) in one process, alternating rounds of two arms: B1, plain node:sqlite on a local
 file in WAL mode with `synchronous=NORMAL`, and the VFS through `open()`, replicating in the
 background. A last phase times `await db.synced()` after one commit at a time. CI fails the run
-when the VFS's commit p50 exceeds B1's by more than 0.5 ms.
+when the VFS's commit p50 exceeds B1's by more than 0.5 ms. With `BENCH_HOLD=1` the VFS arm runs
+with a host directory holding a `hold` file no host takes, so each write transaction tries the hold
+([Hosts](#hosts)).
 
 5,000 commits per arm against the model server on the same host (darwin-arm64, Node 22.22.1):
 
