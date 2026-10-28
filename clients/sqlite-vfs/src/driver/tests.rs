@@ -6622,17 +6622,19 @@ fn a_drain_open_continues_its_roots_claim_while_the_stream_answers() {
     let mut w = World::new();
     let (generation, own, x) = orphan(&mut w, dir.path(), 1, false);
     let c = w.core();
+    // The claims wait, so the binding is seen before any of them is answered.
+    w.hold_sends = Some(Box::new(|request| request.method == Method::Post));
     let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
     assert!(bound.handle.provisional());
     assert_eq!(bound.handle.generation.dir, generation);
     assert_eq!(bound.handle.attach, Attach::Resumed);
     assert_eq!(bound.handle.role, Role::Owner);
-    // The open's HEAD, then the pre-check's, before anything else.
-    assert_eq!(
-        methods(&w, c).get(..2),
-        Some(&[Method::Head, Method::Head][..])
-    );
+    // The open's HEAD, then the pre-check's HEAD and reads, before anything else.
+    let sent = methods(&w, c);
+    assert_eq!(sent.get(..2), Some(&[Method::Head, Method::Head][..]));
+    assert!(sent.iter().all(|m| matches!(m, Method::Head | Method::Get)));
     hand_back(&mut w, c, &bound);
+    w.release_sends();
     w.run_for(10_000);
     assert!(w.resets(c).is_empty(), "{:?}", w.resets(c));
     assert!(retired(&w, c, &bound));
