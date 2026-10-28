@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { DEFAULT_OPEN_MS, reasonOf } from "./abort.ts";
-import { actionOf, type TonboKind, type UnavailableKind, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
+import { type TonboKind, type UnavailableKind, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { type OpenOptions, open as openStream, type UrsulaDatabase } from "./index.ts";
 import { MAX_TIMER_MS, type TokenProvider, USABLE } from "./token.ts";
 
@@ -86,7 +86,7 @@ export class TonboError extends UrsulaError {
 	/** The Tonbo API's request id of the answer that failed, for support. */
 	readonly requestId: string | undefined;
 	constructor(what: string, kind: TonboKind, fix: string, requestId?: string, cause?: unknown) {
-		super(`${kind}: ${what}${requestId === undefined ? "" : ` (request ${requestId})`}. ${fix}`, kind, actionOf(kind), cause);
+		super(`${kind}: ${what}${requestId === undefined ? "" : ` (request ${requestId})`}. ${fix}`, kind, "fix", cause);
 		this.name = "TonboError";
 		this.fix = fix;
 		this.requestId = requestId;

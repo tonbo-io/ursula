@@ -8,9 +8,10 @@
 //
 // Module map:
 //
-// - control.ts: the extension's control connection on this thread, and calls of its SQL functions.
-// - errors.ts: the four error classes, and `classify`, the one mapping from a failure of the
-//   extension to them, which the root entry and the Pi adapter share.
+// - control.ts: the extension's control connection on this thread, calls of its SQL functions, and
+//   `classify`, which asks the extension (`ursula_classify`) what a failure is.
+// - errors.ts: the four error classes, and `errorOf`, the error of a failure the extension
+//   classified, which the root entry and the Pi adapter share.
 // - database.ts: the database `open` returns, a node:sqlite DatabaseSync with `synced()`, `status()`
 //   and the `reset` listeners, whose statements classify their errors.
 // - gate.ts: `gate`, which hands a unit of work's outcome, and a returned Response's body chunk by
@@ -30,7 +31,7 @@ import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
 import { DEFAULT_OPEN_MS, raced, reasonOf } from "./abort.ts";
-import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
+import { errorOf, type Named, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
 import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
 
@@ -243,14 +244,14 @@ async function bind(stream: string, dir: string | undefined, json: string, until
 
 /** The signal fired: cancels `request`, and the error is the last condition it met, or `cancelled`. */
 function giveUp(stream: string, request: number, signal: AbortSignal): UrsulaError {
-	let ended: { kind: string; message: string } | null = null;
+	let ended: (Named & { message: string }) | null = null;
 	try {
-		ended = call<{ kind: string; message: string } | null>("SELECT ursula_cancel(?)", request);
+		ended = call<(Named & { message: string }) | null>("SELECT ursula_cancel(?)", request);
 	} catch {
 		// It resolved meanwhile and its result was taken.
 	}
 	if (ended === null || ended.kind === "cancelled") return marked(cancelled(stream, signal));
-	return marked(errorOf(ended.kind, `${ended.message}: the open of ${stream} gave up when its signal fired`, signal.reason, false));
+	return marked(errorOf(ended, `${ended.message}: the open of ${stream} gave up when its signal fired`, signal.reason));
 }
 
 const marked = <E extends UrsulaError>(error: E): E => {

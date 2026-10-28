@@ -24,6 +24,7 @@ use crate::driver::OpenId;
 use crate::driver::SyncError;
 use crate::driver::runtime::driver;
 use crate::error::Error;
+use crate::error::classify;
 use crate::guard::contain;
 use crate::host::API;
 use crate::host::OK;
@@ -343,6 +344,33 @@ unsafe fn fn_set_token(
     unsafe { result(ctx, "ursula_set_token", outcome.as_ref().map(Clone::clone)) };
 }
 
+/// `ursula_classify(message, errcode, path)` (design: Errors): what a failure a host met is, as
+/// `{kind, action, class, message, fix, request_id}`, or `null` when it is not the extension's.
+/// `message` and `errcode` are SQLite's for the failure: a SQL function's error, or a statement's
+/// on the database at `path` (NULL or `''` for none), whose state names an I/O error.
+unsafe fn fn_classify(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let message = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let errcode = unsafe { arg_int(argc, argv, 1) }.unwrap_or(0);
+    // SAFETY: as above.
+    let path = unsafe { arg(argc, argv, 2) };
+    let classified = classify(&message, errcode, || {
+        if path.is_empty() {
+            None
+        } else {
+            db::failure_state(&path)
+        }
+    });
+    let json = classified.map_or_else(|| "null".to_owned(), |c| status::classified_json(&c));
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_classify", Ok(json)) };
+}
+
 /// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
 /// panic in it ends the call with an error instead of unwinding into SQLite, which aborts the host
 /// process.
@@ -376,6 +404,7 @@ sql_entry!(c_status => fn_status, "ursula_status");
 sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
 sql_entry!(c_import => fn_import, "ursula_import");
+sql_entry!(c_classify => fn_classify, "ursula_classify");
 
 /// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
 /// over "unix" as the default (once per process) and the SQL functions on `db`, direct-only: a
@@ -462,7 +491,7 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 8] = [
+    let fns: [(&CStr, c_int, SqlFn); 9] = [
         (c"ursula_open", 4, c_ursula_open),
         (c"ursula_synced", 2, c_synced),
         (c"ursula_events", 2, c_events),
@@ -471,6 +500,7 @@ unsafe fn init(
         (c"ursula_stats", 1, c_stats),
         (c"ursula_set_token", 2, c_set_token),
         (c"ursula_import", 4, c_import),
+        (c"ursula_classify", 3, c_classify),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the

@@ -2,7 +2,9 @@
 // in the cache root argv[4] with `ursula_open`, opens the database with plain node:sqlite, prints
 // `{"opened": <ursula_open's result>}` (or `{"error": ...}`), then runs one JSON command per stdin
 // line and prints one JSON line for each:
-//   {"exec": sql} | {"all": sql} -> {"ok": true[, "rows"]} or {"ok": false, "error", "errcode"}
+//   {"exec": sql} | {"all": sql} -> {"ok": true[, "rows"]} or {"ok": false, "error", "errcode",
+//   "classified"}, `classified` being what `ursula_classify` makes of the failure on the database
+//   the command ran on (`null` for SQLite's own failures)
 //   {"status": true} | {"synced": ms} | {"events": true} -> the function's JSON
 //   {"close": true} closes the database, {"exit": true} exits.
 //   {"outside": vfs, "sql": [statements]} opens the database's file as `file:<path>?vfs=<vfs>`,
@@ -33,6 +35,8 @@ const control = new DatabaseSync(":memory:", { allowExtension: true });
 control.loadExtension(ext);
 const call = (sql, ...args) => JSON.parse(Object.values(control.prepare(sql).get(...args))[0]);
 const failure = (error) => ({ ok: false, error: String(error), errcode: error.errcode });
+/** What `ursula_classify` makes of `error`, a statement's on the database at `path` or a SQL function's. */
+const classified = (error, path) => call("SELECT ursula_classify(?, ?, ?)", String(error?.message ?? error), error?.errcode ?? null, path ?? null);
 
 let opened;
 try {
@@ -141,6 +145,6 @@ for await (const line of createInterface({ input: process.stdin })) {
 			process.exit(0);
 		}
 	} catch (error) {
-		say(failure(error));
+		say({ ...failure(error), classified: classified(error, cmd.conn === 3 ? reopened?.path : opened.path) });
 	}
 }

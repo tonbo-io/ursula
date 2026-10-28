@@ -1,17 +1,12 @@
-// The errors the package throws (design: Errors), the SQLite result codes they map from, and the
-// one mapping from a failure of the extension to them (`classify`). Shared by the root entry and
-// the Pi adapter (pi.ts). The error classes and the types of their fields are public.
+// The errors the package throws (design: Errors), and the one constructor of the error of a failure
+// the extension classified (`errorOf`). Which failure is which error is the extension's to say
+// (`ursula_classify`, control.ts `classify`): its kind, action and class. Shared by the root entry
+// and the Pi adapter (pi.ts). The error classes and the types of their fields are public. A
+// constructor's default action, which its class's documentation lists, serves an error the
+// application makes, such as a token provider's: the package passes the extension's.
 
 /** SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function. */
 export const SQLITE_ERROR = 1;
-/** SQLITE_IOERR, the primary code (`errcode & 0xff`) of every I/O error. */
-export const SQLITE_IOERR = 10;
-/** SQLITE_IOERR_READ: a statement of a database that was reset, which reads. */
-export const SQLITE_IOERR_READ = 266;
-/** SQLITE_IOERR_WRITE: a statement of a database that was reset, which writes. */
-export const SQLITE_IOERR_WRITE = 778;
-/** SQLITE_IOERR_AUTH: a write refused with nothing committed (`backlog_full`, `unsupported`, `too_large`). */
-export const SQLITE_IOERR_AUTH = 7178;
 
 /** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
 export function errcode(error: unknown): number | undefined {
@@ -68,50 +63,15 @@ export type TonboKind = "missing_credentials" | "credentials_refused" | "invalid
 
 export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind | TonboKind;
 
-const WRITE_REFUSED_KINDS: ReadonlySet<string> = new Set<WriteRefusedKind>(["backlog_full", "unsupported", "too_large"]);
-const RESET_KINDS: ReadonlySet<string> = new Set<ResetKind>(["fenced", "stale", "rewound", "deleted", "local_damage", "stream_state", "internal"]);
-const UNAVAILABLE_KINDS: ReadonlySet<string> = new Set<UnavailableKind>(["unreachable", "unavailable", "rate_limited", "unauthorized", "payment_required", "forbidden", "cancelled"]);
-
-/** Each kind's action: `ErrorKind::action` and `reset_action` in clients/sqlite-vfs/src/error.rs. */
-const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaErrorAction>([
-	["backlog_full", "retry"],
-	["unsupported", "fix"],
-	["too_large", "fix"],
-	["fenced", "stop"],
-	["stale", "reopen"],
-	["rewound", "reopen"],
-	["deleted", "fix"],
-	["local_damage", "reopen"],
-	["stream_state", "fix"],
-	["internal", "reopen"],
-	["unreachable", "retry"],
-	["unavailable", "retry"],
-	["rate_limited", "retry"],
-	["cancelled", "retry"],
-	["claim_races", "retry"],
-	["in_use", "retry"],
-	["unauthorized", "fix"],
-	["payment_required", "fix"],
-	["forbidden", "fix"],
-	["wrong_cluster", "fix"],
-	["invalid_argument", "fix"],
-	["invalid_url", "fix"],
-	["invalid_name", "fix"],
-	["not_found", "fix"],
-	["local_setup", "fix"],
-	["stream_format", "fix"],
-	["no_server_identity", "fix"],
-	["protocol_mismatch", "fix"],
-	["not_bound", "fix"],
-	["bound_elsewhere", "fix"],
-	["missing_credentials", "fix"],
-	["credentials_refused", "fix"],
-	["invalid_api_key", "fix"],
-	["database_not_found", "fix"],
-]);
-
-/** The action of `kind`, `fix` for a kind this package does not know (a newer extension's). */
-export const actionOf = (kind: string): UrsulaErrorAction => ACTIONS.get(kind) ?? "fix";
+/**
+ * A failure as the extension names it, in `ursula_classify`'s result, in events and in status:
+ * its kind, what to do, and the error to throw (`write_refused`, `reset`, `unavailable` or `setup`).
+ */
+export interface Named {
+	readonly kind: string;
+	readonly action: string;
+	readonly class: string;
+}
 
 /**
  * A failure of the extension or of an open: the base class of every error the package throws.
@@ -153,8 +113,8 @@ export class UrsulaError extends Error {
  */
 export class UrsulaWriteRefusedError extends UrsulaError {
 	declare readonly kind: WriteRefusedKind;
-	constructor(message: string, kind: WriteRefusedKind, cause: unknown) {
-		super(message, kind, actionOf(kind), cause);
+	constructor(message: string, kind: WriteRefusedKind, cause: unknown, action: UrsulaErrorAction = kind === "backlog_full" ? "retry" : "fix") {
+		super(message, kind, action, cause);
 		this.name = "UrsulaWriteRefusedError";
 	}
 }
@@ -167,8 +127,8 @@ export class UrsulaWriteRefusedError extends UrsulaError {
  */
 export class UrsulaResetError extends UrsulaError {
 	declare readonly kind: ResetKind;
-	constructor(message: string, kind: ResetKind, cause?: unknown) {
-		super(message, kind, actionOf(kind), cause);
+	constructor(message: string, kind: ResetKind, cause?: unknown, action: UrsulaErrorAction = kind === "fenced" ? "stop" : kind === "deleted" || kind === "stream_state" ? "fix" : "reopen") {
+		super(message, kind, action, cause);
 		this.name = "UrsulaResetError";
 	}
 }
@@ -180,7 +140,7 @@ export class UrsulaResetError extends UrsulaError {
  */
 export class UrsulaUnavailableError extends UrsulaError {
 	declare readonly kind: UnavailableKind;
-	constructor(message: string, kind: UnavailableKind, cause?: unknown, action: UrsulaErrorAction = actionOf(kind)) {
+	constructor(message: string, kind: UnavailableKind, cause?: unknown, action: UrsulaErrorAction = kind === "unauthorized" || kind === "payment_required" || kind === "forbidden" ? "fix" : "retry") {
 		super(message, kind, action, cause);
 		this.name = "UrsulaUnavailableError";
 	}
@@ -192,87 +152,27 @@ export class UrsulaUnavailableError extends UrsulaError {
  */
 export class UrsulaSetupError extends UrsulaError {
 	declare readonly kind: SetupKind;
-	constructor(message: string, kind: SetupKind, cause?: unknown) {
-		super(message, kind, actionOf(kind), cause);
+	constructor(message: string, kind: SetupKind, cause?: unknown, action: UrsulaErrorAction = kind === "in_use" || kind === "claim_races" ? "retry" : kind === "internal" ? "reopen" : "fix") {
+		super(message, kind, action, cause);
 		this.name = "UrsulaSetupError";
 	}
 }
 
 /**
- * The error of `kind` with `message`. `fromSync` says the failure is a statement's or `synced()`'s,
- * where `stream_state` and `internal` are resets; for `open()` they are setup errors.
+ * The error of a failure the extension named (`named`), with `message` and `cause`: its class picks
+ * the error, and its action is the extension's.
  */
-export function errorOf(kind: string, message: string, cause: unknown, fromSync: boolean): UrsulaError {
-	if (WRITE_REFUSED_KINDS.has(kind)) return new UrsulaWriteRefusedError(message, kind as WriteRefusedKind, cause);
-	if (RESET_KINDS.has(kind) && (fromSync || (kind !== "stream_state" && kind !== "internal"))) return new UrsulaResetError(message, kind as ResetKind, cause);
-	if (UNAVAILABLE_KINDS.has(kind)) return new UrsulaUnavailableError(message, kind as UnavailableKind, cause);
-	return new UrsulaSetupError(message, kind as SetupKind, cause);
-}
-
-/** An Ursula SQL function's error: `<function>: <kind>: <message>`. */
-const FUNCTION_ERROR = /^(ursula_[a-z_]+): ([a-z_]+): /;
-
-/** The error for `error` when it is an Ursula SQL function's, `undefined` otherwise. */
-function functionError(error: unknown): UrsulaError | undefined {
-	if (errcode(error) !== SQLITE_ERROR || !(error instanceof Error)) return undefined;
-	const named = FUNCTION_ERROR.exec(error.message);
-	if (named === null) return undefined;
-	const [, fn, kind] = named as unknown as [string, string, string];
-	// An import that got no definite answer may have claimed the stream, which then refuses opens
-	// and imports: a retry into it fails, so fix (check the stream, delete or recreate it).
-	if (fn === "ursula_import" && UNAVAILABLE_KINDS.has(kind)) return new UrsulaUnavailableError(error.message, kind as UnavailableKind, error, "fix");
-	return errorOf(kind, error.message, error, fn !== "ursula_open" && fn !== "ursula_cancel" && fn !== "ursula_import");
-}
-
-/** The fields of `ursula_status` that {@link classify} reads. */
-export interface FailureStatus {
-	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
-	readonly reset: { readonly kind: string; readonly action: string } | null;
-}
-
-/**
- * What to throw for `error`, which a statement or an Ursula SQL function threw: an
- * {@link UrsulaError} when the extension failed it, and `error` itself, unchanged, otherwise (a
- * constraint violation, a syntax error). An Ursula SQL function's error names its kind. A statement's
- * failure surfaces as one of SQLite's I/O errors, which says nothing: then, and only then, `status`
- * reads the database's status, which names it. SQLITE_IOERR_AUTH is a refused write
- * (`status.refused`), 266 and 778 are a reset (`status.reset`). A status that throws, or that names
- * nothing, leaves `error` as it is: the failure was another database's, one used through SQL
- * `ATTACH DATABASE`.
- */
-export function classify(error: unknown, status?: () => FailureStatus): unknown {
-	if (error instanceof UrsulaError) return error;
-	const named = functionError(error);
-	if (named !== undefined) return named;
-	const code = errcode(error);
-	if (code === undefined || status === undefined || (code & 0xff) !== SQLITE_IOERR) return error;
-	let s: FailureStatus;
-	try {
-		s = status();
-	} catch {
-		return error;
-	}
-	if (s.reset !== null) {
-		const kind = s.reset.kind;
-		const what = code === SQLITE_IOERR_WRITE ? "write" : code === SQLITE_IOERR_READ ? "read" : "statement";
-		return errorOf(kind, `${what} refused, the database was reset (${kind}): ${advice(actionOf(kind))}`, error, true);
-	}
-	if (code === SQLITE_IOERR_AUTH && s.refused !== null) {
-		const kind = s.refused.kind;
-		return errorOf(kind, `${s.refused.message}. ${refusedAdvice(kind)}`, error, true);
-	}
-	return error;
-}
-
-/** What to do, in words, about a refused write. */
-function refusedAdvice(kind: string): string {
-	switch (kind) {
-		case "backlog_full":
-			return "Nothing was committed: await synced(), then run the transaction again.";
-		case "too_large":
-			return "Nothing was committed: split the transaction, or raise URSULA_VFS_MAX_COMMIT_BYTES.";
+export function errorOf(named: Named, message: string, cause: unknown): UrsulaError {
+	const action = named.action as UrsulaErrorAction;
+	switch (named.class) {
+		case "write_refused":
+			return new UrsulaWriteRefusedError(message, named.kind as WriteRefusedKind, cause, action);
+		case "reset":
+			return new UrsulaResetError(message, named.kind as ResetKind, cause, action);
+		case "unavailable":
+			return new UrsulaUnavailableError(message, named.kind as UnavailableKind, cause, action);
 		default:
-			return "Nothing was committed.";
+			return new UrsulaSetupError(message, named.kind as SetupKind, cause, action);
 	}
 }
 
@@ -310,18 +210,4 @@ export function findWrapped<T>(error: unknown, match: (error: object) => T | und
 		if ("cause" in next) pending.push(next.cause);
 	}
 	return undefined;
-}
-
-/**
- * {@link classify} for an error a library may have wrapped: the first error of the chain
- * {@link findWrapped} walks that maps to an {@link UrsulaError} is the result, so a failure of the
- * extension never passes for the wrapper's own kind of error. `error` itself otherwise.
- */
-export function classifyWrapped(error: unknown, status: () => FailureStatus): unknown {
-	return (
-		findWrapped(error, (next) => {
-			const classified = classify(next, status);
-			return classified instanceof UrsulaError ? classified : undefined;
-		}) ?? error
-	);
 }
