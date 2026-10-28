@@ -12,8 +12,10 @@
 //! - A failure another try is unlikely to fix (the key refused, a status the exchange cannot use,
 //!   a panic inside the exchange) is retried only at the longest backoff, 15 to 30 s. A host
 //!   waiting for a token fails at once, and a host's next use of the key tries again at once
-//!   ([`Schedule::wanted`]). Such a key no longer serves ([`Schedule::serves`]): another may take
-//!   its place.
+//!   ([`Schedule::wanted`]).
+//! - A key refused (`401`, `403`) no longer serves until an exchange gives it a token
+//!   ([`Schedule::serves`]): its token is no longer valid, so no host is handed it, and another
+//!   key may take its place. Other failures leave a key serving with its last token.
 //! - A `401` to the token held brings its refresh forward to at once, still at least
 //!   [`MIN_REFRESH_MS`] after it arrived, and the token no longer counts as valid. Tokens refused
 //!   one after another back off as failed exchanges do, and a token that served until its refresh
@@ -84,7 +86,7 @@ impl std::fmt::Debug for Token {
     }
 }
 
-/// The token the source holds.
+/// A token of the key's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Held {
     token: Token,
@@ -92,6 +94,18 @@ struct Held {
     expires_ms: u64,
     /// A request was refused `401` under it.
     refused: bool,
+}
+
+/// The token the source holds, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Holding {
+    /// No token yet.
+    Empty,
+    /// The last token of the key this one took the place of, carried until this key's first
+    /// token ([`Schedule::after`]), never as valid.
+    Inherited(Token),
+    /// A token of the key's own.
+    Own(Held),
 }
 
 /// What the source does next.
@@ -108,14 +122,14 @@ enum Phase {
 struct Failing {
     count: u32,
     last: ExchangeError,
+    /// One of them was refused (`401`, `403`): the key no longer serves until a token arrives.
+    refused: bool,
 }
 
 /// One key's schedule.
 #[derive(Debug, Clone)]
 pub(crate) struct Schedule {
-    held: Option<Held>,
-    /// The last token of the key this one took the place of, carried until this key's first token.
-    inherited: Option<Token>,
+    holding: Holding,
     phase: Phase,
     failing: Option<Failing>,
     /// Tokens refused `401` one after another, each before its refresh came due.
@@ -168,8 +182,7 @@ impl Schedule {
     /// A new source: its first exchange is due at once.
     pub(crate) fn new(now_ms: u64) -> Self {
         Self {
-            held: None,
-            inherited: None,
+            holding: Holding::Empty,
             phase: Phase::Due { at_ms: now_ms },
             failing: None,
             refusals: 0,
@@ -182,33 +195,46 @@ impl Schedule {
     /// request without a token would be taken for a missing stream, one with a stale token is
     /// refused `401` and retried.
     pub(crate) fn after(previous: &Schedule, now_ms: u64) -> Self {
+        let holding = match previous.token() {
+            Some(token) => Holding::Inherited(Token(token.to_owned())),
+            None => Holding::Empty,
+        };
         Self {
-            inherited: previous.token().map(|t| Token(t.to_owned())),
+            holding,
             ..Self::new(now_ms)
+        }
+    }
+
+    /// The key's own token, if it got one.
+    fn own(&self) -> Option<&Held> {
+        match &self.holding {
+            Holding::Own(held) => Some(held),
+            Holding::Empty | Holding::Inherited(_) => None,
         }
     }
 
     /// The token requests carry: the last one handed out, kept while exchanges fail, else the one
     /// inherited ([`Schedule::after`]).
     pub(crate) fn token(&self) -> Option<&str> {
-        self.held
-            .as_ref()
-            .map(|h| &h.token)
-            .or(self.inherited.as_ref())
-            .map(|t| t.0.as_str())
+        match &self.holding {
+            Holding::Own(Held { token, .. }) | Holding::Inherited(token) => Some(token.0.as_str()),
+            Holding::Empty => None,
+        }
     }
 
-    /// Whether a token of the key is held that has not expired and was not refused `401`.
+    /// Whether a token of the key is held that has not expired and was not refused `401`, while
+    /// the key serves ([`Schedule::serves`]).
     pub(crate) fn valid(&self, now_ms: u64) -> bool {
-        self.held
-            .as_ref()
-            .is_some_and(|h| h.expires_ms > now_ms && !h.refused)
+        self.serves()
+            && self
+                .own()
+                .is_some_and(|h| h.expires_ms > now_ms && !h.refused)
     }
 
-    /// Whether requests can carry a token of the key: one is held, and the last exchange did not
-    /// fail in a way another try is unlikely to fix.
+    /// Whether requests can carry a token of the key: one is held, and no exchange was refused
+    /// since it arrived. Other failures leave the key serving with its last token.
     pub(crate) fn serves(&self) -> bool {
-        self.held.is_some() && !self.failing.as_ref().is_some_and(|f| f.last.permanent())
+        self.own().is_some() && !self.failing.as_ref().is_some_and(|f| f.refused)
     }
 
     /// Exchanges that ended so far.
@@ -235,7 +261,7 @@ impl Schedule {
         match self.phase {
             Phase::Due { at_ms } if active && at_ms <= now_ms => {
                 // A token that served until its refresh without a 401 ends a run of refusals.
-                if self.held.as_ref().is_some_and(|h| !h.refused) {
+                if self.own().is_some_and(|h| !h.refused) {
                     self.refusals = 0;
                 }
                 self.phase = Phase::Exchanging;
@@ -274,13 +300,12 @@ impl Schedule {
         match outcome {
             Ok(Exchanged { token, lifetime_ms }) => {
                 let changed = self.token() != Some(token.as_str());
-                self.held = Some(Held {
+                self.holding = Holding::Own(Held {
                     token: Token(token),
                     arrived_ms: now_ms,
                     expires_ms: now_ms.saturating_add(lifetime_ms),
                     refused: false,
                 });
-                self.inherited = None;
                 self.failing = None;
                 self.phase = Phase::Due {
                     at_ms: now_ms.saturating_add(refresh_after(lifetime_ms, jitter)),
@@ -292,6 +317,8 @@ impl Schedule {
                     .failing
                     .as_ref()
                     .map_or(1, |f| f.count.saturating_add(1));
+                let refused = matches!(last, ExchangeError::Refused { .. })
+                    || self.failing.as_ref().is_some_and(|f| f.refused);
                 let wait = if last.permanent() {
                     jittered(MAX_RETRY_MS, jitter)
                 } else {
@@ -303,7 +330,11 @@ impl Schedule {
                 self.phase = Phase::Due {
                     at_ms: now_ms.saturating_add(wait),
                 };
-                self.failing = Some(Failing { count, last });
+                self.failing = Some(Failing {
+                    count,
+                    last,
+                    refused,
+                });
                 false
             }
         }
@@ -312,13 +343,12 @@ impl Schedule {
     /// A request carrying `token` was refused `401`. Returns whether the next exchange moved
     /// earlier.
     pub(crate) fn refused(&mut self, token: &str, now_ms: u64, jitter: Jitter) -> bool {
-        let Some(held) = self
-            .held
-            .as_mut()
-            .filter(|h| h.token.0 == token && !h.refused)
-        else {
+        let Holding::Own(held) = &mut self.holding else {
             return false;
         };
+        if held.token.0 != token || held.refused {
+            return false;
+        }
         // The token is no longer valid whatever the schedule does: no host is handed it.
         held.refused = true;
         let arrived_ms = held.arrived_ms;
@@ -357,7 +387,7 @@ impl Schedule {
     }
 
     pub(crate) fn view(&self, now_ms: u64) -> KeyView {
-        let state = match (&self.phase, &self.failing, &self.held) {
+        let state = match (&self.phase, &self.failing, self.own()) {
             (Phase::Exchanging, ..) => KeyState::Exchanging,
             (_, Some(_), _) => KeyState::Failing,
             (_, None, None) => KeyState::Pending,
@@ -366,10 +396,7 @@ impl Schedule {
         };
         KeyView {
             state,
-            expires_in_ms: self
-                .held
-                .as_ref()
-                .map(|h| h.expires_ms.saturating_sub(now_ms)),
+            expires_in_ms: self.own().map(|h| h.expires_ms.saturating_sub(now_ms)),
             refresh_in_ms: match self.phase {
                 Phase::Due { at_ms } => Some(at_ms.saturating_sub(now_ms)),
                 Phase::Exchanging => None,
@@ -612,9 +639,10 @@ mod tests {
         assert_eq!(s.view(50_000).state, KeyState::Fresh);
     }
 
-    // A failure another try is unlikely to fix is retried only at the longest backoff, and the
-    // key no longer serves. A host's use tries again at once, and leaves a passing failure's retry
-    // and a healthy schedule to their times.
+    // A failure another try is unlikely to fix is retried only at the longest backoff. A refused
+    // key no longer serves and hands out no token until one arrives, whatever fails meanwhile. A
+    // host's use tries again at once, and leaves a passing failure's retry and a healthy schedule
+    // to their times.
     #[test]
     fn a_refused_key_retries_slowly_until_a_host_uses_it_again() {
         let mut s = Schedule::new(0);
@@ -624,6 +652,10 @@ mod tests {
         assert!(!s.exchanged(Err(ExchangeError::Refused { status: 401 }), 70_000, HIGH));
         assert_eq!(s.deadline(true), Some(100_000), "the longest backoff");
         assert!(!s.serves(), "its token is no longer one requests can carry");
+        assert!(
+            !s.valid(80_000),
+            "nor one a host is handed, though unexpired"
+        );
         assert_eq!(s.token(), Some("t1"), "kept");
         let view = s.view(80_000);
         assert_eq!(view.state, KeyState::Failing);
@@ -631,6 +663,7 @@ mod tests {
         assert!(s.start(100_000, true));
         assert!(!s.exchanged(Err(ExchangeError::Panicked), 100_000, LOW));
         assert_eq!(s.deadline(true), Some(115_000), "jittered down to half");
+        assert!(!s.serves(), "refused until a token arrives");
         s.wanted(101_000);
         assert_eq!(
             s.deadline(true),
@@ -653,6 +686,29 @@ mod tests {
         assert_eq!(passing.deadline(true), Some(1_000));
         passing.wanted(200);
         assert_eq!(passing.deadline(true), Some(1_000), "the backoff holds");
+    }
+
+    // A failure other than a refusal, even one another try is unlikely to fix, leaves the key
+    // serving: its unexpired token is handed out, and a host's use still tries again at once.
+    #[test]
+    fn only_a_refusal_stops_a_key_serving() {
+        for failure in [
+            ExchangeError::Unexpected { status: 404 },
+            ExchangeError::Panicked,
+            ExchangeError::Unavailable { status: 503 },
+        ] {
+            let mut s = Schedule::new(0);
+            assert!(s.start(0, true));
+            assert!(s.exchanged(token("t1", 100_000), 0, LOW));
+            assert!(s.start(70_000, true));
+            let permanent = failure.permanent();
+            assert!(!s.exchanged(Err(failure), 70_000, HIGH));
+            assert!(s.serves());
+            assert!(s.valid(80_000), "its token is handed out until it expires");
+            s.wanted(80_000);
+            let retry = if permanent { 80_000 } else { 71_000 };
+            assert_eq!(s.deadline(true), Some(retry));
+        }
     }
 
     // A 401 while a retry is scheduled or an exchange is out leaves the schedule alone, but the

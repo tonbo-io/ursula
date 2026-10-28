@@ -651,7 +651,9 @@ Tests:
     expired or not. A host waiting for a token does not cut the backoff short.
   - A key refused (`401`, `403`), a status the exchange cannot use (a redirect, another `4xx`) or
     a panic inside the exchange is retried only every 15 to 30 s. A host waiting for a token fails
-    at once, and a host's next use of the key tries again at once.
+    at once, and a host's next use of the key tries again at once. A refused key hands no host
+    its token, even an unexpired one, until an exchange gives it a new one. Other failures leave
+    the last token serving.
   - The first failure of a run logs `token_exchange_failed`, and so does the first failure in it
     that is one of those (`permanent=true`). The token that ends the run logs
     `token_exchange_recovered`.
@@ -663,9 +665,9 @@ Tests:
   - The process holds one key. Another one is refused while a host waits for the key's token or
     was handed one less than 60 s ago (it asks for its open meanwhile), and while an open, a bound
     database or an import may send requests that can carry its token, since they would all carry
-    the other key's tokens from then on. A key that never got a token, or whose last exchange was
-    refused or failed as above, gives way. The key in its place carries the last token of the key
-    it replaced until its own first one, so requests already out never go without a token.
+    the other key's tokens from then on. A key that never got a token, or was refused since its
+    last token arrived, gives way. The key in its place carries the last token of the key it
+    replaced until its own first one, so requests already out never go without a token.
   - Neither the key nor a token is logged or returned.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
@@ -680,8 +682,8 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `a_lent_token_goes_back_unless_another_was_set_since`,
 `another_key_is_refused_while_requests_may_go_out`,
 `the_log_reports_a_runs_start_its_turn_to_permanent_and_its_end`,
-`a_key_is_exchanged_only_while_active`, `key_errors_have_kinds`, `transport/http/tests.rs` `a_401_to_the_keys_token_refreshes_it`,
-`auth/key.rs`
+`a_key_is_exchanged_only_while_active`, `key_errors_have_kinds`, `transport/http/tests.rs`
+`a_401_to_the_keys_token_refreshes_it`, `auth/key.rs`
 `a_refresh_is_due_at_70_to_80_percent_of_the_lifetime`,
 `failures_back_off_from_1_s_to_30_s_jittered_down_to_half`,
 `exchanges_go_out_one_at_a_time_while_active_and_refresh_on_schedule`,
@@ -691,7 +693,8 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `a_401_refreshes_at_once_but_not_within_1_s_of_arrival`,
 `tokens_refused_in_a_row_back_off_until_one_serves_its_time`,
 `an_inactive_source_refreshes_once_active_again`,
-`a_refused_key_retries_slowly_until_a_host_uses_it_again`, `a_401_always_marks_the_token`,
+`a_refused_key_retries_slowly_until_a_host_uses_it_again`, `only_a_refusal_stops_a_key_serving`,
+`a_401_always_marks_the_token`,
 `a_key_in_place_of_another_carries_its_token_until_its_own`,
 `an_exchange_left_out_is_due_again_once_the_refresher_restarts`, `auth/exchange.rs`
 `a_token_answer_gives_the_token_and_its_lifetime`, `failures_are_classified_by_status`,
@@ -2049,20 +2052,18 @@ since neither e2e server checks tokens.
   at most 8,192 of each kind between drains, and reports what it dropped.
 - Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.
   Events include `open`, `provisional`, `live`, `rekey`, `salvaged`, `reset`, `recut`, `log_cut`,
-  `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`,
-  `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`,
-  `token_exchange_failed`, `token_exchange_recovered`, `token_refresher_failed`,
-  `setting_adjusted`,
-  `host_dir_unreadable` (the host directory's path cannot be read, so it counts as absent),
-  `write_hold_expired` (a write transaction waited 60 s at the host's hold and went on),
-  `write_hold_failed` (the hold file could not be opened or tried, so writes do not wait) and
-  `panic`.
+  `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`, `retention_failed`,
+  `dns_stale`, `token_in_clear`, `token_file_unreadable`, `token_exchange_failed`,
+  `token_exchange_recovered`, `token_refresher_failed`, `setting_adjusted`, `host_dir_unreadable`
+  (the host directory's path cannot be read, so it counts as absent), `write_hold_expired` (a write
+  transaction waited 60 s at the host's hold and went on), `write_hold_failed` (the hold file could
+  not be opened or tried, so writes do not wait) and `panic`.
 - Alert on a growing `commits.pending_bytes`, any `replication.condition` that stays, refused
   writes, any reset, and a `snapshot.log_bytes` that stays above a few times `due_bytes`.
 
 Tests: `status.rs` `a_handed_out_binding_reports_live_or_provisional`, `synced_names_its_target`,
-`the_token_names_its_source_and_the_keys_schedule`,
-`events_render_as_one_object`, `stats_report_what_was_dropped`, `stats.rs`
+`the_token_names_its_source_and_the_keys_schedule`, `events_render_as_one_object`,
+`stats_report_what_was_dropped`, `stats.rs`
 `a_database_nobody_drains_keeps_a_bounded_number_of_each_kind`, `log.rs`
 `values_are_quoted_only_when_needed`.
 

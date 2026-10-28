@@ -549,8 +549,7 @@ mod tests {
         );
     }
 
-    // A binding handed out and not connected yet is live, or provisional before its claim; one
-    // given up for another cache root retires.
+    // The token's status names its source and, with a key, the key's schedule and last failure.
     #[test]
     fn the_token_names_its_source_and_the_keys_schedule() {
         let none = TokenStatus {
@@ -578,6 +577,8 @@ mod tests {
         );
     }
 
+    // A binding handed out and not connected yet is live, or provisional before its claim; one
+    // given up for another cache root retires.
     #[test]
     fn a_handed_out_binding_reports_live_or_provisional() {
         let handed_out = Life::HandedOut { awaiting: 1 };

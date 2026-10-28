@@ -343,8 +343,12 @@ impl Drop for Importing {
 }
 
 /// A request that carried `token` was refused `401`: when it is the key's token, the key is
-/// exchanged again at once (at least 1 s after the token arrived, `key`).
+/// exchanged again at once (at least 1 s after the token arrived, `key`). Without a key, nothing
+/// to do: no jitter is drawn, which reads a file.
 pub(crate) fn refused(token: &str) {
+    if lock(&KEY).is_none() {
+        return;
+    }
     let jitter = jitter();
     let moved = lock(&KEY)
         .as_mut()
@@ -437,11 +441,13 @@ fn admit(held: Option<(&Key, Use)>, next: &Key) -> Admit {
 
 /// Makes `secret`, exchanged at `endpoint` for tokens of `audience`, the process's key, and waits
 /// at most `timeout` for a token of it that has not expired and was not refused. A token held
-/// serves at once. A key whose exchange is refused fails at once, and other failures are retried
-/// on the key's schedule until the time runs out. Another key than the one held fails while a
-/// host waits for the held key's token or was handed it less than [`HANDED_OUT_HOLD_MS`] ago, or
-/// while an open, a bound database or an import may send requests carrying its token. The host
-/// asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open carries this key's tokens.
+/// serves at once. A key whose exchange is refused fails at once: a key refused since its last
+/// token hands out none, unexpired or not, until the exchange this use starts at once gives it one.
+/// Other failures are retried on the key's schedule until the time runs out. Another key than the
+/// one held fails while a host waits for the held key's token or was handed it less than
+/// [`HANDED_OUT_HOLD_MS`] ago, or while an open, a bound database or an import may send requests
+/// carrying its token. The host asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open
+/// carries this key's tokens.
 #[cfg_attr(
     not(test),
     expect(
