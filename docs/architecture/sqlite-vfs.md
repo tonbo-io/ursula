@@ -9,14 +9,15 @@ Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace
 `clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
 event pump, `gate`, the Pi Durable adapter in the `/pi` entry, Tonbo's open by name in the `/tonbo`
 entry, Pi storage on a Tonbo database by name in the `/tonbo/pi` entry, the e2e suites and the
-benchmark). The server
+benchmark), and `clients/sqlite-ursula-python` (Python, the `sqlite-ursula` package for the stdlib
+`sqlite3` module: see [Python](#python)). The server
 contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
 docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
 Each heading below is a label. Code comments cite `design: <Heading>` for a heading here and
 `extensions: <Heading>` for a heading of the extensions specification. Tests are named by file and
 test name: Rust paths are relative to `clients/sqlite-vfs/src/`, TypeScript paths to
-`clients/sqlite-ursula/`.
+`clients/sqlite-ursula/`, Python paths to `clients/sqlite-ursula-python/`.
 
 ## Model
 
@@ -2015,6 +2016,46 @@ test/gate.mjs records each request's `Authorization` header, and the tests check
 request of their streams carried. The `401`s are scripted faults (the model's, or the gate's),
 since neither e2e server checks tokens.
 
+### Python
+
+`clients/sqlite-ursula-python` is the `sqlite-ursula` package (import `sqlite_ursula`) for CPython
+3.11 or newer, free-threaded builds included. It is host glue over the same SQL functions as the
+TypeScript package: `open(url, ...)`, `import_sqlite` and `set_token` at the root, and the error
+classes, whose class, kind and action come from `ursula_classify`.
+
+- **Loading.** The extension loads into the stdlib `sqlite3` module's SQLite at the first call,
+  on an in-memory control connection, with extension loading enabled only for the load. It becomes
+  that SQLite's default VFS, so a framework's own `sqlite3.connect(db.path)` replicates through the
+  binding. The library is `SQLITE_URSULA_VFS`, else the one the wheel carries in
+  `sqlite_ursula/_lib/`. Python keeps no SQLite floor of its own: the extension's refusal of an
+  older SQLite, a `sqlite3` built without loadable extensions, a platform with no VFS and an
+  install with no library all raise `UrsulaSetupError` `host_unsupported` (`fix`), whose `fix`
+  names a Python that can host it. `python -m sqlite_ursula` prints the same check.
+- **Connections.** `open` returns `UrsulaConnection`, a `sqlite3.Connection` subclass made by
+  `sqlite3.connect(path, factory=..., timeout=busy_timeout, check_same_thread=False)`, read-only
+  through `file:<path>?mode=ro`. CPython's `execute*`, `commit` and `__exit__` call SQLite
+  directly, so the subclass overrides them with `cursor`, and its cursor overrides `execute*`,
+  `fetch*` and `__next__`. Each classifies its error and keeps the remembered-error rule of the
+  TypeScript `UrsulaDatabase` for SQL `ROLLBACK`. Refused writes and resets also derive from
+  `sqlite3.OperationalError`, the error they replace.
+- **Events.** One daemon thread, `sqlite-ursula-events`, applies the [Pump](#pump)'s rules: it
+  takes its cursor before any request or ticket is handed out, loops on
+  `ursula_events(cursor, 1000)` on its own connection, and applies each batch under the control
+  connection's lock. `ursula_open` and `ursula_synced` run at timeout 0 under the same lock, with
+  their request or ticket registered in that step. `synced(timeout)` waits on a
+  `threading.Event`, which Ctrl-C interrupts, and raises `TimeoutError` while replication goes
+  on. An open past its `timeout`, or on Ctrl-C, cancels its request. Reset callbacks run on a
+  thread of their own after the path's tickets failed. A failed thread is replaced and its tickets
+  asked for again, and after three failures in a row waits fail `internal`.
+- **Forks.** `os.register_at_fork` marks a child forked after the parent started the extension
+  (an open or an import): every call of the package raises `UrsulaSetupError` `forked` (`fix`),
+  statements of inherited connections included, before touching state a thread of the parent may
+  have held. A child forked before that loads the extension as any process does.
+
+Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_errors.py`, `tests/test_fork.py`,
+`tests/test_import.py` and `tests/test_host.py`, against the model server and against one real
+`ursula` node ([Verification](#verification)).
+
 ## Status
 
 `db.status()` and `ursula_status(path)` return one snake_case JSON:
@@ -2149,6 +2190,14 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-e2e-ursula-parts`: `test/parts.e2e.ts`, `test/import.e2e.ts` and the snapshot-parts cases of `test/core.e2e.ts` (`-t "in parts"`) against three nodes behind a gateway started with `--max-request-body-bytes 4194304` (`E2E_GATEWAY_MAX_REQUEST_BYTES`), with the CI S3 as the cold store (`.github/actions/ci-s3`: AWS S3 on same-repo pull requests and main, MinIO otherwise). The gateway lowers HEAD's `Ursula-Max-Request-Bytes` to 4 MiB and passes the node's `Ursula-Max-Snapshot-Bytes` through, and the test setup refuses to start unless HEAD shows both, so every snapshot above 4 MiB goes up in parts through the gateway and is read back in 4 MiB ranges. 4 MiB is also the client's batch cap, so PART runs keep their sizes. Of the sqlite-vfs e2e jobs, only it has `id-token: write`, and it installs the package with `npm ci --ignore-scripts`. A suite that needs three nodes, the gateway and a cold store joins this job through its `SUITES` list.
 - `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
   0.13.6) against the model server ([Forks](#forks)).
+- `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
+  3.14 and 3.14t, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, and on
+  `python:3.13-slim`, whose SQLite is older than 3.50.4, `python -m sqlite_ursula` failing with
+  `host_unsupported`.
+- `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
+  `python:3.13-alpine`, and the Python suites run there.
+- `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
+  in-memory cold store. The tests that script faults skip there.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
   with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.

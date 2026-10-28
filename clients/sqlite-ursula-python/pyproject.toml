@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlite-ursula"
+dynamic = ["version"]
+description = "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension, for the stdlib sqlite3 module: commits are local and replicate in the background, and db.synced() is the output gate"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: Free Threading :: 2 - Beta",
+  "Topic :: Database",
+]
+
+[project.urls]
+Homepage = "https://ursula.tonbo.io/docs/examples/sqlite-vfs"
+Repository = "https://github.com/tonbo-io/ursula"
+Issues = "https://github.com/tonbo-io/ursula/issues"
+
+[tool.hatch.version]
+path = "src/sqlite_ursula/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlite_ursula"]
+# The prebuilt extension, which the publishing workflow puts there for each platform's wheel.
+artifacts = ["src/sqlite_ursula/_lib/*"]
+
+[dependency-groups]
+test = ["pytest==9.1.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "A", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+force-single-line = true

@@ -56,6 +56,14 @@ if [ "${npm_version}" != "${workspace}" ]; then
   status=1
 fi
 
+# The Python client carries the release version too (its pyproject.toml reads it
+# from the package's __init__.py).
+py_version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py)
+if [ "${py_version}" != "${workspace}" ]; then
+  echo "clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py __version__ is ${py_version}, workspace is ${workspace}" >&2
+  status=1
+fi
+
 # The extension the npm client ships names this version in its User-Agent
 # (clients/sqlite-vfs is outside the workspace and keeps its own version).
 vfs_version=$(awk '$1 == "version" { gsub(/"/, "", $3); print $3; exit }' clients/sqlite-vfs/Cargo.toml)
