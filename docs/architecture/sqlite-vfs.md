@@ -1518,13 +1518,13 @@ checks that the extension opened it.
 
 ### Forks
 
-A process starts the extension with its first `ursula_open`, `ursula_events` or `ursula_import`,
-before any of them makes something that lives on in the process: the driver and its threads, the
-HTTP agents with their pooled connections, the resolver's cache, a token. A child forked after the
-start has all of it in its memory but none of the threads that serve it, and a lock one of them
-held at the fork stays held in the child. Using it there would stall `synced()`, append to the
-parent's log, or send on a TLS connection the parent also writes. So in such a child, and in every
-process forked from one:
+A process starts the extension with its first `ursula_open`, `ursula_events`, `ursula_import` or
+`tonbo_resolve`, before any of them makes something that lives on in the process: the driver and its
+threads, the HTTP agents with their pooled connections, the resolver's cache, a token. A child
+forked after the start has all of it in its memory but none of the threads that serve it, and a lock
+one of them held at the fork stays held in the child. Using it there would stall `synced()`, append
+to the parent's log, or send on a TLS connection the parent also writes. So in such a child, and in
+every process forked from one:
 
 - Every SQL function fails `forked` (action `fix`: open after the fork).
 - Every method on a file of a bound database fails without running, with the code it answers after
@@ -1853,6 +1853,41 @@ adapter wraps), so the caller keeps no reference for the close.
   `UrsulaSetupError` `invalid_name`, an `apiKey` option that cannot be sent `invalid_argument`, and
   a login file that cannot be read `local_setup`.
 
+The extension resolves a name too, for hosts of its SQL functions: `tonbo_resolve(name_or_url,
+options_json, timeout_ms)` (`tonbo.rs`) applies the rules above in one implementation, so a host
+carries none of its own. Only `extension.rs` calls into the `tonbo` module: the open, the registry
+and the driver never do.
+
+- `options_json` holds `api_key`, `api_origin`, `auth_origin`, `own_token`, `timeout_ms` and
+  `agent` (accepted, not sent). The key sources, the login file and the origins are as above, with
+  `TONBO_API_KEY`, `TONBO_API_ORIGIN` and `TONBO_AUTH_ORIGIN` read at each call. The login file is
+  checked with `lstat`, opened with `O_NOFOLLOW | O_NONBLOCK`, and checked again on the descriptor.
+  Its `expires_at` is an RFC 3339 date-time.
+- The lookup is as above: the `exchange_required` exchange and the Management API token held per
+  key, the backoff from 250 ms to 2 s, `Retry-After` in whole seconds and never below the backoff,
+  and no redirect followed. Its requests go out on the agent of appends and reads
+  ([Transport](#transport)), so they trust the same roots and take the same proxy. A lookup is
+  bounded by the time the call has left.
+- Unless `own_token` is set or `URSULA_VFS_TOKEN_FILE` serves the Streams requests, the key becomes
+  the process's key source ([Transport](#transport)), exchanged at `{auth origin}/api/iam/token`
+  for the audience `https://streams.tonbo.dev`, and the call returns only once it holds the first
+  token. A key the token endpoint refuses fails there with `invalid_api_key`, before any open. The
+  process holds one key, so another one fails `invalid_argument` while the first may serve. The
+  stream URL must be `https://`, or `http://` to a loopback host, or the call fails `invalid_url`.
+  With `own_token`, a URL needs no key and the call sends nothing.
+- It returns `{done: true, url, name}`, `name` `null` for a URL. With `timeout_ms` 0 it returns
+  `{done: false, request}` at once and resolves on a thread of its own, for the option `timeout_ms`
+  (30 s by default). A `resolved` event (`{event, request, ok}`) ends it, and a call with the same
+  arguments takes the outcome, the answer or the error. A call with the same arguments meanwhile
+  joins it, `ursula_cancel(request)` gives it up and reports what it ended with, and an outcome no
+  call takes goes after a minute.
+- Errors read `tonbo_resolve: <kind>: <what> (request <id>). <fix>`: the request id when the Tonbo
+  API answered with one, the fix when there is something to run or set. The kinds are the four of
+  `TonboError`, `invalid_name`, `invalid_argument`, `invalid_url`, `local_setup` and `internal`, and
+  the last condition (`unreachable`, `unavailable` or `rate_limited`, else `cancelled`) when the time
+  ran out. Messages name the options as `options_json` spells them, such as `api_key`. No message
+  carries a key or a token.
+
 Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
 stands in for the Management API and the token endpoint as their contracts document them, and
 serves databases whose URLs are streams of the suite's server. The credentials cases are the
@@ -1864,7 +1899,15 @@ no open set a token first, and the gate shows every request carried the file's t
 carried the token the provider exchanged for the key. "opens Pi storage by name in one call for
 Harness.open, whose close closes it, and its Streams requests carry the token exchanged for the key"
 runs the `/tonbo/pi` entry under Pi's `Harness`, and its binding retires once `harness.close`
-returned.
+returned. "the extension's tonbo_resolve" runs `tonbo_resolve` against the same stand-in, with
+`timeout_ms` 0 and its `resolved` event, and blocking in a process of its own
+(test/tonbo-resolve-child.ts) whose stream requests, the gate shows, carry the Streams token the
+call fetched. The tests that fetch a Streams token in the suite's process share one key, after the
+one whose key the token endpoint refuses. The login file's reader runs on the contract's own
+examples in `tonbo/credentials.rs` `the_contracts_examples_are_read_as_it_lists_them`,
+`expires_at_is_an_rfc_3339_date_time`, `the_login_file_is_read_as_the_contract_says` and
+`the_fix_quotes_a_path_the_shell_would_split`, and the Management API's `data` in `json.rs`
+`a_members_object_is_read_one_level_down`.
 
 ### SQL functions
 
@@ -1881,8 +1924,11 @@ returns at once.
 - `ursula_import(url, file, options_json, timeout_ms)`: [Import](#import). `timeout_ms` must be
   positive.
 - `ursula_classify(message, errcode, path)`: what a failure a host met is ([Errors](#errors)).
-- `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
-  `ursula_set_token(path, token)`.
+- `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)` (of an open or a
+  resolve), `ursula_set_token(path, token)`.
+- `tonbo_resolve(name_or_url, options_json, timeout_ms)`: a Tonbo database's stream URL by name
+  ([Tonbo](#tonbo)), returning `{done, url, name}` or `{done: false, request}`. Its `resolved` event
+  says a call with the same arguments takes the outcome.
 
 The extension refuses to load into SQLite older than 3.50.4, one without WAL, or one lacking a
 routine the extension needs. Every such refusal reads `sqlite-ursula-vfs needs ...`, the prefix a

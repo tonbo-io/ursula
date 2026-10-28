@@ -1,7 +1,8 @@
 //! The flat JSON objects the extension reads and writes: `ursula_open`'s `options_json`, the
-//! JSON the SQL functions return, a salvage's `manifest.json`, and a token endpoint's answer. One
-//! writer ([`str`], [`object`], [`array`]) and one parser of objects, which reads no nested object
-//! or array: [`parse_object`] refuses one, and [`parse_members`] checks it and skips it.
+//! JSON the SQL functions return, a salvage's `manifest.json`, a token endpoint's answer, and the
+//! Tonbo login and Management API answers. One writer ([`str`], [`object`], [`array`]) and one
+//! parser of objects, which reads no nested object or array: [`parse_object`] refuses one,
+//! [`parse_members`] checks it and skips it, and [`member_object`] reads one level down.
 
 use std::fmt::Write as _;
 
@@ -84,6 +85,47 @@ pub(crate) fn parse_object(text: &str) -> Result<Vec<(String, Value)>, SyntaxErr
 /// is checked and skipped, for an answer whose other members the reader does not know.
 pub(crate) fn parse_members(text: &str) -> Result<Vec<(String, Value)>, SyntaxError> {
     parse(text, Nested::Skip)
+}
+
+/// The members of the object member `name` of the JSON object `text` holds, read as
+/// [`parse_members`] reads an object: `None` when `text` has no such member or its value is not an
+/// object. Every other member is checked and skipped. For an answer that wraps what the reader
+/// reads in one object, such as `{"data": {...}}`.
+pub(crate) fn member_object(
+    text: &str,
+    name: &str,
+) -> Result<Option<Vec<(String, Value)>>, SyntaxError> {
+    let mut p = Parser {
+        bytes: text.as_bytes(),
+        at: 0,
+    };
+    let mut found = None;
+    p.space();
+    p.expect(b'{')?;
+    p.space();
+    if p.eat(b'}') {
+        return p.end(found);
+    }
+    loop {
+        p.space();
+        let key = p.string()?;
+        p.space();
+        p.expect(b':')?;
+        p.space();
+        let start = p.at;
+        let object = p.peek() == Some(b'{');
+        p.skip(0)?;
+        if object && key == name {
+            let inner = text.get(start..p.at).unwrap_or_default();
+            found = Some(parse_members(inner)?);
+        }
+        p.space();
+        if p.eat(b',') {
+            continue;
+        }
+        p.expect(b'}')?;
+        return p.end(found);
+    }
 }
 
 /// What the parser does with a member whose value is an object or an array.
@@ -300,6 +342,7 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::Value;
+    use super::member_object;
     use super::object;
     use super::parse_members;
     use super::parse_object;
@@ -326,6 +369,32 @@ mod tests {
         ]);
         assert_eq!(parse_object("[]").unwrap_err().at, 0);
         assert_eq!(parse_object("{\"a\":{}}").unwrap_err().at, 5);
+    }
+
+    // One member's object is read one level down, its own nested members skipped, and every other
+    // member checked and skipped.
+    #[test]
+    fn a_members_object_is_read_one_level_down() {
+        let text = r#"{"a": 1, "data": {"state": "active", "url": "https://x/s", "n": {"deep": []}}, "z": [{}]}"#;
+        assert_eq!(
+            member_object(text, "data").unwrap(),
+            Some(vec![
+                ("state".to_owned(), Value::Text("active".to_owned())),
+                ("url".to_owned(), Value::Text("https://x/s".to_owned())),
+            ])
+        );
+        assert_eq!(member_object(text, "a").unwrap(), None, "not an object");
+        assert_eq!(member_object(text, "b").unwrap(), None, "no such member");
+        assert_eq!(member_object(r#"{"data": null}"#, "data").unwrap(), None);
+        assert_eq!(member_object("{}", "data").unwrap(), None);
+        for broken in [
+            r#"{"data": {"a": }}"#,
+            r#"{"data": {}} x"#,
+            r#"{"x": [}"#,
+            "[]",
+        ] {
+            assert!(member_object(broken, "data").is_err(), "{broken}");
+        }
     }
 
     // Members whose values nest are checked and skipped, the others read.

@@ -21,10 +21,11 @@
 //!
 //! Module map:
 //!
-//! - `exchange`: one exchange of a key at its token endpoint, and what the answer gives.
+//! - `exchange`: one exchange of a key at its token endpoint, and what the answer gives, which
+//!   the Tonbo lookup's Management API token uses too (`tonbo`).
 //! - `key`: a key's schedule: when it exchanges, and what a token, a failure or a `401` changes.
 
-mod exchange;
+pub(crate) mod exchange;
 mod key;
 
 use std::fs;
@@ -389,13 +390,6 @@ pub(crate) enum KeyError {
 
 impl KeyError {
     /// The kind a host reports.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Tonbo resolution reports it, in the change that adds it"
-        )
-    )]
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
             KeyError::Invalid(_) | KeyError::AnotherKey => ErrorKind::InvalidArgument,
@@ -448,13 +442,6 @@ fn admit(held: Option<(&Key, Use)>, next: &Key) -> Admit {
 /// [`HANDED_OUT_HOLD_MS`] ago, or while an open, a bound database or an import may send requests
 /// carrying its token. The host asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open
 /// carries this key's tokens.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Tonbo resolution installs the key, in the change that adds it"
-    )
-)]
 pub(crate) fn use_key(
     secret: &str,
     endpoint: &str,
@@ -757,7 +744,7 @@ fn stat(path: &str) -> (Option<SystemTime>, Option<u64>) {
 
 /// A token as `Authorization: Bearer` carries it: trimmed, non-empty, printable ASCII without
 /// spaces.
-fn usable(token: &str) -> Option<String> {
+pub(crate) fn usable(token: &str) -> Option<String> {
     let token = token.trim();
     (!token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())).then(|| token.to_owned())
 }
