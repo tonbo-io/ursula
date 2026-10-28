@@ -5,9 +5,16 @@ use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
 use super::Inspect;
+use super::LockPath;
+use super::PassError;
 use super::Reason;
+use super::Shape;
+use super::Strict;
+use super::check_host_dir;
+use super::effective_uid;
+use super::holds_write_lock;
 use super::inspect;
-use super::is_lock_path;
+use super::lock_path;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
 use crate::generation::is_root_name;
@@ -126,16 +133,56 @@ fn root_names_and_lock_paths_have_one_grammar() {
     )));
 
     let lock = format!("/home/app/.cache/sqlite-ursula/0.8/{ROOT}/lock");
-    assert!(is_lock_path(lock.as_bytes()));
-    assert!(is_lock_path(format!("{lock} (deleted)").as_bytes()));
-    assert!(!is_lock_path(b"lock"));
-    // A reader's lock: readers hold no commit.
-    assert!(!is_lock_path(format!("/c/{ROOT}/reader-3/lock").as_bytes()));
-    assert!(!is_lock_path(format!("/c/{ROOT}/lock2").as_bytes()));
-    assert!(!is_lock_path(format!("/c/{ROOT}/gen-1/log").as_bytes()));
-    assert!(!is_lock_path(
-        b"/c/\xff-0123456789abcdef0123456789abcdef/lock"
-    ));
+    assert_eq!(lock_path(lock.as_bytes()), LockPath::Root);
+    assert_eq!(
+        lock_path(format!("{lock} (deleted)").as_bytes()),
+        LockPath::Root
+    );
+    assert_eq!(lock_path(b"lock"), LockPath::No);
+    // A reader's lock, also while a cleanup deletes its directory: readers hold no commit.
+    assert_eq!(
+        lock_path(format!("/c/{ROOT}/reader-3/lock").as_bytes()),
+        LockPath::No
+    );
+    let trash = "reader-trash-0123456789abcdef0123456789abcdef";
+    assert!(is_root_name(trash));
+    assert_eq!(
+        lock_path(format!("/c/{ROOT}/{trash}/lock (deleted)").as_bytes()),
+        LockPath::No
+    );
+    assert_eq!(
+        lock_path(format!("/c/{ROOT}/lock2").as_bytes()),
+        LockPath::No
+    );
+    assert_eq!(
+        lock_path(format!("/c/{ROOT}/gen-1/log").as_bytes()),
+        LockPath::No
+    );
+    // A root renamed out of the grammar, or a name that is not UTF-8: a root's only when held.
+    for other in [
+        b"/c/notes-old/lock".as_slice(),
+        b"/c/reader-x/lock",
+        b"/c/\xff-0123456789abcdef0123456789abcdef/lock",
+        b"/lock",
+    ] {
+        assert_eq!(lock_path(other), LockPath::Unnamed);
+    }
+
+    // The `lock:` lines of /proc/<pid>/fdinfo/<n>.
+    let fdinfo = |lock: &str| format!("pos:\t0\nflags:\t02100002\nmnt_id:\t30\nino:\t1234\n{lock}");
+    assert!(holds_write_lock(&fdinfo(
+        "lock:\t1: FLOCK  ADVISORY  WRITE 4242 00:2f:1234 0 EOF\n"
+    )));
+    assert!(holds_write_lock(&fdinfo(
+        "lock:\t1: POSIX  ADVISORY  WRITE 4242 00:2f:1234 0 EOF\n"
+    )));
+    assert!(holds_write_lock(&fdinfo(
+        "lock:\t1: OFDLCK ADVISORY  WRITE -1 00:2f:1234 0 EOF\n"
+    )));
+    assert!(!holds_write_lock(&fdinfo(
+        "lock:\t1: FLOCK  ADVISORY  READ 4242 00:2f:1234 0 EOF\n"
+    )));
+    assert!(!holds_write_lock(&fdinfo("")));
 }
 
 #[test]
@@ -335,7 +382,7 @@ fn an_open_lock_is_held_or_unread() {
     let lock = fs::File::open(h.cache.join(ROOT).join("lock")).unwrap();
     let me = std::process::id();
     let seen = h.inspect(vec![me]);
-    assert!(seen.roots[0].held, "{}", seen.to_json());
+    assert_eq!(seen.roots[0].held, Some(true), "{}", seen.to_json());
     assert_eq!(ours(&seen), 0, "{}", seen.to_json());
 
     let moved = base.join("moved");
@@ -354,4 +401,165 @@ fn an_open_lock_is_held_or_unread() {
     );
     drop(lock);
     assert_eq!(ours(&h.inspect(vec![me])), 0);
+}
+
+// A file named `lock` whose directory has no root's name is a root's lock while a process holds an
+// exclusive lock on it: a root renamed under a live process stays an unread lock.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_held_lock_under_a_renamed_root_is_unread() {
+    let h = Host::new("inspect-renamed-root", &[commit(1, 10)]);
+    let renamed = h.cache.join("notes-old");
+    fs::rename(h.cache.join(ROOT), &renamed).unwrap();
+    let ours = |seen: &super::Inspection| {
+        seen.unread_locks
+            .iter()
+            .filter(|l| l.path.starts_with(&renamed))
+            .count()
+    };
+    let lock = fs::File::open(renamed.join("lock")).unwrap();
+    let me = std::process::id();
+    // Open and not locked: not a root's lock by its name alone.
+    let seen = h.inspect(vec![me]);
+    assert_eq!(ours(&seen), 0, "{}", seen.to_json());
+    lock.lock().unwrap();
+    let seen = h.inspect(vec![me]);
+    assert_eq!(ours(&seen), 1, "{}", seen.to_json());
+    assert_eq!(seen.reason(), Some(Reason::UnreadLock));
+    lock.unlock().unwrap();
+    assert_eq!(ours(&h.inspect(vec![me])), 0);
+}
+
+// The strict checks apply to the compiled-in directory, found by its device and inode whatever the
+// spelling, and to its parent and ancestors along the path it is compiled in as. Here a test's
+// directory and owner stand in for them.
+#[test]
+fn the_compiled_in_host_directory_is_checked_strictly() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("inspect-strict");
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let parent = base.join("lib");
+    let host = parent.join("host");
+    fs::create_dir_all(&host).unwrap();
+    let mode = |path: &std::path::Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(&parent, 0o755);
+    mode(&host, 0o1777);
+    let uid = fs::metadata(&host).unwrap().uid();
+    let strict = Strict { path: &host, uid };
+    let shape = |r: Result<_, PassError>| match r {
+        Err(PassError::HostDirShape { why, .. }) => Some(why),
+        Err(e) => panic!("{e}"),
+        Ok(_) => None,
+    };
+    check_host_dir(&host, strict).unwrap();
+    // Another spelling of it is checked as strictly.
+    let other = parent.join("..").join("lib").join("host");
+    check_host_dir(&other, strict).unwrap();
+
+    mode(&host, 0o755);
+    assert!(matches!(
+        shape(check_host_dir(&other, strict)),
+        Some(Shape::Mode {
+            mode: 0o755,
+            want: 0o1777
+        })
+    ));
+    // Any other directory needs only to be a directory.
+    let elsewhere = base.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    mode(&elsewhere, 0o700);
+    check_host_dir(&elsewhere, strict).unwrap();
+    mode(&host, 0o1777);
+
+    assert!(matches!(
+        shape(check_host_dir(&host, Strict {
+            path: &host,
+            uid: uid.wrapping_add(1)
+        })),
+        Some(Shape::Owner { .. })
+    ));
+    mode(&parent, 0o775);
+    assert!(matches!(
+        shape(check_host_dir(&host, strict)),
+        Some(Shape::Mode {
+            mode: 0o775,
+            want: 0o755
+        })
+    ));
+    mode(&parent, 0o755);
+
+    // A link among the ancestors of the compiled-in path.
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&parent, &link).unwrap();
+    let through = link.join("host");
+    assert!(matches!(
+        shape(check_host_dir(&through, Strict {
+            path: &through,
+            uid
+        })),
+        Some(Shape::NotADirectory)
+    ));
+    // A link in its place, or a file.
+    assert!(matches!(
+        shape(check_host_dir(&link, Strict { path: &link, uid })),
+        Some(Shape::NotADirectory)
+    ));
+    let file = base.join("file");
+    fs::write(&file, b"").unwrap();
+    assert!(matches!(
+        shape(check_host_dir(&file, strict)),
+        Some(Shape::NotADirectory)
+    ));
+}
+
+// An entry with a root's name that cannot be looked at may be a root: the directory is unreadable,
+// not empty.
+#[test]
+fn a_root_that_cannot_be_looked_at_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Host::new("inspect-unstattable", &[commit(1, 10)]);
+    if effective_uid().is_ok_and(|uid| uid == 0) {
+        // Root looks at it anyway.
+        return;
+    }
+    // Listable and not searchable: the names are read, their files cannot be.
+    fs::set_permissions(&h.cache, fs::Permissions::from_mode(0o444)).unwrap();
+    let seen = h.inspect(Vec::new());
+    fs::set_permissions(&h.cache, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        seen.reason(),
+        Some(Reason::Unreadable),
+        "{}",
+        seen.to_json()
+    );
+    assert!(seen.roots.is_empty());
+}
+
+// The check of every process needs root: another user's is incomplete, and `held` is null while the
+// lock check did not run.
+#[test]
+fn the_check_of_every_process_needs_root() {
+    let h = Host::new("inspect-not-root", &[commit(1, 10)]);
+    let seen = inspect(&Inspect {
+        dir: Some(h.host.clone()),
+        ..Inspect::default()
+    });
+    if effective_uid().is_ok_and(|uid| uid == 0) {
+        return;
+    }
+    assert_eq!(
+        seen.reason(),
+        Some(Reason::UnreadLock),
+        "{}",
+        seen.to_json()
+    );
+    assert_eq!(seen.roots[0].held, None);
+    assert!(
+        seen.to_json().contains("\"held\":null"),
+        "{}",
+        seen.to_json()
+    );
 }

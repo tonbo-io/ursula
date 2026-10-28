@@ -5,11 +5,12 @@
 //!
 //! A pass reads, and never writes or locks anything:
 //!
-//! 1. The host directory. It must be a directory, not a link. At the compiled-in path
-//!    (`hostdir::DEFAULT`) it must be root's, mode 1777, in a root-owned directory of mode 0755,
-//!    with every ancestor a directory and no link among them. Every name in it must be one the
-//!    host directory's grammar knows (`hostdir::entry`), and every record a record of this line
-//!    (`v` 1) naming an absolute path under its own key.
+//! 1. The host directory: the one the host names, or the compiled-in one (`hostdir::DEFAULT`),
+//!    never the extension's test hook. It must be a directory, not a link. When it is the
+//!    compiled-in directory (the same device and inode) it must be root's, mode 1777, in a
+//!    root-owned directory of mode 0755, with every ancestor a directory and no link among them.
+//!    Every name in it must be one the host directory's grammar knows (`hostdir::entry`), and
+//!    every record a record of this line (`v` 1) naming an absolute path under its own key.
 //! 2. The directories: the recorded ones and those the host names (`scans`), one per real path. A
 //!    missing path, or one that is not a directory, holds no roots. In a present one every
 //!    subdirectory with a root's name (`generation::is_root_name`) is a root. A root with no
@@ -18,11 +19,14 @@
 //!    generation's log by the open's reading rule (`Log::read`) with a fold that keeps a position
 //!    and a length per pending commit (`Unacknowledged`). Its bytes are what
 //!    `Recovered::pending` holds: the frame lengths of the generation's own COMMIT records above
-//!    the latest ACK. The commits its salvages list as unacknowledged are reported beside them,
-//!    outside the bytes.
-//! 4. The lock check: every open file of a live process (`/proc/<pid>/fd`) that is a root's
-//!    `lock` must be the lock of a root this pass read, whatever path the process opened it by.
-//!    Any other is an unread lock.
+//!    the latest ACK. The commits its salvages list as unacknowledged, and those of a superseded
+//!    generation the next open salvages, are reported beside them, outside the bytes.
+//! 4. The lock check: every open file of a live process (`/proc/<pid>/fd`, or the descriptors of
+//!    its threads once its first thread exited) that may be a root's `lock` must be the lock of
+//!    a root this pass read, whatever path the process opened it by. A file named `lock` may be
+//!    a root's when its directory has a root's name, or when the process holds an exclusive lock
+//!    on it (`/proc/<pid>/fdinfo`), since a root's directory may have been renamed. A reader
+//!    directory's lock is not one: readers hold no commit. Any other is an unread lock.
 //!
 //! A pass that cannot do one of these is incomplete, and says why with one reason, the first that
 //! applies of `host_dir`, `unrecognized`, `unread_lock`, `unreadable` and `budget`.
@@ -62,11 +66,14 @@ const VERSION: u64 = 1;
 /// What [`inspect`] reads.
 #[derive(Debug, Clone, Default)]
 pub struct Inspect {
-    /// The host directory: the extension's own (`hostdir::host_dir`) when `None`.
+    /// The host directory: the compiled-in one (`hostdir::DEFAULT`) when `None`. The extension's
+    /// test hook is never read: a hook set in the host's environment would read another
+    /// directory than the extension's.
     pub dir: Option<PathBuf>,
     /// Directories to read besides the recorded ones, such as the default cache roots.
     pub scans: Vec<PathBuf>,
-    /// The processes whose open files the lock check reads: every process when `None`.
+    /// The processes whose open files the lock check reads: every process when `None`, which
+    /// only root can read.
     pub pids: Option<Vec<u32>>,
     /// Read again every 50 ms until the result is clean or incomplete, or this has passed. A pass
     /// after the first reads again only the roots whose files changed.
@@ -107,11 +114,6 @@ impl Reason {
 /// What made a pass incomplete as a whole.
 #[derive(Debug, thiserror::Error)]
 enum PassError {
-    #[error(
-        "no host directory: {} does not exist and none was given",
-        hostdir::DEFAULT
-    )]
-    NoHostDir,
     #[error("the host directory {}: {} {why}", .dir.display(), .path.display())]
     HostDirShape {
         dir: PathBuf,
@@ -126,6 +128,8 @@ enum PassError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the host directory {}: it moved while it was listed", .dir.display())]
+    HostDirMoved { dir: PathBuf },
     #[error("the process table: {op} {}: {source}", .path.display())]
     ProcessTable {
         op: &'static str,
@@ -133,6 +137,12 @@ enum PassError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the process table: {} names no effective uid", .path.display())]
+    NoUid { path: PathBuf },
+    #[error(
+        "the process table: uid {euid} cannot read every process's open files, so the check of every process needs root"
+    )]
+    NotRoot { euid: u32 },
     #[error("the pass ran past its budget of {} ms", .budget.as_millis())]
     Budget { budget: Duration },
 }
@@ -140,10 +150,12 @@ enum PassError {
 impl PassError {
     fn reason(&self) -> Reason {
         match self {
-            PassError::NoHostDir | PassError::HostDirShape { .. } | PassError::HostDirIo { .. } => {
-                Reason::HostDir
-            }
-            PassError::ProcessTable { .. } => Reason::UnreadLock,
+            PassError::HostDirShape { .. }
+            | PassError::HostDirIo { .. }
+            | PassError::HostDirMoved { .. } => Reason::HostDir,
+            PassError::ProcessTable { .. }
+            | PassError::NoUid { .. }
+            | PassError::NotRoot { .. } => Reason::UnreadLock,
             PassError::Budget { .. } => Reason::Budget,
         }
     }
@@ -154,8 +166,8 @@ impl PassError {
 enum Shape {
     #[error("is not a directory")]
     NotADirectory,
-    #[error("is owned by uid {uid}, not root")]
-    Owner { uid: u32 },
+    #[error("is owned by uid {uid}, not {want}")]
+    Owner { uid: u32, want: u32 },
     #[error("has mode {mode:o}, not {want:o}")]
     Mode { mode: u32, want: u32 },
 }
@@ -215,19 +227,32 @@ enum DirState {
     /// Nothing at the path, or something that is not a directory: no roots.
     Absent,
     /// It may hold roots, and could not be read.
-    Unlistable(std::io::Error),
+    Unlistable(DirError),
+}
+
+/// Why a directory that may hold roots could not be read.
+#[derive(Debug, thiserror::Error)]
+#[error("{op} {}: {source}", .path.display())]
+struct DirError {
+    op: &'static str,
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
 }
 
 /// A file's identity: its device and inode.
 type FileId = (u64, u64);
 
-/// What a pass found in one root.
-#[derive(Debug)]
-struct RootRead {
-    /// Its `lock`, if it has one.
-    lock: Option<FileId>,
-    /// `None` for a root with no generation, which holds no commit and is not listed.
-    state: Option<RootState>,
+/// What a pass found in one root, with the identity of its `lock` when it has one.
+#[derive(Debug, Clone)]
+enum RootRead {
+    /// No `gen-<id32>` directory: it holds no commit and is not listed.
+    NoGeneration { lock: Option<FileId> },
+    /// A root the pass lists.
+    Listed {
+        lock: Option<FileId>,
+        state: Arc<RootState>,
+    },
 }
 
 #[derive(Debug)]
@@ -238,10 +263,24 @@ enum RootState {
         /// The frame bytes of its pending commits.
         bytes: u64,
         commits: u64,
-        /// The commits its salvages list as unacknowledged.
+        /// The commits its salvages, and the superseded generations the next open salvages,
+        /// list as unacknowledged.
         salvaged: u64,
     },
-    Unreadable(RootError),
+    Unreadable {
+        error: RootError,
+        /// Its files changed while it was read, as a drain's trim changes them: a pass of
+        /// `--until-clean` reads it again instead of ending.
+        changed: bool,
+    },
+}
+
+impl RootRead {
+    /// Whether it is unreadable while its files changed: a later pass reads it again.
+    fn changed(&self) -> bool {
+        matches!(self, RootRead::Listed { state, .. }
+            if matches!(**state, RootState::Unreadable { changed: true, .. }))
+    }
 }
 
 /// A root a pass lists.
@@ -249,8 +288,9 @@ enum RootState {
 struct RootReport {
     id: String,
     root: PathBuf,
-    read: Arc<RootRead>,
-    held: bool,
+    state: Arc<RootState>,
+    /// Whether a live process holds its lock open, `None` when the lock check did not run.
+    held: Option<bool>,
 }
 
 /// An open root lock of a live process that is the lock of no root a pass read.
@@ -272,7 +312,7 @@ struct Unrecognized {
 /// with no unacknowledged byte), and what it read, as [`Inspection::to_json`] prints it.
 #[derive(Debug)]
 pub struct Inspection {
-    dir: Option<PathBuf>,
+    dir: PathBuf,
     dirs: Vec<DirReport>,
     roots: Vec<RootReport>,
     unread_locks: Vec<UnreadLock>,
@@ -280,20 +320,39 @@ pub struct Inspection {
     errors: Vec<PassError>,
 }
 
+/// The host directory the strict checks apply to (design: Hosts), and the owner they want: the
+/// compiled-in directory and root, or a test's directory and its owner.
+#[derive(Debug, Clone, Copy)]
+struct Strict<'a> {
+    path: &'a Path,
+    uid: u32,
+}
+
+/// Root's uid.
+const ROOT_UID: u32 = 0;
+
 /// Reads every root of the host directory's records and of `request.scans`, and checks every open
 /// root lock (design: Hosts). Never writes or locks anything.
 pub fn inspect(request: &Inspect) -> Inspection {
+    inspect_with(request, Strict {
+        path: Path::new(hostdir::DEFAULT),
+        uid: ROOT_UID,
+    })
+}
+
+/// [`inspect`] with the directory the strict checks apply to given.
+fn inspect_with(request: &Inspect, strict: Strict<'_>) -> Inspection {
     let mut cache = Cache::default();
     let until = request
         .until_clean
         .and_then(|wait| Instant::now().checked_add(wait));
     loop {
-        let seen = pass(request, &mut cache);
+        let seen = pass(request, strict, &mut cache);
         let Some(until) = until else {
             return seen;
         };
         let now = Instant::now();
-        if !seen.complete() || seen.clean() || now >= until {
+        if seen.clean() || (!seen.complete() && !seen.settling()) || now >= until {
             return seen;
         }
         std::thread::sleep(AGAIN.min(until.saturating_duration_since(now)));
@@ -317,9 +376,9 @@ impl Inspection {
     pub fn unacknowledged_bytes(&self) -> u64 {
         self.roots
             .iter()
-            .filter_map(|r| match &r.read.state {
-                Some(RootState::Read { bytes, .. }) => Some(*bytes),
-                _ => None,
+            .filter_map(|r| match &*r.state {
+                RootState::Read { bytes, .. } => Some(*bytes),
+                RootState::Unreadable { .. } => None,
             })
             .fold(0, u64::saturating_add)
     }
@@ -329,7 +388,7 @@ impl Inspection {
         let unreadable = self
             .roots
             .iter()
-            .any(|r| matches!(r.read.state, Some(RootState::Unreadable(_))))
+            .any(|r| matches!(*r.state, RootState::Unreadable { .. }))
             || self
                 .dirs
                 .iter()
@@ -344,6 +403,21 @@ impl Inspection {
             .map(PassError::reason)
             .chain(found.into_iter().flatten())
             .min()
+    }
+
+    /// Whether it is incomplete only for roots whose files changed while they were read: an
+    /// `--until-clean` pass before the freeze reads them again, as the drain it waits for trims
+    /// and rolls their logs.
+    fn settling(&self) -> bool {
+        self.reason() == Some(Reason::Unreadable)
+            && self
+                .dirs
+                .iter()
+                .all(|d| !matches!(d.state, DirState::Unlistable(_)))
+            && self.roots.iter().all(|r| match &*r.state {
+                RootState::Read { .. } => true,
+                RootState::Unreadable { changed, .. } => *changed,
+            })
     }
 
     /// The inspection as one line of JSON (design: Hosts). The format is frozen within a release
@@ -380,7 +454,7 @@ impl Inspection {
             .map_or_else(json::null, |e| json::str(&e.to_string()));
         json::object(&[
             ("v", VERSION.to_string()),
-            ("dir", self.dir.as_deref().map_or_else(json::null, path)),
+            ("dir", path(&self.dir)),
             ("complete", reason.is_none().to_string()),
             ("clean", self.clean().to_string()),
             (
@@ -420,14 +494,14 @@ fn dir_json(d: &DirReport, path: &dyn Fn(&Path) -> String) -> String {
 
 fn root_json(r: &RootReport, path: &dyn Fn(&Path) -> String) -> String {
     let null = json::null;
-    let (stream, cluster, state, bytes, commits, salvaged, error) = match &r.read.state {
-        Some(RootState::Read {
+    let (stream, cluster, state, bytes, commits, salvaged, error) = match &*r.state {
+        RootState::Read {
             stream,
             cluster,
             bytes,
             commits,
             salvaged,
-        }) => (
+        } => (
             json::str(stream),
             json::str(cluster),
             if *bytes == 0 { "clean" } else { "pending" },
@@ -436,24 +510,14 @@ fn root_json(r: &RootReport, path: &dyn Fn(&Path) -> String) -> String {
             salvaged.to_string(),
             null(),
         ),
-        Some(RootState::Unreadable(e)) => (
+        RootState::Unreadable { error, .. } => (
             null(),
             null(),
             "unreadable",
             null(),
             null(),
             null(),
-            json::str(&e.to_string()),
-        ),
-        // Never listed.
-        None => (
-            null(),
-            null(),
-            "clean",
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            null(),
+            json::str(&error.to_string()),
         ),
     };
     json::object(&[
@@ -462,7 +526,7 @@ fn root_json(r: &RootReport, path: &dyn Fn(&Path) -> String) -> String {
         ("stream", stream),
         ("cluster", cluster),
         ("state", json::str(state)),
-        ("held", r.held.to_string()),
+        ("held", r.held.map_or_else(null, |held| held.to_string())),
         ("unacknowledged_bytes", bytes),
         ("commits", commits),
         ("salvaged", salvaged),
@@ -473,7 +537,7 @@ fn root_json(r: &RootReport, path: &dyn Fn(&Path) -> String) -> String {
 /// The roots an earlier pass of one [`inspect`] read, by path, with what their files looked like.
 #[derive(Debug, Default)]
 struct Cache {
-    roots: HashMap<PathBuf, (Fingerprint, Arc<RootRead>)>,
+    roots: HashMap<PathBuf, (Fingerprint, RootRead)>,
 }
 
 /// What a root's files look like: every name in the root, in its `salvage/` and in the `log/` of
@@ -494,14 +558,20 @@ impl Deadline {
     }
 }
 
+/// The pass ran past its deadline.
+#[derive(Debug)]
+struct Stopped;
+
 /// One pass of [`inspect`].
-fn pass(request: &Inspect, cache: &mut Cache) -> Inspection {
-    let budget = request.budget.unwrap_or(Duration::MAX);
+fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection {
     let deadline = Deadline {
         at: request.budget.and_then(|b| Instant::now().checked_add(b)),
-        budget,
+        budget: request.budget.unwrap_or(Duration::MAX),
     };
-    let dir = request.dir.clone().or_else(hostdir::host_dir);
+    let dir = request
+        .dir
+        .clone()
+        .unwrap_or_else(|| strict.path.to_owned());
     let mut inspection = Inspection {
         dir: dir.clone(),
         dirs: Vec::new(),
@@ -511,16 +581,15 @@ fn pass(request: &Inspect, cache: &mut Cache) -> Inspection {
         errors: Vec::new(),
     };
     let mut wanted = Vec::new();
-    match &dir {
-        Some(dir) => match records(dir, &mut inspection.unrecognized) {
-            Ok(recorded) => wanted.extend(recorded.into_iter().map(|d| (d, Source::Record))),
-            Err(e) => inspection.errors.push(e),
-        },
-        None => inspection.errors.push(PassError::NoHostDir),
+    match records(&dir, strict, &mut inspection.unrecognized) {
+        Ok(recorded) => wanted.extend(recorded.into_iter().map(|d| (d, Source::Record))),
+        Err(e) => inspection.errors.push(e),
     }
     wanted.extend(request.scans.iter().map(|d| (d.clone(), Source::Scan)));
-    let mut locks: HashMap<FileId, Option<usize>> = HashMap::new();
-    let mut fresh: HashMap<PathBuf, (Fingerprint, Arc<RootRead>)> = HashMap::new();
+    // Every root lock the pass read, with the listed roots it is the lock of: one lock may be
+    // reached through two paths.
+    let mut locks: HashMap<FileId, Vec<usize>> = HashMap::new();
+    let mut fresh: HashMap<PathBuf, (Fingerprint, RootRead)> = HashMap::new();
     let mut seen = HashSet::new();
     let mut stopped = false;
     'dirs: for (path, from) in wanted {
@@ -538,7 +607,14 @@ fn pass(request: &Inspect, cache: &mut Cache) -> Inspection {
                 }
                 (DirState::Absent, Vec::new())
             }
-            Err(e) => (DirState::Unlistable(e), Vec::new()),
+            Err(source) => (
+                DirState::Unlistable(DirError {
+                    op: "resolve",
+                    path: path.clone(),
+                    source,
+                }),
+                Vec::new(),
+            ),
         };
         inspection.dirs.push(DirReport {
             dir: path,
@@ -553,28 +629,36 @@ fn pass(request: &Inspect, cache: &mut Cache) -> Inspection {
             let print = fingerprint(&root);
             let read = match (&print, cache.roots.remove(&root)) {
                 (Some(print), Some((before, read))) if *print == before => read,
-                _ => match read_root(&root, deadline) {
-                    Some(read) => Arc::new(read),
-                    None => {
+                _ => match read_root(&root, print.as_ref(), deadline) {
+                    Ok(read) => read,
+                    Err(Stopped) => {
                         stopped = true;
                         break 'dirs;
                     }
                 },
             };
-            if let Some(print) = print {
-                fresh.insert(root.clone(), (print, Arc::clone(&read)));
+            if let Some(print) = print
+                && !read.changed()
+            {
+                fresh.insert(root.clone(), (print, read.clone()));
             }
-            let listed = read.state.is_some().then_some(inspection.roots.len());
-            if let Some(lock) = read.lock {
-                locks.insert(lock, listed);
-            }
-            if listed.is_some() {
-                inspection.roots.push(RootReport {
-                    id,
-                    root,
-                    read,
-                    held: false,
-                });
+            match read {
+                RootRead::NoGeneration { lock } => {
+                    if let Some(lock) = lock {
+                        locks.entry(lock).or_default();
+                    }
+                }
+                RootRead::Listed { lock, state } => {
+                    if let Some(lock) = lock {
+                        locks.entry(lock).or_default().push(inspection.roots.len());
+                    }
+                    inspection.roots.push(RootReport {
+                        id,
+                        root,
+                        state,
+                        held: None,
+                    });
+                }
             }
         }
     }
@@ -582,15 +666,19 @@ fn pass(request: &Inspect, cache: &mut Cache) -> Inspection {
     if !stopped {
         match open_locks(request.pids.as_deref(), deadline) {
             Ok(Some(open)) => {
+                for r in &mut inspection.roots {
+                    r.held = Some(false);
+                }
                 let mut unread = HashSet::new();
                 for lock in open {
                     match locks.get(&lock.id) {
-                        Some(Some(i)) => {
-                            if let Some(r) = inspection.roots.get_mut(*i) {
-                                r.held = true;
+                        Some(listed) => {
+                            for i in listed {
+                                if let Some(r) = inspection.roots.get_mut(*i) {
+                                    r.held = Some(true);
+                                }
                             }
                         }
-                        Some(None) => {}
                         None => {
                             if unread.insert((lock.pid, lock.path.clone())) {
                                 inspection.unread_locks.push(UnreadLock {
@@ -625,8 +713,12 @@ fn not_there(e: &std::io::Error) -> bool {
 /// Checks the host directory `dir` (design: Hosts) and reads its records: the directories they
 /// name, in name order. Names it does not know, and records it does not read, go to
 /// `unrecognized`.
-fn records(dir: &Path, unrecognized: &mut Vec<Unrecognized>) -> Result<Vec<PathBuf>, PassError> {
-    check_host_dir(dir)?;
+fn records(
+    dir: &Path,
+    strict: Strict<'_>,
+    unrecognized: &mut Vec<Unrecognized>,
+) -> Result<Vec<PathBuf>, PassError> {
+    let checked = check_host_dir(dir, strict)?;
     let io = |op: &'static str, path: &Path| {
         let (dir, path) = (dir.to_owned(), path.to_owned());
         move |source| PassError::HostDirIo {
@@ -637,9 +729,19 @@ fn records(dir: &Path, unrecognized: &mut Vec<Unrecognized>) -> Result<Vec<PathB
         }
     };
     let handle = hostdir::open_dir(dir).map_err(io("open", dir))?;
+    let opened = handle.metadata().map_err(io("stat", dir))?;
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).map_err(io("list", dir))? {
         names.push(entry.map_err(io("list", dir))?.file_name());
+    }
+    // The listing, the records read through the handle and the checks are of one directory: the
+    // one the path still names once it is listed.
+    let listed = fs::symlink_metadata(dir).map_err(io("lstat", dir))?;
+    let id = |m: &fs::Metadata| (m.dev(), m.ino());
+    if id(&opened) != checked || id(&listed) != checked {
+        return Err(PassError::HostDirMoved {
+            dir: dir.to_owned(),
+        });
     }
     names.sort();
     let mut recorded = Vec::new();
@@ -701,16 +803,16 @@ fn record(name: &str, existing: Existing) -> Result<PathBuf, RecordError> {
     Ok(PathBuf::from(record.dir))
 }
 
-/// Root's uid.
-const ROOT_UID: u32 = 0;
 /// The mode of the compiled-in host directory.
 const HOST_DIR_MODE: u32 = 0o1777;
 /// The mode of the compiled-in host directory's parent.
 const PARENT_MODE: u32 = 0o755;
 
-/// Checks that the host directory `dir` is as it must be (design: Hosts). Another directory than
-/// the compiled-in one, such as a test's, must only be a directory and not a link.
-fn check_host_dir(dir: &Path) -> Result<(), PassError> {
+/// Checks that the host directory `dir` is as it must be (design: Hosts), and returns its
+/// identity. `dir` must be a directory and not a link. When it is the directory `strict` names
+/// (the same device and inode, however `dir` spells it), that directory, its parent and every
+/// ancestor must also be as the strict checks want, along the path `strict` spells.
+fn check_host_dir(dir: &Path, strict: Strict<'_>) -> Result<FileId, PassError> {
     let shape = |path: &Path, why| PassError::HostDirShape {
         dir: dir.to_owned(),
         path: path.to_owned(),
@@ -730,8 +832,11 @@ fn check_host_dir(dir: &Path) -> Result<(), PassError> {
         }
     };
     let owned = |path: &Path, meta: &fs::Metadata, want: u32| {
-        if meta.uid() != ROOT_UID {
-            return Err(shape(path, Shape::Owner { uid: meta.uid() }));
+        if meta.uid() != strict.uid {
+            return Err(shape(path, Shape::Owner {
+                uid: meta.uid(),
+                want: strict.uid,
+            }));
         }
         let mode = meta.mode() & 0o7777;
         if mode != want {
@@ -740,11 +845,24 @@ fn check_host_dir(dir: &Path) -> Result<(), PassError> {
         Ok(())
     };
     let meta = lstat(dir)?;
-    if dir != Path::new(hostdir::DEFAULT) {
-        return Ok(());
+    let id = (meta.dev(), meta.ino());
+    let at_strict = match fs::symlink_metadata(strict.path) {
+        Ok(m) => (m.dev(), m.ino()) == id,
+        Err(e) if not_there(&e) => false,
+        Err(source) => {
+            return Err(PassError::HostDirIo {
+                dir: dir.to_owned(),
+                op: "lstat",
+                path: strict.path.to_owned(),
+                source,
+            });
+        }
+    };
+    if !at_strict {
+        return Ok(id);
     }
-    owned(dir, &meta, HOST_DIR_MODE)?;
-    let mut ancestors = dir.ancestors().skip(1);
+    owned(strict.path, &meta, HOST_DIR_MODE)?;
+    let mut ancestors = strict.path.ancestors().skip(1);
     if let Some(parent) = ancestors.next() {
         let meta = lstat(parent)?;
         owned(parent, &meta, PARENT_MODE)?;
@@ -752,70 +870,106 @@ fn check_host_dir(dir: &Path) -> Result<(), PassError> {
     for ancestor in ancestors {
         lstat(ancestor)?;
     }
-    Ok(())
+    Ok(id)
+}
+
+/// Whether `e`, from a `stat` of a directory's entry, says the entry is no root: nothing there,
+/// or a link that dangles or loops.
+fn no_root(e: &std::io::Error) -> bool {
+    not_there(e) || e.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// The roots in the directory whose real path is `dir`: its subdirectories with a root's name,
 /// by name.
 fn list_roots(dir: &Path) -> (DirState, Vec<(String, PathBuf)>) {
+    let unlistable = |op, path: &Path, source| {
+        (
+            DirState::Unlistable(DirError {
+                op,
+                path: path.to_owned(),
+                source,
+            }),
+            Vec::new(),
+        )
+    };
     match fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return (DirState::Absent, Vec::new()),
         Err(e) if not_there(&e) => return (DirState::Absent, Vec::new()),
-        Err(e) => return (DirState::Unlistable(e), Vec::new()),
+        Err(e) => return unlistable("stat", dir, e),
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if not_there(&e) => return (DirState::Absent, Vec::new()),
-        Err(e) => return (DirState::Unlistable(e), Vec::new()),
+        Err(e) => return unlistable("list", dir, e),
     };
     let mut roots = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(e) => return (DirState::Unlistable(e), Vec::new()),
+            Err(e) => return unlistable("list", dir, e),
         };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        // Another entry belongs to the application. A root may be reached through a link, as
-        // the open's path does.
-        if generation::is_root_name(&name) && fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
-            roots.push((name, entry.path()));
+        // Another entry belongs to the application.
+        if !generation::is_root_name(&name) {
+            continue;
+        }
+        // A root may be reached through a link, as the open's path does. An entry with a root's
+        // name that cannot be looked at may be a root: its commits are not read.
+        let path = entry.path();
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => roots.push((name, path)),
+            Ok(_) => {}
+            Err(e) if no_root(&e) => {}
+            Err(e) => return unlistable("stat", &path, e),
         }
     }
     roots.sort();
     (DirState::Present, roots)
 }
 
-/// What the root `root` holds, or `None` when the pass ran past `deadline` while reading it.
-fn read_root(root: &Path, deadline: Deadline) -> Option<RootRead> {
-    let lock_path = root.join(generation::LOCK);
-    let lock = match fs::metadata(&lock_path) {
-        Ok(meta) => Some((meta.dev(), meta.ino())),
-        Err(e) if not_there(&e) => None,
-        Err(source) => {
-            return Some(RootRead {
-                lock: None,
-                state: Some(RootState::Unreadable(RootError::Lock {
-                    path: lock_path,
-                    source,
-                })),
-            });
+/// What the root `root` holds, `before` its fingerprint ahead of the read, or [`Stopped`] when
+/// the pass ran past `deadline` while reading it.
+fn read_root(
+    root: &Path,
+    before: Option<&Fingerprint>,
+    deadline: Deadline,
+) -> Result<RootRead, Stopped> {
+    let lock_file = root.join(generation::LOCK);
+    let (lock, found) = match fs::metadata(&lock_file) {
+        Ok(meta) => (Some((meta.dev(), meta.ino())), pending(root, deadline)),
+        Err(e) if not_there(&e) => (None, pending(root, deadline)),
+        Err(source) => (
+            None,
+            Err(RootError::Lock {
+                path: lock_file,
+                source,
+            }),
+        ),
+    };
+    let state = match found {
+        Ok(None) => return Ok(RootRead::NoGeneration { lock }),
+        Ok(Some(state)) => state,
+        Err(RootError::Log(LogError::Stopped { .. })) => return Err(Stopped),
+        Err(error) => {
+            let changed = before.is_none_or(|before| fingerprint(root).as_ref() != Some(before));
+            RootState::Unreadable { error, changed }
         }
     };
-    let state = match pending(root, deadline) {
-        Ok(state) => state,
-        Err(RootError::Log(LogError::Stopped { .. })) => return None,
-        Err(e) => Some(RootState::Unreadable(e)),
-    };
-    Some(RootRead { lock, state })
+    Ok(RootRead::Listed {
+        lock,
+        state: Arc::new(state),
+    })
 }
 
 /// The pending commits of the root `root`'s current generation, `None` for a root with no
 /// generation.
 fn pending(root: &Path, deadline: Deadline) -> Result<Option<RootState>, RootError> {
-    let generation = match Root::classify(root)?.current()? {
+    let classified = Root::classify(root)?;
+    let superseded = classified.superseded_dirs();
+    let generation = match classified.current()? {
         None => return Ok(None),
         Some(Ok(generation)) => generation,
         Some(Err(unreadable)) => return Err(RootError::Generation(unreadable.error)),
@@ -836,10 +990,18 @@ fn pending(root: &Path, deadline: Deadline) -> Result<Option<RootState>, RootErr
     let bytes = commits
         .iter()
         .fold(0u64, |sum, (_, len)| sum.saturating_add(*len));
-    let salvaged = salvage::list(root)?
+    let unacknowledged = |m: &salvage::Manifest| m.acknowledged.map_or(0, |a| a.unacknowledged);
+    let mut salvaged = salvage::list(root)?
         .iter()
-        .filter_map(|s| s.manifest.acknowledged.map(|a| a.unacknowledged))
+        .map(|s| unacknowledged(&s.manifest))
         .fold(0u64, u64::saturating_add);
+    // A superseded generation with a manifest is a salvage the next open moves into `salvage/`
+    // ([`Root::finish_leftovers`]), as a crash between the publish and the move leaves it.
+    for dir in superseded {
+        if let Some(manifest) = salvage::read_manifest(&dir)? {
+            salvaged = salvaged.saturating_add(unacknowledged(&manifest));
+        }
+    }
     Ok(Some(RootState::Read {
         stream: state.stream_path.clone(),
         cluster: state.cluster_id.clone(),
@@ -885,7 +1047,7 @@ fn fingerprint(root: &Path) -> Option<Fingerprint> {
     Some(print)
 }
 
-/// An open file of a live process that is a root's lock.
+/// An open file of a live process that may be a root's lock.
 #[derive(Debug)]
 struct OpenLock {
     pid: u32,
@@ -897,21 +1059,30 @@ struct OpenLock {
 /// The `/proc` directory of the processes.
 const PROC: &str = "/proc";
 
-/// Every open file of a live process among `pids` (every process when `None`) that is a root's
-/// lock ([`is_lock_path`]), or `None` when the pass ran past `deadline`. A process that exits
-/// meanwhile is skipped. A process table, or a process's descriptors, that cannot be read fail.
+/// A process-table failure: `op` on `path`.
+fn table(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> PassError {
+    let path = path.to_owned();
+    move |source| PassError::ProcessTable { op, path, source }
+}
+
+/// Every open file of a live process among `pids` (every process when `None`) that may be a
+/// root's lock ([`lock_path`]), or `None` when the pass ran past `deadline`. A process that exits
+/// meanwhile is skipped. A process table, or a process's descriptors, that cannot be read fail,
+/// and so does the check of every process when this one is not root's.
 fn open_locks(
     pids: Option<&[u32]>,
     deadline: Deadline,
 ) -> Result<Option<Vec<OpenLock>>, PassError> {
-    let table = |op: &'static str, path: &Path| {
-        let path = path.to_owned();
-        move |source| PassError::ProcessTable { op, path, source }
-    };
     let proc = Path::new(PROC);
     let pids: Vec<u32> = match pids {
         Some(pids) => pids.to_vec(),
         None => {
+            // Another user sees some processes as absent (`hidepid`) and cannot read the open
+            // files of others.
+            let euid = effective_uid()?;
+            if euid != ROOT_UID {
+                return Err(PassError::NotRoot { euid });
+            }
             let mut all = Vec::new();
             for entry in fs::read_dir(proc).map_err(table("list", proc))? {
                 let entry = entry.map_err(table("list", proc))?;
@@ -922,60 +1093,157 @@ fn open_locks(
             all
         }
     };
+    if !pids.is_empty() {
+        // Without a `/proc` this process can list its own descriptors in (none mounted, or not
+        // Linux), every process would look exited.
+        let own = proc.join("self").join("fd");
+        fs::read_dir(&own).map_err(table("list", &own))?;
+    }
     let mut locks = Vec::new();
     for pid in pids {
         if deadline.passed() {
             return Ok(None);
         }
-        let fds = proc.join(pid.to_string()).join("fd");
-        let entries = match fs::read_dir(&fds) {
+        let process = proc.join(pid.to_string());
+        // Exited, or never there.
+        let Some(listed) = descriptors(&process, pid, &mut locks)? else {
+            continue;
+        };
+        if listed > 0 {
+            continue;
+        }
+        // A process whose first thread exited lists no descriptor, while its other threads
+        // still hold them.
+        let tasks = process.join("task");
+        let entries = match fs::read_dir(&tasks) {
             Ok(entries) => entries,
-            // Exited, or never there.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(table("list", &fds)(e)),
+            Err(e) => return Err(table("list", &tasks)(e)),
         };
         for entry in entries {
-            let fd = match entry {
+            let task = match entry {
                 Ok(entry) => entry.path(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(table("list", &fds)(e)),
+                Err(e) => return Err(table("list", &tasks)(e)),
             };
-            let target = match fs::read_link(&fd) {
-                Ok(target) => target,
-                // Closed since the listing, or the process exited.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(table("readlink", &fd)(e)),
-            };
-            if !is_lock_path(target.as_os_str().as_bytes()) {
-                continue;
-            }
-            match fs::metadata(&fd) {
-                Ok(meta) => locks.push(OpenLock {
-                    pid,
-                    path: target,
-                    id: (meta.dev(), meta.ino()),
-                }),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(table("stat", &fd)(e)),
-            }
+            descriptors(&task, pid, &mut locks)?;
         }
     }
     Ok(Some(locks))
 }
 
-/// Whether `target`, the path a `/proc/<pid>/fd` entry names, is a root's lock: it ends in
-/// `/<label>-<32 hex>/lock`, with or without ` (deleted)`. A reader's `reader-<n>/lock` is not:
-/// readers hold no commit.
-fn is_lock_path(target: &[u8]) -> bool {
+/// Adds every open file of the process `pid`, or of one of its threads, whose `/proc` directory
+/// is `dir` and that may be a root's lock ([`lock_path`]) to `locks`. Returns how many
+/// descriptors it lists, `None` when it exited.
+fn descriptors(
+    dir: &Path,
+    pid: u32,
+    locks: &mut Vec<OpenLock>,
+) -> Result<Option<usize>, PassError> {
+    let fds = dir.join("fd");
+    let entries = match fs::read_dir(&fds) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(table("list", &fds)(e)),
+    };
+    let mut listed = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(table("list", &fds)(e)),
+        };
+        listed = listed.saturating_add(1);
+        let fd = entry.path();
+        let target = match fs::read_link(&fd) {
+            Ok(target) => target,
+            // Closed since the listing, or the process exited.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(table("readlink", &fd)(e)),
+        };
+        let candidate = match lock_path(target.as_os_str().as_bytes()) {
+            LockPath::No => false,
+            LockPath::Root => true,
+            LockPath::Unnamed => {
+                let info = dir.join("fdinfo").join(entry.file_name());
+                match fs::read_to_string(&info) {
+                    Ok(text) => holds_write_lock(&text),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(table("read", &info)(e)),
+                }
+            }
+        };
+        if !candidate {
+            continue;
+        }
+        match fs::metadata(&fd) {
+            Ok(meta) => locks.push(OpenLock {
+                pid,
+                path: target,
+                id: (meta.dev(), meta.ino()),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(table("stat", &fd)(e)),
+        }
+    }
+    Ok(Some(listed))
+}
+
+/// What the path a `/proc/<pid>/fd` entry names says of the file being a root's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockPath {
+    /// Not a file named `lock`, or the lock of a reader directory (`reader-<n>`, or
+    /// `reader-trash-<32 hex>` while a cleanup deletes it): readers hold no commit.
+    No,
+    /// `<label>-<32 hex>/lock`, with or without ` (deleted)`: a root's lock by its name.
+    Root,
+    /// Another file named `lock`: a root's when the process holds an exclusive lock on it
+    /// ([`holds_write_lock`]), since a root's directory may have been renamed.
+    Unnamed,
+}
+
+/// What `target`, the path a `/proc/<pid>/fd` entry names, says of the file being a root's lock.
+fn lock_path(target: &[u8]) -> LockPath {
     let target = target.strip_suffix(DELETED).unwrap_or(target);
     let Some(dir) = target
         .strip_suffix(generation::LOCK.as_bytes())
         .and_then(|t| t.strip_suffix(b"/"))
     else {
-        return false;
+        return LockPath::No;
     };
     let name = dir.rsplit(|&b| b == b'/').next().unwrap_or_default();
-    std::str::from_utf8(name).is_ok_and(generation::is_root_name)
+    match std::str::from_utf8(name) {
+        Ok(name) if generation::is_reader_name(name) => LockPath::No,
+        Ok(name) if generation::is_root_name(name) => LockPath::Root,
+        _ => LockPath::Unnamed,
+    }
+}
+
+/// Whether `fdinfo`, a `/proc/<pid>/fdinfo/<n>`, shows an exclusive lock held through that open
+/// file: a `lock:` line of an `flock` or a record lock for writing, as a root's lock is held.
+fn holds_write_lock(fdinfo: &str) -> bool {
+    fdinfo
+        .lines()
+        .filter_map(|line| line.strip_prefix("lock:"))
+        .any(|lock| {
+            // `<n>: <kind> <mode> <access> <pid> <dev>:<inode> <start> <end>`
+            let mut words = lock.split_whitespace().skip(1);
+            matches!(
+                (words.next(), words.next(), words.next()),
+                (Some("FLOCK" | "POSIX" | "OFDLCK"), Some(_), Some("WRITE"))
+            )
+        })
+}
+
+/// This process's effective uid, from `/proc/self/status`.
+fn effective_uid() -> Result<u32, PassError> {
+    let path = Path::new(PROC).join("self").join("status");
+    let text = fs::read_to_string(&path).map_err(table("read", &path))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .and_then(|euid| euid.parse().ok())
+        .ok_or(PassError::NoUid { path })
 }
 
 #[cfg(test)]

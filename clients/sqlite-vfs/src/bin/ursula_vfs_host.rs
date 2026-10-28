@@ -7,15 +7,17 @@
 //! that every root lock a live process holds belongs to a root it read, and prints the result as
 //! one line of JSON ([`Inspection::to_json`]).
 //!
-//! - `--dir D`: the host directory, the extension's own by default.
+//! - `--dir D`: the host directory, the compiled-in `/var/lib/sqlite-ursula/host` by default.
 //! - `--scan S`: a directory to read besides the recorded ones, such as a default cache root.
-//! - `--pid P`: the lock check reads only these processes, every process without one.
+//! - `--pid P`: the lock check reads only these processes, every process without one, which
+//!   needs root.
 //! - `--until-clean MS`: read again every 50 ms until the result is clean or incomplete, or MS
 //!   have passed, then print the last result.
 //! - `--budget-ms MS`: a pass that runs longer stops, incomplete (`budget`).
 //!
 //! It exits 0 when it printed a result and 2 on a usage error (1 when it could not write either).
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,23 +45,29 @@ enum Usage {
     Number { flag: &'static str, value: String },
 }
 
-fn number<T: std::str::FromStr>(flag: &'static str, value: String) -> Result<T, Usage> {
-    value
-        .parse()
-        .map_err(|_not_a_number| Usage::Number { flag, value })
+fn number<T: std::str::FromStr>(flag: &'static str, value: OsString) -> Result<T, Usage> {
+    let usage = |value: OsString| Usage::Number {
+        flag,
+        value: value.to_string_lossy().into_owned(),
+    };
+    match value.to_str().map(str::parse) {
+        Some(Ok(n)) => Ok(n),
+        Some(Err(_not_a_number)) | None => Err(usage(value)),
+    }
 }
 
-/// The inspection the arguments `args` ask for.
-fn parse(mut args: impl Iterator<Item = String>) -> Result<Inspect, Usage> {
-    match args.next().as_deref() {
-        Some("inspect") => {}
-        Some(other) => return Err(Usage::Command(other.to_owned())),
+/// The inspection the arguments `args` ask for. A path may be any bytes, as a home directory
+/// taken from the password database may be.
+fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Inspect, Usage> {
+    match args.next() {
+        Some(command) if command == "inspect" => {}
+        Some(other) => return Err(Usage::Command(other.to_string_lossy().into_owned())),
         None => return Err(Usage::NoCommand),
     }
     let mut request = Inspect::default();
     while let Some(flag) = args.next() {
         let mut value = |name: &'static str| args.next().ok_or(Usage::Missing(name));
-        match flag.as_str() {
+        match flag.to_str().unwrap_or_default() {
             "--dir" => request.dir = Some(PathBuf::from(value("--dir")?)),
             "--scan" => request.scans.push(PathBuf::from(value("--scan")?)),
             "--pid" => {
@@ -74,7 +82,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Inspect, Usage> {
                 let ms = number("--budget-ms", value("--budget-ms")?)?;
                 request.budget = Some(Duration::from_millis(ms));
             }
-            _ => return Err(Usage::Option(flag.clone())),
+            _ => return Err(Usage::Option(flag.to_string_lossy().into_owned())),
         }
     }
     Ok(request)
@@ -87,7 +95,7 @@ fn print(inspection: &Inspection) -> std::io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let request = match parse(std::env::args().skip(1)) {
+    let request = match parse(std::env::args_os().skip(1)) {
         Ok(request) => request,
         Err(usage) => {
             return match writeln!(std::io::stderr(), "ursula-vfs-host: {usage}\n{USAGE}") {

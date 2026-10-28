@@ -1234,17 +1234,23 @@ until the root is opened where it now is.
 extension's crate that never loads SQLite, never writes a file and never takes a lock. A host runs
 it as root, so that it can read every root and every process's descriptors. One pass reads:
 
-1. The host directory. At the compiled-in path it must be a directory owned by root with mode 1777,
-   in a directory owned by root with mode 0755, with every ancestor a directory and none a link,
-   so an ancestor that disabled recording shows here. A directory given with `--dir` must only be
-   a directory and not a link. Every name in it must be a record, a `.tmp-<pid>-<16 hex>`, `hold`
-   or a name starting with `host`, and every record must have `v` 1 and an absolute `dir` whose
-   key is its name. The open's own check takes any `v`, so that release lines can share a
-   directory. The inspection refuses what it does not know.
+1. The host directory: the one `--dir` names, or the compiled-in path. The inspector never reads
+   `URSULA_VFS_HOST_DIR`, so a test hook left in the host's environment cannot point it at another
+   directory than the extension's. It must be a directory and not a link. When it is the
+   compiled-in directory (the same device and inode, however `--dir` spells it), it must be owned
+   by root with mode 1777, in a directory owned by root with mode 0755, with every ancestor of the
+   compiled-in path a directory and none a link, so an ancestor that disabled recording shows
+   here. The listing and the records come from one directory: the one the inspector opened, which
+   the path must still name once it is listed. Every name in it must be a record, a
+   `.tmp-<pid>-<16 hex>`, `hold` or a name starting with `host`, and every record must have `v` 1
+   and an absolute `dir` whose key is its name. The open's own check takes any `v`, so that
+   release lines can share a directory. The inspection refuses what it does not know.
 2. The directories: every recorded one and every `--scan` one, once per real path. A path with
    nothing at it, or with something other than a directory, holds no roots. In a directory, every
-   subdirectory named `<label>-<32 hex>` is a root, and other entries belong to the application. A
-   root with no `gen-<id32>` directory holds no commit and is not listed.
+   subdirectory named `<label>-<32 hex>` is a root, and other entries belong to the application.
+   An entry with a root's name that cannot be looked at (a `stat` that fails other than for a
+   missing file or a dangling or looping link) makes the directory unreadable. A root with no
+   `gen-<id32>` directory holds no commit and is not listed.
 3. Each root: its current generation by the open's rule (`Root::classify`), and that generation's
    log by the open's reading rule (`Log::read`), with a fold that keeps a position and a frame
    length per pending commit. A pass takes about 64 KiB plus 16 bytes per pending commit, whatever
@@ -1253,12 +1259,20 @@ it as root, so that it can read every root and every process's descriptors. One 
    its `commits.pending_bytes` once it binds. The ACK is lazy, so the bytes can include commits
    acknowledged within the last second, and never miss one. A log the open would refuse, or
    generations of which none is current, make the root `unreadable`.
-4. The lock check: every open descriptor under `/proc/<pid>/fd` whose target ends in
-   `/<label>-<32 hex>/lock`, deleted or not, must be the lock (device and inode) of a root the pass
-   read, which then shows `held`. Any other is an unread lock: a root moved, deleted or hidden under
-   a live process, a root in another mount namespace, or a running copy of any release since 0.8,
-   whatever it recorded. A reader's `reader-<n>/lock` is skipped, since readers hold no commit.
-   `--pid` limits the check to the processes it names.
+4. The lock check: every open descriptor of a live process under `/proc/<pid>/fd`, or under
+   `/proc/<pid>/task/<tid>/fd` once its first thread exited, that may be a root's lock must be the
+   lock (device and inode) of a root the pass read, which then shows `held`. A file named `lock`,
+   deleted or not, may be a root's when its directory is named `<label>-<32 hex>`, or when the
+   process holds an exclusive `flock` or record lock on it (the `lock:` lines of
+   `/proc/<pid>/fdinfo/<n>`), since a root's directory may have been renamed to any name. Any
+   other is an unread lock: a root moved, renamed, deleted or hidden under a live process, a root
+   in another mount namespace, or a running copy of any release since 0.8, whatever it recorded.
+   A lock in a reader directory (`reader-<n>`, or `reader-trash-<32 hex>` while a cleanup deletes
+   it) is skipped, since readers hold no commit and record nothing: a root renamed to a reader
+   directory's name is not seen. `--pid` limits the check to the processes it names. Without
+   `--pid` the inspector must run as root, since another user sees some processes as absent
+   (`hidepid`) or cannot read their descriptors, and with either it needs a `/proc` in which it
+   can list its own descriptors: otherwise the pass is incomplete (`unread_lock`).
 
 ```json
 {"v":1,"dir":"/var/lib/sqlite-ursula/host","complete":true,"clean":false,"incomplete":null,
@@ -1270,17 +1284,35 @@ it as root, so that it can read every root and every process's descriptors. One 
  "unread_locks":[],"unrecognized":[],"error":null}
 ```
 
-`complete` is true when the pass read the host directory and every record in it, found no name it
-does not know, read every root and the open files of every process, and found no unread lock, all
-within `--budget-ms`. Otherwise `incomplete` names one reason, the first that applies of
-`host_dir`, `unrecognized`, `unread_lock`, `unreadable` and `budget`, and `error` says what failed
-when the pass as a whole did. `clean` means complete with no unacknowledged byte. A root's `state` is
-`clean`, `pending` or `unreadable`, and its bytes are null when it is unreadable. `salvaged` counts
-the commits its salvages list as unacknowledged: the extension gave them up and never sends them, so
-they are outside the bytes, and a host reports them on their own. `--until-clean MS` reads again
-every 50 ms, rereading only the roots whose files changed, until the result is clean or incomplete
-or MS have passed. The binary exits 0 when it printed a result and 2 on a usage error. The JSON may
-only grow within a release line.
+- `complete` is true when the pass read the host directory and every record in it, found no name
+  it does not know, read every root and the open files of every process, and found no unread
+  lock, all within `--budget-ms`. `clean` means complete with no unacknowledged byte.
+- `incomplete` is null for a complete inspection, and otherwise names one reason, the first that
+  applies of `host_dir`, `unrecognized`, `unread_lock`, `unreadable` and `budget`.
+- `error` is a message saying what failed when the pass as a whole did (the host directory, the
+  process table or the budget), and null otherwise. A host acts on `incomplete`, never on the
+  message.
+- `dirs[]` lists each directory read: where it came from (`record` or `scan`), whether something
+  is there, and `error`, a message when it may hold roots and could not be read.
+- A root's `state` is `clean`, `pending` or `unreadable`, and its bytes, `commits` and `salvaged`
+  are null when it is unreadable, with `error` its message. `held` says whether a live process
+  holds its lock open, and is null when the lock check did not run (the process table could not
+  be read, or the budget ran out first). `salvaged` counts the commits its salvages list as
+  unacknowledged, and those of a superseded generation the next open moves into `salvage/`: the
+  extension gave them up and never sends them, so they are outside the bytes, and a host reports
+  them on their own.
+- `unread_locks[]` holds the `pid` and the `path` of each unread lock, as `/proc` names it.
+  `unrecognized[]` holds each name the host directory should not hold, with `error` saying why a
+  record's name holds no record of this line, null for a name of no record.
+- `--until-clean MS` reads again every 50 ms, rereading only the roots whose files changed, until
+  the result is clean or incomplete or MS have passed. A root whose read failed while its files
+  changed, as a drain trims and rolls its log, is read again rather than ending the wait.
+- `--budget-ms` bounds a pass, and stops it in the middle of a segment, at its next read of at
+  most 64 KiB. It does not bound an open or a read the kernel blocks, such as a FIFO planted in
+  place of a segment or a hung mount, so a host also bounds the inspector's run time and treats a
+  timeout as incomplete.
+- The binary exits 0 when it printed a result and 2 on a usage error. Paths may be any bytes. The
+  JSON may only grow within a release line.
 
 A read proves nothing about commits made after it. A host freezes everything that may write a root,
 syncs the filesystems, then inspects once, and takes the snapshot only from a complete inspection
@@ -1310,11 +1342,19 @@ crash at each step of the record). The inspection: `inspection/tests.rs`
 `absent_directories_and_roots_without_a_generation_are_clean`,
 `what_the_pass_cannot_read_makes_it_incomplete`,
 `a_missing_host_directory_is_reported_and_the_rest_read`, `a_spent_budget_stops_the_pass`,
-`an_open_lock_is_held_or_unread`, `replog/tests.rs` `a_fold_past_its_deadline_stops_the_read` and
-the read's equivalence proptest, and `test/host.e2e.ts` H6 to H8 and H13 to H15 (the bytes a crash at
-each step leaves equal the reopen's `pending_bytes` and drain to clean, unreadable and unrecognized
-states, an inspection that changes no byte or name, an orphan drained by a reopen, an unread lock
-under a moved or deleted cache directory, and a 0.11.0 copy's root read in a scanned directory).
+`an_open_lock_is_held_or_unread`, `a_held_lock_under_a_renamed_root_is_unread`,
+`the_compiled_in_host_directory_is_checked_strictly`,
+`a_root_that_cannot_be_looked_at_is_unreadable`, `the_check_of_every_process_needs_root`,
+`replog/tests.rs` `a_fold_past_its_deadline_stops_the_read` and the read's equivalence proptest,
+`test/host.e2e.ts` H6 to H8 and H13 to H15, and CI's `sqlite-vfs-host-musl`, which runs the static
+binary as root against the compiled-in directory. H6: after a crash at each step of the commit path
+and of a checkpoint (both checkpoint modes), of a re-key while bound and at open, of a publish that
+salvages, of a fresh open's first publish, of a trim and of an open's cut of a torn tail, the bytes
+read equal the `commits.pending_bytes` of a reopen with the stream refused, the salvaged commits
+are the same before and after the reopen, and the root drains to clean. The others: unreadable and
+unrecognized states, an inspection that changes no byte or name, an orphan drained by a reopen, an
+unread lock under a cache directory moved or deleted and under a root renamed out of its grammar,
+and a 0.11.0 copy's root read in a scanned directory.
 
 ## API
 

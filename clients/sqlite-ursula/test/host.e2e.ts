@@ -18,29 +18,35 @@
 //
 // The host's inspection, `ursula-vfs-host inspect` (URSULA_VFS_HOST, or the crate's release
 // build), run with `--pid` set to the test's children (the test process when none runs):
-// - H6: a crash at each step of the commit path and of a checkpoint, with the stream refused behind
-//   test/gate.mjs so nothing is acknowledged, leaves the bytes a provisional reopen shows as
-//   `commits.pending_bytes`, and after the gate forwards and the reopen closes, a clean inspection.
-//   A crash at each step of the record leaves an inspection that is complete and clean.
+// - H6: a crash at each step of the commit path and of a checkpoint (both checkpoint modes), with
+//   the stream refused behind test/gate.mjs so nothing is acknowledged, leaves the bytes a
+//   provisional reopen shows as `commits.pending_bytes`, and after the gate forwards and the reopen
+//   closes, a clean inspection. So does a crash, with the stream forwarding, at each step of a
+//   re-key while bound and at open, of a publish that salvages (and the salvaged commits are the
+//   same before and after the reopen), of a fresh open's first publish, of a trim, and of an open's
+//   cut of a torn tail, which the read cuts as the open does. A reopen whose generation holds no
+//   CLAIM record waits for the stream instead of opening provisionally, and then nothing is
+//   pending. A crash at each step of the record leaves an inspection that is complete and clean.
 // - H7: a root whose log has another format is unreadable, a stray name in the host directory is
 //   unrecognized, and either makes the inspection incomplete. A deleted cache directory is absent
 //   and clean.
 // - H8: an inspection changes no byte, name or time of the host directory or of a root.
 // - H13: an orphan (a root with bytes no process holds) drains with a reopen and a clean close.
-// - H14: a root held by a live process whose cache directory was renamed, or deleted, is an unread
-//   lock until the process exits. The renamed one is then hidden, the documented limit.
+// - H14: a root held by a live process whose cache directory was renamed, or deleted, or whose root
+//   directory was renamed out of the root-name grammar, is an unread lock until the process exits.
+//   The renamed one is then hidden, the documented limit.
 // - H15: a 0.11.0 extension, from its npm package, records nothing, and its root is read in a
 //   scanned directory, its bytes counted. While it runs, its root shows `held`, and without the scan
-//   its lock is unread.
+//   its lock is unread. It runs on the 0.11 line only: a later line's server refuses a 0.11 copy.
 import { blake3 } from "@noble/hashes/blake3.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { Child, directUrl, freshDir, gate, killChildren, stream } from "./kit.ts";
+import { Child, directUrl, freshDir, gate, killChildren, onModel, stream } from "./kit.ts";
 
 afterEach(killChildren);
 
@@ -278,7 +284,7 @@ interface InspectedRoot {
 	stream: string | null;
 	cluster: string | null;
 	state: "clean" | "pending" | "unreadable";
-	held: boolean;
+	held: boolean | null;
 	unacknowledged_bytes: number | null;
 	commits: number | null;
 	salvaged: number | null;
@@ -288,7 +294,7 @@ interface InspectedRoot {
 /** What `ursula-vfs-host inspect` prints. */
 interface Inspection {
 	v: number;
-	dir: string | null;
+	dir: string;
 	complete: boolean;
 	clean: boolean;
 	incomplete: string | null;
@@ -336,9 +342,12 @@ async function crashTables(url: string, dir: string, env: NodeJS.ProcessEnv): Pr
 	await setup.stop();
 }
 
+/** How test/crash-child.mjs checkpoints: every few pages, or a TRUNCATE checkpoint every few commits. */
+type Checkpoints = "auto:4" | "truncate:3";
+
 /** Runs test/crash-child.mjs until URSULA_VFS_ABORT_AT `abort` kills it. */
-async function crash(url: string, dir: string, env: NodeJS.ProcessEnv, abort: string): Promise<void> {
-	const doomed = new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: abort }, "crash-child.mjs", ["10", "auto:4"]);
+async function crash(url: string, dir: string, env: NodeJS.ProcessEnv, abort: string, checkpoints: Checkpoints = "auto:4"): Promise<void> {
+	const doomed = new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: abort }, "crash-child.mjs", ["10", checkpoints]);
 	for (let out = await doomed.line(); out !== undefined; out = await doomed.line()) {
 		expect(out.done, `${abort} never killed the child`).toBeUndefined();
 	}
@@ -362,21 +371,68 @@ function tree(dir: string): string[] {
 	return out;
 }
 
-/** The commit path and checkpoint steps of test/crash.e2e.ts, each at an occurrence after the first commit. */
-const COMMIT_STEPS = [
-	"admission:2",
-	"capture:2",
-	"encode:2",
-	"logged:2",
-	"forward:2",
-	"phasetwo:2",
-	"checkpoint_start:1",
-	"checkpoint_synced:1",
-	"checkpoint_page:1",
-	"base_start:1",
-	"base_synced:1",
-	"based:1",
-] as const;
+/**
+ * The commit path and checkpoint steps of test/crash.e2e.ts, each at an occurrence after the first
+ * commit, with the checkpoint mode. A TRUNCATE checkpoint's even F2 occurrences are the truncate to
+ * nothing.
+ */
+const COMMIT_STEPS: readonly (readonly [abort: string, checkpoints: Checkpoints])[] = [
+	["admission:2", "auto:4"],
+	["capture:2", "auto:4"],
+	["encode:2", "auto:4"],
+	["logged:2", "auto:4"],
+	["forward:2", "auto:4"],
+	["phasetwo:2", "auto:4"],
+	["checkpoint_start:1", "auto:4"],
+	["checkpoint_synced:1", "auto:4"],
+	["checkpoint_page:1", "auto:4"],
+	["base_start:1", "auto:4"],
+	["base_synced:1", "auto:4"],
+	["based:1", "auto:4"],
+	["checkpoint_start:1", "truncate:3"],
+	["checkpoint_synced:1", "truncate:3"],
+	["checkpoint_page:1", "truncate:3"],
+	["base_start:2", "truncate:3"],
+	["base_synced:2", "truncate:3"],
+	["based:2", "truncate:3"],
+];
+
+/** The table test/crash.e2e.ts's second matrix writes. */
+const TABLE = "CREATE TABLE IF NOT EXISTS t(x INTEGER NOT NULL, pad BLOB)";
+
+/** A history event of the model, restoring `checkpoint` if given. */
+async function history(checkpoint?: string): Promise<void> {
+	const query = checkpoint === undefined ? "" : `?restore=${checkpoint}`;
+	const r = await fetch(`${directUrl()}/__model/history${query}`, { method: "POST" });
+	expect(r.ok, await r.text()).toBe(true);
+}
+
+/** A checkpoint of every stream the model holds: its id. */
+async function checkpoint(): Promise<string> {
+	const r = await fetch(`${directUrl()}/__model/checkpoint`, { method: "POST" });
+	const id = (await r.text()).trim();
+	expect(r.ok, id).toBe(true);
+	return id;
+}
+
+async function synced(child: Child): Promise<void> {
+	expect((await child.send({ synced: 20_000 })).synced).toMatchObject({ synced: true });
+}
+
+/** The child dies by its URSULA_VFS_ABORT_AT `step`. */
+async function killedAt(child: Child, step: string): Promise<void> {
+	const ended = await Promise.race([child.exit, sleep(60_000).then(() => ({ signal: "timeout" }))]);
+	expect(ended.signal, `never killed at ${step}`).toBe("SIGKILL");
+	await child.stop();
+}
+
+/** Binds `url` in `dir` in a child, runs `work`, then closes the database and waits for its binding to retire. */
+async function closedOwner(url: string, dir: string, env: NodeJS.ProcessEnv, work: (child: Child) => Promise<void>): Promise<void> {
+	const child = new Child(url, dir, env);
+	await child.opened();
+	await work(child);
+	await closeAndRetire(child);
+}
 
 describe("the host's inspection (ursula-vfs-host inspect)", () => {
 	let front: Awaited<ReturnType<typeof gate>>;
@@ -395,15 +451,53 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		expect(r.status, await r.text()).toBe(204);
 	}
 
-	for (const abort of COMMIT_STEPS) {
-		it(`H6: a crash at ${abort} with the stream refused leaves the bytes the reopen resends, then drains to clean`, async () => {
+	/**
+	 * After a crash in `dir`, with nothing running: a complete inspection whose bytes are the
+	 * `commits.pending_bytes` of a reopen with the stream refused, which opens provisionally on a
+	 * generation with a CLAIM record. Without one the reopen waits for the stream, fails at its
+	 * deadline, and nothing is pending. Then a reopen with the stream forwarding drains the root to
+	 * clean. Returns the root after the crash and after the drain.
+	 */
+	async function resendsWhatItRead(url: string, dir: string, host: string, env: NodeJS.ProcessEnv): Promise<{ crashed: InspectedRoot; drained: InspectedRoot }> {
+		await mode("refuse");
+		const seen = await inspect(host, [process.pid]);
+		expect(seen, JSON.stringify(seen)).toMatchObject({ complete: true, incomplete: null, error: null, unread_locks: [] });
+		const crashed = onlyRoot(seen);
+		expect(crashed, JSON.stringify(seen)).toMatchObject({ held: false, error: null });
+		expect(["clean", "pending"]).toContain(crashed.state);
+		const offline = new Child(url, dir, env);
+		const first = await offline.first();
+		if (first.ok === true) {
+			expect((first.opened as { state: string }).state).toBe("provisional");
+			const status = (await offline.send({ status: true })).status as { commits: { pending_bytes: number } };
+			expect(status.commits.pending_bytes).toBe(crashed.unacknowledged_bytes);
+			const held = onlyRoot(await inspect(host, [offline.pid]));
+			expect(held).toMatchObject({ held: true, unacknowledged_bytes: crashed.unacknowledged_bytes, salvaged: crashed.salvaged });
+		} else {
+			// No CLAIM record to continue: the generation holds no commit of its own.
+			expect(crashed.unacknowledged_bytes, JSON.stringify(first)).toBe(0);
+		}
+		await offline.stop();
+
+		await mode("forward");
+		const next = new Child(url, dir, env);
+		await next.opened();
+		await synced(next);
+		await closeAndRetire(next);
+		const drained = await inspect(host, [process.pid], { untilClean: 5_000 });
+		expect(drained, JSON.stringify(drained)).toMatchObject({ complete: true, clean: true, unacknowledged_bytes: 0 });
+		return { crashed, drained: onlyRoot(drained) };
+	}
+
+	for (const [abort, checkpoints] of COMMIT_STEPS) {
+		it(`H6: a crash at ${abort} (${checkpoints}) with the stream refused leaves the bytes the reopen resends, then drains to clean`, async () => {
 			const { host, env } = hostDir();
 			const dir = freshDir();
-			const s = stream(`host-h6-${abort.replace(":", "-")}`);
+			const s = stream(`host-h6-${abort.replace(":", "-")}-${checkpoints.replace(":", "-")}`);
 			const url = `${front.url}${s.path}`;
 			await crashTables(url, dir, env);
 			await mode("refuse");
-			await crash(url, dir, env, abort);
+			await crash(url, dir, env, abort, checkpoints);
 
 			const seen = await inspect(host, [process.pid]);
 			expect(seen, JSON.stringify(seen)).toMatchObject({ complete: true, clean: false, incomplete: null, error: null });
@@ -428,6 +522,128 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			expect(onlyRoot(drained).state).toBe("clean");
 		});
 	}
+
+	for (const step of ["rekey_rolled", "rekey_claimed"]) {
+		it.skipIf(!onModel())(`H6: a crash at ${step} in a re-key while bound leaves the bytes the reopen resends`, async () => {
+			const { host, env } = hostDir();
+			const dir = freshDir();
+			const url = `${front.url}${stream(`host-h6-${step}-bound`).path}`;
+			const doomed = new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: step });
+			await doomed.opened();
+			await doomed.exec(`${TABLE}; INSERT INTO t(x) VALUES (1)`);
+			await synced(doomed);
+			await history();
+			// The commit meets the new token, and the re-key it starts dies at `step`.
+			await doomed.send({ exec: "INSERT INTO t(x) VALUES (2)" }).catch(() => undefined);
+			await killedAt(doomed, step);
+			await resendsWhatItRead(url, dir, host, env);
+		});
+
+		it.skipIf(!onModel())(`H6: a crash at ${step} in a re-key at open leaves the bytes the reopen resends`, async () => {
+			const { host, env } = hostDir();
+			const dir = freshDir();
+			const url = `${front.url}${stream(`host-h6-${step}-open`).path}`;
+			await closedOwner(url, dir, env, async (child) => {
+				await child.exec(`${TABLE}; INSERT INTO t(x) VALUES (1)`);
+				await synced(child);
+			});
+			await history();
+			await killedAt(new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: step }), step);
+			await resendsWhatItRead(url, dir, host, env);
+		});
+	}
+
+	for (const step of ["salvage_marked", "publish_renamed", "salvage_moved"]) {
+		it.skipIf(!onModel())(`H6: a crash at ${step} in a salvage after a lossy restore leaves the bytes the reopen resends, and its salvaged commits`, async () => {
+			const { host, env } = hostDir();
+			const dir = freshDir();
+			const url = `${front.url}${stream(`host-h6-${step}`).path}`;
+			const owner = new Child(url, dir, env);
+			await owner.opened();
+			await owner.exec(TABLE);
+			await synced(owner);
+			const saved = await checkpoint();
+			await owner.exec("INSERT INTO t(x) VALUES (1)");
+			await synced(owner);
+			// A commit the stream never acknowledges, which the salvage lists as unacknowledged.
+			await mode("refuse");
+			await owner.exec("INSERT INTO t(x) VALUES (2)");
+			await owner.stop("SIGKILL");
+			await mode("forward");
+			expect(onlyRoot(await inspect(host, [process.pid])).unacknowledged_bytes).toBeGreaterThan(0);
+
+			// The restore lost commit 1: the open salvages the generation and dies at `step`.
+			await history(saved);
+			await killedAt(new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: step }), step);
+			const { crashed, drained } = await resendsWhatItRead(url, dir, host, env);
+			if (step !== "salvage_marked") {
+				// A superseded generation with its manifest, or the salvage it became: the next open
+				// finishes the move, and the count stays.
+				expect(crashed.salvaged).toBeGreaterThan(0);
+				expect(drained.salvaged).toBe(crashed.salvaged);
+			} else {
+				// Marked, never published: the next open unmarks it, and the forwarding one salvages it.
+				expect(crashed.salvaged).toBe(0);
+				expect(drained.salvaged).toBeGreaterThan(0);
+			}
+		});
+	}
+
+	it("H6: a crash at publish_renamed in a fresh open's first publish leaves a clean root", async () => {
+		const { host, env } = hostDir();
+		const dir = freshDir();
+		const url = `${front.url}${stream("host-h6-publish-fresh").path}`;
+		await killedAt(new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: "publish_renamed" }), "publish_renamed");
+		const { crashed } = await resendsWhatItRead(url, dir, host, env);
+		expect(crashed).toMatchObject({ state: "clean", unacknowledged_bytes: 0, salvaged: 0 });
+	});
+
+	it("H6: a crash at trim_unlinked, a trim below the ACK and the BASE, leaves the bytes the reopen resends", async () => {
+		const { host, env } = hostDir();
+		const dir = freshDir();
+		const url = `${front.url}${stream("host-h6-trim").path}`;
+		const doomed = new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: "trim_unlinked" });
+		await doomed.opened();
+		await doomed.exec(TABLE);
+		// 1 MB commits: the log rolls at 16 MiB, and checkpoints move the BASE past the first segment.
+		for (let x = 1; x <= 30; x++) {
+			const reply = await doomed.send({ exec: `INSERT INTO t VALUES (${x}, randomblob(1000000))` }).catch(() => undefined);
+			if (reply?.ok !== true) break;
+		}
+		await killedAt(doomed, "trim_unlinked");
+		await resendsWhatItRead(url, dir, host, env);
+	});
+
+	it("H6: a torn tail is cut by the read as by the open, and a crash at cut_removed leaves the bytes the reopen resends", async () => {
+		const { host, env } = hostDir();
+		const dir = freshDir();
+		const url = `${front.url}${stream("host-h6-cut").path}`;
+		const owner = new Child(url, dir, env);
+		await owner.opened();
+		await owner.exec(`${TABLE}; INSERT INTO t(x) VALUES (1)`);
+		await synced(owner);
+		await mode("refuse");
+		await owner.exec("INSERT INTO t(x) VALUES (2)");
+		await owner.stop("SIGKILL");
+		await mode("forward");
+		// A torn record at the log's tail, as a power loss can leave one.
+		const root = onlyRoot(await inspect(host, [process.pid])).root;
+		const generation = readdirSync(root).find((n) => /^gen-[0-9a-f]{32}$/.test(n));
+		expect(generation).toBeDefined();
+		const log = join(root, generation as string, "log");
+		const last = readdirSync(log)
+			.filter((n) => n.endsWith(".usl"))
+			.sort()
+			.at(-1) as string;
+		appendFileSync(join(log, last), Buffer.alloc(64, 0xff));
+		const torn = await inspect(host, [process.pid]);
+		expect(torn, JSON.stringify(torn)).toMatchObject({ complete: true, clean: false });
+		expect(onlyRoot(torn).unacknowledged_bytes).toBeGreaterThan(0);
+
+		await killedAt(new Child(url, dir, { ...env, URSULA_VFS_ABORT_AT: "cut_removed" }), "cut_removed");
+		const { crashed } = await resendsWhatItRead(url, dir, host, env);
+		expect(crashed.unacknowledged_bytes).toBe(onlyRoot(torn).unacknowledged_bytes);
+	});
 
 	for (const step of ["host_tmp_synced", "host_linked", "host_dir_synced"]) {
 		it(`H6: a crash at ${step} leaves an inspection that is complete and clean`, async () => {
@@ -514,8 +730,8 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		expect(onlyRoot(drained)).toMatchObject({ state: "clean", held: false, unacknowledged_bytes: 0 });
 	});
 
-	for (const how of ["renamed", "deleted"] as const) {
-		it(`H14: a root held under a cache directory ${how} meanwhile is an unread lock while its process runs`, async () => {
+	for (const how of ["renamed", "deleted", "root renamed"] as const) {
+		it(`H14: a root held under a cache directory ${how === "root renamed" ? "whose root was renamed out of the root-name grammar" : how} meanwhile is an unread lock while its process runs`, async () => {
 			const { host, env } = hostDir();
 			const parent = realpathSync(freshDir());
 			const dir = join(parent, "cache");
@@ -528,23 +744,27 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			const root = onlyRoot(before);
 			expect(root.held).toBe(true);
 
-			const moved = join(parent, "moved");
+			const moved = how === "root renamed" ? join(dir, "notes-old") : join(parent, "moved");
 			if (how === "renamed") renameSync(dir, moved);
+			else if (how === "root renamed") renameSync(join(dir, root.id), moved);
 			else rmSync(dir, { recursive: true, force: true });
 			const seen = await inspect(host, [holder.pid]);
 			expect(seen, JSON.stringify(seen)).toMatchObject({ complete: false, clean: false, incomplete: "unread_lock", roots: [] });
-			const lock = how === "renamed" ? join(moved, root.id, "lock") : `${join(dir, root.id, "lock")} (deleted)`;
+			const lock = { renamed: join(moved, root.id, "lock"), "root renamed": join(moved, "lock"), deleted: `${join(dir, root.id, "lock")} (deleted)` }[how];
 			expect(seen.unread_locks).toEqual([{ pid: holder.pid, path: lock }]);
 
 			await holder.stop();
 			const after = await inspect(host, [process.pid]);
-			expect(after, JSON.stringify(after)).toMatchObject({ complete: true, roots: [], unread_locks: [], dirs: [{ present: false }] });
+			expect(after, JSON.stringify(after)).toMatchObject({ complete: true, roots: [], unread_locks: [], dirs: [{ present: how === "root renamed" }] });
 			// The renamed directory, and whatever it holds, is out of the host's sight.
-			expect(existsSync(moved)).toBe(how === "renamed");
+			expect(existsSync(moved)).toBe(how !== "deleted");
 		});
 	}
 
-	describe("H15: a 0.11.0 extension", () => {
+	// The npm copy is 0.11.0: a server or model of a later line refuses it (`protocol_mismatch`),
+	// so this runs on the 0.11 line only.
+	const line011 = (JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8")) as { version: string }).version.startsWith("0.11.");
+	describe.skipIf(!line011)("H15: a 0.11.0 extension", () => {
 		let older = "";
 		beforeAll(async () => {
 			const dest = freshDir();

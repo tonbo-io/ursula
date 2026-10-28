@@ -235,6 +235,40 @@ jobs:
           "$bin" inspect --budget-ms soon || status=$?
           test "$status" -eq 2
 
+      # The compiled-in host directory's checks (design: Hosts), as root, the way a host runs it.
+      - name: Check the compiled-in host directory as root
+        run: |
+          set -euo pipefail
+          bin=clients/sqlite-vfs/target/release/ursula-vfs-host
+          expect() {
+            python3 -c '
+          import json, sys
+          r, want = json.loads(sys.argv[1]), sys.argv[2]
+          assert r["dir"] == "/var/lib/sqlite-ursula/host", r
+          if want == "clean":
+              assert r["complete"] is True and r["clean"] is True and r["incomplete"] is None, r
+          else:
+              assert r["complete"] is False and r["incomplete"] == want, r
+          ' "$1" "$2"
+          }
+          sudo install -d -o root -g root -m 0755 /var/lib/sqlite-ursula
+          sudo install -d -o root -g root -m 1777 /var/lib/sqlite-ursula/host
+          expect "$(sudo "$bin" inspect --pid $$)" clean
+          # The same directory through another spelling is checked as strictly.
+          expect "$(sudo "$bin" inspect --dir /var/lib/sqlite-ursula/../sqlite-ursula/host --pid $$)" clean
+          sudo chmod 0777 /var/lib/sqlite-ursula/host
+          expect "$(sudo "$bin" inspect --dir /var/lib/sqlite-ursula/../sqlite-ursula/host --pid $$)" host_dir
+          sudo chmod 1777 /var/lib/sqlite-ursula/host
+          sudo chmod 0775 /var/lib/sqlite-ursula
+          expect "$(sudo "$bin" inspect --pid $$)" host_dir
+          sudo chmod 0755 /var/lib/sqlite-ursula
+          sudo touch /var/lib/sqlite-ursula/host/stray
+          expect "$(sudo "$bin" inspect --pid $$)" unrecognized
+          sudo rm /var/lib/sqlite-ursula/host/stray
+          # The check of every process needs root.
+          expect "$("$bin" inspect)" unread_lock
+          sudo rm -rf /var/lib/sqlite-ursula
+
   sqlite-vfs-e2e:
     name: sqlite-vfs e2e (model server, Node ${{ matrix.node }})
     needs: [sqlite-vfs]

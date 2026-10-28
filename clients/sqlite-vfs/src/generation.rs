@@ -237,6 +237,24 @@ pub(crate) fn is_root_name(name: &str) -> bool {
     label_ok && hash_ok
 }
 
+/// Whether `name` is a reader directory's name: `reader-<n>`, or `reader-trash-<32 hex>` once a
+/// cleanup renamed it to be deleted ([`clean_readers`]). A host's inspection skips the locks in
+/// them: readers hold no commit.
+pub(crate) fn is_reader_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(READER) else {
+        return false;
+    };
+    match rest.strip_prefix(READER_TRASH) {
+        Some(id) => {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => rest.parse::<u32>().is_ok(),
+    }
+}
+
 /// The root directory of stream `p` under the cache root `dir`.
 pub(crate) fn root_dir(dir: &Path, p: &CanonicalPath) -> PathBuf {
     dir.join(root_name(p))
@@ -482,6 +500,16 @@ pub(crate) struct Classified {
 impl Classified {
     fn superseded(&self, g: &Dir) -> bool {
         self.superseded.contains(&g.id)
+    }
+
+    /// The directories of the generations another one supersedes: the next open salvages each
+    /// that holds a salvage manifest and deletes the others ([`Root::finish_leftovers`]).
+    pub(crate) fn superseded_dirs(&self) -> Vec<PathBuf> {
+        self.gens
+            .iter()
+            .filter(|g| self.superseded(g))
+            .map(|g| g.path.clone())
+            .collect()
     }
 
     /// The current generation's directory: the one no other supersedes. `None` only for a root

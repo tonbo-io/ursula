@@ -1322,8 +1322,8 @@ fn a_hosts_fold_keeps_the_pending_commits_without_their_frames() {
     opens_as_before(&log_dir, acks_go_back).unwrap();
 }
 
-// A host's fold whose deadline passed stops the read after the record it was handed, and the read
-// changes nothing.
+// A host's fold whose deadline passed stops the read at its next read of a segment's bytes, before
+// any record, and the read changes nothing.
 #[test]
 fn a_fold_past_its_deadline_stops_the_read() {
     let dir = TempDir::new("log-read-stopped");
@@ -1338,6 +1338,7 @@ fn a_fold_past_its_deadline_stops_the_read() {
     let err = Log::read(&log_dir, &mut fold).unwrap_err();
     assert!(matches!(err, LogError::Stopped { .. }), "{err}");
     assert_eq!(fold.pending(), None);
+    assert!(fold.state().is_none());
     assert_eq!(snapshot(&log_dir), files);
 }
 
