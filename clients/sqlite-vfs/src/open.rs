@@ -388,9 +388,10 @@ pub(crate) enum GaveUp {
     Missing,
 }
 
-/// A local failure: a gap or malformed record under valid checksums is the extension's own bug
-/// (`internal`), a commit or snapshot from the stream whose page 1 is not a SQLite database's is
-/// the stream's (`stream_state`), anything else `local_setup`.
+/// A local failure: a gap or malformed record under valid checksums, or a segment header's cluster
+/// id that does not parse, is the extension's own bug (`internal`), a commit or snapshot from the
+/// stream whose page 1 is not a SQLite database's is the stream's (`stream_state`), anything else
+/// `local_setup`.
 pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
     let e = e.into();
     if let LocalSetup::Local(l) = &e

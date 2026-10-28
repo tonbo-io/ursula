@@ -97,9 +97,10 @@
 //! rule of its own, and the stream's latest snapshot plays no part. A generation with nothing after
 //! its latest ACK has nothing to send, so a claim would only open the pre-check's window, and its
 //! pre-check could re-key it: the drain declines it, and so never re-keys at its open. When the
-//! drain's first HEAD got no answer with nothing sent, [`decide_drain_unreachable`] continues by
-//! the unreachable row and declines at once where an owner's open would wait. Every refusal and
-//! every decline keeps the local files and sends nothing but the HEAD.
+//! drain's first HEAD got no answer with nothing sent, [`decide_drain_unreachable`] continues only
+//! a trusted generation with a CLAIM record and commits after its latest ACK, as the owner's
+//! unreachable row does, and declines anything else at once, nothing pending included. Every
+//! refusal and every decline keeps the local files and sends nothing but the HEAD.
 
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
@@ -1413,8 +1414,8 @@ mod tests {
         assert_eq!(Declined::NothingPending.kind(), "internal");
     }
 
-    // Unreachable, a drain continues by the owner's provisional row, and declines at once where an
-    // owner's open would wait for the stream.
+    // Unreachable, a drain continues only a trusted generation with a CLAIM record and commits after
+    // its latest ACK, and declines anything else at once, nothing pending included.
     #[test]
     fn an_unreachable_drain_continues_a_claim_and_declines_anything_else_at_once() {
         assert_eq!(
