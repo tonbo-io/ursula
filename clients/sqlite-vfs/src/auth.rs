@@ -451,14 +451,15 @@ fn admit(held: Option<(&Key, Use)>, next: &Key) -> Admit {
 /// one held fails while a host waits for the held key's token or was handed it less than
 /// [`HANDED_OUT_HOLD_MS`] ago, or while an open, a bound database or an import may send requests
 /// carrying its token. The host asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open
-/// carries this key's tokens. The wait ends early once `cancelled` holds, checked again after each
-/// [`wake`]: the host gives up its claim on the key at once.
+/// carries this key's tokens. The wait ends early once `cancelled` holds, asked again after each
+/// [`wake`] and each change of the key, with the key's last failure: the host gives up its claim
+/// on the key at once.
 pub(crate) fn use_key(
     secret: &str,
     endpoint: &str,
     audience: Option<&str>,
     timeout: Duration,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &dyn Fn(Option<&ExchangeError>) -> bool,
 ) -> Result<(), KeyError> {
     let key = Key::new(secret, endpoint, audience)?;
     start_refresher()?;
@@ -502,7 +503,7 @@ pub(crate) fn use_key(
         if !REFRESHER_UP.load(Ordering::Acquire) {
             break Err(KeyError::RefresherStopped);
         }
-        if cancelled() {
+        if cancelled(last) {
             break Err(KeyError::Cancelled {
                 last: last.cloned(),
             });

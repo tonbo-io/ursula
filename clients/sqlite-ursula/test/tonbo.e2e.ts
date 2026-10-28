@@ -804,24 +804,19 @@ describe("the extension's tonbo_resolve", () => {
 		expect(api.of("token")).toEqual([]);
 	});
 
-	it("sends a key it was not passed only to the origins of the environment", async () => {
-		const d = database("ext-ambient");
+	it("sends any key, one it was not passed included, to the origins the options name over the environment's", async () => {
+		const d = database("ext-origins");
 		const elsewhere = await bystander(200);
+		process.env.TONBO_API_ORIGIN = elsewhere.origin;
 		process.env.TONBO_API_KEY = "tbo_ambient";
-		for (const option of ["api_origin", "auth_origin"] as const) {
-			const env = option === "api_origin" ? "TONBO_API_ORIGIN" : "TONBO_AUTH_ORIGIN";
-			await resolveError(tonboResolve(d.name, { own_token: true, [option]: elsewhere.origin }), "invalid_argument", `Pass the API key option with it, or set ${env} instead`);
-		}
-		login(USABLE_LOGINS[1]);
+		await tonboResolve(d.name, { own_token: true, api_origin: api.origin });
 		delete process.env.TONBO_API_KEY;
-		await resolveError(tonboResolve(d.name, { own_token: true, api_origin: elsewhere.origin }), "invalid_argument");
+		login(USABLE_LOGINS[1]);
+		await tonboResolve(d.name, { own_token: true, api_origin: api.origin });
+		await tonboResolve(d.name, { own_token: true, api_key: "tbo_option", api_origin: api.origin });
 		expect(elsewhere.hits).toEqual([]);
 		await elsewhere.stop();
-		expect(api.seen).toEqual([]);
-		// The environment's own origin, named as an option, and any origin with the key passed beside it.
-		await tonboResolve(d.name, { own_token: true, api_origin: api.origin });
-		await tonboResolve(d.name, { own_token: true, api_key: "tbo_ambient", api_origin: api.origin });
-		expect(api.of("management").map((s) => s.authorization)).toEqual(["Bearer tbo_secret", "Bearer tbo_ambient"]);
+		expect(api.of("management").map((s) => s.authorization)).toEqual(["Bearer tbo_ambient", "Bearer tbo_secret", "Bearer tbo_option"]);
 	});
 
 	// Worker threads of this process make the blocking calls, so this thread serves the stand-in meanwhile.

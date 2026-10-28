@@ -18,7 +18,8 @@
 //!
 //! Requests go out on the agent of appends and reads (`transport::http::agent`): the same roots
 //! (`URSULA_VFS_CA_FILE`), the same proxy, no redirect. Each request, the exchange included, is
-//! bounded by the time the resolve has left.
+//! bounded by the time the resolve has left and by the agent's own [`REQUEST_CAP`], so one that
+//! gets no answer is retried, and a cancel ends it within that.
 //!
 //! What an answer says ([`classify`], [`asks_exchange`]), what a database's state says
 //! ([`settle`]) and how long the lookup waits ([`backoff_ms`], [`wait_ms`]) are pure: the loop
@@ -56,6 +57,16 @@ const EXPIRY_MARGIN_MS: u64 = 30_000;
 const ANSWER_LIMIT: u64 = 64 << 10;
 /// The shortest time a request is given, so one sent just before the end still goes out.
 const MIN_REQUEST_MS: u64 = 1;
+/// The longest time a request is given: the agent's own timeout (`transport::http::agent`).
+const REQUEST_CAP: Duration = Duration::from_secs(10);
+
+/// The time a request of the resolve is given: what `until` leaves, at most [`REQUEST_CAP`].
+fn request_time(until: &Until) -> Duration {
+    until
+        .left()
+        .min(REQUEST_CAP)
+        .max(Duration::from_millis(MIN_REQUEST_MS))
+}
 
 /// The two Tonbo APIs, as messages name them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,8 +418,8 @@ fn management_bearer(
     let endpoint = format!("{auth}/api/iam/token");
     let exchanger = Key::new(&key.secret, &endpoint, None)
         .map_err(|e| Failure::Final(TonboError::Unsendable(e)))?;
-    let left = until.left().max(Duration::from_millis(MIN_REQUEST_MS));
-    let got = exchange(&exchanger, Some(left)).map_err(|e| exchange_failure(e, &key.from))?;
+    let got = exchange(&exchanger, Some(request_time(until)))
+        .map_err(|e| exchange_failure(e, &key.from))?;
     let lifetime = Duration::from_millis(got.lifetime_ms.saturating_sub(EXPIRY_MARGIN_MS));
     let now = Instant::now();
     let mut held = MANAGEMENT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -441,15 +452,14 @@ impl Answer {
     }
 }
 
-/// `GET url` with `bearer`, given the time `until` leaves it.
+/// `GET url` with `bearer`, given the time `until` leaves it, at most [`REQUEST_CAP`].
 fn get(url: &str, bearer: &str, until: &Until) -> Result<Answer, Failure> {
-    let left = until.left().max(Duration::from_millis(MIN_REQUEST_MS));
     let mut response = agent()
         .get(url)
         .header("authorization", format!("Bearer {bearer}"))
         .header("accept", "application/json")
         .config()
-        .timeout_global(Some(left))
+        .timeout_global(Some(request_time(until)))
         .build()
         .call()
         .map_err(|e| {

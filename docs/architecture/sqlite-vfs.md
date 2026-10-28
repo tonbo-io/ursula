@@ -1863,44 +1863,51 @@ carries none of its own. Only `extension.rs` calls into the `tonbo` module, and 
   `TONBO_API_KEY`, `TONBO_API_ORIGIN` and `TONBO_AUTH_ORIGIN` read at each call. The login file is
   checked with `lstat`, opened with `O_NOFOLLOW | O_NONBLOCK`, and checked again on the descriptor.
   Its `expires_at` is an RFC 3339 date-time, and a file over 64 KiB is unusable.
-- Any SQL on a connection that loaded the extension may call `tonbo_resolve`, so an `api_origin` or
-  `auth_origin` other than the one the environment gives (`TONBO_API_ORIGIN`, `TONBO_AUTH_ORIGIN`,
-  else the default) takes only a key passed beside it as `api_key`. A key from `TONBO_API_KEY` or
-  the login file goes only to the environment's origins, and otherwise the call fails
-  `invalid_argument` before any request.
+- The `api_origin` and `auth_origin` options take the place of the environment's origins for any
+  key, one from `TONBO_API_KEY` or the login file included, as `apiOrigin` and `authOrigin` of the
+  Node `/tonbo` module do. The SQL that calls `tonbo_resolve` is trusted as the host is: the function is
+  registered only on the connection that loaded the extension, `SQLITE_DIRECTONLY`, and that SQL can
+  already open any stream URL and set any token (`ursula_open`, `ursula_set_token`). A host that
+  runs SQL it does not trust does not load the extension on that connection.
 - The lookup is as above: the `exchange_required` exchange and the Management API token held per
   key, the backoff from 250 ms to 2 s, `Retry-After` in whole seconds and never below the backoff,
   and no redirect followed. Its requests go out on the agent of appends and reads
-  ([Transport](#transport)), so they trust the same roots and take the same proxy. Each request,
-  the Management API token's exchange included, is bounded by the time the call has left. A
-  refusal and a status outside the contract keep the answer's `code`, `detail` and request id, the
-  token endpoint's too.
+  ([Transport](#transport)), so they trust the same roots and take the same proxy. Each request, the
+  Management API token's exchange included, is bounded by the time the call has left and by the
+  agent's 10 s, so a request that gets no answer is retried. A refusal and a status outside the
+  contract keep the answer's `code`, `detail` and request id, the token endpoint's too.
 - Unless `own_token` is set or `URSULA_VFS_TOKEN_FILE` serves the Streams requests, the key becomes
-  the process's key source ([Transport](#transport)), exchanged at `{auth origin}/api/iam/token`
-  for the audience `https://streams.tonbo.dev`, and the call returns only once it holds the first
-  token. A key the token endpoint refuses fails there with `invalid_api_key`, before any open. The
-  process holds one key, so another one fails `invalid_argument` while the first may serve. A
-  cancel ends the wait for the token at once, and with it the call's claim on the key. The stream
-  URL must be one `ursula_open` takes, by the open's own check, or the call fails `invalid_url`
-  before any request: a URL given before the lookup, a URL looked up before the token. With a
-  Streams token for the key it must also be `https://`, or `http://` to a loopback host. With
-  `own_token`, a URL needs no key and the call sends nothing.
+  the process's key source ([Transport](#transport)), exchanged at `{auth origin}/api/iam/token` for
+  the audience `https://streams.tonbo.dev`, and the call returns only once it holds the first token.
+  A key the token endpoint refuses fails there with `invalid_api_key`, before any open. The process
+  holds one key, so another one fails `invalid_argument` while the first may serve. A cancel ends
+  the waits at once, the one for the token with the call's claim on the key, and a request in flight
+  within its 10 s. The stream URL must be one `ursula_open` takes, by the open's own check, or the
+  call fails `invalid_url` before any request: a URL given before the lookup, a URL looked up before
+  the token. With a Streams token for the key it must also be `https://`, or `http://` to a loopback
+  host. With `own_token`, a URL needs no key and the call sends nothing.
 - It returns `{done: true, url, name}`, `name` `null` for a URL. With `timeout_ms` 0 it returns
   `{done: false, request}` at once and resolves on a thread of its own, for the option `timeout_ms`
   (30 s by default). A `resolved` event (`{event, request, ok}`) ends every resolve, one given up
   included, and a call with the same arguments then takes the outcome, the answer or the error. A
   timeout too large for the clock waits a year.
-- Calls with the same arguments join one resolve (`tonbo/requests.rs`, a pure table, as opens
-  count theirs). Every blocking call that joined takes its outcome, and so does a call that
-  returned at once and comes back. A blocking call whose time runs out leaves the resolve to the
-  other calls it owes, and gives it up only as the last. `ursula_cancel(request)` gives it up for
-  the host that cancels: it goes on while a blocking call waits for it, and otherwise ends. The
-  cancel reports what the resolve came to: `null` for an answer, the error it ended with, or
-  `cancelled` with the last condition, as `{kind, action, message, fix, request_id}`. A call that
-  finds the resolve it waited for given up starts another and names its request.
-- An outcome goes only to calls made before it arrived, and leaves with the last of them. Only a
-  call that returned at once and neither came back nor cancelled leaves its outcome for the next
-  such call, for a minute.
+- Calls with the same arguments join one resolve (`tonbo/requests.rs`, a pure table, as opens count
+  theirs). The resolve goes on until the latest deadline of the calls that joined it: a blocking
+  call's `timeout_ms`, or the option for a call that returned at once. Every blocking call that
+  joined takes its outcome, and so does a call that returned at once and comes back. A blocking call
+  that finds an outcome owed to a call that returned at once starts another resolve, whose outcome
+  that call is owed instead. A blocking call whose time runs out leaves the resolve to the other
+  calls it owes, and gives it up only as the last. `ursula_cancel(request)` gives it up for the host
+  that cancels: it goes on while a blocking call waits for it, and otherwise ends. The cancel
+  reports what the resolve came to: `null` for an answer, the error it ended with, or `cancelled`
+  with the last condition, as `{kind, action, message, fix, request_id}`. A call that gives up names
+  what the resolve waited for then, the lookup or the Streams token, with the last condition met
+  while waiting for it. A call that finds the resolve it waited for given up starts another and
+  names its request.
+- An outcome goes only to calls made before it arrived, and leaves with the last of them, with two
+  exceptions. A call made while blocking calls are still to take it takes it with them, and a call
+  that returned at once is then owed it no more. A call that returned at once and neither came back
+  nor cancelled leaves its outcome for the next such call, for a minute.
 - Errors read `tonbo_resolve: <kind>: <what> (request <id>). <fix>`: the request id when the Tonbo
   API answered with one, the fix when there is something to run or set. The kinds are the four of
   `TonboError`, `invalid_name`, `invalid_argument`, `invalid_url`, `local_setup` and `internal`, and

@@ -14,12 +14,14 @@
 //! | running | returning at once | come back for it |
 //! | done, a blocking call still to take it | any | its outcome |
 //! | done, owed to a call that returned at once | returning at once | its outcome, owed no more |
-//! | done, owed to a call that returned at once | blocking | start one: a blocking call never comes back |
+//! | done, owed to a call that returned at once | blocking | start one, still owed to that call: a blocking call never comes back |
 //!
 //! - A resolve that ends with no call owed its outcome leaves the table. One whose last call took
-//!   it leaves too, so an outcome goes only to calls made before it arrived, except a call that
-//!   returned at once and never came back nor cancelled: its outcome goes to the next call that
-//!   returns at once, until [`UNTAKEN`] after it arrived ([`Table::sweep`]).
+//!   it leaves too, so an outcome goes only to calls made before it arrived, with two exceptions.
+//!   A call made while blocking calls are still to take it takes it with them, and one that
+//!   returns at once is then owed it no more. A call that returned at once and never came back nor
+//!   cancelled leaves its outcome to the next call that returns at once, until [`UNTAKEN`] after
+//!   it arrived ([`Table::sweep`]).
 //! - A blocking call whose time runs out leaves the resolve to the other calls it owes, and gives
 //!   it up only when it was the last ([`Table::give_up`]).
 //! - `ursula_cancel(request)` is a call that returned at once and gives up: the resolve goes on
@@ -66,14 +68,15 @@ impl<O, R> Entry<O, R> {
 
 /// Where a call goes ([`Table::arrive`]).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Arrival<O> {
+pub(crate) enum Arrival<O, R> {
     /// No resolve of these arguments is owed to anyone: start one ([`Table::start`]).
     Start,
-    /// Wait for resolve `request`: [`Table::poll`] once it ends, [`Table::give_up`] when the
-    /// call's time runs out.
-    Wait(u64),
-    /// Return at once: the call comes back for resolve `request`.
-    Pending(u64),
+    /// Wait for resolve `request` (`R`), which goes on for the call's time too: [`Table::poll`]
+    /// once it ends, [`Table::give_up`] when the call's time runs out.
+    Wait(u64, R),
+    /// Return at once: the call comes back for resolve `request` (`R`), which goes on for the
+    /// call's time too.
+    Pending(u64, R),
     /// The outcome.
     Take(O),
 }
@@ -128,21 +131,28 @@ impl<O: Clone, R: Clone> Table<O, R> {
     }
 
     /// A call with the arguments `id`: `blocking` when it waits for the outcome.
-    pub(crate) fn arrive(&mut self, id: Id, blocking: bool) -> Arrival<O> {
+    pub(crate) fn arrive(&mut self, id: Id, blocking: bool) -> Arrival<O, R> {
         let Some(entry) = self.entries.get_mut(&id) else {
             return Arrival::Start;
         };
         match &entry.phase {
             Phase::Running if blocking => {
                 entry.waiting = entry.waiting.saturating_add(1);
-                Arrival::Wait(entry.request)
+                Arrival::Wait(entry.request, entry.run.clone())
             }
             Phase::Running => {
                 entry.owed = true;
-                Arrival::Pending(entry.request)
+                Arrival::Pending(entry.request, entry.run.clone())
             }
-            // Blocking calls about to take it: this one takes it with them.
-            Phase::Done { outcome, .. } if entry.waiting > 0 => Arrival::Take(outcome.clone()),
+            // Blocking calls about to take it: this one takes it with them, and a call that
+            // returns at once is owed it no more, so it stays only for them.
+            Phase::Done { outcome, .. } if entry.waiting > 0 => {
+                let outcome = outcome.clone();
+                if !blocking {
+                    entry.owed = false;
+                }
+                Arrival::Take(outcome)
+            }
             Phase::Done { .. } if blocking => Arrival::Start,
             Phase::Done { outcome, .. } => {
                 let outcome = outcome.clone();
@@ -156,13 +166,15 @@ impl<O: Clone, R: Clone> Table<O, R> {
     }
 
     /// Resolve `request` (`run`) started for a call with the arguments `id` that [`Self::arrive`]
-    /// told to start one, in place of an outcome owed to a call that returned at once.
+    /// told to start one, in place of an outcome owed to a call that returned at once: that call
+    /// is owed the new resolve's outcome instead.
     pub(crate) fn start(&mut self, id: Id, request: u64, run: R, blocking: bool) {
+        let owed = !blocking || self.entries.get(&id).is_some_and(|e| e.owed);
         self.entries.insert(id, Entry {
             request,
             run,
             waiting: usize::from(blocking),
-            owed: !blocking,
+            owed,
             phase: Phase::Running,
         });
     }
@@ -283,7 +295,7 @@ mod tests {
     #[test]
     fn every_blocking_call_takes_the_one_outcome() {
         let mut t = started(true);
-        assert_eq!(t.arrive(A, true), Arrival::Wait(7));
+        assert_eq!(t.arrive(A, true), Arrival::Wait(7, "run"));
         assert_eq!(t.arrive(B, true), Arrival::Start, "other arguments");
         assert_eq!(t.poll(A, 7), Poll::Wait);
         t.finish(A, 7, "url", Instant::now());
@@ -303,14 +315,14 @@ mod tests {
     #[test]
     fn a_blocking_timeout_gives_up_only_a_resolve_no_other_call_wants() {
         let mut t = started(false);
-        assert_eq!(t.arrive(A, true), Arrival::Wait(7));
+        assert_eq!(t.arrive(A, true), Arrival::Wait(7, "run"));
         assert_eq!(t.give_up(A, 7), Some(GiveUp::Leave("run")));
         t.finish(A, 7, "url", Instant::now());
         assert_eq!(t.arrive(A, false), Arrival::Take("url"));
         assert_eq!(t.len(), 0);
 
         let mut t = started(true);
-        assert_eq!(t.arrive(A, true), Arrival::Wait(7));
+        assert_eq!(t.arrive(A, true), Arrival::Wait(7, "run"));
         assert_eq!(t.give_up(A, 7), Some(GiveUp::Leave("run")));
         assert_eq!(t.give_up(A, 7), Some(GiveUp::Abandon("run")));
         assert_eq!(t.len(), 0);
@@ -329,7 +341,7 @@ mod tests {
     #[test]
     fn a_cancel_leaves_a_resolve_a_blocking_call_waits_for() {
         let mut t = started(false);
-        assert_eq!(t.arrive(A, true), Arrival::Wait(7));
+        assert_eq!(t.arrive(A, true), Arrival::Wait(7, "run"));
         assert_eq!(t.cancel(7), Some(Cancelled::Left("run")));
         assert_eq!(t.cancel(8), None, "no such request");
         t.finish(A, 7, "url", Instant::now());
@@ -337,7 +349,11 @@ mod tests {
         assert_eq!(t.len(), 0);
 
         let mut t = started(false);
-        assert_eq!(t.arrive(A, false), Arrival::Pending(7), "a call joins");
+        assert_eq!(
+            t.arrive(A, false),
+            Arrival::Pending(7, "run"),
+            "a call joins"
+        );
         assert_eq!(t.cancel(7), Some(Cancelled::Abandoned("run")));
         assert_eq!(t.cancel(7), None);
         assert_eq!(t.arrive(A, false), Arrival::Start);
@@ -357,6 +373,7 @@ mod tests {
         t.finish(A, 7, "not_found", Instant::now());
         assert_eq!(t.arrive(A, false), Arrival::Start);
 
+        // The call that returned at once is owed the new resolve's outcome instead.
         let mut t = started(false);
         t.finish(A, 7, "not_found", Instant::now());
         assert_eq!(
@@ -367,10 +384,26 @@ mod tests {
         t.start(A, 9, "again", true);
         t.finish(A, 9, "url", Instant::now());
         assert_eq!(t.poll(A, 9), Poll::Take("url"));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.arrive(A, false), Arrival::Take("url"));
         assert_eq!(t.len(), 0);
 
+        // A call that returns at once and takes an outcome blocking calls are still to take is
+        // owed it no more: the next such call starts anew.
         let mut t = started(false);
-        assert_eq!(t.arrive(A, false), Arrival::Pending(7), "polled again");
+        assert_eq!(t.arrive(A, true), Arrival::Wait(7, "run"));
+        t.finish(A, 7, "not_found", Instant::now());
+        assert_eq!(t.arrive(A, false), Arrival::Take("not_found"));
+        assert_eq!(t.poll(A, 7), Poll::Take("not_found"));
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.arrive(A, false), Arrival::Start);
+
+        let mut t = started(false);
+        assert_eq!(
+            t.arrive(A, false),
+            Arrival::Pending(7, "run"),
+            "polled again"
+        );
         t.finish(A, 7, "url", Instant::now());
         assert_eq!(t.arrive(A, false), Arrival::Take("url"));
         assert_eq!(t.arrive(A, false), Arrival::Start, "owed once");

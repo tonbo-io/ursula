@@ -16,16 +16,20 @@
 //! - The key is the `api_key` option, else `TONBO_API_KEY`, else the login `tonbo login` saves
 //!   (`credentials`). The Management API is `api_origin`, else `TONBO_API_ORIGIN`, else
 //!   `https://api.tonbo.dev`, and the token endpoint's origin `auth_origin`, else
-//!   `TONBO_AUTH_ORIGIN`, else `https://tonbo.dev`. An origin is `https://`, or `http://` to a
-//!   loopback host, since requests to it carry the key. An origin option other than the one the
-//!   environment gives takes only a key passed beside it: any SQL may name options, so a key from
-//!   the environment or the login goes only where the environment says.
+//!   `TONBO_AUTH_ORIGIN`, else `https://tonbo.dev`, whichever key the resolve holds. An origin is
+//!   `https://`, or `http://` to a loopback host, since requests to it carry the key. The SQL that
+//!   calls `tonbo_resolve` is trusted as the host: the function is registered only on the
+//!   connection that loaded the extension, `SQLITE_DIRECTONLY`, and that SQL can already name any
+//!   stream URL and token.
 //! - The lookup (`lookup`) runs until the database is active, retrying what passes until the
 //!   time runs out. The Streams token is the process's key source (`auth`): the key goes to
 //!   `{auth origin}/api/iam/token` with the audience [`STREAMS_AUDIENCE`], and its tokens are
 //!   refreshed in the background while requests may carry them. They go only to a stream URL that
-//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Every request
-//!   and wait is bounded by the time the resolve has left, and a cancel ends them.
+//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Every wait is
+//!   bounded by the time the resolve has left, and every request by that and the agent's 10 s. A
+//!   cancel ends the waits at once, and a request in flight within its 10 s.
+//! - A resolve goes on for the time of the latest call that joined it, and a call that gives up
+//!   on it reports what it waited for last: the lookup, or the Streams token.
 //! - With `timeout_ms` 0 the call returns `{done: false, request}` at once, and the resolve goes on
 //!   on a thread of its own, for `timeout_ms` of the options (30 s by default). Its end is a
 //!   `resolved` event (`ursula_events`), always, after which the host calls again with the same
@@ -81,6 +85,7 @@ use self::requests::Id;
 use self::requests::Poll;
 use self::requests::Table;
 use crate::auth::KeyError;
+use crate::auth::exchange::ExchangeError;
 use crate::auth::exchange::KeyRefusal;
 use crate::driver::runtime::driver;
 use crate::error::ErrorKind;
@@ -274,15 +279,6 @@ pub(crate) enum TonboError {
         #[source]
         why: OriginRefusal,
     },
-    /// An origin option other than the environment's, without the API key option beside it.
-    #[error(
-        "{option} names {given}, which gets only an API key passed beside it: TONBO_API_KEY and the tonbo login go only to {ambient}"
-    )]
-    AmbientKeyElsewhere {
-        option: OriginOption,
-        given: String,
-        ambient: String,
-    },
     /// No API key option, no `TONBO_API_KEY` and no `tonbo login`.
     #[error("no Tonbo API key")]
     MissingCredentials,
@@ -422,7 +418,6 @@ impl TonboError {
             TonboError::Options(_)
             | TonboError::ApiKeyOption
             | TonboError::Origin { .. }
-            | TonboError::AmbientKeyElsewhere { .. }
             | TonboError::Unexpected { .. }
             | TonboError::NoUrl { .. }
             | TonboError::Unsendable(_) => ErrorKind::InvalidArgument,
@@ -459,10 +454,6 @@ impl TonboError {
             }
             TonboError::Unexpected { api, .. } => Some(api.fix().to_owned()),
             TonboError::NoUrl { .. } => Some(Api::Management.fix().to_owned()),
-            TonboError::AmbientKeyElsewhere { option, .. } => Some(format!(
-                "Pass the API key option with it, or set {} instead",
-                option.env()
-            )),
             TonboError::Exposed { .. } => {
                 Some("Open an https:// URL, or give the open a token of its own".to_owned())
             }
@@ -572,7 +563,6 @@ struct Plan {
     streams: Option<ApiKey>,
     api: String,
     auth: String,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -604,26 +594,6 @@ impl Plan {
         } else {
             None
         };
-        // Any SQL may name the origins: a key it did not pass goes only where the environment
-        // says.
-        if key.as_ref().is_some_and(|key| key.from != KeyFrom::Option) {
-            for (given, option, chosen) in [
-                (&options.api_origin, OriginOption::Api, &api),
-                (&options.auth_origin, OriginOption::Auth, &auth),
-            ] {
-                if given.is_none() {
-                    continue;
-                }
-                let ambient = origin(None, option)?;
-                if *chosen != ambient {
-                    return Err(TonboError::AmbientKeyElsewhere {
-                        option,
-                        given: chosen.clone(),
-                        ambient,
-                    });
-                }
-            }
-        }
         let target = match (url, key.clone()) {
             (false, Some(key)) => Target::Name {
                 name: name_or_url.to_owned(),
@@ -637,7 +607,6 @@ impl Plan {
             streams: key.filter(|_| streams_key),
             api,
             auth,
-            timeout_ms: options.timeout_ms,
         })
     }
 
@@ -658,6 +627,7 @@ impl Plan {
             Target::Url(url) => (url.clone(), None),
         };
         if let Some(key) = &self.streams {
+            until.waits_for(Subject::Token(url.clone()));
             streams_token(key, &self.auth, &url, until)?;
         }
         Ok(Resolved { url, name })
@@ -779,17 +749,31 @@ fn check_url(url: &str, name: Option<&str>, streams: bool) -> Result<(), TonboEr
 
 /// Makes `key` the process's key source for Streams tokens, exchanged at `auth`'s token endpoint,
 /// and waits until it holds one, at most until `until` ends: a bad key fails here, before the open.
-/// A cancel ends the wait at once, and with it the resolve's claim on the key.
+/// The key source's failures that pass are the resolve's last condition. A cancel ends the wait at
+/// once, and with it the resolve's claim on the key.
 fn streams_token(key: &ApiKey, auth: &str, url: &str, until: &Until) -> Result<(), TonboError> {
     let endpoint = format!("{auth}/api/iam/token");
-    let cancelled = || until.cancelled();
-    let outcome = crate::auth::use_key(
-        &key.secret,
-        &endpoint,
-        Some(STREAMS_AUDIENCE),
-        until.left(),
-        &cancelled,
-    );
+    let cancelled = |last: Option<&ExchangeError>| {
+        if let Some(lookup::Failure::Transient(t)) =
+            last.map(|e| lookup::exchange_failure(e.clone(), &key.from))
+        {
+            until.note(&t);
+        }
+        until.cancelled()
+    };
+    let outcome = loop {
+        let outcome = crate::auth::use_key(
+            &key.secret,
+            &endpoint,
+            Some(STREAMS_AUDIENCE),
+            until.left(),
+            &cancelled,
+        );
+        // A call that joined meanwhile may have given the resolve more time.
+        if !matches!(outcome, Err(KeyError::TimedOut { .. })) || until.over() {
+            break outcome;
+        }
+    };
     let gave_up = |last| TonboError::GaveUp {
         subject: Subject::Token(url.to_owned()),
         last,
@@ -825,30 +809,46 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 type Outcome = Result<Resolved, Arc<TonboError>>;
 
 /// A resolve in progress, shared by its thread, the calls waiting for it and `ursula_cancel`: its
-/// cancel, the last condition it met, and how it ended.
+/// cancel, its deadline, what it waits for and the last condition it met, and how it ended.
 #[derive(Debug)]
 struct Run {
-    subject: Subject,
     cancelled: AtomicBool,
     state: Mutex<RunState>,
     /// Signalled under `state`'s lock on a cancel and at the end.
     changed: Condvar,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RunState {
+    /// The latest deadline of the calls that joined it.
+    deadline: Instant,
+    /// What it waits for: the lookup, then the Streams token.
+    subject: Subject,
+    /// The last condition it met while waiting for `subject`.
     last: Option<Transient>,
     ended: Option<Outcome>,
 }
 
 impl Run {
-    fn new(subject: Subject) -> Arc<Self> {
+    /// A resolve of `subject` that goes on for `timeout`.
+    fn new(subject: Subject, timeout: Duration) -> Arc<Self> {
         Arc::new(Self {
-            subject,
             cancelled: AtomicBool::new(false),
-            state: Mutex::new(RunState::default()),
+            state: Mutex::new(RunState {
+                deadline: after(Instant::now(), timeout),
+                subject,
+                last: None,
+                ended: None,
+            }),
             changed: Condvar::new(),
         })
+    }
+
+    /// A call that joined it gives it `timeout` from now, when that ends later than its deadline.
+    fn extend(&self, timeout: Duration) {
+        let deadline = after(Instant::now(), timeout);
+        let mut state = lock(&self.state);
+        state.deadline = state.deadline.max(deadline);
     }
 
     /// Gives the resolve up: its sleeps and its wait for a Streams token end at once.
@@ -884,29 +884,27 @@ impl Run {
         }
     }
 
-    /// The failure of a call that gave up on it, with the last condition it met.
+    /// The failure of a call that gave up on it: what it waited for, and the last condition it
+    /// met.
     fn gave_up(&self, cancelled: bool) -> Arc<TonboError> {
+        let state = lock(&self.state);
         Arc::new(TonboError::GaveUp {
-            subject: self.subject.clone(),
-            last: lock(&self.state).last.clone(),
+            subject: state.subject.clone(),
+            last: state.last.clone(),
             cancelled,
         })
     }
 }
 
-/// When a resolve ends: its deadline, or a cancel.
+/// When a resolve ends: its deadline, which the calls that join it extend, or a cancel.
 #[derive(Debug)]
 pub(crate) struct Until {
-    deadline: Instant,
     run: Arc<Run>,
 }
 
 impl Until {
-    fn new(timeout: Duration, run: Arc<Run>) -> Self {
-        Self {
-            deadline: after(Instant::now(), timeout),
-            run,
-        }
+    fn new(run: Arc<Run>) -> Self {
+        Self { run }
     }
 
     /// The time left, zero once it ended.
@@ -914,7 +912,9 @@ impl Until {
         if self.cancelled() {
             return Duration::ZERO;
         }
-        self.deadline.saturating_duration_since(Instant::now())
+        lock(&self.run.state)
+            .deadline
+            .saturating_duration_since(Instant::now())
     }
 
     pub(crate) fn cancelled(&self) -> bool {
@@ -931,11 +931,20 @@ impl Until {
         lock(&self.run.state).last = Some(last.clone());
     }
 
+    /// The resolve waits for `subject` now, with no condition met yet.
+    fn waits_for(&self, subject: Subject) {
+        let mut state = lock(&self.run.state);
+        state.subject = subject;
+        state.last = None;
+    }
+
     /// Waits `wait`, or until the resolve ends: whether it may go on afterwards.
     pub(crate) fn sleep(&self, wait: Duration) -> bool {
-        let end = after(Instant::now(), wait).min(self.deadline);
+        let wake = after(Instant::now(), wait);
         let mut state = lock(&self.run.state);
         loop {
+            // A call that joined meanwhile may have moved the deadline.
+            let end = wake.min(state.deadline);
             let left = end.saturating_duration_since(Instant::now());
             if self.cancelled() || left.is_zero() {
                 break;
@@ -980,24 +989,26 @@ pub(crate) fn resolve(
 ) -> Result<Resolution, Arc<TonboError>> {
     let id = digest(name_or_url, options);
     let blocking = timeout_ms > 0;
+    let time = Duration::from_millis(resolve_ms(options, timeout_ms));
     let mut planned: Option<(Plan, u64)> = None;
     loop {
         let request = {
             let mut table = table();
             table.sweep(Instant::now());
             match table.arrive(id, blocking) {
-                Arrival::Pending(request) => return Ok(Resolution::Pending(request)),
+                Arrival::Pending(request, run) => {
+                    run.extend(time);
+                    return Ok(Resolution::Pending(request));
+                }
                 Arrival::Take(outcome) => return outcome.map(Resolution::Done),
-                Arrival::Wait(request) => Some(request),
+                Arrival::Wait(request, run) => {
+                    run.extend(time);
+                    Some(request)
+                }
                 Arrival::Start => match planned.take() {
                     Some((plan, request)) => {
-                        let ms = if blocking {
-                            timeout_ms
-                        } else {
-                            plan.timeout_ms.unwrap_or(DEFAULT_RESOLVE_MS)
-                        };
-                        let run = Run::new(subject(name_or_url));
-                        start(id, request, plan, Duration::from_millis(ms), &run)?;
+                        let run = Run::new(subject(name_or_url), time);
+                        start(id, request, plan, &run)?;
                         table.start(id, request, run, blocking);
                         if !blocking {
                             return Ok(Resolution::Pending(request));
@@ -1012,7 +1023,7 @@ pub(crate) fn resolve(
             // Planned outside the table's lock: it reads the environment and the login file.
             let plan = Plan::new(name_or_url, options).map_err(Arc::new)?;
             if !plan.sends() {
-                let until = Until::new(Duration::ZERO, Run::new(subject(name_or_url)));
+                let until = Until::new(Run::new(subject(name_or_url), Duration::ZERO));
                 return plan.run(&until).map(Resolution::Done).map_err(Arc::new);
             }
             planned = Some((plan, driver().request_id()));
@@ -1025,7 +1036,20 @@ pub(crate) fn resolve(
     }
 }
 
-/// What a resolve of `name_or_url` is about.
+/// How long a call with `options` and `timeout_ms` gives its resolve: `timeout_ms` when it
+/// blocks, else the `timeout_ms` option (30 s by default). Options that do not parse fail when
+/// planned.
+fn resolve_ms(options: &str, timeout_ms: u64) -> u64 {
+    if timeout_ms > 0 {
+        return timeout_ms;
+    }
+    ResolveOptions::try_from(options)
+        .ok()
+        .and_then(|options| options.timeout_ms)
+        .unwrap_or(DEFAULT_RESOLVE_MS)
+}
+
+/// What a resolve of `name_or_url` waits for first.
 fn subject(name_or_url: &str) -> Subject {
     if has_scheme(name_or_url) {
         Subject::Token(name_or_url.to_owned())
@@ -1034,16 +1058,10 @@ fn subject(name_or_url: &str) -> Subject {
     }
 }
 
-/// Starts resolve `request` of `plan` under `id`, for at most `timeout`, on a thread of its own.
-/// The caller holds the table's lock, so the thread's end finds its entry.
-fn start(
-    id: Id,
-    request: u64,
-    plan: Plan,
-    timeout: Duration,
-    run: &Arc<Run>,
-) -> Result<(), Arc<TonboError>> {
-    let until = Until::new(timeout, Arc::clone(run));
+/// Starts resolve `request` of `plan` under `id`, until `run` ends, on a thread of its own. The
+/// caller holds the table's lock, so the thread's end finds its entry.
+fn start(id: Id, request: u64, plan: Plan, run: &Arc<Run>) -> Result<(), Arc<TonboError>> {
+    let until = Until::new(Arc::clone(run));
     let ended = Arc::clone(run);
     // Detached: it ends once the resolve ended, cancelled or not.
     std::thread::Builder::new()
