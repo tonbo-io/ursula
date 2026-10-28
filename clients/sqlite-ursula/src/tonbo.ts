@@ -174,7 +174,8 @@ export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = 
  * Resolves the Tonbo database `nameOrUrl` names into what opens it: its stream URL and the `token`
  * option, as {@link open} does before it opens the stream. Hand both to another opener, such as
  * the `/pi` entry's `openUrsulaPiStorage(url, { token })`, whose open then keeps the Streams tokens
- * fresh with no refresher of the caller's own.
+ * fresh with no refresher of the caller's own. The `/tonbo/pi` entry's `openUrsulaPiStorage` does
+ * both in one call.
  *
  * A name is looked up in the Management API with the account's API key, and a URL (`https://...`)
  * is taken as it is. The token is a provider of Streams tokens exchanged for the key, which the open

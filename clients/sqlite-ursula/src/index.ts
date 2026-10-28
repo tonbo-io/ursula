@@ -24,6 +24,8 @@
 // - pi.ts: the `/pi` entry.
 // - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key, or
 //   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes.
+// - tonbo-pi.ts: the `/tonbo/pi` entry, which opens Pi storage on a Tonbo database by name: the
+//   `/tonbo` entry's resolve, then the `/pi` entry's open.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
