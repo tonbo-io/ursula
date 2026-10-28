@@ -94,7 +94,8 @@
 //! - [`codec`]: the formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies, the
 //!   page-1 marker) and the digests the server checks.
 //! - `applier`: applies commits to a db file in batches of final page images, page 1 marked.
-//! - `auth`: the bearer token every request carries.
+//! - `auth`: the bearer token every request carries: the token set, the token file, or an API
+//!   key's exchanges, which a refresher thread keeps fresh.
 //! - `capture`: the WAL's layout, the shape of a write transaction's WAL writes, and its final page
 //!   images at the commit point.
 //! - `config`: settings and test hooks from the environment.

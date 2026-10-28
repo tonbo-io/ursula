@@ -13,9 +13,11 @@
 //! binding's step it resets that binding `internal`.
 //!
 //! A token change reaches the core as [`Core::token_changed`] ([`token_changed`]): from
-//! `ursula_set_token` at once, and from the token file when a read finds a new token in it, a
+//! `ursula_set_token` at once, from the token file when a read finds a new token in it, a
 //! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while requests
-//! carry the file's token and an open or a writer may send them.
+//! carry the file's token and an open or a writer may send them, and from an API key's refresher
+//! when an exchange hands out a new token. The driver tells `auth` whether an open or a writer may
+//! send requests ([`crate::auth::requests_may_go_out`]): the key is exchanged only then.
 //!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
@@ -660,6 +662,8 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
     // When the token file was last checked for a change.
     let mut token_checked: u64 = 0;
     loop {
+        // A key's exchanges run only while an open or a binding may send requests.
+        auth::requests_may_go_out(core.requesting());
         // While requests carry the token file's token and an open or a writer may send them, the
         // file is checked every `FILE_CHECK_MS`: a new token in it comes back as
         // `Command::TokenChanged`.
