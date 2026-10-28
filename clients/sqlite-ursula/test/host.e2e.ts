@@ -38,17 +38,37 @@
 // - H15: a 0.11.0 extension, from its npm package, records nothing, and its root is read in a
 //   scanned directory, its bytes counted. While it runs, its root shows `held`, and without the scan
 //   its lock is unread. It runs on the 0.11 line only: a later line's server refuses a 0.11 copy.
+//
+// The hold, `ursula-vfs-host hold`, which takes the host directory's `hold` file exclusively:
+// - H9: a writer thread that commits every 5 ms with busy_timeout 0 stops within one transaction,
+//   with no error, and the root drains to clean within 1.5 s. Meanwhile reads, `synced()`, a
+//   snapshot and a FULL checkpoint go on. After the release the commits resume.
+// - H10: the host's sequence with SIGSTOP as the freeze (hold, until-clean, freeze, sync, inspect)
+//   proves clean, with at most the one commit whose transaction began before the hold. A
+//   transaction that took the write lock before the hold and commits after the until-clean, with
+//   the stream refused, shows its bytes in the proof, and a second round after a thaw reports
+//   clean.
+// - H11: with the stream blackholed, until-clean never reports clean and the proof reports the
+//   bytes. Once the stream answers they drain.
 import { blake3 } from "@noble/hashes/blake3.js";
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Child, directUrl, freshDir, gate, killChildren, onModel, stream } from "./kit.ts";
 
 afterEach(killChildren);
+
+/** The `ursula-vfs-host hold` processes a test started and has not released. */
+const holds = new Set<ChildProcess>();
+afterEach(() => {
+	for (const p of holds) p.kill("SIGKILL");
+	holds.clear();
+});
 
 /** The compiled-in host directory, which would win over the hook. */
 const DEFAULT = "/var/lib/sqlite-ursula/host";
@@ -446,7 +466,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		await mode("forward");
 	});
 
-	async function mode(m: "forward" | "refuse"): Promise<void> {
+	async function mode(m: "forward" | "refuse" | "blackhole"): Promise<void> {
 		const r = await fetch(`${front.control}/mode`, { method: "PUT", body: JSON.stringify({ mode: m }) });
 		expect(r.status, await r.text()).toBe(204);
 	}
@@ -760,6 +780,165 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			expect(existsSync(moved)).toBe(how !== "deleted");
 		});
 	}
+
+	/** A new host directory with the host's `hold` file, which the extension opens at its first write. */
+	function holdDir(): { host: string; env: NodeJS.ProcessEnv } {
+		const made = hostDir();
+		writeFileSync(join(made.host, "hold"), "");
+		return made;
+	}
+
+	/** `ursula-vfs-host hold` on `host`, once it printed `held`. `release` closes its stdin and awaits its exit. */
+	async function takeHold(host: string): Promise<{ release: () => Promise<void> }> {
+		const proc = spawn(hostBin(), ["hold", "--dir", host], { stdio: ["pipe", "pipe", "inherit"] });
+		holds.add(proc);
+		const exited = new Promise<number | null>((r) => proc.once("exit", (code) => r(code)));
+		const failed = new Promise<never>((_, reject) => proc.once("error", reject));
+		const lines = createInterface({ input: proc.stdout as NodeJS.ReadableStream })[Symbol.asyncIterator]();
+		const first = await Promise.race([lines.next(), failed]);
+		expect(first.value).toBe("held");
+		return {
+			release: async () => {
+				proc.stdin?.end();
+				expect(await exited).toBe(0);
+				holds.delete(proc);
+			},
+		};
+	}
+
+	/** The writer thread's counters (test/core-child.mjs `writer`). */
+	async function progress(c: Child): Promise<{ committed: number; errors: number; error: string | null }> {
+		const reply = await c.send({ progress: true });
+		return reply as unknown as { committed: number; errors: number; error: string | null };
+	}
+
+	/** Waits until `ready` holds, for at most `ms`. */
+	async function until(what: string, ms: number, ready: () => Promise<boolean>): Promise<void> {
+		const deadline = Date.now() + ms;
+		while (!(await ready())) {
+			expect(Date.now(), what).toBeLessThan(deadline);
+			await sleep(20);
+		}
+	}
+
+	/** An owner of a new stream in `dir`, behind the gate, with a writer thread committing every 5 ms. */
+	async function writing(label: string, dir: string, env: NodeJS.ProcessEnv): Promise<Child> {
+		const writer = new Child(`${front.url}${stream(label).path}`, dir, env);
+		await writer.opened();
+		await writer.exec("CREATE TABLE w(n INTEGER NOT NULL)");
+		expect((await writer.send({ writer: 5 })).ok).toBe(true);
+		await until("the writer commits", 20_000, async () => (await progress(writer)).committed >= 20);
+		return writer;
+	}
+
+	/** Freezes `child` (SIGSTOP), syncs the filesystems and inspects once: the host's proof. */
+	async function proof(host: string, child: Child): Promise<Inspection> {
+		process.kill(child.pid, "SIGSTOP");
+		try {
+			await run("sync", []);
+			return await inspect(host, [child.pid]);
+		} finally {
+			process.kill(child.pid, "SIGCONT");
+		}
+	}
+
+	it("H9: under the hold a writer stops within one transaction with no error and drains, while reads, synced(), a snapshot and a FULL checkpoint go on", async () => {
+		const { host, env } = holdDir();
+		const writer = await writing("host-h9", freshDir(), { ...env, URSULA_VFS_SNAPSHOT_DUE_BYTES: "1" });
+
+		const hold = await takeHold(host);
+		const heldAt = Date.now();
+		const atHold = (await progress(writer)).committed;
+		const draining = inspect(host, [writer.pid], { untilClean: 5_000 }).then((seen) => ({ seen, at: Date.now() }));
+		await sleep(300);
+		const stopped = (await progress(writer)).committed;
+		expect(stopped - atHold).toBeLessThanOrEqual(1);
+		const { seen, at } = await draining;
+		expect(seen, JSON.stringify(seen)).toMatchObject({ complete: true, clean: true, unacknowledged_bytes: 0 });
+		expect(onlyRoot(seen).held).toBe(true);
+		expect(at - heldAt).toBeLessThan(1_500);
+
+		// Reads, synced() and the snapshot every acknowledged byte is due for go on.
+		expect(await writer.rows("SELECT count(*) AS n FROM w")).toEqual([{ n: stopped }]);
+		expect((await writer.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
+		await until("a snapshot under the hold", 30_000, async () => {
+			const { snapshot } = (await writer.send({ status: true })).status as { snapshot: { offset: number | null; log_bytes: number } };
+			return snapshot.offset !== null && snapshot.log_bytes === 0;
+		});
+		// A FULL checkpoint takes the write lock with no read mark, and the waiting writer's read mark is on the latest commit.
+		const [checkpointed] = (await writer.rows("PRAGMA wal_checkpoint(FULL)")) as { busy: number; log: number; checkpointed: number }[];
+		expect(checkpointed).toMatchObject({ busy: 0 });
+		expect(checkpointed?.checkpointed).toBe(checkpointed?.log);
+		expect(await progress(writer)).toMatchObject({ committed: stopped, errors: 0 });
+
+		await hold.release();
+		await until("the commits resume", 20_000, async () => (await progress(writer)).committed > stopped + 5);
+		expect(await progress(writer)).toMatchObject({ errors: 0, error: null });
+		await writer.stop("SIGKILL");
+	});
+
+	it("H10: hold, until-clean, freeze, sync and inspect prove clean, and a transaction that held the write lock before the hold takes a second round", async () => {
+		const first = holdDir();
+		const writer = await writing("host-h10", freshDir(), first.env);
+		const hold = await takeHold(first.host);
+		const atHold = (await progress(writer)).committed;
+		const drained = await inspect(first.host, [writer.pid], { untilClean: 5_000 });
+		expect(drained, JSON.stringify(drained)).toMatchObject({ complete: true, clean: true });
+		const proven = await proof(first.host, writer);
+		expect(proven, JSON.stringify(proven)).toMatchObject({ complete: true, clean: true, unacknowledged_bytes: 0 });
+		expect(onlyRoot(proven).held).toBe(true);
+		// At most the one transaction that began before the hold committed after it.
+		expect((await progress(writer)).committed - atHold).toBeLessThanOrEqual(1);
+		await hold.release();
+		await writer.stop("SIGKILL");
+
+		// A transaction that holds the write lock when the host takes the hold commits once more.
+		const { host, env } = holdDir();
+		const owner = new Child(`${front.url}${stream("host-h10-open").path}`, freshDir(), env);
+		await owner.opened();
+		await owner.exec("CREATE TABLE t(x)");
+		await synced(owner);
+		await owner.exec("BEGIN IMMEDIATE; INSERT INTO t VALUES (1)");
+		const second = await takeHold(host);
+		expect(await inspect(host, [owner.pid], { untilClean: 5_000 })).toMatchObject({ complete: true, clean: true });
+		// Refused, so its bytes stay for the proof.
+		await mode("refuse");
+		await owner.exec("COMMIT");
+		const round1 = await proof(host, owner);
+		expect(round1, JSON.stringify(round1)).toMatchObject({ complete: true, clean: false });
+		expect(onlyRoot(round1).unacknowledged_bytes).toBeGreaterThan(0);
+		// Thawed with the hold kept: the commit drains, and the next round proves clean.
+		await mode("forward");
+		expect(await inspect(host, [owner.pid], { untilClean: 30_000 })).toMatchObject({ complete: true, clean: true });
+		const round2 = await proof(host, owner);
+		expect(round2, JSON.stringify(round2)).toMatchObject({ complete: true, clean: true });
+		await second.release();
+		expect(await owner.rows("SELECT x FROM t")).toEqual([{ x: 1 }]);
+		await owner.stop();
+	});
+
+	it("H11: with the stream unreachable until-clean never reports clean and the proof reports the bytes, which drain once it answers", async () => {
+		const { host, env } = holdDir();
+		const owner = new Child(`${front.url}${stream("host-h11").path}`, freshDir(), env);
+		await owner.opened();
+		await owner.exec("CREATE TABLE t(x)");
+		await synced(owner);
+		await mode("blackhole");
+		await owner.exec("INSERT INTO t VALUES (1)");
+		const hold = await takeHold(host);
+		const waited = await inspect(host, [owner.pid], { untilClean: 2_000 });
+		expect(waited, JSON.stringify(waited)).toMatchObject({ complete: true, clean: false });
+		const bytes = onlyRoot(waited).unacknowledged_bytes;
+		expect(bytes).toBeGreaterThan(0);
+		const proven = await proof(host, owner);
+		expect(proven, JSON.stringify(proven)).toMatchObject({ complete: true, clean: false, unacknowledged_bytes: bytes });
+
+		// A request the blackhole held times out before the resend reaches the stream.
+		await mode("forward");
+		expect(await inspect(host, [owner.pid], { untilClean: 60_000 })).toMatchObject({ complete: true, clean: true });
+		await hold.release();
+		await owner.stop();
+	});
 
 	// The npm copy is 0.11.0: a server or model of a later line refuses it (`protocol_mismatch`),
 	// so this runs on the 0.11 line only.

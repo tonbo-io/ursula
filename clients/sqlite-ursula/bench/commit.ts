@@ -11,6 +11,11 @@
 // A commit is a Pi-shaped transaction: BEGIN, an entry row of about 4.5 KB of text, its
 // conversation's head row, COMMIT, timed from BEGIN to COMMIT's return.
 //
+// With BENCH_HOLD=1 the VFS arm runs with a host directory holding the host's `hold` file, which no
+// host takes (design: Hosts): each write transaction then tries the hold before its WAL write lock.
+// The directory is a temporary one the test hook URSULA_VFS_HOST_DIR names, set before the
+// extension loads.
+//
 // A last phase times `synced()` on the VFS: one commit at a time, each followed by
 // `await db.synced()`, timed from COMMIT's return to `synced()` resolving. This is how long a host
 // waits before an external effect, such as a Pi commit resolving, with nothing else in flight.
@@ -19,11 +24,11 @@
 //
 // Settings: BENCH_ROUNDS (10), BENCH_COMMITS per round and arm (500), BENCH_WARMUP commits per arm
 // (300), BENCH_PACE_MS between commits (0, flat out), BENCH_SYNCED commits in the `synced()` phase
-// (500), BENCH_MAX_DELTA_MS (0.5): the run fails when p50_vfs - p50_B1 exceeds it. The `synced()`
+// (500), BENCH_HOLD (0), BENCH_MAX_DELTA_MS (0.5): the run fails when p50_vfs - p50_B1 exceeds it. The `synced()`
 // timings are reported, never a failure. Prints one JSON summary, and appends a table to GITHUB_STEP_SUMMARY.
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, mkdtempSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -37,6 +42,7 @@ const WARMUP = setting("BENCH_WARMUP", 300);
 const PACE_MS = setting("BENCH_PACE_MS", 0);
 const SYNCED = setting("BENCH_SYNCED", 500);
 const MAX_DELTA_MS = setting("BENCH_MAX_DELTA_MS", 0.5);
+const HOLD = setting("BENCH_HOLD", 0) === 1;
 const ext = process.env.SQLITE_URSULA_VFS;
 if (ext === undefined || ext.length === 0) throw new Error("set SQLITE_URSULA_VFS to the extension");
 const modelBin = resolve(process.env.URSULA_VFS_MODEL ?? join(import.meta.dirname, "../../sqlite-vfs/target/release/ursula-vfs-model"));
@@ -132,6 +138,14 @@ if (model === undefined) {
 	const r = await fetch(bucket, { method: "PUT" });
 	if (!r.ok && r.status !== 409) throw new Error(`create the bucket ${bucket}: ${r.status} ${await r.text()}`);
 }
+if (HOLD) {
+	// The hook is read only when the compiled-in host directory does not exist.
+	if (existsSync("/var/lib/sqlite-ursula/host")) throw new Error("BENCH_HOLD needs a host without /var/lib/sqlite-ursula/host");
+	const host = join(mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-host-")), "host");
+	mkdirSync(host);
+	writeFileSync(join(host, "hold"), "");
+	process.env.URSULA_VFS_HOST_DIR = host;
+}
 const control = loadUrsulaVfs(ext);
 const vfsDb = await open(`${bucket}/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
 const vfs = new Arm("VFS", vfsDb);
@@ -184,6 +198,8 @@ const summary = {
 		50,
 	),
 	server: model === undefined ? "ursula" : "model",
+	// A hold file present and not taken (BENCH_HOLD).
+	hold: HOLD,
 	node: process.version,
 	platform: `${process.platform}-${process.arch}`,
 };
@@ -195,12 +211,12 @@ if (out !== undefined && out.length > 0) {
 	appendFileSync(
 		out,
 		[
-			`### Commit latency, VFS against B1 (${summary.commits_per_arm} commits per arm, ${summary.server} server, ${summary.platform}, Node ${summary.node})`,
+			`### Commit latency, VFS${HOLD ? " with a hold file present" : ""} against B1 (${summary.commits_per_arm} commits per arm, ${summary.server} server, ${summary.platform}, Node ${summary.node})`,
 			"",
 			"| arm | p50 ms | p90 ms | p99 ms | max ms |",
 			"| --- | --- | --- | --- | --- |",
 			row("B1 (plain node:sqlite, WAL, NORMAL)", summary.b1_ms),
-			row("VFS (open(), commit only)", summary.vfs_ms),
+			row(`VFS (open(), commit only${HOLD ? ", hold file present" : ""})`, summary.vfs_ms),
 			row("VFS hook (capture, encode, log)", summary.vfs_hook_ms),
 			row(`VFS synced() after a commit (${summary.synced_commits}, one at a time)`, summary.synced_ms),
 			"",

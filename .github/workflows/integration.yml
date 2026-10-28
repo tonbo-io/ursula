@@ -268,6 +268,10 @@ jobs:
           sudo rm /var/lib/sqlite-ursula/host/stray
           # The check of every process needs root.
           expect "$("$bin" inspect)" unread_lock
+          # The hold: taken and released once its stdin closes, a known name to the inspection.
+          sudo install -o root -g root -m 0644 /dev/null /var/lib/sqlite-ursula/host/hold
+          test "$(sudo "$bin" hold < /dev/null)" = held
+          expect "$(sudo "$bin" inspect --pid $$)" clean
           sudo rm -rf /var/lib/sqlite-ursula
 
   sqlite-vfs-e2e:
@@ -561,12 +565,12 @@ jobs:
   # M1 exit criterion: a commit's p50 on the VFS within 0.5 ms of B1, plain node:sqlite with WAL and
   # synchronous=NORMAL, on the same workload (clients/sqlite-ursula/bench/commit.ts). Latency on a
   # shared runner is noisy, so this job is not a required check: it reports both values in the job
-  # summary and fails when the criterion is not met.
+  # summary and fails when the criterion is not met. A second run has the host's hold file present.
   sqlite-vfs-perf:
     name: sqlite-vfs perf (commit p50 against B1)
     needs: [sqlite-vfs]
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
       - name: Use the RunsOn cache
@@ -593,3 +597,10 @@ jobs:
           cd clients/sqlite-ursula
           npm ci
           URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" node bench/commit.ts
+
+      # The same with the host's hold file present and not taken: each write transaction tries it.
+      - name: Commit p50, VFS with a hold file present, against B1
+        timeout-minutes: 10
+        run: |
+          cd clients/sqlite-ursula
+          BENCH_HOLD=1 URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" node bench/commit.ts

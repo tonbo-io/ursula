@@ -10,6 +10,8 @@ use std::ptr::NonNull;
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use libsqlite3_sys as ffi;
 
@@ -37,8 +39,11 @@ use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
 use crate::db::for_tests;
 use crate::db::for_tests_with_limit;
+use crate::db::reader_for_tests;
 use crate::db::registered_for_tests;
 use crate::driver::Holder;
+use crate::hold::Hold;
+use crate::hold::set_for_tests as set_hold;
 use crate::publication::HandleState;
 use crate::replicator::ResetKind;
 use crate::testdir::TempDir;
@@ -68,14 +73,23 @@ fn pages_read_back_are_checked_against_what_was_written() {
 /// A file of `b` with this VFS's state, over a stand-in "unix" file with `inner` methods. The
 /// caller frees `ext` unless the file is closed.
 fn file_of(b: &Arc<Binding>, main: bool, inner: *const ffi::sqlite3_io_methods) -> File {
-    let role = if main {
-        Role::Main {
-            holder: Holder::Host,
+    file_held_by(b, main.then_some(Holder::Host), inner)
+}
+
+/// [`file_of`]: a main db handle of `holder`'s connection, or a WAL handle with none.
+fn file_held_by(
+    b: &Arc<Binding>,
+    holder: Option<Holder>,
+    inner: *const ffi::sqlite3_io_methods,
+) -> File {
+    let role = match holder {
+        Some(holder) => Role::Main {
+            holder,
             state: Cell::new(HandleState::Idle),
             exclusive: Cell::new(false),
-        }
-    } else {
-        Role::Wal
+            marks: Cell::new(0),
+        },
+        None => Role::Wal,
     };
     File {
         base: ffi::sqlite3_file {
@@ -804,4 +818,194 @@ fn a_commit_above_the_limit_fails_alone_with_nothing_logged() {
     drop(unsafe { Box::from_raw(main.ext) });
     // SAFETY: as above.
     drop(unsafe { Box::from_raw(wal.ext) });
+}
+
+/// A host's hold for this thread's write transactions: the lock file in `dir`, which the returned
+/// file holds exclusively (as `ursula-vfs-host hold` does) until it is unlocked, waited at for at
+/// most `limit`.
+fn held_hold(dir: &std::path::Path, limit: Duration) -> (&'static Hold, std::fs::File) {
+    let path = dir.join("hold");
+    std::fs::write(&path, b"").unwrap();
+    let host = std::fs::File::open(&path).unwrap();
+    host.lock().unwrap();
+    let ours = std::fs::File::open(&path).unwrap();
+    let hold: &'static Hold = Box::leak(Box::new(Hold::new(
+        ours,
+        path,
+        limit,
+        Duration::from_millis(5),
+    )));
+    set_hold(Some(hold));
+    (hold, host)
+}
+
+const READ_MARK: c_int = ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_SHARED;
+const READ_UNMARK: c_int = ffi::SQLITE_SHM_UNLOCK | ffi::SQLITE_SHM_SHARED;
+const LOCK_EXCLUSIVE: c_int = ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_EXCLUSIVE;
+const UNLOCK_EXCLUSIVE: c_int = ffi::SQLITE_SHM_UNLOCK | ffi::SQLITE_SHM_EXCLUSIVE;
+
+/// The time `xShmLock` of the WAL write lock on `f` took, which must succeed.
+fn write_lock_takes(f: *mut ffi::sqlite3_file) -> Duration {
+    let started = Instant::now();
+    assert_eq!(shm_lock(f, 0, LOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    started.elapsed()
+}
+
+/// Releases `host`'s exclusive lock after `after`, on a thread of its own.
+fn release_after(host: std::fs::File, after: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        std::thread::sleep(after);
+        host.unlock().unwrap();
+    })
+}
+
+// A write transaction (the WAL write lock asked for with a read mark held) waits while the host
+// holds the hold, and goes on once it is released, with SQLITE_OK: SQLite sees a transaction that
+// took longer (design: Hosts).
+#[test]
+fn a_write_transaction_waits_while_the_host_holds_the_hold() {
+    let dir = TempDir::new("vfs-hold-wait");
+    let b = for_tests(dir.path());
+    let (hold, host) = held_hold(dir.path(), Duration::from_secs(60));
+    let mut main = file_of(&b, true, &raw const STAND_IN);
+    let m = (&raw mut main).cast::<ffi::sqlite3_file>();
+    assert_eq!(shm_lock(m, 3, READ_MARK), ffi::SQLITE_OK);
+    let release = release_after(host, Duration::from_millis(200));
+    let waited = write_lock_takes(m);
+    release.join().unwrap();
+    assert!(waited >= Duration::from_millis(150), "{waited:?}");
+    assert!(waited < Duration::from_secs(30), "{waited:?}");
+    assert!(!hold.expired());
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    // Free: the next one does not wait.
+    assert!(write_lock_takes(m) < Duration::from_secs(30));
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    set_hold(None);
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// The valve: a write transaction waits at most the limit (60 s in the extension), then goes on and
+// sets a latch, under which the next one that finds the hold taken goes on at once. The first try
+// that finds the hold free clears the latch, so a later hold makes writers wait again.
+#[test]
+fn the_valve_lets_a_write_go_on_and_latches_until_the_hold_is_free() {
+    let dir = TempDir::new("vfs-hold-valve");
+    let b = for_tests(dir.path());
+    let limit = Duration::from_millis(300);
+    let (hold, host) = held_hold(dir.path(), limit);
+    let mut main = file_of(&b, true, &raw const STAND_IN);
+    let m = (&raw mut main).cast::<ffi::sqlite3_file>();
+    assert_eq!(shm_lock(m, 3, READ_MARK), ffi::SQLITE_OK);
+
+    assert!(write_lock_takes(m) >= limit);
+    assert!(hold.expired());
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    // Latched: at once, though the hold is still taken.
+    assert!(write_lock_takes(m) < limit);
+    assert!(hold.expired());
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+
+    host.unlock().unwrap();
+    assert!(write_lock_takes(m) < limit);
+    assert!(!hold.expired(), "a free hold clears the latch");
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    host.lock().unwrap();
+    assert!(
+        write_lock_takes(m) >= limit,
+        "the next hold is waited at again"
+    );
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    set_hold(None);
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// Only a write transaction of the host's connection to an owner binding waits: the private
+// connection and a reader's handle do not, and neither does a write lock asked for with no read
+// mark held, as a wal-index recovery and a checkpoint of any mode (FULL, RESTART and TRUNCATE take
+// the write lock after the checkpoint lock) ask for it, or after the read mark was released.
+#[test]
+fn only_a_write_transaction_of_the_host_waits_at_the_hold() {
+    let dir = TempDir::new("vfs-hold-exempt");
+    let reader_dir = TempDir::new("vfs-hold-exempt-reader");
+    let b = for_tests(dir.path());
+    let r = reader_for_tests(reader_dir.path());
+    // A wrongly held request would wait the whole minute.
+    let (hold, _host) = held_hold(dir.path(), Duration::from_secs(60));
+    let quick = Duration::from_secs(30);
+    let mut private = file_held_by(&b, Some(Holder::Private), &raw const STAND_IN);
+    let mut reader = file_of(&r, true, &raw const STAND_IN);
+    let mut main = file_of(&b, true, &raw const STAND_IN);
+    let (p, rd, m) = (
+        (&raw mut private).cast::<ffi::sqlite3_file>(),
+        (&raw mut reader).cast::<ffi::sqlite3_file>(),
+        (&raw mut main).cast::<ffi::sqlite3_file>(),
+    );
+    for f in [p, rd] {
+        assert_eq!(shm_lock(f, 3, READ_MARK), ffi::SQLITE_OK);
+        assert!(write_lock_takes(f) < quick);
+        assert_eq!(shm_lock(f, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+        assert_eq!(shm_lock(f, 3, READ_UNMARK), ffi::SQLITE_OK);
+    }
+    // A wal-index recovery: no read mark.
+    assert!(write_lock_takes(m) < quick);
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    // A checkpoint that takes the write lock.
+    assert_eq!(shm_lock(m, 1, LOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert!(write_lock_takes(m) < quick);
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(m, 1, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    // A read mark taken and released, and one only locked exclusively to be set, as a read
+    // transaction's start does: neither is held.
+    assert_eq!(shm_lock(m, 4, READ_MARK), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(m, 4, READ_UNMARK), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(m, 5, LOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(m, 5, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert!(write_lock_takes(m) < quick);
+    assert_eq!(shm_lock(m, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert!(!hold.expired());
+    set_hold(None);
+    // SAFETY: the `Box`es `file_of` and `file_held_by` made, which nothing freed.
+    drop(unsafe { Box::from_raw(private.ext) });
+    // SAFETY: as above.
+    drop(unsafe { Box::from_raw(reader.ext) });
+    // SAFETY: as above.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// A transaction that writes two attached databases never waits while it holds one's write lock:
+// on a thread that holds a bound database's WAL write lock, the next database's write lock does
+// not wait. Once the first is released, it does.
+#[test]
+fn a_thread_holding_a_bound_write_lock_does_not_wait_for_another() {
+    let (first_dir, second_dir) = (
+        TempDir::new("vfs-hold-two-a"),
+        TempDir::new("vfs-hold-two-b"),
+    );
+    let (a, b) = (for_tests(first_dir.path()), for_tests(second_dir.path()));
+    let mut first = file_of(&a, true, &raw const STAND_IN);
+    let mut second = file_of(&b, true, &raw const STAND_IN);
+    let (f1, f2) = (
+        (&raw mut first).cast::<ffi::sqlite3_file>(),
+        (&raw mut second).cast::<ffi::sqlite3_file>(),
+    );
+    assert_eq!(shm_lock(f1, 3, READ_MARK), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(f2, 3, READ_MARK), ffi::SQLITE_OK);
+    // The first write lock, before the host takes the hold.
+    assert!(write_lock_takes(f1) < Duration::from_secs(30));
+    let (hold, host) = held_hold(first_dir.path(), Duration::from_secs(60));
+    assert!(write_lock_takes(f2) < Duration::from_secs(30));
+    assert_eq!(shm_lock(f2, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert_eq!(shm_lock(f1, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    let release = release_after(host, Duration::from_millis(200));
+    assert!(write_lock_takes(f2) >= Duration::from_millis(150));
+    release.join().unwrap();
+    assert_eq!(shm_lock(f2, 0, UNLOCK_EXCLUSIVE), ffi::SQLITE_OK);
+    assert!(!hold.expired());
+    set_hold(None);
+    // SAFETY: the `Box`es `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(first.ext) });
+    // SAFETY: as above.
+    drop(unsafe { Box::from_raw(second.ext) });
 }

@@ -40,6 +40,10 @@
 //! every write fails (`SQLITE_IOERR_WRITE`), db-file writes included, so no checkpoint moves pages
 //! of a commit that may be discarded. A panic in a file method resets `internal`.
 //!
+//! While a host holds the host directory's `hold` file, a write transaction of the host's
+//! connection to an owner binding waits in `xShmLock` before its WAL write lock request goes on,
+//! at most 60 s, holding only its read mark ([`hold`], design: Hosts).
+//!
 //! A reader binding's db file opens read-only whatever the connection asked (design: Readers), so
 //! SQLite refuses its writes with `SQLITE_READONLY`, and a write or truncate that reaches one of
 //! its files anyway is refused the same way: a reader logs no commit.
@@ -49,6 +53,7 @@
 //! `szOsFile` bytes SQLite allocated for it (`x_open` fills it in), and buffers and out-parameters
 //! are valid for the sizes SQLite passes with them.
 //!
+//! [`hold`]: crate::hold
 //! [`publication`]: crate::publication
 //! [`marker`]: crate::codec::marker
 #![expect(
@@ -96,6 +101,7 @@ use crate::driver::Holder;
 use crate::driver::runtime::driver;
 use crate::error::WriteRefusal;
 use crate::guard::contain;
+use crate::hold;
 use crate::host::OK;
 use crate::host::unix;
 use crate::ids::CommitId;
@@ -120,6 +126,9 @@ const WAL_CKPT_LOCK: c_int = 1;
 /// takes shared.
 const WAL_READ_LOCK_0: c_int = 3;
 
+/// `WAL_NREADER`: the read-mark lock slots, `WAL_READ_LOCK_0` and the four after it.
+const WAL_NREADER: c_int = 5;
+
 /// The longest a commit waits at its commit point for another connection's logged commit to be
 /// decided (design: Publication).
 const UNDECIDED_WAIT: Duration = Duration::from_secs(1);
@@ -134,6 +143,9 @@ const WINDOW_POLL: Duration = Duration::from_millis(100);
 thread_local! {
     /// The extension's private connection is opening on this thread (`opening_private`).
     static PRIVATE: Cell<bool> = const { Cell::new(false) };
+    /// The WAL write locks of bound databases this thread holds: a write transaction that holds
+    /// one never waits at the hold for another (design: Hosts).
+    static WRITE_LOCKS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Runs `open`, the open of the extension's private connection (`host::Private`), so that it
@@ -198,12 +210,14 @@ fn uwal(name: &str, bound: impl FnOnce(&str) -> bool) -> Option<String> {
 }
 
 enum Role {
-    /// A main db handle: whose connection it is, where its commit stands, and whether it holds an
-    /// EXCLUSIVE file lock.
+    /// A main db handle: whose connection it is, where its commit stands, whether it holds an
+    /// EXCLUSIVE file lock, and the read-mark lock slots it holds shared (bit `i` for
+    /// `WAL_READ_LOCK(i)`).
     Main {
         holder: Holder,
         state: Cell<HandleState>,
         exclusive: Cell<bool>,
+        marks: Cell<u8>,
     },
     Wal,
 }
@@ -382,6 +396,7 @@ unsafe fn x_open(
                         holder,
                         state: Cell::new(HandleState::Idle),
                         exclusive: Cell::new(false),
+                        marks: Cell::new(0),
                     },
                 })
             }
@@ -551,6 +566,7 @@ fn closing(ext: &Ext, addr: usize) {
             holder,
             state,
             exclusive,
+            ..
         } => {
             {
                 let mut c = b.lock();
@@ -1177,12 +1193,41 @@ unsafe fn x_shm_map(
     fwd!(file, xShmMap, pg, pgsz, extend, pp)
 }
 
+/// Whether a WAL write lock request on `ext`, a main db handle, waits at the hold first (design:
+/// Hosts): the host's connection to an owner binding, holding a read mark, so a write transaction
+/// (SQLite takes the write lock only with a read mark held), on a thread that holds no other
+/// bound database's write lock. A checkpoint of any mode and a wal-index recovery hold no read
+/// mark when they ask for it, and the private connection and readers never wait.
+fn waits_at_hold(ext: &Ext) -> bool {
+    matches!(
+        ext.role,
+        Role::Main {
+            holder: Holder::Host,
+            ref marks,
+            ..
+        } if marks.get() != 0
+    ) && ext.binding.handle.role == crate::driver::Role::Owner
+        && WRITE_LOCKS.get() == 0
+}
+
+/// The read-mark lock slots among `n` slots from `offset`, as `Role::Main`'s `marks` has them.
+fn read_marks(offset: c_int, n: c_int) -> u8 {
+    (0..WAL_NREADER)
+        .filter(|i| {
+            let slot = WAL_READ_LOCK_0.saturating_add(*i);
+            slot >= offset && slot < offset.saturating_add(n)
+        })
+        .filter_map(|i| u32::try_from(i).ok().and_then(|i| 1u8.checked_shl(i)))
+        .fold(0, |mask, bit| mask | bit)
+}
+
 /// Feeds the WAL write lock to publication and tracks the write transaction and checkpoints of a
 /// bound database; SQLite takes both locks through the main db handle. The end of a write
 /// transaction runs under the binding's mutex *before* the real lock is released: once it is
 /// released, another connection may start its own write transaction, whose state the bookkeeping
 /// would otherwise clear. Lock order: the real shm lock may be taken without the mutex, and the
-/// mutex may be held while releasing it, which never blocks.
+/// mutex may be held while releasing it, which never blocks. A write transaction's write lock
+/// request first waits at the hold (`waits_at_hold`), with no mutex and no WAL write lock held.
 unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
     // SAFETY: the module contract.
     let main = unsafe { ext(file) }.filter(|e| e.is_main());
@@ -1196,7 +1241,15 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
     let locking = flags & ffi::SQLITE_SHM_LOCK != 0;
     if tracked && offset == WAL_WRITE_LOCK {
         if locking {
+            if waits_at_hold(ext)
+                && let Some(hold) = hold::process_hold()
+            {
+                hold.wait();
+            }
             let rc = fwd!(file, xShmLock, offset, n, flags);
+            if rc == OK {
+                WRITE_LOCKS.set(WRITE_LOCKS.get().saturating_add(1));
+            }
             let call = if rc == OK {
                 Call::LockWrite
             } else {
@@ -1220,6 +1273,7 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         }
         c.writer = 0;
         c.txn = None;
+        WRITE_LOCKS.set(WRITE_LOCKS.get().saturating_sub(1));
         return fwd!(file, xShmLock, offset, n, flags);
     }
     // SAFETY: the module contract.
@@ -1235,7 +1289,18 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         return ffi::SQLITE_IOERR_READ;
     }
     if !tracked {
-        return fwd!(file, xShmLock, offset, n, flags);
+        let rc = fwd!(file, xShmLock, offset, n, flags);
+        if flags & ffi::SQLITE_SHM_SHARED != 0
+            && let Role::Main { marks, .. } = &ext.role
+        {
+            let slots = read_marks(offset, n);
+            if !locking {
+                marks.set(marks.get() & !slots);
+            } else if rc == OK {
+                marks.set(marks.get() | slots);
+            }
+        }
+        return rc;
     }
     if locking {
         let rc = fwd!(file, xShmLock, offset, n, flags);
