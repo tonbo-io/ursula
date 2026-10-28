@@ -430,7 +430,11 @@ impl OpenError {
             OpenError::InUse { .. } => ErrorKind::InUse,
             OpenError::BoundElsewhere { kept, .. } => kept.error_kind(),
             OpenError::LocalSetup(_) => ErrorKind::LocalSetup,
-            OpenError::Internal(_) | OpenError::Panicked => ErrorKind::Internal,
+            // No SQL function opens as a drain, so the kinds SQL shares do not grow: a drain
+            // reports the decline's own token (`Declined::kind`).
+            OpenError::Internal(_) | OpenError::Panicked | OpenError::Declined(_) => {
+                ErrorKind::Internal
+            }
             OpenError::StreamFormat(_) => ErrorKind::StreamFormat,
             OpenError::NoServerIdentity => ErrorKind::NoServerIdentity,
             OpenError::ProtocolMismatch { .. } => ErrorKind::ProtocolMismatch,

@@ -246,6 +246,26 @@ pub(crate) enum Condition {
     Blocked(BlockedReason),
 }
 
+impl Condition {
+    /// The stable token (design: Answers, Status): status reports it, and so does a host's drain.
+    pub(crate) fn token(&self) -> &'static str {
+        match self {
+            Self::Retrying => "retrying",
+            Self::Blocked(reason) => match reason {
+                BlockedReason::RequestTooLarge => "request_too_large",
+                BlockedReason::Unauthorized => "unauthorized",
+                BlockedReason::PaymentRequired => "payment_required",
+                BlockedReason::Forbidden => "forbidden",
+                BlockedReason::Redirected { .. } => "redirected",
+                BlockedReason::WrongCluster => "wrong_cluster",
+                BlockedReason::NoServerIdentity => "no_server_identity",
+                BlockedReason::ProtocolMismatch { .. } => "protocol_mismatch",
+                BlockedReason::Rejected { .. } => "rejected",
+            },
+        }
+    }
+}
+
 /// The resets (design: Resets), one enum for the replicator and the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetKind {

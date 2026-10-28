@@ -15,13 +15,33 @@ pub(crate) const DEFAULT_MAX_PENDING_BYTES: u64 = 64 << 20;
 /// (design: Open, Readers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Access {
-    /// Claims the stream. With `recreate`, a missing stream whose trusted local generation holds
-    /// data is created again, the generation salvaged (`recreated`), instead of refusing
-    /// `not_found`.
-    Owner { recreate: bool },
+    /// An owner's open: it locks the root, records its cache directory in the host directory and
+    /// claims the stream, as `mode` says.
+    Owner { mode: OwnerMode },
     /// `read_only`: the stream as of the open, from a reader directory or the binding this process
     /// owns, claiming nothing.
     Reader,
+}
+
+/// How an owner's open claims the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerMode {
+    /// The open table's (design: Open): it takes the stream over, or creates or builds it. With
+    /// `recreate`, a missing stream whose trusted local generation holds data is created again,
+    /// the generation salvaged (`recreated`), instead of refusing `not_found`.
+    Open { recreate: bool },
+    /// A host's drain of a root no process holds ([`crate::open::table::decide_drain`]): it only
+    /// continues the claim the root's log holds, behind the pre-check (design: Pre-check), and
+    /// never takes the stream over, creates it or builds a generation. `options_json` never asks
+    /// for it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only a host's drain opens with it, and no command runs one yet"
+        )
+    )]
+    Drain,
 }
 
 /// What `options_json` asks for.
@@ -49,7 +69,9 @@ impl Default for OpenOptions {
             token: None,
             agent: None,
             timeout_ms: None,
-            access: Access::Owner { recreate: false },
+            access: Access::Owner {
+                mode: OwnerMode::Open { recreate: false },
+            },
         }
     }
 }
@@ -138,7 +160,9 @@ impl TryFrom<&str> for OpenOptions {
         options.access = match (read_only, recreate) {
             (true, true) => return Err(OptionsError::ReadOnlyRecreate),
             (true, false) => Access::Reader,
-            (false, recreate) => Access::Owner { recreate },
+            (false, recreate) => Access::Owner {
+                mode: OwnerMode::Open { recreate },
+            },
         };
         Ok(options)
     }
@@ -177,6 +201,7 @@ mod tests {
     use super::DEFAULT_MAX_PENDING_BYTES;
     use super::OpenOptions;
     use super::OptionsError;
+    use super::OwnerMode;
     use crate::ids::Activation;
     use crate::json::SyntaxError;
 
@@ -209,12 +234,16 @@ mod tests {
         assert_eq!(o.token.as_deref(), Some("t1\"x"));
         assert_eq!(o.agent.as_deref(), Some("sdk/1"));
         assert_eq!(o.timeout_ms, Some(60_000));
-        assert_eq!(o.access, Access::Owner { recreate: false });
+        assert_eq!(o.access, Access::Owner {
+            mode: OwnerMode::Open { recreate: false }
+        });
         assert_eq!(
             OpenOptions::try_from(r#"{"recreate": true}"#)
                 .unwrap()
                 .access,
-            Access::Owner { recreate: true }
+            Access::Owner {
+                mode: OwnerMode::Open { recreate: true }
+            }
         );
         assert_eq!(
             OpenOptions::try_from(r#"{"read_only": true, "recreate": false}"#)

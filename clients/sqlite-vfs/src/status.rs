@@ -21,8 +21,6 @@ use crate::json::null;
 use crate::json::object;
 use crate::json::str as json_str;
 use crate::open::OpenError;
-use crate::replicator::BlockedReason;
-use crate::replicator::Condition;
 use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
@@ -49,24 +47,6 @@ fn with_kind(
         .chain(after.iter().cloned())
         .collect();
     object(&fields)
-}
-
-/// The token of a replication condition (design: Answers, Status).
-fn condition(c: &Condition) -> &'static str {
-    match c {
-        Condition::Retrying => "retrying",
-        Condition::Blocked(reason) => match reason {
-            BlockedReason::RequestTooLarge => "request_too_large",
-            BlockedReason::Unauthorized => "unauthorized",
-            BlockedReason::PaymentRequired => "payment_required",
-            BlockedReason::Forbidden => "forbidden",
-            BlockedReason::Redirected { .. } => "redirected",
-            BlockedReason::WrongCluster => "wrong_cluster",
-            BlockedReason::NoServerIdentity => "no_server_identity",
-            BlockedReason::ProtocolMismatch { .. } => "protocol_mismatch",
-            BlockedReason::Rejected { .. } => "rejected",
-        },
-    }
 }
 
 /// The `state` status reports (design: Status): a reset, else the binding's life, a live one
@@ -105,7 +85,7 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
             replication
                 .condition
                 .as_ref()
-                .map_or_else(null, |c| json_str(condition(c))),
+                .map_or_else(null, |c| json_str(c.token())),
         ),
     ]);
     let snapshots = h.snapshots.status();
@@ -423,7 +403,7 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                 ("path", path(*binding)),
                 (
                     "condition",
-                    c.as_ref().map_or_else(null, |c| json_str(condition(c))),
+                    c.as_ref().map_or_else(null, |c| json_str(c.token())),
                 ),
             ]),
             DriverEvent::Reset { binding, cause } => with_kind(

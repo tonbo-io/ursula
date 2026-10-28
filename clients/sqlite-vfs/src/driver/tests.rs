@@ -67,11 +67,15 @@ use crate::open::OpenSpec;
 use crate::open::StreamFormat;
 use crate::open::StreamState;
 use crate::open::Unavailable;
+use crate::open::table::Declined;
 use crate::options::Access;
+use crate::options::OwnerMode;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
+use crate::replog::Log;
+use crate::replog::Unacknowledged;
 use crate::salvage::Reason;
 use crate::salvage::Salvaged;
 use crate::salvage::State;
@@ -97,7 +101,9 @@ fn spec(dir: &Path, activation: u8) -> OpenSpec {
         max_request_bytes: None,
         max_commit_bytes: crate::capture::DEFAULT_MAX_COMMIT_BYTES,
         timeout_ms: 30_000,
-        access: Access::Owner { recreate: false },
+        access: Access::Owner {
+            mode: OwnerMode::Open { recreate: false },
+        },
     }
 }
 
@@ -2909,7 +2915,9 @@ fn a_head_404_without_the_protocol_is_no_missing_stream() {
     w.concealed = true;
     let c2 = w.core();
     let e = kind(w.open_result(c2, OpenSpec {
-        access: Access::Owner { recreate: true },
+        access: Access::Owner {
+            mode: OwnerMode::Open { recreate: true },
+        },
         ..spec(dir.path(), 2)
     }));
     assert!(matches!(*e, OpenError::NoServerIdentity), "{e}");
@@ -3399,7 +3407,9 @@ fn recreate_salvages_the_generation_and_creates_the_stream() {
     w.server.delete(PATH).unwrap();
     let c2 = w.core();
     let bound = w.open(c2, OpenSpec {
-        access: Access::Owner { recreate: true },
+        access: Access::Owner {
+            mode: OwnerMode::Open { recreate: true },
+        },
         ..spec(dir.path(), 2)
     });
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::Recreated));
@@ -4960,7 +4970,9 @@ fn a_create_answered_200_salvages_as_a_history_change() {
     }));
     let c2 = w.core();
     let bound = w.open(c2, OpenSpec {
-        access: Access::Owner { recreate: true },
+        access: Access::Owner {
+            mode: OwnerMode::Open { recreate: true },
+        },
         ..spec(dir.path(), 2)
     });
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::HistoryChanged));
@@ -6520,4 +6532,413 @@ fn a_delete_then_recreate_or_import_under_a_bound_owner_salvages_every_commit() 
         assert!(holds_commit(&s, &acked), "import {import}");
         assert!(holds_commit(&s, &pending), "import {import}");
     }
+}
+
+/// A host's drain of the root under `dir` (`OwnerMode::Drain`), under an activation of its own.
+fn drain_spec(dir: &Path, activation: u8) -> OpenSpec {
+    OpenSpec {
+        access: Access::Owner {
+            mode: OwnerMode::Drain,
+        },
+        ..spec(dir, activation)
+    }
+}
+
+/// The drain gives the binding back as soon as it binds, as the driver's cancel of an untaken
+/// result does: no connection ever opens it, and it retires once nothing is pending.
+fn hand_back(w: &mut World, c: usize, bound: &Bound) {
+    bound.handle.retiring();
+    let now = w.now;
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.deliver();
+}
+
+/// Whether core `c` reported the binding retired.
+fn retired(w: &World, c: usize, bound: &Bound) -> bool {
+    w.events(c)
+        .iter()
+        .any(|e| matches!(e, DriverEvent::Retired { binding } if *binding == bound.binding))
+}
+
+/// The positions of the generation's own commits after its latest ACK, as a host's inspection
+/// reads them, and that ACK's position.
+fn unacknowledged(gen_dir: &Path) -> (Vec<Position>, Position) {
+    let mut fold = Unacknowledged::until(None);
+    Log::read(&gen_dir.join("log"), &mut fold).unwrap();
+    let pending = fold.pending().unwrap().iter().map(|(p, _)| *p).collect();
+    (pending, fold.state().unwrap().acked)
+}
+
+/// The epochs of the stream's CLAIM frames, in order.
+fn stream_claims(w: &World) -> Vec<Epoch> {
+    frames(w.server.frames(PATH).unwrap_or_default())
+        .iter()
+        .filter_map(|f| match decode(f) {
+            Frame::Claim { epoch, .. } => Some(epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The methods of the requests core `c` sent, in order.
+fn methods(w: &World, c: usize) -> Vec<Method> {
+    w.sent
+        .iter()
+        .filter(|s| s.core == c)
+        .map(|s| s.request.method)
+        .collect()
+}
+
+fn epoch(n: u64) -> Epoch {
+    Epoch::try_from(n).unwrap()
+}
+
+/// An owner that committed `salt` and crashed with the commit after its log's latest ACK: never
+/// sent (the stream out of its reach), or with `landed` acknowledged by the stream before the ACK
+/// record was written. The generation, the epoch of the owner's claim and the commit's frame.
+fn orphan(w: &mut World, dir: &Path, salt: u8, landed: bool) -> (PathBuf, Epoch, Vec<u8>) {
+    let c = w.core();
+    let bound = w.open(c, spec(dir, 1));
+    w.down[c] = !landed;
+    let frame = w.commit(c, &bound, salt).unwrap();
+    assert_eq!(bound.handle.pending_bytes() == 0, landed);
+    let own = *w.claims(c).last().unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.crash(c);
+    assert_eq!(unacknowledged(&generation).0.len(), 1, "landed {landed}");
+    (generation, own, frame)
+}
+
+/// A drain binds at once, provisionally, though the stream answers: its claim waits behind the
+/// pre-check (a HEAD, then the reads from the log's acknowledged offset). Then the log's claim goes
+/// out again, its repeat brings the one continuation claim at `own + 1`, the orphan's commit goes
+/// out, and the binding given back at bind retires. The application's reopen then claims above
+/// the drain's and resumes with nothing pending.
+#[test]
+fn a_drain_open_continues_its_roots_claim_while_the_stream_answers() {
+    let dir = TempDir::new("driver-drain-continues");
+    let mut w = World::new();
+    let (generation, own, x) = orphan(&mut w, dir.path(), 1, false);
+    let c = w.core();
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    assert!(bound.handle.provisional());
+    assert_eq!(bound.handle.generation.dir, generation);
+    assert_eq!(bound.handle.attach, Attach::Resumed);
+    assert_eq!(bound.handle.role, Role::Owner);
+    // The open's HEAD, then the pre-check's, before anything else.
+    assert_eq!(
+        methods(&w, c).get(..2),
+        Some(&[Method::Head, Method::Head][..])
+    );
+    hand_back(&mut w, c, &bound);
+    w.run_for(10_000);
+    assert!(w.resets(c).is_empty(), "{:?}", w.resets(c));
+    assert!(retired(&w, c, &bound));
+    assert!(!bound.handle.holds_root());
+    let next = epoch(own.get() + 1);
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(stream_claims(&w), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![x]);
+    assert!(unacknowledged(&generation).0.is_empty());
+    drop(bound);
+    let a = w.core();
+    let reopened = w.open(a, spec(dir.path(), 3));
+    assert_eq!(reopened.handle.generation.dir, generation);
+    assert_eq!(reopened.handle.pending_bytes(), 0);
+    assert_eq!(claimed(&w, a), vec![epoch(own.get() + 2)]);
+}
+
+/// The binding given back at bind drains as after a last close and retires only once every
+/// commit it held is acknowledged, with an ACK at exactly the last one. An orphan whose commit
+/// already reached the stream, its ACK not yet written, still claims `own + 1` once: its pre-check
+/// acknowledges the commit in memory, and only the bind reports it. Nothing is sent twice.
+#[test]
+fn a_drain_handed_back_at_bind_retires_with_an_exact_ack() {
+    for landed in [false, true] {
+        let dir = TempDir::new("driver-drain-exact-ack");
+        let mut w = World::new();
+        let (generation, own, x) = orphan(&mut w, dir.path(), 1, landed);
+        let (pending, _) = unacknowledged(&generation);
+        let c = w.core();
+        // The claims wait until the binding was given back.
+        w.hold_sends = Some(Box::new(|request| request.method == Method::Post));
+        let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+        hand_back(&mut w, c, &bound);
+        assert!(bound.handle.holds_root(), "landed {landed}");
+        assert!(!retired(&w, c, &bound), "landed {landed}");
+        w.release_sends();
+        w.run_for(10_000);
+        assert!(w.resets(c).is_empty(), "landed {landed}: {:?}", w.resets(c));
+        assert!(retired(&w, c, &bound), "landed {landed}");
+        assert!(!bound.handle.holds_root(), "landed {landed}");
+        let next = epoch(own.get() + 1);
+        assert_eq!(claimed(&w, c), vec![own, next], "landed {landed}");
+        assert_eq!(stream_claims(&w), vec![own, next], "landed {landed}");
+        assert_eq!(w.stream_commits(), vec![x], "landed {landed}");
+        if landed {
+            assert!(
+                w.appends(c).iter().all(|(_, seq, _)| *seq == 0),
+                "no commit was sent again"
+            );
+        }
+        assert_eq!(
+            unacknowledged(&generation),
+            (Vec::new(), pending[0]),
+            "landed {landed}"
+        );
+        assert!(matches!(
+            log_records(&generation).last(),
+            Some(RecordBody::Ack { acked, .. }) if *acked == pending[0]
+        ));
+    }
+}
+
+/// A root whose log holds nothing after its latest ACK by the time the drain binds retires at
+/// once when given back, its pre-check still out: no claim goes out, and nothing is logged.
+#[test]
+fn a_drain_whose_root_holds_nothing_at_bind_retires_without_a_claim() {
+    let dir = TempDir::new("driver-drain-nothing");
+    let mut w = World::new();
+    let (generation, _, _) = crashed_owner(&mut w, dir.path(), 1);
+    let records = log_records(&generation);
+    let c = w.core();
+    // Only the open's HEAD is answered: the pre-check waits.
+    let heads = Rc::new(Cell::new(0u32));
+    let counted = Rc::clone(&heads);
+    w.hold_sends = Some(Box::new(move |_| {
+        counted.set(counted.get() + 1);
+        counted.get() > 1
+    }));
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    hand_back(&mut w, c, &bound);
+    assert!(retired(&w, c, &bound));
+    assert!(!bound.handle.holds_root());
+    w.release_sends();
+    w.run_for(10_000);
+    assert!(claimed(&w, c).is_empty(), "{:?}", claimed(&w, c));
+    let after = log_records(&generation);
+    assert!(
+        after
+            .iter()
+            .skip(records.len())
+            .all(|r| !matches!(r, RecordBody::Claim { .. })),
+        "{after:?}"
+    );
+    assert!(w.resets(c).is_empty());
+}
+
+/// The bind starts the hand-out timer, which finds the binding given back and changes nothing:
+/// with its claim's answer held past it, the binding keeps the root, and drains and retires
+/// once the answer comes.
+#[test]
+fn a_drain_handed_back_at_bind_outlives_the_hand_out_timer() {
+    let dir = TempDir::new("driver-drain-hand-out");
+    let mut w = World::new();
+    let (generation, _, x) = orphan(&mut w, dir.path(), 1, false);
+    let c = w.core();
+    w.hold_sends = Some(Box::new(|request| request.method == Method::Post));
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    hand_back(&mut w, c, &bound);
+    w.run_for(UNCONNECTED_MS + 10_000);
+    assert!(bound.handle.holds_root());
+    assert_eq!(bound.handle.life(), Life::Retiring);
+    assert!(!retired(&w, c, &bound));
+    assert!(w.resets(c).is_empty());
+    w.release_sends();
+    w.run_for(10_000);
+    assert!(retired(&w, c, &bound));
+    assert!(!bound.handle.holds_root());
+    assert_eq!(w.stream_commits(), vec![x]);
+    assert!(unacknowledged(&generation).0.is_empty());
+}
+
+/// Another process took the stream over in another cache root before the drain's pre-check read
+/// the tail, and stayed idle or wrote: the pre-check finds its claim and the drain resets
+/// `fenced` with nothing sent but its HEADs and reads. The orphan keeps its commit, and the other
+/// owner goes on, its next commit acknowledged.
+#[test]
+fn a_drain_never_applies_above_a_claim_made_before_its_pre_check_read() {
+    for writes in [false, true] {
+        let dir = TempDir::new("driver-drain-fenced");
+        let other = TempDir::new("driver-drain-fenced-other");
+        let mut w = World::new();
+        let (generation, _, x) = orphan(&mut w, dir.path(), 1, false);
+        let b = w.core();
+        let bound_b = w.open(b, spec(other.path(), 7));
+        if writes {
+            w.commit(b, &bound_b, 3).unwrap();
+        }
+        w.run_for(2_000);
+        let before = w.server.frames(PATH).unwrap().to_vec();
+        let c = w.core();
+        let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+        hand_back(&mut w, c, &bound);
+        w.run_for(10_000);
+        assert_eq!(w.resets(c), vec![ResetKind::Fenced], "writes {writes}");
+        assert!(claimed(&w, c).is_empty(), "writes {writes}");
+        assert!(
+            methods(&w, c)
+                .iter()
+                .all(|m| matches!(m, Method::Head | Method::Get)),
+            "writes {writes}"
+        );
+        assert_eq!(
+            w.server.frames(PATH).unwrap(),
+            &before[..],
+            "writes {writes}"
+        );
+        assert!(!bound.handle.holds_root(), "writes {writes}");
+        assert_eq!(unacknowledged(&generation).0.len(), 1, "writes {writes}");
+        assert!(!w.stream_commits().contains(&x));
+        let more = w.commit(b, &bound_b, 4).unwrap();
+        let ticket = w.sync(b, bound_b.binding);
+        w.run_for(1_000);
+        assert_eq!(w.outcome(b, ticket), Some(Ok(())), "writes {writes}");
+        assert!(w.resets(b).is_empty(), "writes {writes}");
+        assert_eq!(w.stream_commits().last(), Some(&more));
+    }
+}
+
+/// Another writer's commit after the root's acknowledged offset, with no claim before it: the
+/// drain resets `stale` with nothing sent, and the orphan keeps its commit.
+#[test]
+fn a_drain_meeting_another_writers_commit_resets_stale_with_nothing_sent() {
+    let dir = TempDir::new("driver-drain-stale");
+    let mut w = World::new();
+    let (generation, _, x) = orphan(&mut w, dir.path(), 1, false);
+    foreign_commit(&mut w.server, 9);
+    let before = w.server.frames(PATH).unwrap().to_vec();
+    let c = w.core();
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    hand_back(&mut w, c, &bound);
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Stale]);
+    assert!(claimed(&w, c).is_empty());
+    assert_eq!(w.server.frames(PATH).unwrap(), &before[..]);
+    assert!(!bound.handle.holds_root());
+    assert_eq!(unacknowledged(&generation).0.len(), 1);
+    assert!(!w.stream_commits().contains(&x));
+}
+
+/// The window the pre-check accepts (design: Pre-check): two takeovers of the root whose claims
+/// never reached the stream left claims `own + 1` and `own + 2` in its log. An explicit open of
+/// the stream in another cache root claims `own + 1` after the drain's pre-check read the tail and
+/// before its repeat of `own + 2` is answered: that repeat applies fresh, above the explicit
+/// claim, and fences it. The drain then continues, and no acknowledged commit is lost.
+#[test]
+fn a_drain_repeat_of_an_unapplied_claim_can_fence_a_claim_made_within_its_pre_check() {
+    let dir = TempDir::new("driver-drain-window");
+    let other = TempDir::new("driver-drain-window-other");
+    let mut w = World::new();
+    let (_, own, x) = orphan(&mut w, dir.path(), 1, false);
+    for activation in [3, 4] {
+        let a = w.core();
+        w.hold_sends = Some(Box::new(|request| request.method == Method::Post));
+        start_open(&mut w, a, spec(dir.path(), activation));
+        w.run_for(1_000);
+        assert_eq!(w.held_sends.len(), 1, "the takeover's claim is out");
+        w.held_sends.clear();
+        w.hold_sends = None;
+        w.crash(a);
+    }
+    assert_eq!(stream_claims(&w), vec![own]);
+    let c = w.core();
+    w.hold_sends = Some(Box::new(|request| request.method == Method::Post));
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    hand_back(&mut w, c, &bound);
+    assert_eq!(
+        w.held_sends.len(),
+        1,
+        "the repeat is out, the pre-check done"
+    );
+    w.hold_sends = None;
+    let b = w.core();
+    let bound_b = w.open(b, spec(other.path(), 7));
+    assert_eq!(claimed(&w, b), vec![epoch(own.get() + 1)]);
+    w.release_sends();
+    w.run_for(10_000);
+    assert!(w.resets(c).is_empty(), "{:?}", w.resets(c));
+    assert_eq!(claimed(&w, c), vec![
+        epoch(own.get() + 2),
+        epoch(own.get() + 3)
+    ]);
+    assert!(w.stream_commits().contains(&x));
+    assert!(!bound.handle.holds_root());
+    let mine = w.commit(b, &bound_b, 5).unwrap();
+    let ticket = w.sync(b, bound_b.binding);
+    w.run_for(10_000);
+    assert_eq!(w.resets(b), vec![ResetKind::Fenced]);
+    assert_eq!(
+        w.outcome(b, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Fenced)))
+    );
+    assert!(!w.stream_commits().contains(&mine));
+}
+
+/// What a drain cannot continue it refuses or declines with nothing sent but its HEAD, the local
+/// files as they were: a deleted stream (never created again), a replaced db file (reachable, or
+/// unreachable at once instead of at the deadline) and a root another process holds.
+#[test]
+fn a_drain_refuses_or_declines_with_nothing_sent_but_its_head() {
+    let dir = TempDir::new("driver-drain-deleted");
+    let mut w = World::new();
+    let (generation, _, _) = orphan(&mut w, dir.path(), 1, false);
+    w.server.delete(PATH).unwrap();
+    let c = w.core();
+    let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
+    assert!(matches!(*e, OpenError::NotFound), "{e}");
+    assert_eq!(methods(&w, c), vec![Method::Head]);
+    assert!(w.server.frames(PATH).is_none(), "never created");
+    assert_eq!(unacknowledged(&generation).0.len(), 1);
+
+    for down in [false, true] {
+        let dir = TempDir::new("driver-drain-replaced");
+        let mut w = World::new();
+        let (generation, _, _) = orphan(&mut w, dir.path(), 1, false);
+        std::fs::write(generation.join("db"), &sqlite(Box::new([0; 4096]))[..]).unwrap();
+        let before = files(&generation);
+        let c = w.core();
+        w.down[c] = down;
+        let start = w.now;
+        let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
+        assert!(
+            matches!(*e, OpenError::Declined(Declined::Replaced)),
+            "down {down}: {e}"
+        );
+        assert!(w.now - start <= 5_000, "down {down}: {} ms", w.now - start);
+        assert_eq!(methods(&w, c), vec![Method::Head], "down {down}");
+        assert_eq!(files(&generation), before, "down {down}");
+    }
+
+    let dir = TempDir::new("driver-drain-in-use");
+    let _held = Root::lock(dir.path(), &canonical_path(URL).unwrap()).unwrap();
+    let mut w = World::new();
+    let c = w.core();
+    let e = kind(w.open_result(c, drain_spec(dir.path(), 2)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    assert!(methods(&w, c).is_empty());
+}
+
+/// Unreachable at its open, a drain continues the root's claim by the unreachable row, and drains
+/// once the stream answers.
+#[test]
+fn a_drain_of_an_unreachable_stream_continues_once_it_answers() {
+    let dir = TempDir::new("driver-drain-unreachable");
+    let mut w = World::new();
+    let (generation, own, x) = orphan(&mut w, dir.path(), 1, false);
+    let c = w.core();
+    w.down[c] = true;
+    let bound = w.open_result(c, drain_spec(dir.path(), 2)).unwrap();
+    assert!(bound.handle.provisional());
+    hand_back(&mut w, c, &bound);
+    w.run_for(10_000);
+    assert!(bound.handle.holds_root());
+    w.down[c] = false;
+    w.run_for(30_000);
+    assert!(retired(&w, c, &bound));
+    assert_eq!(claimed(&w, c), vec![own, epoch(own.get() + 1)]);
+    assert_eq!(w.stream_commits(), vec![x]);
+    assert!(unacknowledged(&generation).0.is_empty());
 }

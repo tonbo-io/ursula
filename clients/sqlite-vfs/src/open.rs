@@ -32,6 +32,13 @@
 //! Pre-check). Without a trusted generation, or without a claim to continue, the open retries until
 //! its deadline.
 //!
+//! A host's drain of a root ([`OwnerMode::Drain`]) runs the owner's local steps, then decides by
+//! the drain's rows ([`table::decide_drain`]): it binds provisionally, as the unreachable row does,
+//! even when the stream answers, so it only ever continues the root's own claim behind the
+//! pre-check and never takes the stream over. It never creates the stream or builds a generation,
+//! and what it cannot continue it declines ([`OpenError::Declined`]) with nothing sent but the
+//! HEAD.
+//!
 //! A read-only open ([`Access::Reader`]) runs the same steps in a reader directory of its own
 //! ([`Root::reader`]) and decides by the reader rows ([`table::decide_reader`], [`reader`]): it
 //! builds a reader generation, catches a trusted one of the stream's token up in place, and binds
@@ -71,6 +78,8 @@ use self::reader::Applying;
 use self::reader::CatchUp;
 use self::reader::ReaderReady;
 use self::table::Asked;
+use self::table::Declined;
+use self::table::DrainRow;
 use self::table::HeadSeen;
 use self::table::Local;
 use self::table::LocalSummary;
@@ -115,6 +124,7 @@ use crate::materialize::LocalError;
 use crate::materialize::Materialized;
 use crate::materialize::holds_data;
 use crate::options::Access;
+use crate::options::OwnerMode;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
 use crate::replicator::LocalState;
@@ -161,7 +171,7 @@ pub(crate) struct OpenSpec {
     pub(crate) max_commit_bytes: u64,
     /// How long the open may take, from its start.
     pub(crate) timeout_ms: u64,
-    /// An owner's open (with `recreate` or not) or a reader's.
+    /// An owner's open (with `recreate` or not, or a host's drain) or a reader's.
     pub(crate) access: Access,
 }
 
@@ -345,6 +355,10 @@ pub(crate) enum OpenError {
     GaveUp(GaveUp),
     #[error("{}: the takeover reset", .0.kind())]
     Reset(ResetKind),
+    /// A drain's open found nothing it could continue ([`table::decide_drain`]). No SQL function
+    /// opens as a drain, so none meets it.
+    #[error("{}: the drain declined the root: {0}", .0.kind())]
+    Declined(Declined),
     #[error("cancelled")]
     Cancelled,
 }
@@ -1727,9 +1741,13 @@ impl Opening {
                 // A build that started over after a history change takes over with its token.
                 let head = read.unwrap_or(head);
                 match self.spec.access {
-                    Access::Owner { .. } => {
-                        self.takeover(m, cluster_id, &head, highest, attach, None)
-                    }
+                    Access::Owner {
+                        mode: OwnerMode::Open { .. },
+                    } => self.takeover(m, cluster_id, &head, highest, attach, None),
+                    // No drain row builds a generation.
+                    Access::Owner {
+                        mode: OwnerMode::Drain,
+                    } => OpenStep::Fail(OpenError::Panicked),
                     Access::Reader => {
                         let (incarnation, closed) = (head.incarnation(), head.closed());
                         self.reader_ready(m, cluster_id.as_str(), incarnation, closed, attach)
@@ -1949,8 +1967,17 @@ impl Opening {
             stream: stream.as_ref(),
             content_type: answer.content_type.as_deref(),
         };
+        let recreate = match self.spec.access {
+            Access::Owner {
+                mode: OwnerMode::Open { recreate },
+            } => recreate,
+            Access::Owner {
+                mode: OwnerMode::Drain,
+            } => return self.drain(table::decide_drain(local, seen)),
+            Access::Reader => false,
+        };
         let asked = Asked {
-            recreate: matches!(self.spec.access, Access::Owner { recreate: true }),
+            recreate,
             created: self.created,
         };
         match table::decide(local, asked, seen) {
@@ -2014,6 +2041,11 @@ impl Opening {
             return OpenStep::Fail(OpenError::Panicked);
         };
         let local = std::mem::replace(&mut prepared.found, Local::None);
+        if matches!(self.spec.access, Access::Owner {
+            mode: OwnerMode::Drain
+        }) {
+            return self.drain(table::decide_drain_unreachable(local));
+        }
         let back = match table::decide_unreachable(local) {
             // A cluster id the header holds is one the open wrote: one that does not parse leaves
             // nothing a claim could be checked against, so the open waits.
@@ -2029,6 +2061,23 @@ impl Opening {
             prepared.found = back;
         }
         self.failed(exchange, now_ms)
+    }
+
+    /// Carries out a drain's row: a continue binds provisionally, anything else fails with nothing
+    /// sent but the HEAD and the local files as they were.
+    fn drain(self: Box<Self>, row: DrainRow<Box<Materialized>, Replaced>) -> OpenStep {
+        match row {
+            // A cluster id the header holds is one the open wrote, and a HEAD that answered named
+            // the same: one that does not parse leaves nothing a claim could be checked against.
+            DrainRow::Continue { local: m, claim } => {
+                match ClusterId::new(&m.recovered.header.cluster_id) {
+                    Ok(cluster_id) => self.provisional(m, cluster_id, claim),
+                    Err(_unparsed) => OpenStep::Fail(OpenError::Declined(Declined::NoClaim)),
+                }
+            }
+            DrainRow::Decline { declined, .. } => OpenStep::Fail(OpenError::Declined(declined)),
+            DrainRow::Refuse { refused, .. } => OpenStep::Fail(refused.into()),
+        }
     }
 
     /// Binds the trusted generation `m` now, under the log's token, its claim `claim` deferred
