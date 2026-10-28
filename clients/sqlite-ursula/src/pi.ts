@@ -37,6 +37,9 @@ export type UrsulaPiStorageOptions = Pick<NodeSqliteStorageOptions, "walAutoChec
  * reset throws the `UrsulaResetError` itself, unwrapped, so Pi's Session poisons itself: open the
  * storage again, or stop when its `action` is `stop`. Other failures of the extension throw the root entry's errors.
  * `close` waits up to `closeTimeoutMs` for `synced()`, then closes.
+ *
+ * A Tonbo database by name: pass the `url` and `token` the `/tonbo` entry's `resolveDatabase` hands
+ * out, and the open keeps the Streams tokens exchanged for the API key fresh.
  */
 export async function openUrsulaPiStorage(url: string | URL, options: UrsulaPiStorageOptions = {}): Promise<SqliteStorage> {
 	const { walAutoCheckpointPages, busyTimeoutMs, closeTimeoutMs = 10_000, ...openOptions } = options;

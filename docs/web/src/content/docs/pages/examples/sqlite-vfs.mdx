@@ -200,7 +200,7 @@ const storage = await openUrsulaPiStorage("https://ursula.example.com/pi/harness
 - A reset throws the `UrsulaResetError` itself, so the session stops. Open the storage again, or stop when its `action` is `stop`.
 - `close` waits up to `closeTimeoutMs` for `synced()`, then closes. On Pi 1.3, `Session.close` first waits for the storage calls in flight, which wait for the stream, so closing a session during an outage waits until the stream answers. Bound the shutdown in your host if it must end sooner.
 
-`@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.4.0`, and npm refuses the install with `ERESOLVE` outside it.
+`@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.4.0`, and npm refuses the install with `ERESOLVE` outside it. To open a Tonbo database by name, see [Pi Durable by name](#pi-durable-by-name).
 
 ## Tonbo databases
 
@@ -230,6 +230,20 @@ Errors are `TonboError`, an `UrsulaError` with action `fix`, whose `fix` field n
 | `database_not_found` | no database of that name in the key's account (`404`), or it is being deleted | `Run: tonbo database create <name>` |
 
 When the signal fires while the Tonbo API does not answer, or the database is still being created, `open` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`). Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
+
+### Pi Durable by name
+
+`resolveDatabase` does the lookup without the open. It takes `apiKey`, `apiOrigin`, `authOrigin`, `token` and `signal`, and returns `{ url, token }`: the stream URL and a token provider for the key. Pass both to `openUrsulaPiStorage`, whose open calls the provider and keeps the Streams token fresh, so you run no token refresher of your own:
+
+```ts
+import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
+import { resolveDatabase } from "@tonbo/sqlite-ursula/tonbo";
+
+const { url, token } = await resolveDatabase("notes");
+const storage = await openUrsulaPiStorage(url, { token, closeTimeoutMs: 10_000 });
+```
+
+It fails with the same errors as `open`. A key the token endpoint refuses a Streams token fails `openUrsulaPiStorage` with `invalid_api_key`.
 
 ## Other hosts
 

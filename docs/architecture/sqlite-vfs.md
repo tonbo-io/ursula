@@ -1440,7 +1440,11 @@ storage goes on (Pi up to 1.1)", "throws a reset as the UrsulaResetError itself,
 
 `open(nameOrUrl, options)` of the `/tonbo` entry (`tonbo.ts`) opens a database of a Tonbo account
 by name with a Tonbo API key, then calls `open` with the stream URL and a token provider. It only
-resolves the URL and the Streams token: everything after is the root entry's open.
+resolves the URL and the Streams token: everything after is the root entry's open. That resolution
+is `resolveDatabase(nameOrUrl, options)`, exported on its own: it returns `{ url, token }`, and
+`open` is it followed by the root entry's open, so the key sources, the lookup and the provider have
+one implementation. A caller of another opener, such as `openUrsulaPiStorage`, passes both to it,
+and that open calls the provider.
 
 - The key is the `apiKey` option, else `TONBO_API_KEY`, else the login `tonbo login` saves (the
   Tonbo CLI's credentials contract, version 1): `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`,
@@ -1484,6 +1488,8 @@ contract's own usable and unusable examples. Each test waits until its bindings 
 next starts with no token held. `URSULA_VFS_TOKEN_FILE` runs in a process of its own
 (test/tonbo-child.ts), on a stream and cache root of its own with a token no other test uses, where
 no open set a token first, and the gate shows every request carried the file's token.
+`resolveDatabase` runs with `openUrsulaPiStorage`: the gate shows the Pi storage's stream requests
+carried the token the provider exchanged for the key.
 
 ### SQL functions
 
