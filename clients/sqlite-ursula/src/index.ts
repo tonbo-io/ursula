@@ -17,13 +17,18 @@
 //   chunk, on only after `synced()`.
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
+// - token.ts: the bearer token, a string or the latest from a provider, refreshed ahead of expiry
+//   and after a 401.
+// - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
+import { raced, reasonOf } from "./abort.ts";
 import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
+import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
 
 export { loadUrsulaVfs } from "./control.ts";
 export { type GateOptions, gate } from "./gate.ts";
@@ -41,6 +46,7 @@ export {
 	UrsulaWriteRefusedError,
 	type WriteRefusedKind,
 } from "./errors.ts";
+export type { BearerToken, TokenProvider } from "./token.ts";
 
 /** {@link open}'s options: where the cache is, how to reach the stream, and node:sqlite's own settings. */
 export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
@@ -49,8 +55,15 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	 * also when the stream is open in this process under another root.
 	 */
 	readonly dir?: string | undefined;
-	/** The bearer token requests carry. One per process in this release: the last open's applies. */
-	readonly token?: string | undefined;
+	/**
+	 * The bearer token requests carry, or a {@link TokenProvider} that hands out tokens and when they
+	 * expire. The package calls a provider before the open's first request when it holds no valid
+	 * token, again ahead of each token's expiry, and again at once after a request was refused with
+	 * 401, and stops once no binding this thread opened is bound. One token per process: the last
+	 * open's applies. A later open with another function names the function the next call runs, and
+	 * shares the token held meanwhile. One with a string stops the provider on its thread.
+	 */
+	readonly token?: string | TokenProvider | undefined;
 	/** Bounds the open: by default it gives up after 30 s. */
 	readonly signal?: AbortSignal | undefined;
 	/** How many bytes of compressed commits may wait for the stream before writes fail with `backlog_full`. By default 64 MiB. */
@@ -130,13 +143,20 @@ const byAbort = new WeakSet<object>();
  *
  * Errors say what to do through `action`: {@link UrsulaSetupError} (`fix`, or `retry` for `in_use` and
  * `claim_races`), and {@link UrsulaUnavailableError} when the signal fired first: the last condition
- * the open met, or `cancelled` when it met none.
+ * the open met, or `cancelled` when it met none. With a token provider, the open also rejects with
+ * the provider's own {@link UrsulaError} when it fails for good, with an `UrsulaSetupError`
+ * `invalid_argument` when it hands out a token that cannot be sent, and with an
+ * `UrsulaUnavailableError` `unavailable` whose cause is the provider's last error when it handed out
+ * no token before the signal fired. A bind refused with 401 after a failed call of the provider
+ * fails `unauthorized` with that failure as its cause, and action `retry` unless it failed for good.
  */
 export async function open(url: string | URL, options: OpenOptions = {}): Promise<UrsulaDatabase> {
 	const { dir, token, signal, maxPendingBytes, recreate, readOnly, timeout, ...rest } = options;
 	const stream = String(url);
 	const settings: Record<string, unknown> = { timeout_ms: EXTENSION_OPEN_MS };
-	if (token !== undefined) settings.token = token;
+	if (token !== undefined && typeof token !== "string" && typeof token !== "function") {
+		throw new UrsulaSetupError(`invalid_argument: token must be a string or a token provider function, not ${typeof token}`, "invalid_argument");
+	}
 	if (maxPendingBytes !== undefined) {
 		if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes < 0) {
 			throw new UrsulaSetupError(`invalid_argument: maxPendingBytes must be a whole number of bytes, not ${maxPendingBytes}`, "invalid_argument");
@@ -159,8 +179,17 @@ export async function open(url: string | URL, options: OpenOptions = {}): Promis
 	const json = JSON.stringify(settings);
 	const sqlite = { ...rest, timeout: timeout ?? DEFAULT_BUSY_MS, readOnly: readOnly === true };
 	const until = signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
+	// Either kind of token is applied once, here, with `ursula_set_token`, never in `ursula_open`'s
+	// options, which a bind sends again on each of its retries, over a token applied meanwhile.
+	if (typeof token === "function") return openWithProvider(token, stream, until, () => opened(stream, dir, json, sqlite, readOnly === true, until));
+	if (typeof token === "string") useStringToken(token);
+	return bound(await opened(stream, dir, json, sqlite, readOnly === true, until));
+}
+
+/** The open of `stream` once its token is set: a connection on its binding, binding it first unless another open does. */
+async function opened(stream: string, dir: string | undefined, json: string, sqlite: Omit<DatabaseSyncOptions, "open">, readOnly: boolean, until: AbortSignal): Promise<UrsulaDatabase> {
 	// An owner's and a reader's binds of one stream are different binds.
-	const key = `${stream}\n${dir ?? ""}\n${readOnly === true ? "reader" : "owner"}`;
+	const key = `${stream}\n${dir ?? ""}\n${readOnly ? "reader" : "owner"}`;
 	for (;;) {
 		if (until.aborted) throw marked(cancelled(stream, until));
 		const shared = inflight.get(key);
@@ -227,21 +256,11 @@ const marked = <E extends UrsulaError>(error: E): E => {
 	return error;
 };
 
-/** `promise`, or `signal`'s reason when it fires first. */
-function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	return new Promise((resolve, reject) => {
-		const abort = (): void => reject(signal.reason);
-		signal.addEventListener("abort", abort, { once: true });
-		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-	});
-}
-
 /** The open of `stream` gave up at `signal` before it met any condition. */
 function cancelled(stream: string, signal: AbortSignal): UrsulaUnavailableError {
 	return new UrsulaUnavailableError(`cancelled: the open of ${stream} gave up when its signal fired: ${reasonOf(signal.reason)}`, "cancelled", signal.reason);
 }
 
-const reasonOf = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason));
 /** A connection to what `ursula_open` bound, with node:sqlite's `settings`. */
 function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open">): UrsulaDatabase {
 	try {
@@ -255,7 +274,11 @@ function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open">):
 
 /** {@link importSqlite}'s options. */
 export interface ImportOptions {
-	/** The bearer token requests carry. One per process in this release. */
+	/**
+	 * The bearer token the import's requests carry, for the import alone. A string only: the import
+	 * blocks its thread, so no provider could refresh it meanwhile. To import with a provider, pass
+	 * `(await provider({ signal })).token`.
+	 */
 	readonly token?: string | undefined;
 	/** How long the import may take. By default 10 minutes. */
 	readonly timeoutMs?: number | undefined;

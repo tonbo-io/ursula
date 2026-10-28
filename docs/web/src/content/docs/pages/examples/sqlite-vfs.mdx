@@ -86,7 +86,7 @@ The gate does not cover effects inside `work` before it returns (an outbound cal
 | option | default | meaning |
 | --- | --- | --- |
 | `dir` | `<user cache>/sqlite-ursula/0.8` | The cache root, created when missing |
-| `token` | none | The bearer token requests carry. One per process: the last open's applies |
+| `token` | none | The bearer token requests carry, or a provider that hands out tokens, see [TLS and tokens](#tls-and-tokens). One per process: the last open's applies |
 | `signal` | 30 s | Bounds the open |
 | `maxPendingBytes` | 64 MiB | Compressed commits that may wait for the stream before writes fail with `backlog_full` |
 | `recreate` | `false` | When the stream is missing and the cache holds data, move the cache aside and create the stream again, instead of `not_found` |
@@ -114,7 +114,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed (`errcode` 7178) | `backlog_full`, `unsupported`, `too_large` |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
-| `UrsulaUnavailableError` | `open()` when its signal fires first, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` |
+| `UrsulaUnavailableError` | `open()` when its signal fires first (also while it waited for a token provider: `unavailable`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 `unsupported` is a transaction the extension cannot capture: EXCLUSIVE locking mode, or a commit that leaves WAL mode or 4096-byte pages. Only that transaction fails.
@@ -222,7 +222,7 @@ const db = await open("https://ursula.example.com/acme/notes");
 - The file must have 4096-byte pages, no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
 - The stream must be missing, or empty. A stream of another content type fails with `stream_format`, anything else with `stream_state`, and nothing is published. A server of another release line fails with `protocol_mismatch`, and an answer without `Ursula-Protocol` and `Ursula-Cluster-Id` with `no_server_identity`. While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until you delete or recreate it.
 - A file whose compressed snapshot is above the request limit goes up in parts, which needs a cold backend on the server. Without one it fails with `invalid_argument`, naming the limit.
-- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default).
+- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default). Its `token` is therefore a string, for the import alone: to import with a token provider, pass `(await provider({ signal })).token`.
 
 ## Moving from 0.7
 
@@ -291,6 +291,28 @@ export URSULA_VFS_TOKEN_FILE=/var/run/secrets/ursula/token
 ```
 
 The token is process-wide in 0.8, and its audience must not depend on the host name, since every host name of a deployment shares one cache. A refused token is reread and the request sent again. A token refused twice blocks replication as `unauthorized` until it changes, and commits continue until the backlog fills. When the file holds no token as it is read, the extension keeps the last token it read and logs `token_file_unreadable`.
+
+With short-lived tokens, pass a provider as `token` instead of running a refresher process: an async function that returns `{ token, expiresAt }`, where `expiresAt` is a `Date` or milliseconds since the epoch.
+
+```ts
+import { open, type TokenProvider, UrsulaUnavailableError } from "@tonbo/sqlite-ursula";
+
+const token: TokenProvider = async ({ signal }) => {
+  const r = await fetch(exchangeUrl, { method: "POST", headers: { authorization: `Bearer ${apiKey}` }, signal });
+  if (r.status === 401) throw new UrsulaUnavailableError("unauthorized: the exchange refused the key", "unauthorized");
+  if (!r.ok) throw new Error(`the exchange answered ${r.status}`);
+  const { access_token, expires_in } = await r.json();
+  return { token: access_token, expiresAt: Date.now() + expires_in * 1000 };
+};
+
+const db = await open("https://ursula.example.com/acme/notes", { token });
+```
+
+- The package calls the provider before an open's first request when it holds no valid token, again after 70 to 80% of each token's lifetime, and again at once when a request was refused with `401`. Concurrent calls share one. A later open gets a valid token held at once, while a due refresh runs in the background. An expired token serves only while the provider is failing: otherwise the open waits for the next one. Which function minted the token held does not matter, so an inline arrow works too: an open with another function shares the token held and names the function the next call runs.
+- An `UrsulaError` whose `action` is `fix` thrown by the provider fails for good: an open waiting for its token rejects with it, and the package stops calling the provider until the next open with a provider. Other errors are retried with backoff, from 1 s up to 30 s, while the token held keeps serving, and so is a token that expires within 1 s. When an open's signal fires while it waits, it rejects with `UrsulaUnavailableError` `unavailable` (action `retry`), whose `cause` is the provider's last error, or the signal's reason when the provider did not answer. A token that cannot be sent, or an `expiresAt` in seconds rather than milliseconds, fails the open with `invalid_argument`.
+- After a `401` of a bound database the provider is called at once, and the extension sends the blocked request again at once under the new token. A bind refused with `401` fails `unauthorized` at its signal, and the next open waits for a new token. When the provider's last call had failed, that failure is the error's `cause`, and its action is `retry` unless the provider failed for good. After the open, a provider failure shows once the server refuses the token held: `status().replication.condition` is `unauthorized`.
+- The last open that names a token sets the process's token, and an open with a string stops the provider on its thread. Each JavaScript thread runs its own provider, so give the threads of a process the same kind of token.
+- The provider's timers keep the process alive only while an open waits for a token, and the provider stops once no database its thread opened is bound, whatever token the open named. No token is logged.
 
 Over `http://` the token crosses the network in clear. Use `https://` for any endpoint on another host. The extension logs `token_in_clear` once when it sends a token over `http://` to a host that is not a loopback address.
 

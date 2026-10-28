@@ -9,9 +9,14 @@
 // forwards to changes with `PUT /target`, as a routing mistake in front of a deployment would.
 //
 // It also scripts faults for the next requests it forwards, as the model's `/__model/faults` does
-// (clients/sqlite-vfs/src/model/faults.rs), so the suites that hold an answer back run against a
-// real server too (test/stack.ts puts a gate in front of it). Only `delay <ms>` is scripted: the
-// request is forwarded at once and its answer held back for `ms`.
+// (clients/sqlite-vfs/src/model/faults.rs), so the suites that hold an answer back or script a
+// refusal run against a real server too (test/stack.ts puts a gate in front of it). Two faults are
+// scripted: `delay <ms>`, the request forwarded at once and its answer held back for `ms`, and
+// `status <code>`, the request answered with that status in place of the server and not forwarded,
+// as a layer in front of it would.
+//
+// It records the method and the `Authorization` header of the last requests it received, so a
+// suite sees which token went out on each request of a stream (test/token.e2e.ts).
 //
 // For test/token-change.e2e.ts it also stands in for an authorizer: once told a token, it answers `401`
 // to every request that does not carry it as `Authorization: Bearer <token>`, and forwards nothing
@@ -23,30 +28,38 @@
 //   PUT /target {"url": "<server URL>"} -> 204: later requests go to that server
 //   PUT /auth {"token": "<token>" | null} -> 204: later requests without that token get `401`
 //     (null: none required)
-//   GET /stats -> {"mode", "forwarded", "held", "refused", "unauthorized", "token"}
-//   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` -> 204: the fault for the next
-//     `times` (1) forwarded requests with that method (any method when absent)
+//   GET /stats -> {"mode", "forwarded", "answered", "held", "refused", "unauthorized", "token"}
+//   GET /requests?path=<path> -> [{"method", "authorization"}]: the recorded requests to `path` and
+//     below it, oldest first, `authorization` null for a request without one
+//   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` or `status <code>` -> 204: the
+//     fault for the next `times` (1) requests with that method (any method when absent) that the
+//     authorizer lets through
 // It exits when its stdin closes, so it never outlives the test process that started it.
 import { createServer, request } from "node:http";
 
 let target = new URL(process.argv[2]);
-const state = { mode: "forward", forwarded: 0, held: 0, refused: 0, unauthorized: 0, token: null };
+const state = { mode: "forward", forwarded: 0, answered: 0, held: 0, refused: 0, unauthorized: 0, token: null };
 const sockets = new Set();
 let port = 0;
-/** Scripted faults, in order: `{ method, delayMs, times }`. */
+/** Scripted faults, in order: `{ method, delayMs, status, times }`, with one of `delayMs` and `status`. */
 const faults = [];
+/** The last requests received, oldest first: `{ path, method, authorization }`. */
+const seen = [];
+const SEEN = 10_000;
 
-/** The answer delay for a request with `method`: the first scripted fault that matches, used once. */
-function takeDelay(method) {
+/** The fault for a request with `method`: the first scripted fault that matches, used once. */
+function takeFault(method) {
 	const at = faults.findIndex((f) => f.method === undefined || f.method === method);
-	if (at < 0) return 0;
+	if (at < 0) return undefined;
 	const fault = faults[at];
 	fault.times -= 1;
 	if (fault.times <= 0) faults.splice(at, 1);
-	return fault.delayMs;
+	return fault;
 }
 
 const proxy = createServer((req, res) => {
+	seen.push({ path: new URL(req.url, "http://gate").pathname, method: req.method, authorization: req.headers.authorization ?? null });
+	if (seen.length > SEEN) seen.shift();
 	if (state.mode === "blackhole") {
 		state.held++;
 		// Read the body and never answer.
@@ -61,8 +74,16 @@ const proxy = createServer((req, res) => {
 		req.resume();
 		return;
 	}
+	const fault = takeFault(req.method);
+	if (fault?.status !== undefined) {
+		// Answered in place of the server once the body is read: nothing is forwarded.
+		state.answered++;
+		req.on("end", () => res.writeHead(fault.status, { "content-length": "0" }).end());
+		req.resume();
+		return;
+	}
 	state.forwarded++;
-	const delayMs = takeDelay(req.method);
+	const delayMs = fault?.delayMs ?? 0;
 	const up = request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
 		const send = () => {
 			res.writeHead(answer.statusCode ?? 502, answer.headers);
@@ -124,6 +145,12 @@ const control = createServer((req, res) => {
 		res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(state));
 		return;
 	}
+	if (req.method === "GET" && req.url.startsWith("/requests?")) {
+		const path = new URL(req.url, "http://gate").searchParams.get("path") ?? "";
+		const of = seen.filter((r) => r.path === path || r.path.startsWith(`${path}/`)).map(({ method, authorization }) => ({ method, authorization }));
+		res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(of));
+		return;
+	}
 	let body = "";
 	req.on("data", (chunk) => {
 		body += chunk;
@@ -132,12 +159,14 @@ const control = createServer((req, res) => {
 		const url = new URL(req.url, "http://gate");
 		if (req.method === "POST" && url.pathname === "/faults") {
 			const delay = /^delay (\d+)$/.exec(body.trim());
+			const status = /^status ([1-5]\d\d)$/.exec(body.trim());
 			const times = Number(url.searchParams.get("times") ?? 1);
-			if (delay === null || !Number.isInteger(times) || times < 0) {
-				res.writeHead(400).end(`the gate scripts only \`delay <ms>\`: ${body}`);
+			if ((delay === null && status === null) || !Number.isInteger(times) || times < 0) {
+				res.writeHead(400).end(`the gate scripts only \`delay <ms>\` and \`status <code>\`: ${body}`);
 				return;
 			}
-			if (times > 0) faults.push({ method: url.searchParams.get("method") ?? undefined, delayMs: Number(delay[1]), times });
+			const method = url.searchParams.get("method") ?? undefined;
+			if (times > 0) faults.push(delay !== null ? { method, delayMs: Number(delay[1]), times } : { method, status: Number(status[1]), times });
 			res.writeHead(204).end();
 			return;
 		}

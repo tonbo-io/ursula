@@ -2,8 +2,8 @@
 // - E2E_SERVER=model: the model of the 0.8 server (`ursula-vfs-model`, clients/sqlite-vfs with the
 //   `model` feature), from URSULA_VFS_MODEL or the crate's release build.
 // - E2E_SERVER=ursula (the default): the Ursula from URSULA_BIN, in the default config except where
-//   noted, behind test/gate.mjs, a transparent proxy that scripts the answer delays the suites ask
-//   for (`fault` in test/kit.ts), as the model does. The per-group hot admission limit always stays
+//   noted, behind test/gate.mjs, a transparent proxy that scripts the answer delays and statuses the
+//   suites ask for (`fault` in test/kit.ts), as the model does, and records each request's token. The per-group hot admission limit always stays
 //   at its default.
 //   - Default: one `ursula server` node (`server.cluster_id` set) with its Raft WAL in its
 //     temporary directory and an in-memory cold store (URSULA_COLD=none for none).
@@ -502,6 +502,8 @@ declare module "vitest" {
 		ursulaDirect: string;
 		/** Where `fault` (test/kit.ts) scripts a fault: the model's `/__model/faults` or the gate's `/faults`. */
 		ursulaFaults: string;
+		/** The gate's control URL (test/gate.mjs), or "" on the model. */
+		ursulaGate: string;
 		ursulaNodes: StackNode[];
 		/** The cluster's control server (E2E_NODES=3), or "". */
 		ursulaControl: string;
@@ -519,6 +521,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
 		project.provide("ursulaUrl", stack.url);
 		project.provide("ursulaDirect", stack.url);
 		project.provide("ursulaFaults", `${stack.url}/__model/faults`);
+		project.provide("ursulaGate", "");
 		project.provide("ursulaNodes", []);
 		project.provide("ursulaControl", "");
 		return () => stack.stop();
@@ -535,6 +538,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
 	project.provide("ursulaUrl", gate.url);
 	project.provide("ursulaDirect", stack.url);
 	project.provide("ursulaFaults", `${gate.control}/faults`);
+	project.provide("ursulaGate", gate.control);
 	project.provide("ursulaNodes", [...stack.nodes]);
 	project.provide("ursulaControl", stack.control ?? "");
 	return async () => {

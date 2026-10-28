@@ -10,6 +10,9 @@
 // (`sync_failed`) only when it was abandoned or its binding was not bound, and all of a binding's
 // tickets fail with its `reset` event.
 //
+// The token provider (token.ts) follows the events through `watch`: a 401 and a retired binding. A
+// failed worker is replaced while a ticket is pending or a watcher wants the events.
+//
 // The worker is unref'd while nothing waits, so an idle process exits as if it were not there, and
 // ref'd while an `open()` or a `synced()` is pending, so `await db.synced()` never lets the process
 // exit with the wait unresolved.
@@ -34,7 +37,8 @@ export type PumpEvent =
 	| { event: "sync_failed"; ticket: number; kind: string }
 	| { event: "reset"; path: string | null; kind: string; action: string }
 	| { event: "gap"; dropped: number }
-	| { event: "acked" | "condition" | "retired"; path: string | null };
+	| { event: "condition"; path: string | null; condition: string | null }
+	| { event: "acked" | "retired"; path: string | null };
 
 interface Ticket {
 	readonly path: string;
@@ -66,6 +70,28 @@ const MAX_FAILURES = 3;
 /** The stop flags of this thread's pump workers, set when the thread exits. */
 const stops = new Set<Int32Array>();
 let exitListener = false;
+/** What else follows the events, and whether it wants them now: the token provider (token.ts). */
+const watchers = new Map<(event: PumpEvent) => void, () => boolean>();
+
+/**
+ * Calls `watcher` with every event this thread's pumps deliver, after the pump handled it. While
+ * `wanted()` holds, a failed pump is replaced, and the replacement hands the watcher a `gap` for the
+ * events between the two.
+ */
+export function watch(watcher: (event: PumpEvent) => void, wanted: () => boolean): void {
+	watchers.set(watcher, wanted);
+}
+
+/** Hands `event` to every watcher: a watcher's failure is its own. */
+function notify(event: PumpEvent): void {
+	for (const watcher of watchers.keys()) {
+		try {
+			watcher(event);
+		} catch {
+			// The rest of the batch applies.
+		}
+	}
+}
 
 /** Fires `target`'s listeners on the resets of its path. */
 export function track(target: ResetTarget): void {
@@ -265,6 +291,7 @@ class Pump {
 				default:
 					break;
 			}
+			notify(event);
 		}
 	}
 
@@ -314,8 +341,9 @@ class Pump {
 	}
 
 	/**
-	 * The worker is gone: pending opens ask again, and pending tickets move to a new pump. After
-	 * {@link MAX_FAILURES} failures in a row they fail instead, and so does every later call.
+	 * The worker is gone: pending opens ask again, and pending tickets move to a new pump, which also
+	 * starts while a watcher wants the events. After {@link MAX_FAILURES} failures in a row the
+	 * tickets fail instead, and so does every later call.
 	 */
 	#fail(onExit: () => void): void {
 		if (this.#failed) return;
@@ -325,7 +353,7 @@ class Pump {
 		for (const request of [...this.#opens.keys()]) this.#wakeOpen(request);
 		void this.#worker.terminate();
 		setImmediate(() => {
-			if (exiting || tickets.size === 0) return;
+			if (exiting || (tickets.size === 0 && ![...watchers.values()].some((wanted) => wanted()))) return;
 			try {
 				pump();
 			} catch (error) {
@@ -335,6 +363,7 @@ class Pump {
 				return;
 			}
 			reissue();
+			notify({ event: "gap", dropped: 0 });
 		});
 	}
 }
