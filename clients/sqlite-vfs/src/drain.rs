@@ -793,7 +793,7 @@ fn start_workers(
     let queue = Arc::new(Mutex::new(VecDeque::from(streams)));
     let mut workers = Vec::new();
     for _ in 0..count {
-        let (shared, queue) = (Arc::clone(shared), Arc::clone(&queue));
+        let (board, queue) = (Arc::clone(shared), Arc::clone(&queue));
         let spawned = std::thread::Builder::new()
             .name("ursula-vfs-drain".to_owned())
             .spawn(move || {
@@ -807,7 +807,7 @@ fn start_workers(
                     };
                     for job in stream {
                         let outcome = drain_root(&job, deadline);
-                        shared.record(job.index, outcome);
+                        board.record(job.index, outcome);
                     }
                 }
             });
