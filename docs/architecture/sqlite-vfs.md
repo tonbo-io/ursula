@@ -1597,8 +1597,9 @@ and status field that names a kind names its action and class beside it. A reset
 shows, which ends with what to do. The package picks the error by class (`errors.ts` `errorOf`)
 and takes the action and message as the extension gives them. Errors the package itself makes (an
 invalid argument, a cancelled open) take their class's default action, which repeats
-`ErrorKind::action`, and `test/core.e2e.ts` checks it against the extension for every kind. `loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a
-library older than the package fails there with `UrsulaSetupError` (`local_setup`).
+`ErrorKind::action`, and `test/core.e2e.ts` checks it against the extension for every kind.
+`loadUrsulaVfs` prepares `ursula_classify` when it loads the library, so a library older than the
+package fails there with `UrsulaSetupError` (`local_setup`).
 
 | class (`class`) | thrown by | kinds |
 | --- | --- | --- |
@@ -1614,8 +1615,8 @@ with `SQLITE_IOERR_WRITE` (778). Other errors stay SQLite's own. Every SQL funct
 
 `ursula_classify(message, errcode, path)` takes SQLite's message and result code for a failure and
 returns `{kind, action, class, message, fix, request_id}`, or `null` for a failure that is not the
-extension's (a constraint, a syntax error, an I/O error of a database used through
-`ATTACH DATABASE`):
+extension's (a constraint, a syntax error, an I/O error of an attached database while the database
+at `path` has no reset and has refused no write):
 
 - A SQL function's error (`SQLITE_ERROR`) names its kind. `stream_state` and `internal` are setup
   errors of an open (`ursula_open`, `ursula_cancel`, `ursula_import`, an `opened` event) and

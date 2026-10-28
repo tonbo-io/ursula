@@ -72,8 +72,9 @@ function parsed<T>(row: Record<string, unknown>): T {
  * What to throw for `error`, which a statement or an Ursula SQL function threw: the
  * {@link UrsulaError} of what the extension's `ursula_classify` makes of it, and `error` itself,
  * unchanged, when the extension says it is not its failure (a constraint violation, a syntax
- * error, an I/O error of a database used through SQL `ATTACH DATABASE`). `path` is the bound
- * database the statement ran on, whose state names a statement's I/O error, which says nothing.
+ * error, an I/O error of an attached database while the database at `path` has no reset and has
+ * refused no write). `path` is the bound database the statement ran on, whose state names a
+ * statement's I/O error, which says nothing.
  */
 export function classify(error: unknown, path?: string): unknown {
 	if (error instanceof UrsulaError) return error;

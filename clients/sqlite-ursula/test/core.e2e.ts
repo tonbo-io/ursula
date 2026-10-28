@@ -125,6 +125,7 @@ describe("the 0.8 core on node:sqlite", () => {
 		// argument) take their constructor's default action: it must be the extension's, and the
 		// class the extension names must pick that constructor. `ursula_status` fails a bound
 		// database, `ursula_open` an open, where `stream_state` and `internal` are setup errors.
+		// The list is written out by hand: a new `ErrorKind` in `error.rs` needs a row here.
 		const made: [fn: "status" | "open", error: UrsulaError][] = [
 			["status", new UrsulaWriteRefusedError("", "backlog_full", undefined)],
 			["status", new UrsulaWriteRefusedError("", "unsupported", undefined)],
