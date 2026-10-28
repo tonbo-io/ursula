@@ -168,7 +168,7 @@ impl PassError {
 
 /// How a path of the host directory is not what it must be.
 #[derive(Debug, thiserror::Error)]
-enum Shape {
+pub(crate) enum Shape {
     #[error("is not a directory")]
     NotADirectory,
     #[error("is owned by uid {uid}, not {want}")]
