@@ -131,7 +131,20 @@ After a reset, pending `synced()` calls reject first, then the `reset` listeners
 
 ## Pi Durable
 
-`@tonbo/sqlite-ursula/pi` runs Pi Durable's official node `SqliteStorage` on a replicated database:
+Persist a Pi harness in a Tonbo database with Pi's own idiom, only the storage swapped:
+
+```ts
+import { Harness } from "@earendil-works/pi-durable";
+import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/tonbo/pi";
+
+const harness = await Harness.open(await openUrsulaPiStorage("harness-1"), { models, registry }, context);
+// ...
+await harness.close(context); // closes the storage too
+```
+
+`@tonbo/sqlite-ursula/tonbo/pi` opens the database by name with a Tonbo API key, as `@tonbo/sqlite-ursula/tonbo` does ([Tonbo](#tonbo)), and runs Pi Durable's official node `SqliteStorage` on it. `openUrsulaPiStorage(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the options of the `/pi` entry's `openUrsulaPiStorage`, fails with the same errors as the `/tonbo` entry's `open` (it exports `TonboError` and the error classes), and keeps the Streams token fresh. Without `dir` it uses the default cache root. `harness.close(context)` closes the storage the harness was opened with, on Pi 1.0 to 1.3, so the storage needs no close of its own.
+
+For a stream of your own Ursula, `@tonbo/sqlite-ursula/pi` opens the storage by URL:
 
 ```ts
 import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
@@ -139,7 +152,7 @@ import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 const storage = await openUrsulaPiStorage("https://streams.example.com/acme/agent", { closeTimeoutMs: 10_000 });
 ```
 
-Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0. To open a Tonbo database by name, pass what `resolveDatabase` hands out ([Tonbo](#tonbo)).
+Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0, and the `/pi` and `/tonbo/pi` entries are the only ones that import it.
 
 `openUrsulaPiStorage(url, options)` passes `dir`, `token`, `signal`, `maxPendingBytes` and `recreate` to `open`, and takes no other option of `open`. `walAutoCheckpointPages` (SQLite's WAL auto-checkpoint threshold) and `busyTimeoutMs` (how long a statement waits for a lock) go to Pi's node driver, which opens its own connection on the database and applies Pi's defaults to the ones you leave out. `closeTimeoutMs` is 10 s by default.
 
@@ -172,15 +185,7 @@ Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`
 
 A `429` is looked up again after its `Retry-After`, and a `408`, a `5xx`, a network failure or a `200` whose body holds no database after a backoff, until the signal fires. Then `open()` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`), and with `unavailable` when the database was still being created. The token endpoint's `408`, `429`, `5xx`, network failures and a `200` that holds no token are retried too: during the lookup as above, and for a Streams token as any failure of a [token provider](#tokens) is. A token endpoint that refuses the key a Streams token fails the open with `invalid_api_key`. Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
 
-`resolveDatabase(nameOrUrl, { apiKey, apiOrigin, authOrigin, token, signal })` resolves a database without opening it, for another opener such as Pi Durable's storage. It finds the key and looks the name up as `open` does, and returns `{ url, token }`: the stream URL and a token provider for the key. The open you pass them to calls the provider and keeps the token fresh, so you run no refresher of your own. It fails with the same errors as `open`, and a key the token endpoint refuses a Streams token fails that open with `invalid_api_key`.
-
-```ts
-import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
-import { resolveDatabase } from "@tonbo/sqlite-ursula/tonbo";
-
-const { url, token } = await resolveDatabase("notes");
-const storage = await openUrsulaPiStorage(url, { token, closeTimeoutMs: 10_000 });
-```
+`resolveDatabase(nameOrUrl, { apiKey, apiOrigin, authOrigin, token, signal })` resolves a database without opening it, for another opener. It finds the key and looks the name up as `open` does, and returns `{ url, token }`: the stream URL and a token provider for the key. The open you pass them to calls the provider and keeps the token fresh, so you run no refresher of your own. It fails with the same errors as `open`, and a key the token endpoint refuses a Streams token fails that open with `invalid_api_key`. For Pi Durable's storage, `@tonbo/sqlite-ursula/tonbo/pi` does both in one call ([Pi Durable](#pi-durable)).
 
 ## SQL functions
 
