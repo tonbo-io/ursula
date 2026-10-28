@@ -2,7 +2,7 @@
 //! snapshots or moves the process, or the VM it runs in. It never loads SQLite. `inspect` writes
 //! no file and takes no lock, `hold` locks the host directory's `hold` file, and `drain` is a
 //! process of the extension: it locks roots, writes their logs and claims, so a host that tells
-//! its helpers apart by executable tells a drain apart by its first argument.
+//! its helpers apart by executable must tell a drain apart by its first argument.
 //!
 //! `ursula-vfs-host inspect [--dir D] [--scan S]... [--pid P]... [--until-clean MS] [--budget-ms MS]`
 //! reads every root of the directories the host directory records and of each `--scan S`, checks

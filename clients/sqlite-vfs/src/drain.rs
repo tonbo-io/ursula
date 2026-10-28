@@ -45,12 +45,16 @@ use crate::driver::runtime::driver;
 use crate::error::ErrorKind;
 use crate::generation::canonical_path;
 use crate::generation::root_name;
+use crate::guard;
 use crate::hostdir;
 use crate::ids::Activation;
 use crate::inspection;
 use crate::inspection::Listed;
+use crate::inspection::PassError;
 use crate::inspection::ReadAgain;
+use crate::inspection::RootError;
 use crate::inspection::RootState;
+use crate::inspection::WalkError;
 use crate::json;
 use crate::log;
 use crate::log::Level;
@@ -273,12 +277,14 @@ pub(crate) enum Undrained {
     Reset(ResetKind),
     /// The binding's condition at the deadline.
     Condition(Condition),
-    /// The drain could not check or open the root: its effective uid unread, or the driver gone.
+    /// The drain could not check or open the root: its effective uid unread, the driver gone, or a
+    /// panic.
     Internal,
     /// The deadline came with no condition to name, or before the root's turn.
     Budget,
-    /// The binding drained what it held and released the root, and another process logged
-    /// commits in it since.
+    /// The binding drained what it held and released the root, and the root holds commits after
+    /// its latest ACK: another process logged commits in it since, or the retire could not write
+    /// its exact ACK (the driver logs `ack_lost`).
     Reopened,
 }
 
@@ -385,37 +391,108 @@ pub(crate) struct FirstRead {
     pub(crate) counts: Counts,
 }
 
+/// A root's read: what it holds, or why the inspection's read of it failed.
+pub(crate) type Read = Result<FirstRead, Arc<RootError>>;
+
+/// Why a root is pending as it is, for a person: the source of its `error`, rendered only in the
+/// JSON.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(crate) enum Note {
+    /// The open's refusal or decline, whose message starts with its own token.
+    #[error(transparent)]
+    Open(Arc<OpenError>),
+    #[error("the drain could not read its effective uid, so it opens nothing")]
+    NoUid,
+    #[error("the root belongs to {}, and the drain runs as uid {euid}", owned_by(.owner))]
+    NotOwner { owner: Option<u32>, euid: u32 },
+    #[error(
+        "the root's name is not the root name of its stream {stream:?}: it was renamed or copied"
+    )]
+    Misnamed { stream: String },
+    #[error("the deadline came before the root's turn")]
+    BeforeTurn,
+    #[error("the open had not resolved at the deadline")]
+    Unresolved,
+    #[error("the binding's condition at the deadline, its commits not all acknowledged")]
+    Condition,
+    #[error("the binding had not drained what it held at the deadline")]
+    Holding,
+    #[error("the deadline came before the drain of the root ended")]
+    Unfinished,
+    #[error("the deadline cut the read after the drain")]
+    ReadCut,
+    #[error("the drain's binding reset with its commits not sent")]
+    Reset,
+    #[error(
+        "the drain's binding drained what it held and released the root, and the root holds \
+         commits after its latest ACK: another process logged commits in it since, or the retire \
+         could not write its exact ACK"
+    )]
+    Reopened,
+    #[error("the driver did not start, or is gone")]
+    DriverGone,
+    #[error("no worker could drain it")]
+    NoWorker,
+    #[error("the drain of the root panicked")]
+    Panicked,
+    #[error("the drain of an earlier root of its stream panicked, so it was not opened")]
+    StreamPanicked,
+    #[error("the drain's pass panicked")]
+    PassPanicked,
+}
+
+/// Who owns a root, for [`Note::NotOwner`].
+fn owned_by(owner: &Option<u32>) -> String {
+    owner.map_or_else(
+        || "an owner it could not read".to_owned(),
+        |u| format!("uid {u}"),
+    )
+}
+
 /// A root's outcome (`outcome`, with its `kind` for a pending one).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Outcome {
     /// The drain bound the root, its binding held commits, and the last read found 0 bytes.
     Drained(Counts),
     /// The last read found 0 bytes and the drain drained nothing.
     Clean(Counts),
-    /// The last completed read found bytes: why, and a message for a person.
+    /// The last completed read found bytes: why, and a note for a person.
     Pending {
         why: Undrained,
         counts: Counts,
-        error: String,
+        note: Note,
     },
     /// The last read failed.
-    Unreadable { error: String },
+    Unreadable { error: Arc<RootError> },
 }
 
 impl Outcome {
-    fn pending(why: Undrained, counts: Counts, error: impl Into<String>) -> Self {
-        let error = format!("{}: {}", why.token(), error.into());
-        Outcome::Pending { why, counts, error }
+    fn pending(why: Undrained, counts: Counts, note: Note) -> Self {
+        Outcome::Pending { why, counts, note }
+    }
+}
+
+/// The `error` of a pending root: its note, after its kind's token unless the note starts with
+/// it.
+fn pending_error(why: &Undrained, note: &Note) -> String {
+    match note {
+        Note::Open(e) => e.to_string(),
+        other => format!("{}: {other}", why.token()),
     }
 }
 
 /// What the plan does with a root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Plan {
     /// Not opened: its outcome now.
     Done(Outcome),
-    /// Drained: opened as a drain at `url` in the cache root `dir`.
-    Drain { url: String, dir: PathBuf },
+    /// Drained: opened as a drain at `url` in the cache root `dir`, with what its first read found.
+    Drain {
+        url: String,
+        dir: PathBuf,
+        stream: String,
+        first: Counts,
+    },
 }
 
 /// What the plan reads of a root besides its first read.
@@ -434,11 +511,11 @@ pub(crate) struct Facts<'a> {
 /// drain cannot check its owner, another user owns it (a file the drain creates in it must stay
 /// the owner's), or its name is not its stream's root name (an open of a renamed or copied root
 /// would lock, and build, another root).
-pub(crate) fn plan(first: &Result<FirstRead, String>, facts: Facts<'_>, origin: &Origin) -> Plan {
+pub(crate) fn plan(first: &Read, facts: Facts<'_>, origin: &Origin) -> Plan {
     let read = match first {
         Err(error) => {
             return Plan::Done(Outcome::Unreadable {
-                error: error.clone(),
+                error: Arc::clone(error),
             });
         }
         Ok(read) => read,
@@ -450,18 +527,17 @@ pub(crate) fn plan(first: &Result<FirstRead, String>, facts: Facts<'_>, origin: 
         return Plan::Done(Outcome::pending(
             Undrained::Internal,
             read.counts,
-            "the drain could not read its effective uid, so it opens nothing",
+            Note::NoUid,
         ));
     };
     if facts.owner != Some(euid) {
-        let owner = facts.owner.map_or_else(
-            || "an owner it could not read".to_owned(),
-            |u| format!("uid {u}"),
-        );
         return Plan::Done(Outcome::pending(
             Undrained::NotOwner,
             read.counts,
-            format!("the root belongs to {owner}, and the drain runs as uid {euid}"),
+            Note::NotOwner {
+                owner: facts.owner,
+                euid,
+            },
         ));
     }
     let url = origin.url(&read.stream);
@@ -474,65 +550,68 @@ pub(crate) fn plan(first: &Result<FirstRead, String>, facts: Facts<'_>, origin: 
         (Some(name), Some(named), Some(dir)) if name == named => Plan::Drain {
             url,
             dir: dir.to_owned(),
+            stream: read.stream.clone(),
+            first: read.counts,
         },
         _ => Plan::Done(Outcome::pending(
             Undrained::Misnamed,
             read.counts,
-            format!(
-                "the root's name is not the root name of its stream {:?}: it was renamed or copied",
-                read.stream
-            ),
+            Note::Misnamed {
+                stream: read.stream.clone(),
+            },
         )),
     }
 }
 
 /// What came of a root's open, before its last read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Opened {
-    /// Refused or declined, with nothing claimed: why, and the open's message.
-    Refused { why: Undrained, error: String },
+    /// Refused or declined, with nothing claimed: why, and the open's error.
+    Refused {
+        why: Undrained,
+        error: Arc<OpenError>,
+    },
     /// Bound, given back, and the root released, with the binding's reset if it reset. A drain
     /// binds only a root that holds commits after its latest ACK (`table::decide_drain`).
     Released { reset: Option<ResetKind> },
 }
 
 /// What a root's last read found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum LastRead {
     Read(Counts),
-    Unreadable(String),
+    Unreadable(Arc<RootError>),
     /// The deadline cut it.
     Cut,
 }
 
-/// A drained root's outcome, a pure function of its open and its last read: the bytes decide.
+/// A drained root's outcome, a pure function of its open, its last read and its first read's
+/// numbers: the bytes of the last read that completed decide. A refusal keeps its kind when the
+/// read after it fails or is cut, with the first read's numbers, since nothing was claimed.
 pub(crate) fn decide(opened: Opened, last: LastRead, first: Counts) -> Outcome {
-    let counts = match last {
-        LastRead::Read(counts) => counts,
-        LastRead::Unreadable(error) => return Outcome::Unreadable { error },
-        LastRead::Cut => {
-            return Outcome::pending(
-                Undrained::Budget,
-                first,
-                "the deadline cut the read after the drain",
-            );
+    match (opened, last) {
+        (Opened::Refused { .. }, LastRead::Read(counts)) if counts.bytes == 0 => {
+            Outcome::Clean(counts)
         }
-    };
-    match (opened, counts.bytes) {
-        (Opened::Released { .. }, 0) => Outcome::Drained(counts),
-        (Opened::Refused { .. }, 0) => Outcome::Clean(counts),
-        (Opened::Refused { why, error }, _) => Outcome::Pending { why, counts, error },
-        (Opened::Released { reset: Some(kind) }, _) => Outcome::pending(
-            Undrained::Reset(kind),
-            counts,
-            "the drain's binding reset with its commits not sent",
-        ),
-        (Opened::Released { reset: None }, _) => Outcome::pending(
-            Undrained::Reopened,
-            counts,
-            "the drain's binding drained what it held and released the root, and another \
-             process logged commits in it since",
-        ),
+        (Opened::Refused { why, error }, LastRead::Read(counts)) => {
+            Outcome::pending(why, counts, Note::Open(error))
+        }
+        (Opened::Refused { why, error }, LastRead::Unreadable(_) | LastRead::Cut) => {
+            Outcome::pending(why, first, Note::Open(error))
+        }
+        (Opened::Released { .. }, LastRead::Unreadable(error)) => Outcome::Unreadable { error },
+        (Opened::Released { .. }, LastRead::Cut) => {
+            Outcome::pending(Undrained::Budget, first, Note::ReadCut)
+        }
+        (Opened::Released { .. }, LastRead::Read(counts)) if counts.bytes == 0 => {
+            Outcome::Drained(counts)
+        }
+        (Opened::Released { reset: Some(kind) }, LastRead::Read(counts)) => {
+            Outcome::pending(Undrained::Reset(kind), counts, Note::Reset)
+        }
+        (Opened::Released { reset: None }, LastRead::Read(counts)) => {
+            Outcome::pending(Undrained::Reopened, counts, Note::Reopened)
+        }
     }
 }
 
@@ -544,8 +623,30 @@ struct Entry {
     root: PathBuf,
     /// The resolved root directory's owner.
     uid: Option<u32>,
-    first: Result<FirstRead, String>,
+    first: Read,
     outcome: Option<Outcome>,
+}
+
+/// What kept the drain from reading everything it should have, or from running (the top-level
+/// `error`). The roots it listed stay valid.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Narrowed {
+    /// The pass could not read the host directory, a name in it, a directory, or ran out of time.
+    #[error(transparent)]
+    Walk(#[from] WalkError),
+    /// The drain's effective uid could not be read, so it opens nothing.
+    #[error(transparent)]
+    Uid(PassError),
+    #[error("the drain could not start its pass: {0}")]
+    Pass(#[source] std::io::Error),
+    #[error("the drain could not start a worker: {0}")]
+    Worker(#[source] std::io::Error),
+    #[error("the pass ran past the drain's budget of {} ms", .0.as_millis())]
+    PassBudget(Duration),
+    #[error("the drain's pass panicked")]
+    PassPanicked,
+    #[error("the driver did not start, or is gone")]
+    DriverGone,
 }
 
 /// What the workers recorded, which the main thread prints.
@@ -554,8 +655,8 @@ struct Board {
     entries: Vec<Entry>,
     /// The pass and the plan are done, and every root to drain is queued.
     planned: bool,
-    /// What the pass could not read, or what kept the drain from running.
-    error: Option<String>,
+    /// What the pass could not read, or what kept the drain from running, the first such.
+    error: Option<Narrowed>,
 }
 
 /// The board and its signal.
@@ -589,11 +690,29 @@ impl Shared {
     }
 
     /// Records what kept the drain from reading or running, the first time.
-    fn narrowed(&self, error: String) {
+    fn narrowed(&self, error: Narrowed) {
         let mut board = self.lock();
         if board.error.is_none() {
             board.error = Some(error);
         }
+    }
+
+    /// After the pass panicked: every root it listed without an outcome is `internal`, or
+    /// `unreadable` when its read failed, and the plan is over.
+    fn pass_panicked(&self) {
+        self.narrowed(Narrowed::PassPanicked);
+        let mut board = self.lock();
+        for entry in board.entries.iter_mut().filter(|e| e.outcome.is_none()) {
+            entry.outcome = Some(match &entry.first {
+                Ok(read) => Outcome::pending(Undrained::Internal, read.counts, Note::PassPanicked),
+                Err(error) => Outcome::Unreadable {
+                    error: Arc::clone(error),
+                },
+            });
+        }
+        board.planned = true;
+        drop(board);
+        self.changed.notify_all();
     }
 }
 
@@ -616,7 +735,7 @@ pub struct Drained {
     uid: Option<u32>,
     dir: Option<PathBuf>,
     entries: Vec<Entry>,
-    error: Option<String>,
+    error: Option<Narrowed>,
 }
 
 /// Drains every root of the host directory's records and of `request.scans` that holds commits
@@ -627,23 +746,34 @@ pub fn drain(request: &Drain) -> Drained {
     let deadline = start.checked_add(request.budget);
     let shared = Arc::new(Shared::default());
     let dir = hostdir::host_dir();
-    let euid = inspection::effective_uid();
-    if let Err(e) = &euid {
-        shared.narrowed(e.to_string());
-    }
-    let euid = euid.ok();
+    let euid = match inspection::effective_uid() {
+        Ok(euid) => Some(euid),
+        Err(e) => {
+            shared.narrowed(Narrowed::Uid(e));
+            None
+        }
+    };
     let pass = {
         let (shared, request, dir) = (Arc::clone(&shared), request.clone(), dir.clone());
         std::thread::Builder::new()
             .name("ursula-vfs-drain".to_owned())
-            .spawn(move || run(&shared, &request, dir.as_deref(), euid, deadline))
+            .spawn(move || {
+                guard::contain(
+                    "drain_pass",
+                    || {
+                        shared.pass_panicked();
+                        Vec::new()
+                    },
+                    || run(&shared, &request, dir.as_deref(), euid, deadline),
+                )
+            })
     };
     // The workers are never joined: the process exits at the deadline whatever they do, as a
     // process of the extension exits with its driver running.
     let _pass: Option<JoinHandle<Vec<JoinHandle<()>>>> = match pass {
         Ok(handle) => Some(handle),
         Err(e) => {
-            shared.narrowed(format!("the drain could not start its pass: {e}"));
+            shared.narrowed(Narrowed::Pass(e));
             let mut board = shared.lock();
             board.planned = true;
             None
@@ -659,10 +789,7 @@ pub fn drain(request: &Drain) -> Drained {
         });
         if left.is_zero() {
             if !board.planned && board.error.is_none() {
-                board.error = Some(format!(
-                    "the pass ran past the drain's budget of {} ms",
-                    request.budget.as_millis()
-                ));
+                board.error = Some(Narrowed::PassBudget(request.budget));
             }
             break;
         }
@@ -677,7 +804,7 @@ pub fn drain(request: &Drain) -> Drained {
         uid: euid,
         dir,
         entries: board.entries.clone(),
-        error: board.error.clone(),
+        error: board.error.take(),
     }
 }
 
@@ -715,17 +842,20 @@ fn run(
             let index = board.entries.len();
             let outcome = match planned {
                 Plan::Done(outcome) => Some(outcome),
-                Plan::Drain { url, dir } => {
-                    if let Ok(read) = &first {
-                        jobs.push(Job {
-                            index,
-                            stream: read.stream.clone(),
-                            resolved: resolved.clone(),
-                            url,
-                            dir,
-                            first: read.counts,
-                        });
-                    }
+                Plan::Drain {
+                    url,
+                    dir,
+                    stream,
+                    first: counts,
+                } => {
+                    jobs.push(Job {
+                        index,
+                        stream,
+                        resolved: resolved.clone(),
+                        url,
+                        dir,
+                        first: counts,
+                    });
                     None
                 }
             };
@@ -739,7 +869,7 @@ fn run(
         },
     );
     if let Some(error) = narrowed {
-        shared.narrowed(error);
+        shared.narrowed(error.into());
     }
     let workers = start_workers(shared, request.concurrency, jobs, deadline);
     shared.lock().planned = true;
@@ -748,7 +878,7 @@ fn run(
 }
 
 /// A root's first read, as the plan reads it.
-fn first_read(state: &RootState) -> Result<FirstRead, String> {
+fn first_read(state: &RootState) -> Read {
     match state {
         RootState::Read {
             stream,
@@ -765,7 +895,7 @@ fn first_read(state: &RootState) -> Result<FirstRead, String> {
                 salvaged: *salvaged,
             },
         }),
-        RootState::Unreadable { error, .. } => Err(error.to_string()),
+        RootState::Unreadable { error, .. } => Err(Arc::clone(error)),
     }
 }
 
@@ -805,15 +935,12 @@ fn start_workers(
                     let Some(stream) = next else {
                         break;
                     };
-                    for job in stream {
-                        let outcome = drain_root(&job, deadline);
-                        board.record(job.index, outcome);
-                    }
+                    drain_stream(&board, stream, deadline);
                 }
             });
         match spawned {
             Ok(worker) => workers.push(worker),
-            Err(e) => shared.narrowed(format!("the drain could not start a worker: {e}")),
+            Err(e) => shared.narrowed(Narrowed::Worker(e)),
         }
     }
     if count > 0 && workers.is_empty() {
@@ -822,11 +949,36 @@ fn start_workers(
         for job in stranded.into_iter().flatten() {
             shared.record(
                 job.index,
-                Outcome::pending(Undrained::Internal, job.first, "no worker could drain it"),
+                Outcome::pending(Undrained::Internal, job.first, Note::NoWorker),
             );
         }
     }
     workers
+}
+
+/// Drains the roots of one stream one after another. A drain that panicked may have left its
+/// binding bound, so the stream's later roots are not opened: a process binds a stream under one
+/// root at a time.
+fn drain_stream(shared: &Shared, stream: Vec<Job>, deadline: Option<Instant>) {
+    let mut panicked = false;
+    for job in stream {
+        let outcome = if panicked {
+            Outcome::pending(Undrained::Internal, job.first, Note::StreamPanicked)
+        } else {
+            match guard::contain(
+                "drain_root",
+                || None,
+                || Some(drain_root(shared, &job, deadline)),
+            ) {
+                Some(outcome) => outcome,
+                None => {
+                    panicked = true;
+                    Outcome::pending(Undrained::Internal, job.first, Note::Panicked)
+                }
+            }
+        };
+        shared.record(job.index, outcome);
+    }
 }
 
 /// The time left until `deadline` less [`GRACE`], `None` once nothing is left.
@@ -841,11 +993,12 @@ fn left_before_grace(deadline: Option<Instant>) -> Option<Duration> {
 }
 
 /// Drains the root of `job` (steps 3 to 5): opens it as a drain, gives the binding back at once,
-/// waits until it released the root, and reads the root again.
-fn drain_root(job: &Job, deadline: Option<Instant>) -> Outcome {
-    let budget = |error: &str| Outcome::pending(Undrained::Budget, job.first, error);
+/// waits until it released the root, and reads the root again. A driver that did not start, or is
+/// gone, also narrows the whole drain.
+fn drain_root(shared: &Shared, job: &Job, deadline: Option<Instant>) -> Outcome {
+    let budget = |note| Outcome::pending(Undrained::Budget, job.first, note);
     let Some(left) = left_before_grace(deadline) else {
-        return budget("the deadline came before the root's turn");
+        return budget(Note::BeforeTurn);
     };
     let spec = OpenSpec {
         url: job.url.clone(),
@@ -863,11 +1016,8 @@ fn drain_root(job: &Job, deadline: Option<Instant>) -> Outcome {
     };
     let driver = driver();
     let gone = || {
-        Outcome::pending(
-            Undrained::Internal,
-            job.first,
-            "the driver did not start, or is gone",
-        )
+        shared.narrowed(Narrowed::DriverGone);
+        Outcome::pending(Undrained::Internal, job.first, Note::DriverGone)
     };
     let Ok(open) = driver.open(spec) else {
         return gone();
@@ -879,13 +1029,13 @@ fn drain_root(job: &Job, deadline: Option<Instant>) -> Outcome {
         if driver.cancel(open).is_err() {
             return gone();
         }
-        return budget("the open had not resolved at the deadline");
+        return budget(Note::Unresolved);
     }
     let opened = match driver.try_open(open) {
-        None => return budget("the open had not resolved at the deadline"),
+        None => return budget(Note::Unresolved),
         Some(Err(e)) => Opened::Refused {
             why: refusal(&e),
-            error: e.to_string(),
+            error: Arc::new(e),
         },
         Some(Ok(bound)) => match hand_back(driver, &bound, deadline) {
             Waited::Released => Opened::Released {
@@ -895,12 +1045,10 @@ fn drain_root(job: &Job, deadline: Option<Instant>) -> Outcome {
                 return Outcome::pending(
                     Undrained::Condition(condition),
                     job.first,
-                    "the binding's condition at the deadline, its commits not all acknowledged",
+                    Note::Condition,
                 );
             }
-            Waited::Deadline(None) => {
-                return budget("the binding had not drained what it held at the deadline");
-            }
+            Waited::Deadline(None) => return budget(Note::Holding),
             Waited::Gone => return gone(),
         },
     };
@@ -984,7 +1132,9 @@ impl Drained {
             ("roots", json::array(&roots)),
             (
                 "error",
-                self.error.as_deref().map_or_else(json::null, json::str),
+                self.error
+                    .as_ref()
+                    .map_or_else(json::null, |e| json::str(&e.to_string())),
             ),
         ])
     }
@@ -1005,13 +1155,9 @@ fn entry_json(e: &Entry, path: &dyn Fn(&Path) -> String) -> String {
     // found.
     let outcome = match (&e.outcome, &e.first) {
         (Some(outcome), _) => outcome.clone(),
-        (None, Ok(read)) => Outcome::pending(
-            Undrained::Budget,
-            read.counts,
-            "the deadline came before the drain of the root ended",
-        ),
+        (None, Ok(read)) => Outcome::pending(Undrained::Budget, read.counts, Note::Unfinished),
         (None, Err(error)) => Outcome::Unreadable {
-            error: error.clone(),
+            error: Arc::clone(error),
         },
     };
     let counts = |c: &Counts| (int(c.bytes), int(c.commits), int(c.salvaged));
@@ -1020,16 +1166,19 @@ fn entry_json(e: &Entry, path: &dyn Fn(&Path) -> String) -> String {
         Outcome::Pending {
             why,
             counts: c,
-            error,
+            note,
         } => (
             json::str(why.token()),
             json::str(why.later().as_str()),
             counts(c),
-            json::str(error),
+            json::str(&pending_error(why, note)),
         ),
-        Outcome::Unreadable { error } => {
-            (null(), null(), (null(), null(), null()), json::str(error))
-        }
+        Outcome::Unreadable { error } => (
+            null(),
+            null(),
+            (null(), null(), null()),
+            json::str(&error.to_string()),
+        ),
     };
     json::object(&[
         ("id", json::str(&e.id)),

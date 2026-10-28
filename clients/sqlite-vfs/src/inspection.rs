@@ -179,7 +179,7 @@ pub(crate) enum Shape {
 
 /// Why a name in the host directory is not a record this line reads.
 #[derive(Debug, thiserror::Error)]
-enum RecordError {
+pub(crate) enum RecordError {
     #[error("is not a regular file")]
     NotAFile,
     #[error("is not a record: {0}")]
@@ -238,7 +238,7 @@ enum DirState {
 /// Why a directory that may hold roots could not be read.
 #[derive(Debug, thiserror::Error)]
 #[error("{op} {}: {source}", .path.display())]
-struct DirError {
+pub(crate) struct DirError {
     op: &'static str,
     path: PathBuf,
     #[source]
@@ -275,7 +275,7 @@ pub(crate) enum RootState {
         salvaged: u64,
     },
     Unreadable {
-        error: RootError,
+        error: Arc<RootError>,
         /// Its files changed while it was read, as a drain's trim changes them: a pass of
         /// `--until-clean` reads it again instead of ending.
         changed: bool,
@@ -338,13 +338,20 @@ struct Strict<'a> {
 /// Root's uid.
 const ROOT_UID: u32 = 0;
 
+impl Strict<'static> {
+    /// The compiled-in host directory, owned by root.
+    fn compiled_in() -> Self {
+        Strict {
+            path: Path::new(hostdir::DEFAULT),
+            uid: ROOT_UID,
+        }
+    }
+}
+
 /// Reads every root of the host directory's records and of `request.scans`, and checks every open
 /// root lock (design: Hosts). Never writes or locks anything.
 pub fn inspect(request: &Inspect) -> Inspection {
-    inspect_with(request, Strict {
-        path: Path::new(hostdir::DEFAULT),
-        uid: ROOT_UID,
-    })
+    inspect_with(request, Strict::compiled_in())
 }
 
 /// [`inspect`] with the directory the strict checks apply to given.
@@ -375,6 +382,25 @@ pub(crate) struct Listed {
     pub(crate) state: Arc<RootState>,
 }
 
+/// What narrowed a host's drain's walk ([`walk_for_drain`]): the first part of the disk it could
+/// not read.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WalkError {
+    /// The host directory, or the deadline (`budget`).
+    #[error(transparent)]
+    Pass(#[from] PassError),
+    #[error("the host directory's {name} {error}")]
+    Record {
+        name: String,
+        #[source]
+        error: RecordError,
+    },
+    #[error("the host directory holds {name}, which this line does not read")]
+    Unknown { name: String },
+    #[error(transparent)]
+    Dir(DirError),
+}
+
 /// A host's drain's walk ([`crate::drain`], design: Hosts): the inspection's own walk and per-root
 /// read, of the records of the host directory `host` (the compiled-in one checked strictly) and of
 /// `scans`, until `at`. No lock check runs. Each root it lists goes to `listed`, as it is read.
@@ -386,14 +412,10 @@ pub(crate) fn walk_for_drain(
     at: Option<Instant>,
     budget: Duration,
     listed: &mut dyn FnMut(Listed),
-) -> Option<String> {
-    let strict = Strict {
-        path: Path::new(hostdir::DEFAULT),
-        uid: ROOT_UID,
-    };
+) -> Option<WalkError> {
     let deadline = Deadline { at, budget };
     let mut unrecognized = Vec::new();
-    let (wanted, error) = wanted(host, scans, strict, &mut unrecognized);
+    let (wanted, error) = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
     let mut dirs = Vec::new();
     let walked = walk(wanted, deadline, &mut dirs, |id, root| {
         if let RootRead::Listed { state, .. } = read_root(&root, None, deadline)? {
@@ -401,25 +423,25 @@ pub(crate) fn walk_for_drain(
         }
         Ok(())
     });
-    let unlistable = dirs.iter().find_map(|d| match &d.state {
-        DirState::Unlistable(e) => Some(e.to_string()),
+    let unlistable = dirs.into_iter().find_map(|d| match d.state {
+        DirState::Unlistable(e) => Some(WalkError::Dir(e)),
         DirState::Present | DirState::Absent => None,
     });
-    let unknown = unrecognized.first().map(|u| match &u.error {
-        Some(e) => format!("the host directory's {} {e}", u.name),
-        None => format!(
-            "the host directory holds {}, which this line does not read",
-            u.name
-        ),
+    let unknown = unrecognized.into_iter().next().map(|u| match u.error {
+        Some(error) => WalkError::Record {
+            name: u.name,
+            error,
+        },
+        None => WalkError::Unknown { name: u.name },
     });
     error
-        .map(|e| e.to_string())
+        .map(WalkError::Pass)
         .or(unknown)
         .or(unlistable)
         .or_else(|| {
             walked
                 .err()
-                .map(|Stopped| PassError::Budget { budget }.to_string())
+                .map(|Stopped| WalkError::Pass(PassError::Budget { budget }))
         })
 }
 
@@ -1087,7 +1109,10 @@ fn read_root(
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
             };
-            RootState::Unreadable { error, changed }
+            RootState::Unreadable {
+                error: Arc::new(error),
+                changed,
+            }
         }
     };
     Ok(RootRead::Listed {

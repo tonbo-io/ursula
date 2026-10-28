@@ -96,10 +96,10 @@
 //! databases are private copies, and files of no bound database pass through (`fork`, design:
 //! Forks).
 //!
-//! Each binding opened by a host of the SQL functions has a snapshot thread, and a drain's has
-//! none: past `max(db size, 8 MiB)` of acknowledged frame bytes it publishes a `USS3` snapshot
-//! keyed by its stream offset and digest, and moves retention one snapshot behind. Builds install
-//! the latest snapshot, then read the tail.
+//! Each binding opened by a host of the SQL functions has a snapshot thread: past
+//! `max(db size, 8 MiB)` of acknowledged frame bytes that thread publishes a `USS3` snapshot keyed
+//! by its stream offset and digest, and moves retention one snapshot behind. A drain's binding has
+//! none. Builds install the latest snapshot, then read the tail.
 //!
 //! Comments cite `design: <Heading>` for a heading of `docs/architecture/sqlite-vfs.md` and
 //! `extensions: <Heading>` for a heading of the extensions specification.

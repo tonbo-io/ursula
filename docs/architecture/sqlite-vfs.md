@@ -959,7 +959,8 @@ Tests: `open/table.rs` `another_line_or_no_identity_is_refused_before_anything_e
 and the drain's rows `a_drain_refuses_an_old_server_another_cluster_a_missing_stream_and_its_state`,
 `a_drain_continues_a_trusted_generation_with_a_claim_whatever_the_token`,
 `a_drain_declines_a_replaced_generation_one_without_a_claim_and_one_with_nothing_pending`,
-`an_unreachable_drain_continues_a_claim_and_declines_anything_else_at_once`. Driver: `driver/tests.rs` `a_server_without_identity_is_refused`,
+`an_unreachable_drain_continues_a_claim_and_declines_anything_else_at_once`. Driver:
+`driver/tests.rs` `a_server_without_identity_is_refused`,
 `a_server_of_another_release_line_is_refused`,
 `a_head_404_without_the_protocol_is_no_missing_stream`,
 `a_stream_of_another_content_type_is_refused`, `a_stream_of_usq1_frames_is_refused`,
@@ -1347,8 +1348,8 @@ until the root is opened where it now is.
 `ursula-vfs-host` is a binary of the extension's crate that never loads SQLite. `inspect`
 (`inspection::inspect`) is the host's read of the disk, and never writes a file or takes a lock.
 `drain` is a process of the extension that locks roots and writes their logs and claims
-([Draining](#draining)), so a host that tells its helpers apart by executable tells a drain apart by
-its first argument. A host runs `inspect` as root, so that it can read every root and every
+([Draining](#draining)), so a host that tells its helpers apart by executable must tell a drain apart
+by its first argument. A host runs `inspect` as root, so that it can read every root and every
 process's descriptors. One pass reads:
 
 1. The host directory: the one `--dir` names, or the compiled-in path. The inspector never reads
@@ -1577,7 +1578,9 @@ thread, checkpoint or WAL runs in it.
    every commit it held is acknowledged, with an exact, fsynced ACK, and releases the root. A
    pre-check that meets another owner's frame resets it with nothing sent.
 5. The root is read again, and its bytes decide: none is `drained`, or `clean` when the drain held
-   nothing, and more is `pending` with a kind.
+   nothing, and more is `pending` with a kind. A read that fails is `unreadable`, and one the
+   deadline cuts is `pending`, `budget`, with the first read's numbers. A root whose open was
+   refused keeps its refusal's kind, with the first read's numbers, when that read fails or is cut.
 
 Up to `--concurrency` streams (1 to 16, 4 by default) drain at once, the roots of one stream one
 after another, so the drain never binds one stream under two roots. Of two roots of one stream at
@@ -1586,6 +1589,13 @@ The drain prints one line of JSON once every root has an outcome, and at `--budg
 latest, its opens and its waits for a binding ending 250 ms before. It exits 0 when it printed, 2 on
 a usage error and 1 when it could not write, and it exits without waiting for its workers. A host
 bounds its run at `--budget-ms` plus 2 s at the earliest and waits for its exit in any case.
+
+A drain never reads stdin, so a host passes `/dev/null`. Its stdout carries only the one line, printed
+at the end. Its stderr carries the extension's log lines (logfmt) and a usage error's message, and a
+host drains or redirects it: a full stderr pipe blocks the extension's logging, and with it the
+driver. An exit by a signal, or a panic's 101, is no result, and a host takes a result only from
+exit 0 with one complete line. A host passes the drain exactly the VFS variables its workload runs
+with, and nothing else.
 
 What a drain guarantees is what the pre-check guarantees. Its claim applies only above the root's
 own latest claim, and only after a read found no other owner's frame between the root's
@@ -1618,8 +1628,9 @@ commits it came to send if that owner wrote.
   `rate_limited` and the condition `retrying` (yes), `unauthorized`, `payment_required`,
   `forbidden`, `request_too_large`, `redirected` and `rejected` (fix), `budget` (yes: the deadline
   came with no condition to name, or before the root's turn) and `reopened` (yes: another process
-  logged commits in the root after the drain released it). A token has one `later` whatever
-  produced it. Kinds may grow within a line, and a host decides one it does not know by its
+  logged commits in the root after the drain released it, or the binding's retire could not write
+  its exact ACK, which the drain's log lines name as `ack_lost`). `internal` also covers a panic in
+  the drain. A token has one `later` whatever produced it. Kinds may grow within a line, and a host decides one it does not know by its
   `later`.
 - `uid` is the drain's effective uid, read from `/proc/self/status`, and null when it could not be
   read: the drain then opens nothing. A root's `uid` is its directory's owner. `dir` is the host
@@ -1670,8 +1681,10 @@ takeover, idle or committing, leaves the orphan `fenced` with the stream and the
 unchanged, while the application's own reopen of the orphan, a takeover, fences the other process.
 H18: a misrouted origin, a deleted stream, a deleted and recreated one, a held root and a renamed
 root are refused before any claim. H19: the token file. H20: the deadline with the stream
-blackholed or refused, and a SIGKILL during the continuation. H21: a drain under the hold, and the
-inspection beside it. H22: two orphans of one stream in two cache roots, in either order.
+blackholed or refused, a SIGKILL during the continuation, and a panic in a root's drain or in the
+pass. H21: a drain under the hold, and the inspection beside it. H22: two orphans of one stream in
+two cache roots, in either order, and orphans of two streams under `--concurrency` 1 and 2. The
+musl job also checks that each usage error exits 2 with nothing on stdout.
 
 ### Forks
 
@@ -2568,7 +2581,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   keeps its tail for its next open's reconcile.
 - **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
   an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
-  around it). Each database uses two HTTP worker threads and a snapshot thread.
+  around it). Each database uses two HTTP worker threads and a snapshot thread. A drain's binding
+  has no snapshot thread.
 - **One token per process,** and no separate read origin.
 - **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold store.
 - **Local durability.** A power loss drops unacknowledged commits since the last log fsync.

@@ -57,12 +57,15 @@
 // - H19: a wrong token file is `unauthorized` (fix) within the budget, and the right one, or one
 //   written during the drain, drains.
 // - H20: with the stream blackholed (`later: yes`) or refused (`retrying`), a drain of 1000 ms
-//   prints within 1250 ms. A SIGKILL during the continuation leaves the bytes counted, and the next
-//   drain drains.
+//   prints within 1250 ms. A SIGKILL during the continuation, once the drain holds the root and its
+//   claim is out, leaves the bytes counted, and the next drain drains. A panic in a root's drain is
+//   `internal` and one in the pass the top-level `error`, the drain still prints, and nothing is
+//   claimed.
 // - H21: under the hold a drain drains, an inspection with its pid sees the root held, and after
 //   its exit the root is clean and not held.
 // - H22: of two orphans of one stream in two cache roots, in either scan order, the later claimant
-//   drains and the older is fenced.
+//   drains and the older is fenced. Orphans of two streams, one recorded and one scanned, both drain
+//   under `--concurrency` 1 and 2.
 //
 // The hold, `ursula-vfs-host hold`, which takes the host directory's `hold` file exclusively:
 // - H9: a writer thread that commits every 5 ms with busy_timeout 0 stops within one transaction,
@@ -1096,8 +1099,9 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		}
 
 		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget: its result, checked by the output's rules, and how long it ran. */
-		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string } = {}): Promise<{ drained: Drained; ms: number }> {
+		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string; concurrency?: number } = {}): Promise<{ drained: Drained; ms: number }> {
 			const args = ["drain", "--origin", options.origin ?? front.url, "--budget-ms", String(options.budgetMs ?? 20_000), ...(options.scans ?? []).flatMap((s) => ["--scan", s])];
+			if (options.concurrency !== undefined) args.push("--concurrency", String(options.concurrency));
 			const started = Date.now();
 			const { stdout } = await run(hostBin(), args, { env: { ...process.env, ...env } });
 			const ms = Date.now() - started;
@@ -1282,15 +1286,24 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 
 		it("H20: a drain killed during its continuation leaves bytes the inspection counts, and the next drain drains them", async () => {
 			const o = await orphan("host-h20-kill");
+			/** The POSTs the gate received for the stream. */
+			const posts = async (): Promise<number> => {
+				const r = await fetch(`${front.control}/requests?path=${encodeURIComponent(o.s.path)}`);
+				return ((await r.json()) as { method: string }[]).filter((q) => q.method === "POST").length;
+			};
+			const before = await posts();
 			// The repeat of the log's claim goes out, and its answer is held back.
-			await delayPosts(3_000);
+			await delayPosts(10_000);
 			const killed = spawn(hostBin(), ["drain", "--origin", front.url, "--budget-ms", "20000"], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, ...o.env } });
 			const exited = new Promise<NodeJS.Signals | null>((r) => killed.once("exit", (_code, signal) => r(signal)));
 			let printed = "";
 			killed.stdout?.on("data", (chunk: Buffer) => {
 				printed += chunk.toString();
 			});
-			await sleep(1_000);
+			// The kill lands during the continuation: the drain holds the root, and its claim is out with its answer held back.
+			const pid = killed.pid as number;
+			await until("the drain holds the root", 10_000, async () => onlyRoot(await inspect(o.host, [pid])).held === true);
+			await until("the drain's claim is out", 10_000, async () => (await posts()) > before);
 			killed.kill("SIGKILL");
 			expect(await exited).toBe("SIGKILL");
 			expect(printed).toBe("");
@@ -1299,6 +1312,19 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			expect(left.unacknowledged_bytes).toBeGreaterThanOrEqual(o.root.unacknowledged_bytes as number);
 			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
 			expect(await inspect(o.host, [process.pid])).toMatchObject({ complete: true, clean: true });
+		});
+
+		it("H20: a panic in a root's drain is internal and in the pass the top-level error, the process still prints, and the next drain drains", async () => {
+			const o = await orphan("host-h20-panic");
+			const claimsBefore = await claims(o.s.path);
+			const { drained: rooted } = await drain({ ...o.env, URSULA_VFS_PANIC_IN: "drain_root" });
+			expect(rooted.error, JSON.stringify(rooted)).toBeNull();
+			expect(onlyDrained(rooted), JSON.stringify(rooted)).toMatchObject({ outcome: "pending", kind: "internal", later: "no", unacknowledged_bytes: o.root.unacknowledged_bytes });
+			const { drained: passed } = await drain({ ...o.env, URSULA_VFS_PANIC_IN: "drain_pass" });
+			expect(passed.roots, JSON.stringify(passed)).toEqual([]);
+			expect(passed.error, JSON.stringify(passed)).not.toBeNull();
+			expect(await claims(o.s.path)).toEqual(claimsBefore);
+			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
 		});
 
 		it("H21: under the hold a drain drains, an inspection with its pid sees the root it holds, and after its exit the root is clean and not held", async () => {
@@ -1347,6 +1373,24 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 				expect(of(later), JSON.stringify(drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
 				expect(of(older), JSON.stringify(drained)).toMatchObject({ outcome: "pending", kind: "fenced", later: "no" });
 				expect(await fromStream(s.url, "SELECT count(*) AS c FROM t WHERE i >= 100")).toEqual([{ c: 2 }]);
+			});
+		}
+
+		for (const concurrency of [1, 2]) {
+			it(`H22: orphans of two streams, one recorded and one scanned, both drain under --concurrency ${concurrency}`, async () => {
+				const a = await orphan(`host-h22-streams-${concurrency}-a`);
+				const b = await orphan(`host-h22-streams-${concurrency}-b`);
+				const claimsA = await claims(a.s.path);
+				const claimsB = await claims(b.s.path);
+				const { drained } = await drain(a.env, { scans: [b.dir], concurrency });
+				expect(drained.roots, JSON.stringify(drained)).toHaveLength(2);
+				// The recorded directory first, then the scan.
+				expect(drained.roots.map((r) => r.id)).toEqual([a.root.id, b.root.id]);
+				for (const r of drained.roots) expect(r, JSON.stringify(drained)).toMatchObject({ outcome: "drained", unacknowledged_bytes: 0 });
+				expect(await claims(a.s.path)).toEqual([...claimsA, (claimsA.at(-1) as number) + 1]);
+				expect(await claims(b.s.path)).toEqual([...claimsB, (claimsB.at(-1) as number) + 1]);
+				expect(await inspect(a.host, [process.pid])).toMatchObject({ complete: true, clean: true });
+				expect(await inspect(b.host, [process.pid])).toMatchObject({ complete: true, clean: true });
 			});
 		}
 	});

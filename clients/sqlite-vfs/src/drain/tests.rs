@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::Concurrency;
 use super::ConcurrencyError;
@@ -19,6 +20,7 @@ use super::Opened;
 use super::Origin;
 use super::Outcome;
 use super::Plan;
+use super::Read;
 use super::Undrained;
 use super::decide;
 use super::later_of;
@@ -26,7 +28,9 @@ use super::plan;
 use crate::error::ErrorKind;
 use crate::generation::canonical_path;
 use crate::generation::root_name;
+use crate::inspection::RootError;
 use crate::json;
+use crate::open::OpenError;
 use crate::open::table::Declined;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
@@ -267,11 +271,18 @@ fn counts(bytes: u64) -> Counts {
     }
 }
 
-fn read(bytes: u64) -> Result<FirstRead, String> {
+fn read(bytes: u64) -> Read {
     Ok(FirstRead {
         stream: STREAM.to_owned(),
         cluster: "c1".to_owned(),
         counts: counts(bytes),
+    })
+}
+
+/// A read that failed.
+fn torn() -> Arc<RootError> {
+    Arc::new(RootError::Changed {
+        dir: PathBuf::from("/cache/torn"),
     })
 }
 
@@ -297,29 +308,38 @@ fn the_plan_opens_only_a_root_with_bytes_its_user_owns_under_its_own_name() {
         owner: Some(1000),
         euid: Some(1000),
     };
-    assert_eq!(plan(&read(500), facts, &origin), Plan::Drain {
-        url: format!("http://h{STREAM}"),
-        dir: PathBuf::from("/cache"),
-    });
-    assert_eq!(
-        plan(&Err("torn".to_owned()), facts, &origin),
-        Plan::Done(Outcome::Unreadable {
-            error: "torn".to_owned()
-        })
-    );
-    assert_eq!(
+    match plan(&read(500), facts, &origin) {
+        Plan::Drain {
+            url,
+            dir,
+            stream,
+            first,
+        } => {
+            assert_eq!(url, format!("http://h{STREAM}"));
+            assert_eq!(dir, PathBuf::from("/cache"));
+            assert_eq!(stream, STREAM);
+            assert_eq!(first, counts(500));
+        }
+        other => panic!("{other:?}"),
+    }
+    let error = torn();
+    assert!(matches!(
+        plan(&Err(Arc::clone(&error)), facts, &origin),
+        Plan::Done(Outcome::Unreadable { error: e }) if Arc::ptr_eq(&e, &error)
+    ));
+    assert!(matches!(
         plan(&read(0), facts, &origin),
-        Plan::Done(Outcome::Clean(counts(0)))
-    );
+        Plan::Done(Outcome::Clean(c)) if c == counts(0)
+    ));
     // A clean root is clean whoever owns it.
     let other = Facts {
         owner: Some(0),
         ..facts
     };
-    assert_eq!(
+    assert!(matches!(
         plan(&read(0), other, &origin),
-        Plan::Done(Outcome::Clean(counts(0)))
-    );
+        Plan::Done(Outcome::Clean(c)) if c == counts(0)
+    ));
     assert_eq!(
         kind(&plan(&read(500), other, &origin)),
         Some(&Undrained::NotOwner)
@@ -358,14 +378,25 @@ fn the_plan_opens_only_a_root_with_bytes_its_user_owns_under_its_own_name() {
         kind(&plan(&odd, facts, &origin)),
         Some(&Undrained::Misnamed)
     );
-    // Every pending plan keeps the first read's numbers.
+    // Every pending plan keeps the first read's numbers, and its error names its kind first.
     match plan(&read(500), other, &origin) {
         Plan::Done(Outcome::Pending {
-            counts: c, error, ..
+            why,
+            counts: c,
+            note,
         }) => {
             assert_eq!(c, counts(500));
+            let error = super::pending_error(&why, &note);
             assert!(error.starts_with("not_owner: "), "{error}");
         }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The kind and the numbers of a pending outcome.
+fn pending(o: Outcome) -> (Undrained, Counts) {
+    match o {
+        Outcome::Pending { why, counts, .. } => (why, counts),
         other => panic!("{other:?}"),
     }
 }
@@ -374,63 +405,78 @@ fn the_plan_opens_only_a_root_with_bytes_its_user_owns_under_its_own_name() {
 fn the_bytes_of_the_last_read_decide_the_outcome() {
     let first = counts(500);
     let released = Opened::Released { reset: None };
-    let refused = Opened::Refused {
+    let in_use = Opened::Refused {
         why: Undrained::Open(ErrorKind::InUse),
-        error: "in_use: held".to_owned(),
+        error: Arc::new(OpenError::InUse {
+            root: PathBuf::from("/cache/r"),
+        }),
     };
-    assert_eq!(
+    let no_identity = Opened::Refused {
+        why: Undrained::Open(ErrorKind::NoServerIdentity),
+        error: Arc::new(OpenError::NoServerIdentity),
+    };
+    assert!(matches!(
         decide(released.clone(), LastRead::Read(counts(0)), first),
-        Outcome::Drained(counts(0))
-    );
-    assert_eq!(
-        decide(refused.clone(), LastRead::Read(counts(0)), first),
-        Outcome::Clean(counts(0))
-    );
-    assert_eq!(
-        decide(refused, LastRead::Read(counts(400)), first),
+        Outcome::Drained(c) if c == counts(0)
+    ));
+    assert!(matches!(
+        decide(in_use.clone(), LastRead::Read(counts(0)), first),
+        Outcome::Clean(c) if c == counts(0)
+    ));
+    match decide(in_use.clone(), LastRead::Read(counts(400)), first) {
         Outcome::Pending {
-            why: Undrained::Open(ErrorKind::InUse),
-            counts: counts(400),
-            error: "in_use: held".to_owned(),
+            why,
+            counts: c,
+            note,
+        } => {
+            assert_eq!((&why, c), (&Undrained::Open(ErrorKind::InUse), counts(400)));
+            // The open's message already starts with its token.
+            let error = super::pending_error(&why, &note);
+            assert!(error.starts_with("in_use: /cache/r: "), "{error}");
         }
-    );
+        other => panic!("{other:?}"),
+    }
+    // A refusal keeps its kind, with the first read's numbers, when the read after it fails or is
+    // cut: nothing was claimed, and the first read is the last that completed.
+    let refusals = [
+        (in_use, Undrained::Open(ErrorKind::InUse)),
+        (no_identity, Undrained::Open(ErrorKind::NoServerIdentity)),
+    ];
+    for (refused, why) in refusals {
+        assert_eq!(
+            pending(decide(refused.clone(), LastRead::Unreadable(torn()), first)),
+            (why.clone(), first)
+        );
+        assert_eq!(pending(decide(refused, LastRead::Cut, first)), (why, first));
+    }
     let reset = Opened::Released {
         reset: Some(ResetKind::Fenced),
-    };
-    let pending = |o: Outcome| match o {
-        Outcome::Pending { why, counts, .. } => (why, counts),
-        other => panic!("{other:?}"),
     };
     assert_eq!(
         pending(decide(reset.clone(), LastRead::Read(counts(500)), first)),
         (Undrained::Reset(ResetKind::Fenced), counts(500))
     );
     // A reset whose commits all landed meanwhile drained them.
-    assert_eq!(
+    assert!(matches!(
         decide(reset, LastRead::Read(counts(0)), first),
-        Outcome::Drained(counts(0))
-    );
+        Outcome::Drained(c) if c == counts(0)
+    ));
     assert_eq!(
         pending(decide(released.clone(), LastRead::Read(counts(9)), first)),
         (Undrained::Reopened, counts(9))
     );
-    assert_eq!(
-        decide(
-            released.clone(),
-            LastRead::Unreadable("moved".to_owned()),
-            first
-        ),
-        Outcome::Unreadable {
-            error: "moved".to_owned()
-        }
-    );
+    let error = torn();
+    assert!(matches!(
+        decide(released.clone(), LastRead::Unreadable(Arc::clone(&error)), first),
+        Outcome::Unreadable { error: e } if Arc::ptr_eq(&e, &error)
+    ));
     assert_eq!(
         pending(decide(released, LastRead::Cut, first)),
         (Undrained::Budget, first)
     );
 }
 
-fn entry(first: Result<FirstRead, String>, outcome: Option<Outcome>) -> Entry {
+fn entry(first: Read, outcome: Option<Outcome>) -> Entry {
     Entry {
         id: "notes-0123456789abcdef0123456789abcdef".to_owned(),
         root: PathBuf::from("/cache/notes-0123456789abcdef0123456789abcdef"),
@@ -485,7 +531,7 @@ fn the_json_has_its_keys_in_order_and_each_outcome_its_invariants() {
                 Some(Outcome::pending(
                     Undrained::Reset(ResetKind::Fenced),
                     counts(500),
-                    "x",
+                    super::Note::Reset,
                 )),
             ),
             "pending",
@@ -493,21 +539,11 @@ fn the_json_has_its_keys_in_order_and_each_outcome_its_invariants() {
         // Still draining at the deadline: its first read's numbers.
         (entry(read(500), None), "pending"),
         (
-            entry(
-                Err("torn".to_owned()),
-                Some(Outcome::Unreadable {
-                    error: "torn".to_owned(),
-                }),
-            ),
+            entry(Err(torn()), Some(Outcome::Unreadable { error: torn() })),
             "unreadable",
         ),
         (
-            entry(
-                read(500),
-                Some(Outcome::Unreadable {
-                    error: "moved".to_owned(),
-                }),
-            ),
+            entry(read(500), Some(Outcome::Unreadable { error: torn() })),
             "unreadable",
         ),
     ];

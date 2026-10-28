@@ -246,8 +246,8 @@ jobs:
           status=0
           "$bin" inspect --budget-ms soon || status=$?
           test "$status" -eq 2
-          # The drain's open, driver and transport run here: nothing answers the origin, and the
-          # scanned directory holds no root.
+          # The drain's CLI, its pass and its JSON run here: the scanned directory holds no root, so
+          # nothing is opened. Its open, driver and transport run in sqlite-vfs-host-musl-e2e.
           mkdir -p "$RUNNER_TEMP/empty-scan"
           out=$("$bin" drain --origin http://127.0.0.1:9 --budget-ms 500 --scan "$RUNNER_TEMP/empty-scan" < /dev/null)
           echo "$out"
@@ -257,9 +257,23 @@ jobs:
           assert list(r) == ["v", "origin", "uid", "dir", "roots", "error"], r
           assert r["v"] == 1 and r["origin"] == "http://127.0.0.1:9" and r["roots"] == [], r
           ' "$out"
-          status=0
-          "$bin" drain --origin http://127.0.0.1:9 --budget-ms 0 || status=$?
-          test "$status" -eq 2
+          # Each usage error exits 2 with nothing on stdout.
+          for args in \
+            "--origin http://127.0.0.1:9 --budget-ms 0" \
+            "--budget-ms 500" \
+            "--origin http://127.0.0.1:9" \
+            "--origin http://127.0.0.1:9 --budget-ms" \
+            "--origin ftp://127.0.0.1:9 --budget-ms 500" \
+            "--origin http://127.0.0.1:9/v1 --budget-ms 500" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --concurrency 0" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --concurrency 17" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --dir $RUNNER_TEMP" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --pid 1"; do
+            status=0
+            out=$("$bin" drain $args < /dev/null) || status=$?
+            test "$status" -eq 2 || { echo "::error::drain $args exited $status"; exit 1; }
+            test -z "$out" || { echo "::error::drain $args printed $out"; exit 1; }
+          done
           ls -l "$bin"
 
       - name: Upload the static x64 ursula-vfs-host
