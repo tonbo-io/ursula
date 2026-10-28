@@ -341,7 +341,7 @@ pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
     object(&[
         ("kind", json_str(kind.as_str())),
         ("action", json_str(kind.action().as_str())),
-        ("message", json_str(&e.to_string())),
+        ("message", json_str(&e.report().to_string())),
         ("fix", e.fix().as_deref().map_or_else(null, json_str)),
         ("request_id", e.request_id().map_or_else(null, json_str)),
     ])
@@ -599,7 +599,10 @@ mod tests {
                 expires_in_ms: Some(0),
                 refresh_in_ms: Some(2_000),
                 failures: 2,
-                error: Some(ExchangeError::Refused { status: 401 }),
+                error: Some(ExchangeError::Refused {
+                    status: 401,
+                    problem: Box::default(),
+                }),
             }),
         };
         assert_eq!(

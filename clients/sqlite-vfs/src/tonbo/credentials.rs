@@ -11,11 +11,10 @@
 //! - Content that does not match the schema (`version` 1, a non-empty `account_id` and `key_id`, a
 //!   `key` that starts with `tbo_`, and `expires_at` an RFC 3339 date-time or `null`) is unusable,
 //!   and a login whose `expires_at` is at or before now is expired. Members the schema does not
-//!   name are skipped.
+//!   name are skipped. A file over 64 KiB is unusable unread: a login is a few hundred bytes.
 //!
 //! Neither the key nor the file's content is ever printed: no error carries them.
 
-use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -23,6 +22,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use super::ShellWord;
 use crate::error::ErrorKind;
 use crate::json::Value;
 use crate::json::parse_members;
@@ -31,7 +31,7 @@ use crate::json::whole;
 /// The fix for a login that is missing, unusable or expired.
 pub(crate) const LOGIN_FIX: &str = "Run: tonbo login";
 
-/// The largest login file read: a login is a few hundred bytes.
+/// The largest login file read: a login is a few hundred bytes, and a larger file is unusable.
 const LIMIT: u64 = 64 << 10;
 
 /// Where `tonbo login` saves the login, `None` when neither `XDG_CONFIG_HOME` nor a home
@@ -103,29 +103,14 @@ impl LoginError {
             LoginError::Refused {
                 path,
                 why: Refusal::OpenToOthers { .. },
-            } => format!("Run: chmod 600 {}", ShellWord(path)),
+            } => format!("Run: chmod 600 {}", ShellWord(&path.to_string_lossy())),
             LoginError::Unusable { .. } | LoginError::Expired { .. } => LOGIN_FIX.to_owned(),
             LoginError::Unreadable { path, .. } => {
-                format!("Run: chmod 600 {}, or run: tonbo login", ShellWord(path))
+                format!(
+                    "Run: chmod 600 {}, or run: tonbo login",
+                    ShellWord(&path.to_string_lossy())
+                )
             }
-        }
-    }
-}
-
-/// A path as one shell word: as it is when it needs no quoting, single-quoted otherwise.
-struct ShellWord<'a>(&'a Path);
-
-impl fmt::Display for ShellWord<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = self.0.to_string_lossy();
-        let plain = !text.is_empty()
-            && text
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
-        if plain {
-            f.write_str(&text)
-        } else {
-            write!(f, "'{}'", text.replace('\'', "'\\''"))
         }
     }
 }
@@ -168,13 +153,20 @@ pub(crate) fn read(path: &Path, now_ms: i64) -> Result<Option<String>, LoginErro
             mode: meta.mode() & 0o777,
         }));
     }
+    let unusable = || LoginError::Unusable {
+        path: path.to_owned(),
+    };
+    if meta.len() > LIMIT {
+        return Err(unusable());
+    }
+    // One byte past the limit shows a file that grew since.
     let mut bytes = Vec::new();
     file.take(LIMIT.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
-    let unusable = || LoginError::Unusable {
-        path: path.to_owned(),
-    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
+        return Err(unusable());
+    }
     let text = String::from_utf8(bytes).map_err(|_not_utf8| unusable())?;
     let login = parse(&text).ok_or_else(unusable)?;
     match login.expires_at {
@@ -381,21 +373,15 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::testdir::TempDir;
 
-    /// The contract's `examples.usable`, as it lists them.
-    const USABLE: [&str; 2] = [
-        r#"{"version": 1, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret", "expires_at": "2027-04-24T00:00:00.000Z"}"#,
-        r#"{"version": 1, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret", "expires_at": null}"#,
-    ];
+    /// The contract's `examples.usable`, as it lists them, one per line: the file test/tonbo.e2e.ts
+    /// reads too.
+    const USABLE: &str = include_str!("vectors/credentials-v1-usable.jsonl");
+    /// The contract's `examples.unusable`, as it lists them, one per line.
+    const UNUSABLE: &str = include_str!("vectors/credentials-v1-unusable.jsonl");
 
-    /// The contract's `examples.unusable`, as it lists them.
-    const UNUSABLE: [&str; 6] = [
-        r#"{"access_token": "access", "refresh_token": "refresh", "token_type": "bearer"}"#,
-        r#"{"version": 2, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret", "expires_at": null}"#,
-        r#"{"version": 1, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "not-a-personal-key", "expires_at": null}"#,
-        r#"{"version": 1, "account_id": "", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret", "expires_at": null}"#,
-        r#"{"version": 1, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret", "expires_at": "not a date"}"#,
-        r#"{"version": 1, "account_id": "10000000-0000-4000-8000-000000000001", "key_id": "20000000-0000-4000-8000-000000000002", "key": "tbo_secret"}"#,
-    ];
+    fn usable(i: usize) -> &'static str {
+        USABLE.lines().nth(i).unwrap()
+    }
 
     /// 2027-04-24T00:00:00.000Z.
     const EXPIRY_MS: i64 = 1_808_524_800_000;
@@ -412,18 +398,20 @@ mod tests {
     // unusable examples, and members of another type, give none.
     #[test]
     fn the_contracts_examples_are_read_as_it_lists_them() {
-        let first = parse(USABLE[0]).unwrap();
+        assert_eq!(USABLE.lines().count(), 2);
+        assert_eq!(UNUSABLE.lines().count(), 6);
+        let first = parse(usable(0)).unwrap();
         assert_eq!(first.key, "tbo_secret");
         assert_eq!(first.expires_at, Expiry::At {
             ms: EXPIRY_MS,
             text: "2027-04-24T00:00:00.000Z".to_owned(),
         });
-        assert_eq!(parse(USABLE[1]).unwrap().expires_at, Expiry::Never);
-        for text in UNUSABLE {
+        assert_eq!(parse(usable(1)).unwrap().expires_at, Expiry::Never);
+        for text in UNUSABLE.lines() {
             assert_eq!(parse(text), None, "{text}");
         }
         let with = |member: &str| {
-            USABLE[1].replace(
+            usable(1).replace(
                 r#""expires_at": null"#,
                 &format!(r#""expires_at": null, {member}"#),
             )
@@ -501,7 +489,7 @@ mod tests {
             "a file on the way"
         );
 
-        write(&path, USABLE[0], 0o600);
+        write(&path, usable(0), 0o600);
         assert_eq!(
             read(&path, EXPIRY_MS.saturating_sub(1)).unwrap().as_deref(),
             Some("tbo_secret")
@@ -512,12 +500,12 @@ mod tests {
         );
         assert_eq!(expired.kind(), ErrorKind::InvalidApiKey);
         assert_eq!(expired.fix(), "Run: tonbo login");
-        write(&path, USABLE[1], 0o400);
+        write(&path, usable(1), 0o400);
         assert_eq!(
             read(&path, i64::MAX).unwrap().as_deref(),
             Some("tbo_secret")
         );
-        for text in UNUSABLE {
+        for text in UNUSABLE.lines() {
             write(&path, text, 0o600);
             let e = read(&path, 0).unwrap_err();
             assert!(matches!(e, LoginError::Unusable { .. }), "{text}");
@@ -526,7 +514,7 @@ mod tests {
         }
 
         for mode in [0o640, 0o604, 0o601, 0o700 | 0o020] {
-            write(&path, USABLE[1], mode);
+            write(&path, usable(1), mode);
             let e = read(&path, 0).unwrap_err();
             assert!(
                 matches!(e, LoginError::Refused { why: Refusal::OpenToOthers { mode: m }, .. } if m == mode),
@@ -538,7 +526,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         let target = dir.path().join("elsewhere.json");
-        write(&target, USABLE[1], 0o600);
+        write(&target, usable(1), 0o600);
         symlink(&target, &path).unwrap();
         let e = read(&path, 0).unwrap_err();
         assert!(matches!(e, LoginError::Refused {
@@ -546,6 +534,12 @@ mod tests {
             ..
         }));
         assert_eq!(e.kind(), ErrorKind::CredentialsRefused);
+        fs::remove_file(&path).unwrap();
+
+        // A file over the limit is unusable, the usable login padded included.
+        let padded = usable(1).replace('{', &format!("{{{}", " ".repeat(65_536)));
+        write(&path, &padded, 0o600);
+        assert!(matches!(read(&path, 0), Err(LoginError::Unusable { .. })));
         fs::remove_file(&path).unwrap();
 
         fs::create_dir(&path).unwrap();

@@ -52,7 +52,8 @@
 //!   database into its stream URL with the account's API key, and fetches the key's first Streams
 //!   token before it returns `{done, url, name}` (`tonbo`). With `timeout_ms` 0 it returns
 //!   `{done: false, request}` at once, a `resolved` event ends it, and a call with the same
-//!   arguments then takes its outcome. Nothing else in the extension calls into Tonbo.
+//!   arguments then takes its outcome. Only the SQL functions call into Tonbo, and the JSON and
+//!   error rendering show what it returns: the open, the registry and the driver never do.
 //!
 //! A write refused at admission (`backlog_full`), one the extension does not capture
 //! (`unsupported`) or a commit above the commit limit (`too_large`) fails its transaction alone with

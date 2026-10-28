@@ -17,11 +17,16 @@
 //!   `invalid_argument` naming the origin to check.
 //!
 //! Requests go out on the agent of appends and reads (`transport::http::agent`): the same roots
-//! (`URSULA_VFS_CA_FILE`), the same proxy, no redirect. A lookup is bounded by the time the resolve
-//! has left, and an exchange by the agent's own 10 s.
+//! (`URSULA_VFS_CA_FILE`), the same proxy, no redirect. Each request, the exchange included, is
+//! bounded by the time the resolve has left.
+//!
+//! What an answer says ([`classify`], [`asks_exchange`]), what a database's state says
+//! ([`settle`]) and how long the lookup waits ([`backoff_ms`], [`wait_ms`]) are pure: the loop
+//! around them only sends, sleeps and keeps the last condition.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
@@ -29,15 +34,16 @@ use std::time::Instant;
 
 use super::ApiKey;
 use super::KeyFrom;
+use super::Subject;
 use super::TonboError;
 use super::Until;
 use crate::auth::exchange::ExchangeError;
 use crate::auth::exchange::Key;
+use crate::auth::exchange::Problem;
 use crate::auth::exchange::exchange;
 use crate::error::ErrorKind;
 use crate::json::Value;
 use crate::json::member_object;
-use crate::json::parse_members;
 use crate::transport::http::agent;
 use crate::wire::RETRY_AFTER;
 
@@ -59,11 +65,12 @@ pub(crate) enum Api {
 }
 
 impl Api {
-    /// The option and the variable that name the API's origin, to check.
+    /// The option and the variable that name the API's origin, to check, in words any host's
+    /// spelling of the option fits.
     pub(crate) fn fix(self) -> &'static str {
         match self {
-            Api::Management => "Check api_origin (or TONBO_API_ORIGIN)",
-            Api::TokenEndpoint => "Check auth_origin (or TONBO_AUTH_ORIGIN)",
+            Api::Management => "Check the API origin option or TONBO_API_ORIGIN",
+            Api::TokenEndpoint => "Check the auth origin option or TONBO_AUTH_ORIGIN",
         }
     }
 }
@@ -78,42 +85,49 @@ impl fmt::Display for Api {
 }
 
 /// A failure a resolve retries until its time runs out: the condition it reports then.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum Transient {
-    #[error("{api} did not answer: {reason}")]
-    Unreachable { api: Api, reason: String },
-    #[error("{api} answered 429")]
-    RateLimited {
-        api: Api,
-        retry_after_ms: Option<u64>,
+    #[error("{} did not answer: {source}", Api::Management)]
+    Unreachable {
+        #[source]
+        source: Arc<ureq::Error>,
     },
-    #[error("{api} answered {status}")]
-    Unavailable { api: Api, status: u16 },
+    #[error("the answer of {} broke off: {source}", Api::Management)]
+    BrokeOff {
+        #[source]
+        source: Arc<ureq::Error>,
+    },
+    #[error("{} answered 429", Api::Management)]
+    RateLimited { retry_after_ms: Option<u64> },
+    #[error("{} answered {status}", Api::Management)]
+    Unavailable { status: u16 },
     #[error("{} answered {status} without a database", Api::Management)]
     NoDatabase { status: u16 },
-    #[error("{} answered without a usable token", Api::TokenEndpoint)]
-    NoToken,
     #[error("database \"{name}\" is {state}")]
     NotActive { name: String, state: String },
+    /// The token endpoint's failure that passes.
+    #[error(transparent)]
+    Exchange(ExchangeError),
 }
 
 impl Transient {
     /// The kind a resolve that gave up on it reports.
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
-            Transient::Unreachable { .. } => ErrorKind::Unreachable,
+            Transient::Unreachable { .. } | Transient::BrokeOff { .. } => ErrorKind::Unreachable,
             Transient::RateLimited { .. } => ErrorKind::RateLimited,
             Transient::Unavailable { .. }
             | Transient::NoDatabase { .. }
-            | Transient::NoToken
             | Transient::NotActive { .. } => ErrorKind::Unavailable,
+            Transient::Exchange(e) => e.kind(),
         }
     }
 
     /// The wait it asked for: a `429`'s `Retry-After`.
     fn retry_after_ms(&self) -> Option<u64> {
         match self {
-            Transient::RateLimited { retry_after_ms, .. } => *retry_after_ms,
+            Transient::RateLimited { retry_after_ms } => *retry_after_ms,
+            Transient::Exchange(e) => e.retry_after_ms(),
             _ => None,
         }
     }
@@ -128,39 +142,86 @@ pub(crate) enum Failure {
     Transient(Transient),
 }
 
-/// What an exchange's failure is to a resolve that holds the key from `from`.
+/// What an exchange's failure is to a resolve that holds the key from `from`: a refusal and a
+/// status outside the contract fail for good, with the answer's problem details, and the rest
+/// passes.
 pub(crate) fn exchange_failure(e: ExchangeError, from: &KeyFrom) -> Failure {
     let api = Api::TokenEndpoint;
     match e {
-        ExchangeError::Unreachable { reason } => {
-            Failure::Transient(Transient::Unreachable { api, reason })
-        }
-        ExchangeError::Refused { .. } => Failure::Final(TonboError::KeyRefused {
-            by: api,
-            from: from.clone(),
-            code: None,
-            request_id: None,
-        }),
-        ExchangeError::RateLimited { retry_after_ms } => {
-            Failure::Transient(Transient::RateLimited {
-                api,
-                retry_after_ms,
+        ExchangeError::Refused { problem, .. } => {
+            let Problem {
+                code, request_id, ..
+            } = *problem;
+            Failure::Final(TonboError::KeyRefused {
+                by: api,
+                from: from.clone(),
+                code,
+                request_id,
             })
         }
-        ExchangeError::Unavailable { status } => {
-            Failure::Transient(Transient::Unavailable { api, status })
-        }
-        ExchangeError::Unexpected { status } => Failure::Final(TonboError::Unexpected {
-            api,
-            status,
-            name: None,
-            detail: None,
-            request_id: None,
-        }),
-        ExchangeError::NoToken | ExchangeError::ShortLived { .. } => {
-            Failure::Transient(Transient::NoToken)
+        ExchangeError::Unexpected { status, problem } => {
+            let Problem {
+                detail, request_id, ..
+            } = *problem;
+            Failure::Final(TonboError::Unexpected {
+                api,
+                status,
+                name: None,
+                detail,
+                request_id,
+            })
         }
         ExchangeError::Panicked => Failure::Final(TonboError::Panicked),
+        e @ (ExchangeError::Unreachable { .. }
+        | ExchangeError::RateLimited { .. }
+        | ExchangeError::Unavailable { .. }
+        | ExchangeError::NoToken
+        | ExchangeError::ShortLived { .. }) => Failure::Transient(Transient::Exchange(e)),
+    }
+}
+
+/// The wait before the lookup's try after `attempt` failed ones: from 250 ms, doubled up to 2 s.
+fn backoff_ms(attempt: u32) -> u64 {
+    FIRST_RETRY_MS
+        .checked_shl(attempt.min(8))
+        .unwrap_or(MAX_RETRY_MS)
+        .min(MAX_RETRY_MS)
+}
+
+/// The wait after `t`: its `Retry-After`, never less than `backoff_ms`.
+fn wait_ms(t: &Transient, backoff_ms: u64) -> u64 {
+    t.retry_after_ms().unwrap_or(0).max(backoff_ms)
+}
+
+/// What a database's state says to the lookup.
+#[derive(Debug)]
+enum Settled {
+    /// Active: its stream URL.
+    Url(String),
+    Failed(TonboError),
+    /// Not yet: looked up again after the backoff.
+    Again(Transient),
+}
+
+/// What the database `found` of `name` says: `active` gives its URL, `deleting` and `deleted`
+/// are not found, and any other state is looked up again.
+fn settle(name: &str, found: Found) -> Settled {
+    match found.state.as_str() {
+        "active" => match found.url {
+            Some(url) => Settled::Url(url),
+            None => Settled::Failed(TonboError::NoUrl {
+                name: name.to_owned(),
+                request_id: found.request_id,
+            }),
+        },
+        "deleting" | "deleted" => Settled::Failed(TonboError::NotFound {
+            name: name.to_owned(),
+            request_id: found.request_id,
+        }),
+        state => Settled::Again(Transient::NotActive {
+            name: name.to_owned(),
+            state: state.to_owned(),
+        }),
     }
 }
 
@@ -176,46 +237,31 @@ pub(crate) fn look_up(
     let mut last: Option<Transient> = None;
     let mut attempt: u32 = 0;
     loop {
-        let backoff = FIRST_RETRY_MS
-            .checked_shl(attempt.min(8))
-            .unwrap_or(MAX_RETRY_MS)
-            .min(MAX_RETRY_MS);
+        let backoff = backoff_ms(attempt);
         attempt = attempt.saturating_add(1);
-        let wait = match once(name, key, api, auth, until) {
-            Ok(found) => match found.state.as_str() {
-                "active" => {
-                    return found.url.ok_or_else(|| TonboError::NoUrl {
-                        name: name.to_owned(),
-                        request_id: found.request_id,
-                    });
-                }
-                "deleting" | "deleted" => {
-                    return Err(TonboError::NotFound {
-                        name: name.to_owned(),
-                        request_id: found.request_id,
-                    });
-                }
-                state => {
-                    last = Some(Transient::NotActive {
-                        name: name.to_owned(),
-                        state: state.to_owned(),
-                    });
-                    backoff
-                }
-            },
-            Err(Failure::Final(e)) => return Err(e),
+        let passed = match once(name, key, api, auth, until).map(|found| settle(name, found)) {
+            Ok(Settled::Url(url)) => return Ok(url),
+            Ok(Settled::Failed(e)) | Err(Failure::Final(e)) => return Err(e),
+            Ok(Settled::Again(t)) => Some((t, backoff)),
             // A request the end of the resolve cut short says nothing new: the last condition
             // stands.
-            Err(Failure::Transient(_)) if until.over() => 0,
+            Err(Failure::Transient(_)) if until.over() => None,
             Err(Failure::Transient(t)) => {
-                let wait = t.retry_after_ms().unwrap_or(0).max(backoff);
+                let wait = wait_ms(&t, backoff);
+                Some((t, wait))
+            }
+        };
+        let wait = match passed {
+            Some((t, wait)) => {
+                until.note(&t);
                 last = Some(t);
                 wait
             }
+            None => 0,
         };
         if !until.sleep(Duration::from_millis(wait)) {
             return Err(TonboError::GaveUp {
-                subject: super::Subject::Database(name.to_owned()),
+                subject: Subject::Database(name.to_owned()),
                 last,
                 cancelled: until.cancelled(),
             });
@@ -234,18 +280,24 @@ struct Found {
 /// One lookup of `name`, exchanging the key first when the Management API asks for it.
 fn once(name: &str, key: &ApiKey, api: &str, auth: &str, until: &Until) -> Result<Found, Failure> {
     let url = format!("{api}/v1/databases/{}", component(name));
-    let mut bearer = management_bearer(key, auth, false)?;
-    let mut answer = get(&url, &bearer, until)?;
-    if answer.status == 401 {
-        let problem = answer.problem();
-        // A key that must be exchanged, or an exchanged token that expired early: exchange, and
-        // look up again once.
-        if problem.code.as_deref() != Some("exchange_required") && bearer == key.secret {
-            return Err(Failure::Final(refused(key, problem)));
-        }
-        bearer = management_bearer(key, auth, true)?;
-        answer = get(&url, &bearer, until)?;
+    let bearer = management_bearer(key, auth, false, until)?;
+    let mut answer = get(&url, &bearer.token, until)?;
+    if asks_exchange(&answer, bearer.is_key) {
+        let bearer = management_bearer(key, auth, true, until)?;
+        answer = get(&url, &bearer.token, until)?;
     }
+    classify(&answer, name, &key.from)
+}
+
+/// Whether `answer` asks the lookup to exchange the key and look up again once: a `401` with
+/// `exchange_required`, or one to a token exchanged before (`is_key` false), which expired early.
+fn asks_exchange(answer: &Answer, is_key: bool) -> bool {
+    answer.status == 401
+        && (!is_key || answer.problem().code.as_deref() == Some("exchange_required"))
+}
+
+/// What `answer` to the lookup of `name` with the key from `from` says.
+fn classify(answer: &Answer, name: &str, from: &KeyFrom) -> Result<Found, Failure> {
     let status = answer.status;
     if (200..300).contains(&status) {
         let data = std::str::from_utf8(&answer.body)
@@ -265,47 +317,38 @@ fn once(name: &str, key: &ApiKey, api: &str, auth: &str, until: &Until) -> Resul
         return Ok(Found {
             state,
             url,
-            request_id: answer.request_id,
+            request_id: answer.request_id.clone(),
         });
     }
-    let api = Api::Management;
-    match status {
-        429 => Err(Failure::Transient(Transient::RateLimited {
-            api,
+    let problem = answer.problem();
+    Err(match status {
+        429 => Failure::Transient(Transient::RateLimited {
             retry_after_ms: answer.retry_after_ms,
-        })),
-        408 | 500..=599 => Err(Failure::Transient(Transient::Unavailable { api, status })),
-        401 => Err(Failure::Final(refused(key, answer.problem()))),
-        403 => Err(Failure::Final(TonboError::Forbidden {
+        }),
+        408 | 500..=599 => Failure::Transient(Transient::Unavailable { status }),
+        401 => Failure::Final(TonboError::KeyRefused {
+            by: Api::Management,
+            from: from.clone(),
+            code: problem.code,
+            request_id: problem.request_id,
+        }),
+        403 => Failure::Final(TonboError::Forbidden {
             name: name.to_owned(),
-            from: key.from.clone(),
-            request_id: answer.problem().request_id,
-        })),
-        404 => Err(Failure::Final(TonboError::NotFound {
+            from: from.clone(),
+            request_id: problem.request_id,
+        }),
+        404 => Failure::Final(TonboError::NotFound {
             name: name.to_owned(),
-            request_id: answer.problem().request_id,
-        })),
-        _ => {
-            let problem = answer.problem();
-            Err(Failure::Final(TonboError::Unexpected {
-                api,
-                status,
-                name: Some(name.to_owned()),
-                detail: problem.detail,
-                request_id: problem.request_id,
-            }))
-        }
-    }
-}
-
-/// The Management API refused the key.
-fn refused(key: &ApiKey, problem: Problem) -> TonboError {
-    TonboError::KeyRefused {
-        by: Api::Management,
-        from: key.from.clone(),
-        code: problem.code,
-        request_id: problem.request_id,
-    }
+            request_id: problem.request_id,
+        }),
+        _ => Failure::Final(TonboError::Unexpected {
+            api: Api::Management,
+            status,
+            name: Some(name.to_owned()),
+            detail: problem.detail,
+            request_id: problem.request_id,
+        }),
+    })
 }
 
 /// A Management API token exchanged for a key.
@@ -318,10 +361,22 @@ struct Held {
 /// origin and the key: an entry says the key needs the exchange, its value is the token held.
 static MANAGEMENT: Mutex<Option<HashMap<[u8; 32], Option<Held>>>> = Mutex::new(None);
 
+/// The bearer token of a Management API request.
+struct Bearer {
+    token: String,
+    /// The key itself, not a token exchanged for it.
+    is_key: bool,
+}
+
 /// The bearer token of a Management API request with `key`: the key itself, or the token
 /// exchanged for it at `auth`'s token endpoint, anew with `fresh`. The exchange runs outside the
-/// lock.
-fn management_bearer(key: &ApiKey, auth: &str, fresh: bool) -> Result<String, Failure> {
+/// lock, within the time `until` leaves it.
+fn management_bearer(
+    key: &ApiKey,
+    auth: &str,
+    fresh: bool,
+    until: &Until,
+) -> Result<Bearer, Failure> {
     let id = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(auth.as_bytes());
@@ -333,24 +388,27 @@ fn management_bearer(key: &ApiKey, auth: &str, fresh: bool) -> Result<String, Fa
         let mut held = MANAGEMENT.lock().unwrap_or_else(PoisonError::into_inner);
         let tokens = held.get_or_insert_with(HashMap::new);
         match tokens.get(&id) {
-            None if !fresh => return Ok(key.secret.clone()),
+            None if !fresh => {
+                return Ok(Bearer {
+                    token: key.secret.clone(),
+                    is_key: true,
+                });
+            }
             Some(Some(h)) if !fresh && h.expires_at > Instant::now() => {
-                return Ok(h.token.clone());
+                return Ok(Bearer {
+                    token: h.token.clone(),
+                    is_key: false,
+                });
             }
             _ => {}
         }
         tokens.insert(id, None);
     }
     let endpoint = format!("{auth}/api/iam/token");
-    let exchanger = Key::new(&key.secret, &endpoint, None).map_err(|_unsendable| {
-        Failure::Final(TonboError::KeyRefused {
-            by: Api::TokenEndpoint,
-            from: key.from.clone(),
-            code: None,
-            request_id: None,
-        })
-    })?;
-    let got = exchange(&exchanger).map_err(|e| exchange_failure(e, &key.from))?;
+    let exchanger = Key::new(&key.secret, &endpoint, None)
+        .map_err(|e| Failure::Final(TonboError::Unsendable(e)))?;
+    let left = until.left().max(Duration::from_millis(MIN_REQUEST_MS));
+    let got = exchange(&exchanger, Some(left)).map_err(|e| exchange_failure(e, &key.from))?;
     let lifetime = Duration::from_millis(got.lifetime_ms.saturating_sub(EXPIRY_MARGIN_MS));
     let now = Instant::now();
     let mut held = MANAGEMENT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -361,7 +419,10 @@ fn management_bearer(key: &ApiKey, auth: &str, fresh: bool) -> Result<String, Fa
             expires_at: now.checked_add(lifetime).unwrap_or(now),
         }),
     );
-    Ok(got.token)
+    Ok(Bearer {
+        token: got.token,
+        is_key: false,
+    })
 }
 
 /// An answer of the Management API, as far as the lookup reads it.
@@ -372,50 +433,16 @@ struct Answer {
     body: Vec<u8>,
 }
 
-/// An answer's problem details (`application/problem+json`), as far as the lookup reads them.
-#[derive(Debug, Default)]
-struct Problem {
-    code: Option<String>,
-    detail: Option<String>,
-    request_id: Option<String>,
-}
-
 impl Answer {
     /// The problem details of the body, the request id from `X-Request-Id` when the body names
-    /// none. A body that is not JSON gives none: the status says it all.
+    /// none.
     fn problem(&self) -> Problem {
-        let mut problem = Problem::default();
-        let members = std::str::from_utf8(&self.body)
-            .ok()
-            .and_then(|text| parse_members(text).ok())
-            .unwrap_or_default();
-        for (member, value) in members {
-            let Value::Text(text) = value else { continue };
-            if text.is_empty() {
-                continue;
-            }
-            match member.as_str() {
-                "code" => problem.code = Some(text),
-                "detail" => problem.detail = Some(text),
-                "request_id" => problem.request_id = Some(text),
-                _ => {}
-            }
-        }
-        if problem.request_id.is_none() {
-            problem.request_id.clone_from(&self.request_id);
-        }
-        problem
+        Problem::read(&self.body, self.request_id.as_deref())
     }
 }
 
 /// `GET url` with `bearer`, given the time `until` leaves it.
 fn get(url: &str, bearer: &str, until: &Until) -> Result<Answer, Failure> {
-    let unreachable = |reason: String| {
-        Failure::Transient(Transient::Unreachable {
-            api: Api::Management,
-            reason,
-        })
-    };
     let left = until.left().max(Duration::from_millis(MIN_REQUEST_MS));
     let mut response = agent()
         .get(url)
@@ -425,7 +452,11 @@ fn get(url: &str, bearer: &str, until: &Until) -> Result<Answer, Failure> {
         .timeout_global(Some(left))
         .build()
         .call()
-        .map_err(|e| unreachable(e.to_string()))?;
+        .map_err(|e| {
+            Failure::Transient(Transient::Unreachable {
+                source: Arc::new(e),
+            })
+        })?;
     let header = |name: &str| {
         response
             .headers()
@@ -444,7 +475,11 @@ fn get(url: &str, bearer: &str, until: &Until) -> Result<Answer, Failure> {
         .with_config()
         .limit(ANSWER_LIMIT)
         .read_to_vec()
-        .map_err(|e| unreachable(format!("the answer's body broke off: {e}")))?;
+        .map_err(|e| {
+            Failure::Transient(Transient::BrokeOff {
+                source: Arc::new(e),
+            })
+        })?;
     Ok(Answer {
         status,
         retry_after_ms,

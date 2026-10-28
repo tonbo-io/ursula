@@ -569,7 +569,7 @@ pub(crate) enum Error {
     Reset(ResetKind),
     #[error("{path} is not a database ursula_open bound in this process")]
     NotBound { path: String },
-    #[error("the request {request} is not an open in progress")]
+    #[error("the request {request} is not an open or a resolve in progress")]
     NoRequest { request: u64 },
     #[error("{name}: {why}")]
     InvalidArgument { name: &'static str, why: String },
@@ -589,7 +589,7 @@ pub(crate) enum Error {
     /// Every SQL function's failure in a child forked after its parent started the extension.
     #[error("the process forked after the extension started: open databases after the fork")]
     Forked,
-    #[error("{0}")]
+    #[error("{}", .0.report())]
     Tonbo(#[source] Arc<TonboError>),
 }
 

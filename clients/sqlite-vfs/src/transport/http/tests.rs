@@ -365,7 +365,7 @@ fn a_401_to_the_keys_token_refreshes_it() {
     };
     let (endpoint, exchanges) = serve(vec![token("t1"), token("t2")]);
     let wait = Duration::from_secs(30);
-    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait).unwrap();
+    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait, &|| false).unwrap();
 
     let (url, refusing) = serve(vec![answer("401 Unauthorized")]);
     let exchange = HttpTransport::new(url).send(&create(), Attempt::default());
@@ -376,7 +376,7 @@ fn a_401_to_the_keys_token_refreshes_it() {
     let sent = refusing.join().unwrap();
     assert_eq!(request_header(&sent[0], "authorization"), Some("Bearer t1"));
 
-    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait).unwrap();
+    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait, &|| false).unwrap();
     assert_eq!(crate::auth::token(false).as_deref(), Some("t2"));
     crate::auth::forget_key();
     let sent = exchanges.join().unwrap();

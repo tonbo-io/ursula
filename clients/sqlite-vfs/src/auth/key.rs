@@ -649,7 +649,14 @@ mod tests {
         assert!(s.start(0, true));
         assert!(s.exchanged(token("t1", 100_000), 0, LOW));
         assert!(s.start(70_000, true));
-        assert!(!s.exchanged(Err(ExchangeError::Refused { status: 401 }), 70_000, HIGH));
+        assert!(!s.exchanged(
+            Err(ExchangeError::Refused {
+                status: 401,
+                problem: Box::default(),
+            }),
+            70_000,
+            HIGH
+        ));
         assert_eq!(s.deadline(true), Some(100_000), "the longest backoff");
         assert!(!s.serves(), "its token is no longer one requests can carry");
         assert!(
@@ -743,7 +750,14 @@ mod tests {
         assert!(old.start(0, true));
         assert!(old.exchanged(token("t1", 100_000), 0, LOW));
         assert!(old.start(70_000, true));
-        assert!(!old.exchanged(Err(ExchangeError::Refused { status: 403 }), 70_000, LOW));
+        assert!(!old.exchanged(
+            Err(ExchangeError::Refused {
+                status: 403,
+                problem: Box::default(),
+            }),
+            70_000,
+            LOW
+        ));
 
         let mut next = Schedule::after(&old, 70_000);
         assert_eq!(next.token(), Some("t1"));
