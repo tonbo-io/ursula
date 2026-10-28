@@ -13,10 +13,12 @@ wrapping of SQLAlchemy, keep working. The SQLite error is ``__cause__``, and its
 
 from __future__ import annotations
 
+import copy
 import sqlite3
 from collections.abc import Mapping
 from typing import Any
 from typing import Literal
+from typing import TypeVar
 
 __all__ = [
     "Action",
@@ -124,3 +126,15 @@ def error_of(named: Mapping[str, Any], message: str, cause: BaseException | None
         "unavailable": UrsulaUnavailableError,
     }.get(str(named.get("class")), UrsulaSetupError)
     return cls(message, kind, action, fix=fix if isinstance(fix, str) else None, cause=cause)
+
+
+E = TypeVar("E", bound=BaseException)
+
+
+def again(error: E) -> E:
+    """A copy of ``error``, an error the package keeps, to raise once more: with its cause and
+    without a traceback. Each raise of one object adds its frames to that object's
+    ``__traceback__``, which a retry loop grows without end and threads change at once."""
+    raised = copy.copy(error)
+    raised.__cause__ = error.__cause__
+    return raised

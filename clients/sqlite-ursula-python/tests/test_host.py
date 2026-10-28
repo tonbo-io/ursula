@@ -1,13 +1,16 @@
-"""The host check: ``python -m sqlite_ursula`` says whether this Python can host the extension,
-and a library SQLite cannot load fails the first call as ``local_setup``. The refusal of a SQLite
-older than the extension's floor (``host_unsupported``) runs in CI on ``python:3.13-slim``, whose
-SQLite is older."""
+"""The host check: ``python -m sqlite_ursula`` says whether this Python can host the extension, an
+install without a library is ``host_unsupported`` naming ``SQLITE_URSULA_VFS``, and a library
+SQLite cannot load fails the first call as ``local_setup``. The refusal of a SQLite older than the
+extension's floor (``host_unsupported``) runs in CI on ``python:3.13-slim``, whose SQLite is older,
+and the refusal of Windows on Windows."""
 
 from __future__ import annotations
 
 import subprocess
 import sys
 
+import pytest
+from conftest import SRC
 from conftest import env
 
 
@@ -41,3 +44,12 @@ def test_a_library_sqlite_cannot_load_is_local_setup():
     )
     out = run("-c", script, SQLITE_URSULA_VFS="/nonexistent/libsqlite_ursula_vfs.so")
     assert out.stdout.split() == ["local_setup", "fix"], out.stdout + out.stderr
+
+
+def test_an_install_without_a_library_is_host_unsupported_naming_sqlite_ursula_vfs():
+    if (SRC / "sqlite_ursula" / "_lib").exists():
+        pytest.skip("this checkout carries a library")
+    out = run("-m", "sqlite_ursula", SQLITE_URSULA_VFS="")
+    assert out.returncode == 1, out.stdout + out.stderr
+    assert "result: host_unsupported" in out.stdout
+    assert "fix: set SQLITE_URSULA_VFS to a library built from clients/sqlite-vfs" in out.stdout

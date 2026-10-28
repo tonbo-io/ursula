@@ -3,13 +3,17 @@
 An open binds with ``ursula_open`` at timeout 0 and waits on the events thread while the bind
 goes on, as Node's does. The extension shares one bind between concurrent opens of a stream,
 from any thread. Its own deadline for the bind is far past ``timeout``, which governs the open: on
-the timeout, or on Ctrl-C, the open cancels the bind (``ursula_cancel``).
+the timeout, or on Ctrl-C or any other exception once the request is known, the open cancels the
+bind (``ursula_cancel``).
+
+``autocommit=False`` (Python 3.12 or newer) is refused. In that mode the connection is always in
+a transaction: CPython runs its own ROLLBACK after a refused COMMIT, which hides the refusal, and a
+connection kept open holds a read snapshot after any SELECT, which stops checkpoints of the WAL.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 import time
@@ -19,6 +23,9 @@ from typing import Any
 
 from . import _control
 from . import _events
+from ._args import flag
+from ._args import invalid
+from ._args import seconds
 from ._connection import UrsulaConnection
 from .errors import UrsulaError
 from .errors import UrsulaSetupError
@@ -36,24 +43,6 @@ DEFAULT_IMPORT_S = 600.0
 DEFAULT_BUSY_S = 5.0
 #: ``sqlite3.connect`` arguments ``open`` decides itself.
 OWN = frozenset({"database", "uri"})
-
-
-def invalid(message: str) -> UrsulaSetupError:
-    return UrsulaSetupError(f"invalid_argument: {message}", "invalid_argument", "fix")
-
-
-def _seconds(name: str, value: object, *, positive: bool) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
-        raise invalid(f"{name} must be a number of seconds, not {value!r}")
-    if value < 0 or (positive and value == 0):
-        raise invalid(f"{name} must be {'positive' if positive else 'zero or more'}, not {value!r}")
-    return float(value)
-
-
-def _flag(name: str, value: object) -> bool:
-    if not isinstance(value, bool):
-        raise invalid(f"{name} must be a boolean, not {value!r}")
-    return value
 
 
 def _url(url: object) -> str:
@@ -115,7 +104,9 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
       connections of a binding share its files.
     - Every other keyword goes to ``sqlite3.connect``. ``check_same_thread`` is ``False`` unless
       given, since frameworks run statements on threads of their own. A ``factory`` must be a
-      subclass of :class:`UrsulaConnection`.
+      subclass of :class:`UrsulaConnection`. ``autocommit=False`` is refused: in that mode the
+      connection is always in a transaction, so a refused COMMIT would be hidden by CPython's own
+      ROLLBACK, and a connection kept open would hold a read snapshot that stops checkpoints.
 
     Returns an :class:`UrsulaConnection`, a ``sqlite3.Connection`` subclass. Statements are local:
     commit, then call ``db.synced()`` before anything outside the process acts on what you wrote or
@@ -138,15 +129,21 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
                 f"max_pending_bytes must be a whole number of bytes, not {max_pending_bytes!r}"
             )
         settings["max_pending_bytes"] = max_pending_bytes
-    if _flag("recreate", recreate):
+    if flag("recreate", recreate):
         settings["recreate"] = True
-    if _flag("read_only", read_only):
+    if flag("read_only", read_only):
         # With `recreate` too, the extension refuses it: `invalid_argument`.
         settings["read_only"] = True
-    limit = _seconds("timeout", timeout, positive=True)
-    busy = _seconds("busy_timeout", busy_timeout, positive=False)
+    limit = seconds("timeout", timeout, positive=True)
+    busy = seconds("busy_timeout", busy_timeout, positive=False)
     for key in OWN.intersection(connect_kwargs):
         raise invalid(f"open() decides sqlite3.connect's {key}")
+    if connect_kwargs.get("autocommit") is False:
+        raise invalid(
+            "autocommit=False keeps the connection in a transaction, where a refused COMMIT is "
+            "hidden by the ROLLBACK that follows it: use the default transaction control, "
+            "isolation_level=None, or autocommit=True"
+        )
     factory = connect_kwargs.pop("factory", UrsulaConnection)
     if not (isinstance(factory, type) and issubclass(factory, UrsulaConnection)):
         raise invalid(f"factory must be a subclass of UrsulaConnection, not {factory!r}")
@@ -162,29 +159,44 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
 
 def _bind(stream: str, root: str | None, options: str, timeout: float) -> dict[str, Any]:
     """Binds ``stream``: ``ursula_open`` with timeout 0, waiting on the events thread while it goes
-    on."""
+    on.
+
+    Any exception once the request is known (Ctrl-C included, which Python delivers right after
+    the call returns) cancels it, so no bind goes on to claim the stream after the open gave up.
+    """
     deadline = time.monotonic() + timeout
     while True:
+        opened: dict[str, Any] | None = None
+        ev: _events.Events | None = None
+        waiter = None
         try:
-            opened, ev, waiter = _events.wait_open(
-                lambda: _control.call("SELECT ursula_open(?, ?, ?, 0)", stream, root, options)
-            )
-        except UrsulaUnavailableError as error:
+            with _control.lock():
+                # The thread first, so its cursor precedes the request, and the waiter registered
+                # in the step that got the request, before any event about it applies.
+                ev = _events.events()
+                opened = _control.call("SELECT ursula_open(?, ?, ?, 0)", stream, root, options)
+                if opened["done"]:
+                    return opened
+                waiter = ev.wait_open(int(opened["request"]))
+            left = deadline - time.monotonic()
+            woke = left > 0 and waiter.wait(left)
+        except BaseException as error:
+            if opened is not None and not opened["done"]:
+                request = int(opened["request"])
+                if ev is not None and waiter is not None:
+                    ev.forget_open(request, waiter)
+                _give_up(stream, request, timeout)
+                raise
             # Another thread's open of the stream, which this one shared, was cancelled.
-            if error.kind == "cancelled" and time.monotonic() < deadline:
+            if (
+                isinstance(error, UrsulaUnavailableError)
+                and error.kind == "cancelled"
+                and time.monotonic() < deadline
+            ):
                 continue
             raise
-        if ev is None or waiter is None:
-            return opened
-        request = int(opened["request"])
-        left = deadline - time.monotonic()
-        try:
-            woke = left > 0 and waiter.wait(left)
-        except BaseException:
-            ev.forget_open(request, waiter)
-            _give_up(stream, request, timeout)
-            raise
         if not woke:
+            request = int(opened["request"])
             ev.forget_open(request, waiter)
             raise _give_up(stream, request, timeout)
 
@@ -270,7 +282,7 @@ def import_sqlite(
     """
     stream = _url(url)
     chosen = _token(token)
-    limit = _seconds("timeout", timeout, positive=True)
+    limit = seconds("timeout", timeout, positive=True)
     source = os.fspath(file)
     settings = {} if chosen is None else {"token": chosen}
     _control.start()

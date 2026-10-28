@@ -1,8 +1,8 @@
 """``synced()`` and the events thread against the model server, whose faults hold the stream's
 answers back: it returns once the stream holds every commit made before the call, resolves any
 number of waiting threads through one watermark, gives up at its timeout and at Ctrl-C while the
-commits keep replicating, asks again for what a gap in the events may have dropped, and survives
-the loss of its events thread."""
+commits keep replicating, covers its own database alone, asks again for what a gap in the events
+may have dropped, and survives the loss of its events thread until the third in a row."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import time
 import pytest
 
 import sqlite_ursula
+from sqlite_ursula import UrsulaSetupError
 from sqlite_ursula import _control
 from sqlite_ursula import _events
 
@@ -84,6 +85,34 @@ def test_gives_up_at_its_timeout_while_the_commits_keep_replicating(model, fresh
     db.synced()
     assert model.frames(s.path) == {"claims": 1, "commits": 2}
     db.close()
+
+
+def test_refuses_a_timeout_it_cannot_take_as_invalid_argument(model, fresh):
+    _, db = opened(model, fresh, "bad-timeout")
+    for timeout in (-1, "5", float("nan"), True):
+        with pytest.raises(UrsulaSetupError) as invalid:
+            db.synced(timeout=timeout)
+        assert (invalid.value.kind, invalid.value.action) == ("invalid_argument", "fix"), timeout
+    db.synced(timeout=30)
+    db.close()
+
+
+def test_covers_its_own_database_alone(model, fresh):
+    _, slow = opened(model, fresh, "own-slow")
+    _, fast = opened(model, fresh, "own-fast")
+    model.fault("delay 2000", 1, "POST")
+    slow.execute("INSERT INTO t VALUES (1)")
+    # The slow database's append goes out first and takes the delay.
+    time.sleep(0.2)
+    fast.execute("INSERT INTO t VALUES (1)")
+    started = time.monotonic()
+    fast.synced()
+    assert time.monotonic() - started < 1.5
+    assert slow.status()["commits"]["pending"] == 1
+    slow.synced()
+    assert slow.status()["commits"]["pending"] == 0
+    slow.close()
+    fast.close()
 
 
 def test_ctrl_c_interrupts_it(model, fresh):
@@ -157,4 +186,47 @@ def test_a_lost_events_thread_is_replaced_and_its_waits_go_on(model, fresh):
     assert failed == []
     assert _events.events() is not first
     db.synced()
+    db.close()
+
+
+def test_after_the_third_lost_events_thread_in_a_row_waits_fail_internal(model, fresh):
+    _, db = opened(model, fresh, "lost")
+    model.fault("delay 5000", 1, "POST")
+    db.execute("INSERT INTO t VALUES (1)")
+    failed: list[BaseException] = []
+
+    def wait() -> None:
+        try:
+            db.synced(timeout=30)
+        except BaseException as e:
+            failed.append(e)
+
+    waiters = [threading.Thread(target=wait) for _ in range(2)]
+    for t in waiters:
+        t.start()
+    time.sleep(0.1)
+    dead = sqlite3.connect(":memory:")
+    dead.close()
+    try:
+        with _control.lock():
+            # Two threads were lost in a row before this one.
+            _events._failures = _events.MAX_FAILURES - 1
+            _events.events().conn = dead
+        for t in waiters:
+            t.join(30)
+        assert len(failed) == 2
+        for error in failed:
+            assert isinstance(error, UrsulaSetupError)
+            assert (error.kind, error.action) == ("internal", "reopen")
+        # Each waiter raised an error of its own.
+        assert failed[0] is not failed[1]
+        with pytest.raises(UrsulaSetupError) as later:
+            db.synced(timeout=30)
+        assert later.value.kind == "internal"
+    finally:
+        with _control.lock():
+            _events._failures = 0
+    # A new thread starts at the next call once the failures are cleared.
+    db.synced()
+    assert db.status()["commits"]["pending"] == 0
     db.close()

@@ -4,7 +4,8 @@ name: Integration
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against the
 # model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three,
 # its parts suites through three nodes behind the gateway with an S3 cold store, and the Python
-# package's suites against the model on uv-managed CPython and Alpine and against one `ursula` node.
+# package's suites against the model on uv-managed CPython and Alpine and against one `ursula` node,
+# with its host check on Windows.
 # S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
 # PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
@@ -395,7 +396,8 @@ jobs:
   # The Python package (clients/sqlite-ursula-python) against the model server, on uv-managed
   # CPython, whose SQLite is new enough and loads extensions: the oldest supported minor, the
   # newest, and the newest free-threaded. uv is pinned, and with it the Python builds it installs.
-  # The 3.14 leg also lints, checks that a wheel finds the library it carries, and checks that
+  # The 3.14 leg also lints, checks that a wheel finds the library it carries and that a
+  # uv-managed CPython on Debian hosts it as recipes/Dockerfile.uv installs it, and checks that
   # python:3.13-slim, whose SQLite is older than the extension's floor, fails with
   # host_unsupported and says what to use instead.
   sqlite-ursula-python:
@@ -460,6 +462,24 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m sqlite_ursula | tee doctor.txt
           grep -q "(bundled)$" doctor.txt
 
+      - name: A uv-managed CPython on debian:trixie-slim hosts the wheel, as recipes/Dockerfile.uv installs it
+        if: matrix.python == '3.14'
+        env:
+          IMAGE: public.ecr.aws/docker/library/debian:trixie-slim
+        run: |
+          set -euo pipefail
+          # The recipe's steps, with the runner's uv (the pinned 0.13.6, as the recipe's) and the
+          # wheel the step above built.
+          docker run --rm -v "$(command -v uv):/usr/local/bin/uv:ro" -v "$RUNNER_TEMP/dist:/dist:ro" \
+            -e UV_PYTHON_PREFERENCE=only-managed -e UV_PYTHON_INSTALL_DIR=/opt/python -e VIRTUAL_ENV=/opt/venv \
+            "$IMAGE" sh -euc '
+              uv venv --python 3.13 /opt/venv
+              uv pip install --no-cache /dist/sqlite_ursula-*.whl
+              cd /
+              /opt/venv/bin/python -m sqlite_ursula
+            ' | tee recipe.txt
+          grep -q "^result: ok" recipe.txt
+
       - name: python:3.13-slim cannot host the extension, and says what to use instead
         if: matrix.python == '3.14'
         env:
@@ -472,8 +492,48 @@ jobs:
           echo "$out"
           test "$status" -eq 1
           grep -q "^result: host_unsupported" <<<"$out"
-          grep -q "needs SQLite 3.50.4 or newer" <<<"$out"
+          grep -q "sqlite-ursula-vfs needs SQLite [0-9.]* or newer" <<<"$out"
           grep -q "^fix: .*python:3.13-alpine" <<<"$out"
+
+  # The host check on Windows, which the extension has no VFS for: the package imports, and
+  # `python -m sqlite_ursula` and `open()` fail with host_unsupported, whose fix is WSL.
+  sqlite-ursula-python-windows:
+    name: sqlite-ursula-python (Windows host check)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: python -m sqlite_ursula and open() fail with host_unsupported
+        shell: bash
+        working-directory: clients/sqlite-ursula-python
+        env:
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          status=0
+          out=$(uv run --no-project --python 3.13 python -m sqlite_ursula) || status=$?
+          echo "$out"
+          test "$status" -eq 1
+          grep -q "^result: host_unsupported" <<<"$out"
+          grep -q "^fix: .*WSL" <<<"$out"
+          script='
+          import sqlite_ursula
+          try:
+              sqlite_ursula.open("http://127.0.0.1:9/a/b")
+          except sqlite_ursula.UrsulaSetupError as e:
+              print(e.kind, e.action)
+          '
+          # Python writes \r\n on Windows.
+          kind=$(uv run --no-project --python 3.13 python -c "$script" | tr -d '\r')
+          echo "$kind"
+          test "$kind" = "host_unsupported fix"
 
   # The Python suites on python:3.13-alpine (Alpine 3.23, SQLite 3.53), the image the Docker recipe
   # switches to: the extension and the model server are built there for musl, the extension

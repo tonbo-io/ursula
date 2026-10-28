@@ -9,27 +9,27 @@ db = sqlite_ursula.open("https://streams.example.com/acme/notes")
 db.execute("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)")
 db.execute("INSERT INTO notes(body) VALUES (?)", ("hello",))
 db.commit()  # committed on this host
-db.synced()  # in the stream, and this process still owns it
+db.synced()  # this database's commits are in the stream, and this process still owns it
 send(reply)
 ```
 
 **The one rule:** before anything outside the process acts on what you wrote or read (a response, a queue acknowledgement, a call to another service), call `db.synced()`.
 
-A commit is local. The extension appends it to a log it owns and replicates the log to the stream in the background, on threads of its own. `synced()` returns once the stream holds every commit the process made before the call, and a round trip that started after the call found this process still the owner. Scripts call it before they exit.
+A commit is local. The extension appends it to a log it owns and replicates the log to the stream in the background, on threads of its own. `synced()` returns once the stream holds every commit the process made on that database before the call, and a round trip that started after the call found this process still the owner. Scripts call it before they exit.
 
 ## Hosts
 
-The extension loads into the `sqlite3` module's own SQLite and becomes its default VFS, so every `sqlite3.connect(path)` of a bound database in the process replicates, a framework's included. That takes a Python whose `sqlite3` loads extensions and runs SQLite 3.50.4 or newer.
+The extension loads into the `sqlite3` module's own SQLite and becomes its default VFS, so every `sqlite3.connect(path)` of a bound database in the process replicates, a framework's included. That takes a Python whose `sqlite3` loads extensions and runs a SQLite the extension supports. The extension's refusal of an older one names the version it needs.
 
 | Python | hosts the extension |
 | --- | --- |
 | uv-managed CPython (`uv python install`), Homebrew, conda-forge | yes |
 | `python:3.x-alpine` (Alpine 3.23 or newer) | yes, on x64 |
-| `python:3.x-slim`, Debian and Ubuntu `apt`, RHEL and UBI, Amazon Linux, Colab | no: SQLite older than 3.50.4 |
+| `python:3.x-slim`, Debian and Ubuntu `apt`, RHEL and UBI, Amazon Linux, Colab | no: SQLite older than the extension supports |
 | the python.org macOS installer, Apple's `/usr/bin/python3`, pyenv's default build | no: built without loadable extensions |
 | Windows | no: use WSL |
 
-On a Python that cannot host it, `open()` raises `UrsulaSetupError` with kind `host_unsupported`, whose `fix` names a Python that can. `python -m sqlite_ursula` runs the same check and prints what it found.
+On a Python that cannot host it, `open()` raises `UrsulaSetupError` with kind `host_unsupported`, whose `fix` says what to do for that reason: a Python that can host it, WSL on Windows, or `SQLITE_URSULA_VFS` where the install carries no library. `python -m sqlite_ursula` runs the same check and prints what it found.
 
 ### Docker
 
@@ -52,6 +52,7 @@ On macOS, use uv or Homebrew.
 - `token` is the bearer token requests carry. One token per process: `set_token(token)` replaces it, and `set_token(None)` goes back to `URSULA_VFS_TOKEN_FILE`.
 - The open gives up after `timeout` seconds (30 by default) with `UrsulaUnavailableError`, whose kind is the last condition it met. Ctrl-C cancels it too.
 - `busy_timeout` is `sqlite3.connect`'s `timeout`, 5 seconds by default, since a binding's connections share its files. The other keywords go to `sqlite3.connect`. `check_same_thread` is `False` unless given.
+- `autocommit=False` (Python 3.12 or newer) is refused with `invalid_argument`. In that mode the connection is always in a transaction: CPython's own `ROLLBACK` after a refused `COMMIT` would hide the refusal, and a connection kept open would hold a read snapshot that stops checkpoints. Use the default transaction control, `isolation_level=None` or `autocommit=True`.
 - `read_only=True` claims nothing and never fences the owner, and writes fail with `SQLITE_READONLY`.
 - `db.close()` closes the connection. Once a binding's last connection closes, replication drains in the background and the binding retires. Keep `db` open while a framework uses `db.path`.
 
@@ -62,7 +63,7 @@ db = sqlite_ursula.open(url)
 other = sqlite3.connect(db.path)  # a framework's own connection: it replicates too
 ```
 
-`synced()` covers every connection of the process on every database. It raises `TimeoutError` after `timeout` seconds while the commits keep replicating, and `UrsulaResetError` on a reset. Network failures never raise from it: it waits. Ctrl-C interrupts it.
+`synced()` covers every connection of the process on this database (`db.path`), a framework's included, and no other: gate each database an output depends on. A negative or non-numeric `timeout` is `invalid_argument`. It raises `TimeoutError` after `timeout` seconds while the commits keep replicating, and `UrsulaResetError` on a reset. Network failures never raise from it: it waits. Ctrl-C interrupts it.
 
 `import_sqlite(url, file, *, token, timeout)` makes a plain SQLite file with 4096-byte pages the first snapshot of a new stream, then `open()` it as any other.
 
@@ -83,7 +84,7 @@ A reset rejects the database's pending `synced()` calls first, then runs its `on
 
 ## Forks
 
-Open databases after a fork, never before: the extension's replication does not survive `fork()`. In a child forked after its parent opened a database, every call of the package raises `forked`, statements of inherited connections included. Importing the package before the fork is fine. Use gunicorn's `post_fork` hook, Celery's `worker_process_init` signal, or multiprocessing's `spawn` or `forkserver` start method.
+Open databases after a fork, never before: the extension's replication does not survive `fork()`. In a child forked after its parent opened a database, `open()`, `import_sqlite()` and `set_token()` raise `forked`, and so do the statements, transactions, `synced()`, `status()` and `on_reset()` of an inherited `UrsulaConnection`, whose `close()` does nothing. Its other `sqlite3.Connection` methods (`backup`, `blobopen`, `serialize` and the like) and a framework's own connections on `db.path` are not the package's to guard: the extension fails their I/O on a bound file in the child. Importing the package before the fork is fine. Use gunicorn's `post_fork` hook, Celery's `worker_process_init` signal, or multiprocessing's `spawn` or `forkserver` start method.
 
 ## The extension
 

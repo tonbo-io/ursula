@@ -19,8 +19,9 @@ control lock:
 
 The thread takes its cursor before any request or ticket is handed out, and requests and tickets
 are registered under the lock in the same step that asks for them, so no event about one applies
-before it is registered. A thread that fails is replaced, handing its pending tickets to the new
-one as a gap would. After three failures in a row, waits fail.
+before it is registered. A thread that fails is replaced while tickets wait or connections are
+open, and the new one starts with a gap, since events may have passed between the two. After three
+failures in a row, waits fail ``internal``.
 """
 
 from __future__ import annotations
@@ -29,13 +30,14 @@ import logging
 import os
 import threading
 import weakref
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 from typing import Any
 
+from . import _args
 from . import _control
 from .errors import UrsulaResetError
 from .errors import UrsulaSetupError
+from .errors import again
 from .errors import error_of
 
 if TYPE_CHECKING:
@@ -240,9 +242,10 @@ class Events:
         _fire(hit)
 
     def _fail(self) -> None:
-        """The thread is gone: pending opens ask again, and pending tickets move to a new thread.
-        After :data:`MAX_FAILURES` failures in a row the tickets fail instead, and so does every
-        later call."""
+        """The thread is gone: pending opens ask again, and while tickets wait or connections are
+        open a new thread starts with a gap, since events may have passed between the two. After
+        :data:`MAX_FAILURES` failures in a row the tickets fail instead, and so does every later
+        call."""
         global _current, _failures
         with _control.lock():
             if self._failed:
@@ -253,17 +256,17 @@ class Events:
                 _current = None
             for request in list(self._opens):
                 self._wake(request)
-            if not _tickets:
+            if not _tickets and not _live():
                 return
             try:
-                events()
+                replacement = events()
             except Exception as error:
                 pending = list(_tickets.values())
                 _tickets.clear()
                 for t in pending:
                     t.reject(error)
                 return
-            _reissue()
+            replacement._gap()
 
 
 def events() -> Events:
@@ -283,9 +286,10 @@ def events() -> Events:
 
 
 def synced(path: str, timeout: float | None) -> None:
-    """Waits until the stream holds every commit of the process logged before the call, for at
-    most ``timeout`` seconds (``None``: no limit). Raises ``TimeoutError`` on the timeout, and the
-    reset error on a reset."""
+    """Waits until the stream holds every commit of the database at ``path`` that the process
+    logged before the call, for at most ``timeout`` seconds (``None``: no limit). Raises
+    ``TimeoutError`` on the timeout, and the reset error on a reset."""
+    limit = None if timeout is None else _args.seconds("timeout", timeout, positive=False)
     with _control.lock():
         # Started before the call, so its events cursor precedes the ticket.
         events()
@@ -295,7 +299,7 @@ def synced(path: str, timeout: float | None) -> None:
         t = Ticket(path)
         _tickets[int(answer["ticket"])] = t
     try:
-        if not t.done.wait(timeout):
+        if not t.done.wait(limit):
             raise TimeoutError(
                 f"synced() gave up after {timeout} s: the commits keep replicating, so call it "
                 "again to wait for them"
@@ -307,28 +311,21 @@ def synced(path: str, timeout: float | None) -> None:
                     del _tickets[ticket]
         raise
     if t.error is not None:
-        raise t.error
-
-
-def wait_open(call: Callable[[], Any]) -> tuple[Any, Events | None, threading.Event | None]:
-    """Runs ``call`` (an ``ursula_open`` with timeout 0) with the events thread started and the lock
-    held: its answer, and while it goes on, the thread and a waiter for its request."""
-    with _control.lock():
-        ev = events()
-        opened = call()
-        if opened["done"]:
-            return opened, None, None
-        return opened, ev, ev.wait_open(int(opened["request"]))
+        raise again(t.error)
 
 
 def _after_fork_in_child() -> None:
     global _current, _failures
     if _current is not None:
         _control._inherited.append(_current)
+    # The parent's connections stay referenced, so collecting one never closes a bound file in
+    # the child.
+    _control._inherited.extend(_live())
     _current = None
     _failures = 0
     _tickets.clear()
     _targets.clear()
 
 
-os.register_at_fork(after_in_child=_after_fork_in_child)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)

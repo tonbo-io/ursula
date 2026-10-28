@@ -1,7 +1,7 @@
 # An application image that can host sqlite-ursula, from python:3.13-slim in one line.
 #
-# sqlite-ursula needs a Python whose sqlite3 module loads extensions and runs SQLite 3.50.4 or
-# newer. python:3.13-slim runs Debian's SQLite, which is older, and fails with host_unsupported.
+# sqlite-ursula needs a Python whose sqlite3 module loads extensions and runs a SQLite the extension
+# supports. python:3.13-slim runs Debian's SQLite, which is older, and fails with host_unsupported.
 # Alpine 3.23 and newer ship a SQLite that is new enough, so the one change is the base image:
 #
 #   -FROM python:3.13-slim

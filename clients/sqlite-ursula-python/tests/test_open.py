@@ -1,10 +1,11 @@
 """``open()`` against the e2e server: it binds and claims the stream and returns a
 ``sqlite3.Connection`` subclass, later opens share the binding, a framework's own
 ``sqlite3.connect(db.path)`` replicates through the same binding, and what cannot succeed fails
-as a setup error or, past the timeout, as an unavailable one."""
+as a setup error or, past the timeout, as an unavailable one. Ctrl-C cancels an open."""
 
 from __future__ import annotations
 
+import signal
 import sqlite3
 import threading
 import time
@@ -130,6 +131,8 @@ def test_refuses_what_it_cannot_take_as_a_setup_error_to_fix(stream, fresh):
         {"read_only": "yes"},
         {"factory": sqlite3.Connection},
         {"uri": True},
+        # Always in a transaction, where CPython's ROLLBACK after a refused COMMIT hides it.
+        {"autocommit": False},
     ):
         with pytest.raises(UrsulaSetupError) as invalid:
             sqlite_ursula.open(stream.url, dir=fresh(), **kwargs)
@@ -149,3 +152,27 @@ def test_reports_the_last_condition_the_open_met_when_its_timeout_passes(fresh):
     assert time.monotonic() - started < 15
     assert gave_up.value.kind in ("unreachable", "cancelled")
     assert gave_up.value.action == "retry"
+
+
+def test_ctrl_c_cancels_an_open_and_the_stream_is_not_held(model, fresh):
+    from conftest import new_stream
+
+    s = new_stream(model, "interrupted")
+    root = fresh()
+    # The bind's answers are held back longer than the interrupt waits.
+    model.fault("delay 3000", 4)
+    main = threading.main_thread().ident
+    assert main == threading.get_ident()
+    timer = threading.Timer(0.3, signal.pthread_kill, (main, signal.SIGINT))
+    started = time.monotonic()
+    timer.start()
+    with pytest.raises(KeyboardInterrupt):
+        sqlite_ursula.open(s.url, dir=root)
+    assert time.monotonic() - started < 2.5
+    timer.join()
+    time.sleep(3.5)
+    db = sqlite_ursula.open(s.url, dir=root)
+    db.execute("CREATE TABLE t(x)")
+    db.commit()
+    db.synced()
+    db.close()

@@ -15,7 +15,13 @@ is active", which would replace the error the caller needs. So the connection re
 run through ``execute`` that finds no transaction then succeeds, since nothing is left to roll
 back. Through ``executescript``, which may hold more statements after it, it raises the remembered
 error instead, and so does a ``ROLLBACK TO`` or ``RELEASE`` that finds no savepoint. The legacy
-``rollback()`` method runs no ROLLBACK when no transaction is open.
+``rollback()`` method runs no ROLLBACK when no transaction is open. ``open()`` refuses
+``autocommit=False``, the mode in which the connection is always in a transaction (see ``_open``).
+
+In a child forked after the parent made the connection, its overridden calls raise ``forked``,
+and ``close()`` does nothing: the file and its locks are the parent's. Its other methods
+(``backup``, ``blobopen``, ``serialize`` and the like) are ``sqlite3.Connection``'s, and the
+extension guards the bound file under them.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from . import _control
 from . import _events
 from .errors import UrsulaError
 from .errors import UrsulaResetError
+from .errors import again
 
 log = logging.getLogger("sqlite_ursula")
 
@@ -147,7 +154,17 @@ class UrsulaConnection(sqlite3.Connection):
 
     def close(self) -> None:
         """Closes the connection. Once a binding's last connection closes, replication drains in the
-        background and the binding retires. Use ``open()`` to use the database again."""
+        background and the binding retires. Use ``open()`` to use the database again.
+
+        In a child forked after the parent made the connection it closes nothing, since a thread of
+        the parent may have held the file's locks at the fork, and keeps the connection so that
+        collecting it closes nothing either.
+        """
+        if self._inherited():
+            if not self._closed:
+                self._closed = True
+                _control._inherited.append(self)
+            return
         super().close()
         if not self._closed:
             self._closed = True
@@ -157,18 +174,20 @@ class UrsulaConnection(sqlite3.Connection):
     # What the extension adds.
 
     def synced(self, timeout: float | None = None) -> None:
-        """Returns once the stream holds every commit this process logged before the call, and a
-        round trip that started after the call found this process still the owner (design:
-        Synced). Call it before anything outside the process acts on what you wrote or read.
+        """Returns once the stream holds every commit this process logged on this database before
+        the call, and a round trip that started after the call found this process still the owner
+        (design: Synced). Call it before anything outside the process acts on what you wrote or
+        read.
 
-        It covers every connection of the process, a framework's on :attr:`path` included. It
-        raises ``TimeoutError`` after ``timeout`` seconds (``None``: no limit), while the commits
-        keep replicating, and an :class:`UrsulaResetError` on a reset. Network failures never
-        raise: it waits. Ctrl-C interrupts it. On a reader cache it returns at once.
+        It covers every connection of the process on this database (:attr:`path`), a framework's
+        included, and no other database: gate each one an output depends on. It raises
+        ``TimeoutError`` after ``timeout`` seconds (``None``: no limit), while the commits keep
+        replicating, and an :class:`UrsulaResetError` on a reset. Network failures never raise: it
+        waits. Ctrl-C interrupts it. On a reader cache it returns at once.
         """
         self._check_fork()
         if self._reset is not None:
-            raise self._reset
+            raise again(self._reset)
         try:
             _events.synced(self.path, timeout)
         except UrsulaResetError as error:
@@ -183,13 +202,15 @@ class UrsulaConnection(sqlite3.Connection):
 
     def on_reset(self, callback: ResetCallback) -> ResetCallback:
         """Runs ``callback`` once when the database is reset, with the reset error, after its
-        pending ``synced()`` calls raised it. It runs on a thread of the package's. Returns
+        pending ``synced()`` calls were rejected. It runs on a thread of the package's. Returns
         ``callback``, so it serves as a decorator."""
+        self._check_fork()
         self._listeners.append(callback)
         return callback
 
     def off_reset(self, callback: ResetCallback) -> None:
         """Removes a callback :meth:`on_reset` added."""
+        self._check_fork()
         if callback in self._listeners:
             self._listeners.remove(callback)
 
@@ -218,8 +239,12 @@ class UrsulaConnection(sqlite3.Connection):
 
     # Classification.
 
+    def _inherited(self) -> bool:
+        """Whether the connection is the parent's: bound before a fork this process came from."""
+        return self._bound and self._generation != _control.generation()
+
     def _check_fork(self) -> None:
-        if self._bound and self._generation != _control.generation():
+        if self._inherited():
             raise _control.forked_error()
 
     def _in_transaction(self) -> bool:
@@ -254,7 +279,7 @@ class UrsulaConnection(sqlite3.Connection):
                     self._rolled_back = None
                     return rolled_back()
                 if message == NO_TRANSACTION or message.startswith(NO_SAVEPOINT):
-                    raise remembered from remembered.__cause__
+                    raise again(remembered) from remembered.__cause__
             classified = self._classify(error)
             if isinstance(classified, UrsulaError) and not self._in_transaction():
                 self._rolled_back = classified

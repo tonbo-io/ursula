@@ -1,7 +1,8 @@
 """Errors through ``ursula_classify``: a takeover resets the old owner (its ``synced()`` raises,
 then its ``on_reset`` callbacks run once, and every statement raises the reset), a refused write
 fails alone, and SQLite's own errors stay SQLite's. Refused writes and resets are
-``sqlite3.OperationalError`` too, and a transaction helper's ROLLBACK after one does not hide it.
+``sqlite3.OperationalError`` too, a refusal met partway through a statement's rows is classified
+where it surfaced, and a transaction helper's ROLLBACK after one does not hide it.
 """
 
 from __future__ import annotations
@@ -124,6 +125,16 @@ def test_refuses_a_write_past_max_pending_bytes_and_keeps_it_across_a_helpers_ro
     assert (refused.value.kind, refused.value.action) == ("backlog_full", "retry")
     assert refused.value.sqlite_errorcode == SQLITE_IOERR_AUTH
 
+    # A statement with RETURNING commits once its last row is read, so the refusal surfaces from
+    # the fetch, or from the iteration, partway through its rows.
+    rows = db.execute("INSERT INTO t VALUES (7) RETURNING x")
+    with pytest.raises(UrsulaWriteRefusedError) as fetched:
+        rows.fetchall()
+    assert fetched.value.kind == "backlog_full"
+    with pytest.raises(UrsulaWriteRefusedError) as iterated:
+        list(db.execute("INSERT INTO t VALUES (8), (9) RETURNING x"))
+    assert iterated.value.kind == "backlog_full"
+
     # A transaction helper's ROLLBACK after the refused COMMIT does not hide it.
     with pytest.raises(UrsulaWriteRefusedError) as manual:
         try:
@@ -143,6 +154,12 @@ def test_refuses_a_write_past_max_pending_bytes_and_keeps_it_across_a_helpers_ro
     legacy = sqlite_ursula.open(s.url, dir=root)
     with pytest.raises(UrsulaWriteRefusedError), legacy:
         legacy.execute("INSERT INTO t VALUES (5)")
+    assert not legacy.in_transaction
+    # And rollback() after a refused commit() finds nothing to roll back, and succeeds.
+    legacy.execute("INSERT INTO t VALUES (5)")
+    with pytest.raises(UrsulaWriteRefusedError):
+        legacy.commit()
+    legacy.rollback()
     assert not legacy.in_transaction
 
     db.synced()

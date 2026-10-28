@@ -11,7 +11,7 @@ in the background. ``db.synced()`` is the output gate::
     db.execute("CREATE TABLE IF NOT EXISTS notes(body TEXT)")
     db.execute("INSERT INTO notes VALUES (?)", ("hello",))
     db.commit()
-    db.synced()  # in the stream, and this process still owns it
+    db.synced()  # this database's commits are in the stream, and this process still owns it
 
 Module map:
 
@@ -25,6 +25,7 @@ Module map:
 - ``_connection``: :class:`UrsulaConnection`, the ``sqlite3.Connection`` subclass ``open``
   returns, and its cursor, whose statements classify their errors.
 - ``_open``: :func:`open`, :func:`import_sqlite` and :func:`set_token`.
+- ``_args``: the checks of their arguments, and of ``synced()``'s, as ``invalid_argument``.
 - ``_doctor``: ``python -m sqlite_ursula``, which says whether this Python can host the extension.
 - ``errors``: the four error classes.
 """

@@ -22,18 +22,32 @@ from .errors import UrsulaSetupError
 #: Where the README explains the hosts, with the Docker recipes.
 HOSTS_URL = "https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula-python#hosts"
 
-#: What ``host_unsupported`` says to do.
-FIX = (
-    "use a Python whose sqlite3 module loads extensions and runs SQLite 3.50.4 or newer: a "
-    "uv-managed CPython (uv python install 3.13, then uv venv --managed-python), Homebrew's or "
-    "conda-forge's, or the python:3.13-alpine image in Docker instead of python:3.13-slim "
+#: ``host_unsupported``'s fix for a Python whose ``sqlite3`` cannot host the extension. It names no
+#: SQLite version: the extension's refusal, in the error's message, names the one it needs.
+OTHER_PYTHON = (
+    "use a Python whose sqlite3 module loads extensions and runs a SQLite the extension "
+    "supports: a uv-managed CPython (uv python install 3.13, then uv venv --managed-python), "
+    "Homebrew's or conda-forge's, or the python:3.13-alpine image in Docker instead of "
+    f"python:3.13-slim ({HOSTS_URL}). python -m sqlite_ursula checks a Python."
+)
+#: ``host_unsupported``'s fix on a platform the extension has no VFS for.
+UNDER_WSL = (
+    "run the application under WSL, with a Python there that can host the extension "
     f"({HOSTS_URL}). python -m sqlite_ursula checks a Python."
+)
+#: ``host_unsupported``'s fix for an install that carries no library.
+OWN_LIBRARY = (
+    "set SQLITE_URSULA_VFS to a library built from clients/sqlite-vfs, or install on a platform "
+    "with a prebuilt one: Linux x64 and arm64 with glibc, Linux x64 with musl, macOS arm64. In "
+    "Docker on arm64, use a uv-managed CPython on a glibc base, as recipes/Dockerfile.uv does "
+    f"({HOSTS_URL})."
 )
 
 #: The library's file name on each platform the extension supports.
 FILES = {"linux": "libsqlite_ursula_vfs.so", "darwin": "libsqlite_ursula_vfs.dylib"}
 
-#: The start of the extension's refusals of a host SQLite (clients/sqlite-vfs `GateRefusal`).
+#: The start of every refusal of the extension to load into a host's SQLite (clients/sqlite-vfs
+#: `GateRefusal`, design: SQL functions), which its unit tests pin.
 REFUSAL = "sqlite-ursula-vfs needs "
 
 
@@ -46,9 +60,10 @@ class Library:
     source: Literal["SQLITE_URSULA_VFS", "bundled"]
 
 
-def unsupported(why: str) -> UrsulaSetupError:
-    """``host_unsupported``: this Python cannot host the extension, for the reason ``why``."""
-    return UrsulaSetupError(f"host_unsupported: {why}: {FIX}", "host_unsupported", "fix", fix=FIX)
+def unsupported(why: str, fix: str) -> UrsulaSetupError:
+    """``host_unsupported``: this Python cannot host the extension, for the reason ``why``, and
+    ``fix`` says what to do about that reason."""
+    return UrsulaSetupError(f"host_unsupported: {why}: {fix}", "host_unsupported", "fix", fix=fix)
 
 
 def library() -> Library:
@@ -62,15 +77,11 @@ def library() -> Library:
         return Library(chosen, "SQLITE_URSULA_VFS")
     name = FILES.get(sys.platform)
     if name is None:
-        raise unsupported(
-            f"the extension has no VFS for {sys.platform} (on Windows, run under WSL)"
-        )
+        raise unsupported(f"the extension has no VFS for {sys.platform}", UNDER_WSL)
     bundled = Path(__file__).parent / "_lib" / name
     if not bundled.is_file():
         raise unsupported(
-            "this install of sqlite-ursula carries no extension for this platform "
-            "(prebuilt: Linux x64 and arm64 with glibc, Linux x64 with musl, macOS arm64), "
-            "so set SQLITE_URSULA_VFS to one built from clients/sqlite-vfs"
+            "this install of sqlite-ursula carries no extension for this platform", OWN_LIBRARY
         )
     return Library(str(bundled), "bundled")
 
@@ -90,14 +101,15 @@ def load(conn: sqlite3.Connection, lib: Library) -> None:
     if not loads_extensions():
         raise unsupported(
             "this Python's sqlite3 module was built without loadable extensions, as the "
-            "python.org macOS installer's, Apple's and pyenv's default builds are"
+            "python.org macOS installer's, Apple's and pyenv's default builds are",
+            OTHER_PYTHON,
         )
     conn.enable_load_extension(True)
     try:
         conn.load_extension(lib.path)
     except sqlite3.OperationalError as error:
         if REFUSAL in str(error):
-            raise unsupported(str(error)) from error
+            raise unsupported(str(error), OTHER_PYTHON) from error
         raise UrsulaSetupError(
             f"local_setup: SQLite could not load the sqlite-ursula extension at {lib.path} "
             f"({error})",

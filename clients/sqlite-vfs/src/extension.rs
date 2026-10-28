@@ -542,6 +542,9 @@ unsafe fn init(
 pub(crate) const MIN_SQLITE: c_int = 3_050_004;
 
 /// Why the extension refuses to load into the host's SQLite.
+///
+/// Every refusal reads `sqlite-ursula-vfs needs ...`: hosts match that prefix to tell a SQLite the
+/// extension refuses from a library SQLite cannot load (design: SQL functions).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum GateRefusal {
     #[error(
@@ -552,7 +555,7 @@ pub(crate) enum GateRefusal {
     TooOld(c_int),
     #[error("sqlite-ursula-vfs needs WAL mode, which the host's SQLite omits (SQLITE_OMIT_WAL)")]
     NoWal,
-    #[error("the host's SQLite lacks {0}")]
+    #[error("sqlite-ursula-vfs needs {0}, which the host's SQLite lacks")]
     MissingRoutine(&'static str),
 }
 
@@ -643,6 +646,7 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
 mod tests {
     use std::sync::Arc;
 
+    use super::GateRefusal;
     use super::MIN_SQLITE;
     use super::function_error;
     use super::version;
@@ -683,6 +687,30 @@ mod tests {
              databases after the fork"
         );
         assert_eq!(Error::Forked.kind().action(), Action::Fix);
+    }
+
+    // Hosts tell the extension's refusal of their SQLite by this prefix, whatever the reason.
+    #[test]
+    fn every_gate_refusal_reads_as_the_prefix_hosts_match() {
+        let refusals = [
+            GateRefusal::TooOld(3_045_001),
+            GateRefusal::NoWal,
+            GateRefusal::MissingRoutine("sqlite3_libversion_number"),
+        ];
+        for refusal in &refusals {
+            // A new variant fails to compile here: add it to the list as well.
+            match refusal {
+                GateRefusal::TooOld(_) | GateRefusal::NoWal | GateRefusal::MissingRoutine(_) => {}
+            }
+            assert!(
+                refusal.to_string().starts_with("sqlite-ursula-vfs needs "),
+                "{refusal}"
+            );
+        }
+        assert_eq!(
+            GateRefusal::TooOld(3_045_001).to_string(),
+            "sqlite-ursula-vfs needs SQLite 3.50.4 or newer, the host runs 3.45.1"
+        );
     }
 
     // The floor is Node 22.19.0's SQLite.

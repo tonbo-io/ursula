@@ -8,9 +8,11 @@ timeout 0, or on a connection of its own), so one lock serializes them. The even
 before any event about it applies.
 
 A fork copies the process without its threads. A child forked after the parent started the
-extension (an open or an import) is marked forked, and every call of the package in it raises
-``forked`` at once, before it could touch a lock that another thread of the parent held at the
-fork. A child forked before that starts the extension as any process does.
+extension (an open or an import) is marked forked, and the package's calls in it (``open``,
+``import_sqlite``, ``set_token``) raise ``forked`` at once, before they could touch a lock that
+another thread of the parent held at the fork. So do the calls of a connection the parent made
+(``_connection``), whose ``close()`` touches nothing. A child forked before that starts the
+extension as any process does. A platform without ``fork`` (Windows) registers no hook.
 """
 
 from __future__ import annotations
@@ -156,4 +158,5 @@ def _after_fork_in_child() -> None:
         _forked = True
 
 
-os.register_at_fork(after_in_child=_after_fork_in_child)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)

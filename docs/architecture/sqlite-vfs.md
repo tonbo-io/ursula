@@ -1884,11 +1884,14 @@ returns at once.
 - `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
   `ursula_set_token(path, token)`.
 
-The extension refuses to load into SQLite older than 3.50.4. In a child forked after its parent
-started the extension, every function fails `forked` ([Forks](#forks)).
+The extension refuses to load into SQLite older than 3.50.4, or one without WAL. Every such
+refusal reads `sqlite-ursula-vfs needs ...`, the prefix a host matches to tell a SQLite the
+extension refuses from a library SQLite cannot load. In a child forked after its parent started
+the extension, every function fails `forked` ([Forks](#forks)).
 
 Tests: `test/core.e2e.ts` "loads into the running SQLite and registers the 0.8 functions only",
 `options.rs` `every_option`, `refusals_name_the_option`, `extension.rs` `the_floor_is_3_50_4`,
+`every_gate_refusal_reads_as_the_prefix_hosts_match`,
 `driver/tests.rs` `the_event_log_coalesces_acks_and_reports_what_it_dropped`, `test/handout.e2e.ts`.
 
 ### Import
@@ -2027,30 +2030,42 @@ classes, whose class, kind and action come from `ursula_classify`.
   on an in-memory control connection, with extension loading enabled only for the load. It becomes
   that SQLite's default VFS, so a framework's own `sqlite3.connect(db.path)` replicates through the
   binding. The library is `SQLITE_URSULA_VFS`, else the one the wheel carries in
-  `sqlite_ursula/_lib/`. Python keeps no SQLite floor of its own: the extension's refusal of an
-  older SQLite, a `sqlite3` built without loadable extensions, a platform with no VFS and an
-  install with no library all raise `UrsulaSetupError` `host_unsupported` (`fix`), whose `fix`
-  names a Python that can host it. `python -m sqlite_ursula` prints the same check.
+  `sqlite_ursula/_lib/`. Python keeps no SQLite floor of its own: the extension's refusal of the
+  host's SQLite, told by its prefix ([SQL functions](#sql-functions)), a `sqlite3` built without
+  loadable extensions, a platform with no VFS and an install with no library all raise
+  `UrsulaSetupError` `host_unsupported` (`fix`). Its `fix` says what to do for that reason: a
+  Python that can host the extension, WSL on Windows, or `SQLITE_URSULA_VFS` for an install with
+  no library. `python -m sqlite_ursula` prints the same check.
 - **Connections.** `open` returns `UrsulaConnection`, a `sqlite3.Connection` subclass made by
   `sqlite3.connect(path, factory=..., timeout=busy_timeout, check_same_thread=False)`, read-only
   through `file:<path>?mode=ro`. CPython's `execute*`, `commit` and `__exit__` call SQLite
   directly, so the subclass overrides them with `cursor`, and its cursor overrides `execute*`,
   `fetch*` and `__next__`. Each classifies its error and keeps the remembered-error rule of the
   TypeScript `UrsulaDatabase` for SQL `ROLLBACK`. Refused writes and resets also derive from
-  `sqlite3.OperationalError`, the error they replace.
+  `sqlite3.OperationalError`, the error they replace. `open` refuses `autocommit=False`
+  (`invalid_argument`): in that mode the connection is always in a transaction, so CPython's own
+  ROLLBACK after a refused COMMIT would hide the refusal, and a connection kept open would hold a
+  read snapshot that stops checkpoints.
 - **Events.** One daemon thread, `sqlite-ursula-events`, applies the [Pump](#pump)'s rules: it
   takes its cursor before any request or ticket is handed out, loops on
   `ursula_events(cursor, 1000)` on its own connection, and applies each batch under the control
   connection's lock. `ursula_open` and `ursula_synced` run at timeout 0 under the same lock, with
-  their request or ticket registered in that step. `synced(timeout)` waits on a
-  `threading.Event`, which Ctrl-C interrupts, and raises `TimeoutError` while replication goes
-  on. An open past its `timeout`, or on Ctrl-C, cancels its request. Reset callbacks run on a
-  thread of their own after the path's tickets failed. A failed thread is replaced and its tickets
-  asked for again, and after three failures in a row waits fail `internal`.
-- **Forks.** `os.register_at_fork` marks a child forked after the parent started the extension
-  (an open or an import): every call of the package raises `UrsulaSetupError` `forked` (`fix`),
-  statements of inherited connections included, before touching state a thread of the parent may
-  have held. A child forked before that loads the extension as any process does.
+  their request or ticket registered in that step. `synced(timeout)` covers the database at the
+  connection's path, the target `ursula_synced` takes, and waits on a `threading.Event`, which
+  Ctrl-C interrupts, and raises `TimeoutError` while replication goes on. An open past its
+  `timeout`, or interrupted by any exception once its request is known, Ctrl-C included, cancels
+  the request. Reset callbacks run on a thread of their own after the path's tickets were
+  rejected. A failed thread is replaced while tickets wait or connections are open, and the new
+  one starts with a gap: tickets asked for again and resets read from status. After three
+  failures in a row waits fail `internal`.
+- **Forks.** `os.register_at_fork`, where the platform has it, marks a child forked after the
+  parent started the extension (an open or an import). There `open`, `import_sqlite` and
+  `set_token` raise `UrsulaSetupError` `forked` (`fix`), and so do the overridden calls of a
+  connection the parent made: statements, transactions, `synced()`, `status()` and the reset
+  callbacks. Its `close()` closes nothing, and the child keeps the parent's connections so that
+  collecting one closes nothing either. Its other `sqlite3.Connection` methods and a framework's
+  own connections on the path rely on the extension, which fails their I/O on a bound file in the
+  child. A child forked before the extension started loads it as any process does.
 
 Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_errors.py`, `tests/test_fork.py`,
 `tests/test_import.py` and `tests/test_host.py`, against the model server and against one real
@@ -2191,9 +2206,12 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
   0.13.6) against the model server ([Forks](#forks)).
 - `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
-  3.14 and 3.14t, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, and on
-  `python:3.13-slim`, whose SQLite is older than 3.50.4, `python -m sqlite_ursula` failing with
-  `host_unsupported`.
+  3.14 and 3.14t, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, the wheel
+  hosted by a uv-managed CPython on `debian:trixie-slim` as `recipes/Dockerfile.uv` installs it,
+  and on `python:3.13-slim`, whose SQLite is older than the extension supports,
+  `python -m sqlite_ursula` failing with `host_unsupported`.
+- `sqlite-ursula-python-windows`: on Windows, which has no VFS, `import sqlite_ursula` works, and
+  `python -m sqlite_ursula` and `open()` fail with `host_unsupported`, whose fix is WSL.
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
   `python:3.13-alpine`, and the Python suites run there.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
