@@ -638,21 +638,29 @@ Tests:
   a loopback address logs `token_in_clear` once.
 - An API key is exchanged at its token endpoint (`auth/exchange.rs`): a `POST` with the key as the
   bearer token and `{"audience": ...}` as the body, answered with `access_token` and
-  `expires_in` in whole seconds. It goes out on the agent of appends and reads, so it trusts the
-  same roots, takes the same proxy and follows no redirect. The endpoint is `https://`, or
-  `http://` to a loopback host. A refresher thread exchanges the key by its schedule
-  (`auth/key.rs`), only while an open or a bound database may send requests carrying its token, or
-  while a host waits for its token:
+  `expires_in` in seconds. Other members of the answer are skipped, nested ones included. It goes
+  out on the agent of appends and reads, so it trusts the same roots, takes the same proxy and
+  follows no redirect. The endpoint is `https://`, or `http://` to a loopback host. A refresher
+  thread exchanges the key by its schedule (`auth/key.rs`), only while an open, a bound database
+  or an import may send requests carrying its token, or while a host waits for its token. An open
+  counts from when it is asked for.
   - A token is refreshed after 70 to 80% of its lifetime, and at least 1 s after it arrived. A
     token that lives shorter counts as a failed exchange.
-  - A failed exchange is retried after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, and the
-    last token serves meanwhile, expired or not. The first failure of a run logs
-    `token_exchange_failed`.
+  - A failed exchange is retried after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, and a
+    `429` no sooner than its `Retry-After` (up to a minute). The last token serves meanwhile,
+    expired or not. A host waiting for a token does not cut the backoff short. The first failure
+    of a run logs `token_exchange_failed`.
+  - A key refused (`401`, `403`) or an answer the exchange cannot use (a redirect, another `4xx`)
+    stops the exchanges until a host uses the key again.
   - A `401` to the key's token brings its refresh forward to at once, at least 1 s after the token
-    arrived, with one exchange out at a time. Tokens refused one after another back off as failed
-    exchanges do, until one serves until its refresh.
-  - The process holds one key. Another one is refused while an open or a bound database may send
-    requests, since they would all carry its tokens from then on.
+    arrived, with one exchange out at a time, and a host waiting for a token waits for the next
+    one. Tokens refused one after another back off as failed exchanges do. A token that lasts
+    until its refresh ends that run. A `401` while an exchange is out, a retry is scheduled or the
+    exchanges stopped changes nothing.
+  - The process holds one key. Another one is refused while a host waits for the key's token or
+    was handed one and has not yet asked for its open, and while an open, a bound database or an
+    import may send requests that can carry its token, since they would all carry the other key's
+    tokens from then on. A key that never got a token, or whose exchanges stopped, gives way.
   - Neither the key nor a token is logged or returned.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
@@ -665,18 +673,22 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`,
 `the_read_that_finds_a_new_token_signals_the_change`,
 `a_lent_token_goes_back_unless_another_was_set_since`,
-`another_key_is_refused_while_requests_may_go_out`, `auth/key.rs`
+`another_key_is_refused_while_requests_may_go_out`, `a_key_is_exchanged_only_while_active`,
+`key_errors_have_kinds`, `transport/http/tests.rs` `a_401_to_the_keys_token_refreshes_it`,
+`auth/key.rs`
 `a_refresh_is_due_at_70_to_80_percent_of_the_lifetime`,
 `failures_back_off_from_1_s_to_30_s_jittered_down_to_half`,
 `exchanges_go_out_one_at_a_time_while_active_and_refresh_on_schedule`,
 `a_failed_exchange_keeps_the_last_token_and_backs_off`,
+`a_429_is_retried_no_sooner_than_its_retry_after`,
 `a_token_shorter_lived_than_a_refresh_is_a_failure`,
 `a_401_refreshes_at_once_but_not_within_1_s_of_arrival`,
 `tokens_refused_in_a_row_back_off_until_one_serves_its_time`,
 `an_inactive_source_refreshes_once_active_again`,
-`a_waiting_host_retries_a_failed_exchange_at_once`, `auth/exchange.rs`
+`a_refused_key_stops_until_a_host_uses_it_again`, `auth/exchange.rs`
 `a_token_answer_gives_the_token_and_its_lifetime`, `failures_are_classified_by_status`,
-`a_key_goes_only_to_a_confidential_endpoint_and_never_prints`, `replicator/tests/machine.rs`
+`a_key_goes_only_to_a_confidential_endpoint_and_never_prints`, `json.rs`
+`nested_members_are_skipped_but_checked`, `replicator/tests/machine.rs`
 `a_token_change_resends_a_request_blocked_unauthorized_at_once`,
 `a_token_changed_while_the_refused_attempt_was_out_goes_at_once`,
 `a_token_change_leaves_a_resend_in_backoff_to_its_timer`, `driver/tests.rs`
@@ -2020,9 +2032,11 @@ since neither e2e server checks tokens.
 - `token` is the process's: `source` names where the token requests carry comes from
   ([Transport](#transport)), and `key` is `null` until the process holds an API key. Then it
   shows the key's schedule: `state` (`pending` before its first token, `exchanging`, `fresh`,
-  `expired` once its token expired while nothing sent requests, `failing`), the time until its
-  token expires and until its next exchange, the failed exchanges in a row and the last failure's
-  `{kind, action, message}`. It never shows the key or a token.
+  `expired` once its token expired while no exchange went out, because nothing sent requests or
+  requests carried a set token or the token file's, `failing` while a retry is scheduled,
+  `stopped` once the exchanges stopped), the time until its token expires and until its next
+  exchange (`null` while one is out or they stopped), the failed exchanges in a row and the last
+  failure's `{kind, action, message}`. It never shows the key or a token.
 - `ursula_stats(path)` drains per-commit measurements (bytes, pages, time in the log and the VFS),
   at most 8,192 of each kind between drains, and reports what it dropped.
 - Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.

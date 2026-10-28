@@ -1,7 +1,7 @@
 //! The flat JSON objects the extension reads and writes: `ursula_open`'s `options_json`, the
-//! JSON the SQL functions return, and a salvage's `manifest.json`. One writer ([`str`],
-//! [`object`], [`array`]) and one parser of flat objects ([`parse_object`]), which reads no nested
-//! object or array.
+//! JSON the SQL functions return, a salvage's `manifest.json`, and a token endpoint's answer. One
+//! writer ([`str`], [`object`], [`array`]) and one parser of objects, which reads no nested object
+//! or array: [`parse_object`] refuses one, and [`parse_members`] checks it and skips it.
 
 use std::fmt::Write as _;
 
@@ -77,6 +77,26 @@ pub(crate) fn whole(n: f64) -> Option<u64> {
 
 /// The members of a flat JSON object, in order.
 pub(crate) fn parse_object(text: &str) -> Result<Vec<(String, Value)>, SyntaxError> {
+    parse(text, Nested::Refuse)
+}
+
+/// The members of a JSON object whose values are not objects or arrays, in order: a nested value
+/// is checked and skipped, for an answer whose other members the reader does not know.
+pub(crate) fn parse_members(text: &str) -> Result<Vec<(String, Value)>, SyntaxError> {
+    parse(text, Nested::Skip)
+}
+
+/// What the parser does with a member whose value is an object or an array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nested {
+    Refuse,
+    Skip,
+}
+
+/// How deep a skipped value may nest.
+const MAX_DEPTH: usize = 64;
+
+fn parse(text: &str, nested: Nested) -> Result<Vec<(String, Value)>, SyntaxError> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         at: 0,
@@ -94,8 +114,12 @@ pub(crate) fn parse_object(text: &str) -> Result<Vec<(String, Value)>, SyntaxErr
         p.space();
         p.expect(b':')?;
         p.space();
-        let value = p.value()?;
-        members.push((key, value));
+        if nested == Nested::Skip && matches!(p.peek(), Some(b'{' | b'[')) {
+            p.skip(0)?;
+        } else {
+            let value = p.value()?;
+            members.push((key, value));
+        }
         p.space();
         if p.eat(b',') {
             continue;
@@ -175,6 +199,38 @@ impl Parser<'_> {
         }
     }
 
+    /// Checks and skips one value, objects and arrays included, `depth` levels deep.
+    fn skip(&mut self, depth: usize) -> Result<(), SyntaxError> {
+        let (close, object) = match self.peek() {
+            Some(b'{') => (b'}', true),
+            Some(b'[') => (b']', false),
+            _ => return self.value().map(drop),
+        };
+        if depth >= MAX_DEPTH {
+            return self.fail("nested too deep");
+        }
+        self.bump();
+        self.space();
+        if self.eat(close) {
+            return Ok(());
+        }
+        loop {
+            self.space();
+            if object {
+                self.string()?;
+                self.space();
+                self.expect(b':')?;
+                self.space();
+            }
+            self.skip(depth.saturating_add(1))?;
+            self.space();
+            if self.eat(b',') {
+                continue;
+            }
+            return self.expect(close);
+        }
+    }
+
     fn number(&mut self) -> Result<Value, SyntaxError> {
         let start = self.at;
         while self
@@ -245,6 +301,7 @@ impl Parser<'_> {
 mod tests {
     use super::Value;
     use super::object;
+    use super::parse_members;
     use super::parse_object;
     use super::str;
 
@@ -269,5 +326,30 @@ mod tests {
         ]);
         assert_eq!(parse_object("[]").unwrap_err().at, 0);
         assert_eq!(parse_object("{\"a\":{}}").unwrap_err().at, 5);
+    }
+
+    // Members whose values nest are checked and skipped, the others read.
+    #[test]
+    fn nested_members_are_skipped_but_checked() {
+        let text =
+            r#"{"a": [1, "x", {"b": [true, null, {}]}, []], "c": "y", "d": {"e": {"f": 2}}}"#;
+        assert_eq!(parse_members(text).unwrap(), vec![(
+            "c".to_owned(),
+            Value::Text("y".to_owned())
+        )]);
+        assert!(parse_members("{}").unwrap().is_empty());
+        for broken in [
+            r#"{"a": [1,}"#,
+            r#"{"a": {"b"}}"#,
+            r#"{"a": {1: 2}}"#,
+            r#"{"a": [1] "c": 2}"#,
+            r#"{"a": ["#,
+        ] {
+            assert!(parse_members(broken).is_err(), "{broken}");
+        }
+        let deep = format!("{{\"a\": {}{}}}", "[".repeat(65), "]".repeat(65));
+        assert_eq!(parse_members(&deep).unwrap_err().why, "nested too deep");
+        let fits = format!("{{\"a\": {}{}}}", "[".repeat(64), "]".repeat(64));
+        assert!(parse_members(&fits).unwrap().is_empty());
     }
 }

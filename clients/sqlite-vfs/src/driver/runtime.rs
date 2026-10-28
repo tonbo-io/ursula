@@ -16,8 +16,9 @@
 //! `ursula_set_token` at once, from the token file when a read finds a new token in it, a
 //! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while requests
 //! carry the file's token and an open or a writer may send them, and from an API key's refresher
-//! when an exchange hands out a new token. The driver tells `auth` whether an open or a writer may
-//! send requests ([`crate::auth::requests_may_go_out`]): the key is exchanged only then.
+//! when an exchange hands out a new token. The driver tells `auth` whether an open or a binding may
+//! send requests ([`crate::auth::requests_may_go_out`]), from when an open is asked for: the key is
+//! exchanged only then.
 //!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
@@ -307,7 +308,13 @@ impl Driver {
     /// Starts an open; [`Driver::wait_open`] waits for its outcome.
     pub(crate) fn open(&self, spec: OpenSpec) -> Result<OpenId, DriverGone> {
         let open = OpenId(self.id());
-        self.shared.lock().pending.insert(open);
+        {
+            // Requests may go out from the moment the open is asked for, before the driver
+            // thread takes it: a key a host claimed for it is in use from then on.
+            let mut state = self.shared.lock();
+            state.pending.insert(open);
+            auth::requests_may_go_out(true);
+        }
         self.command(Command::Open { open, spec })?;
         Ok(open)
     }
@@ -662,8 +669,13 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
     // When the token file was last checked for a change.
     let mut token_checked: u64 = 0;
     loop {
-        // A key's exchanges run only while an open or a binding may send requests.
-        auth::requests_may_go_out(core.requesting());
+        // A key's exchanges run only while an open or a binding may send requests: an open counts
+        // from when it was asked for ([`Driver::open`]) until its outcome is published. Both say
+        // so under the shared lock, so an open asked for meanwhile is never undone here.
+        {
+            let state = shared.lock();
+            auth::requests_may_go_out(core.requesting() || !state.pending.is_empty());
+        }
         // While requests carry the token file's token and an open or a writer may send them, the
         // file is checked every `FILE_CHECK_MS`: a new token in it comes back as
         // `Command::TokenChanged`.

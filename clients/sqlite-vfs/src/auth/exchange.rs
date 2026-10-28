@@ -1,6 +1,7 @@
 //! One exchange of an API key for a bearer token: a `POST` to the token endpoint with the key as
 //! its bearer token and `{"audience": ...}` (or `{}` without an audience) as its body, answered
-//! with `{"access_token": ..., "expires_in": <seconds>}`. It goes out on the agent of appends and
+//! with `{"access_token": ..., "expires_in": <seconds>}` and any other members, which are skipped.
+//! It goes out on the agent of appends and
 //! reads (`transport::http::agent`), so it trusts the same roots (`URSULA_VFS_CA_FILE`), takes
 //! the same proxy and follows no redirect.
 //!
@@ -8,15 +9,16 @@
 //! no error carries either.
 
 use std::fmt;
+use std::time::Duration;
 
 use ureq::http::Uri;
 
 use crate::error::ErrorKind;
 use crate::json::Value;
-use crate::json::parse_object;
-use crate::json::whole;
+use crate::json::parse_members;
 use crate::transport::http::agent;
 use crate::transport::http::in_clear;
+use crate::wire::RETRY_AFTER;
 
 /// The largest answer body read: a token answer is a few KiB.
 const ANSWER_LIMIT: u64 = 64 << 10;
@@ -108,15 +110,16 @@ pub(crate) enum ExchangeError {
     /// `401` or `403`: the key was refused.
     #[error("the token endpoint refused the API key ({status})")]
     Refused { status: u16 },
+    /// `429`, with the wait its `Retry-After` asked for in whole seconds.
     #[error("the token endpoint answered 429")]
-    RateLimited,
+    RateLimited { retry_after_ms: Option<u64> },
     /// `408` or `5xx`.
     #[error("the token endpoint answered {status}")]
     Unavailable { status: u16 },
     /// A status the exchange cannot use: a redirect (never followed) or another `4xx`.
     #[error("the token endpoint answered {status}, which the exchange cannot use")]
     Unexpected { status: u16 },
-    /// A `2xx` without a usable `access_token` and a positive whole `expires_in`.
+    /// A `2xx` without a usable `access_token` and a positive `expires_in`.
     #[error("the token endpoint answered without a usable token")]
     NoToken,
     /// A token that expires within the earliest refresh.
@@ -124,6 +127,9 @@ pub(crate) enum ExchangeError {
         "the token endpoint handed out a token that expires in {lifetime_ms} ms, under the {min_ms} ms a refresh needs"
     )]
     ShortLived { lifetime_ms: u64, min_ms: u64 },
+    /// The exchange panicked inside the extension.
+    #[error("the exchange failed inside the extension")]
+    Panicked,
 }
 
 impl ExchangeError {
@@ -133,21 +139,32 @@ impl ExchangeError {
             ExchangeError::Unreachable { .. } => ErrorKind::Unreachable,
             ExchangeError::Refused { status: 403 } => ErrorKind::Forbidden,
             ExchangeError::Refused { .. } => ErrorKind::Unauthorized,
-            ExchangeError::RateLimited => ErrorKind::RateLimited,
+            ExchangeError::RateLimited { .. } => ErrorKind::RateLimited,
             ExchangeError::Unavailable { .. }
             | ExchangeError::Unexpected { .. }
             | ExchangeError::NoToken
             | ExchangeError::ShortLived { .. } => ErrorKind::Unavailable,
+            ExchangeError::Panicked => ErrorKind::Internal,
         }
     }
 
-    /// Whether trying again cannot help until the key or the endpoint changes: a refused key, or
-    /// an answer the exchange cannot use.
+    /// Whether trying again cannot help until the key or the endpoint changes: a refused key, an
+    /// answer the exchange cannot use, or a failure inside the extension.
     pub(crate) fn permanent(&self) -> bool {
         matches!(
             self,
-            ExchangeError::Refused { .. } | ExchangeError::Unexpected { .. }
+            ExchangeError::Refused { .. }
+                | ExchangeError::Unexpected { .. }
+                | ExchangeError::Panicked
         )
+    }
+
+    /// The wait a `429` asked for.
+    pub(crate) fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            ExchangeError::RateLimited { retry_after_ms } => *retry_after_ms,
+            _ => None,
+        }
     }
 }
 
@@ -167,6 +184,12 @@ pub(crate) fn exchange(key: &Key) -> Result<Exchanged, ExchangeError> {
         reason: e.to_string(),
     })?;
     let status = response.status().as_u16();
+    let retry_after_ms = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|seconds| seconds.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000));
     let body = response
         .body_mut()
         .with_config()
@@ -175,31 +198,33 @@ pub(crate) fn exchange(key: &Key) -> Result<Exchanged, ExchangeError> {
         .map_err(|e| ExchangeError::Unreachable {
             reason: format!("the answer's body broke off: {e}"),
         })?;
-    answer(status, &body)
+    answer(status, retry_after_ms, &body)
 }
 
-/// What the endpoint's answer `status` with `body` gives.
-pub(crate) fn answer(status: u16, body: &[u8]) -> Result<Exchanged, ExchangeError> {
+/// What the endpoint's answer `status` with `body` gives; `retry_after_ms` is its `Retry-After`.
+pub(crate) fn answer(
+    status: u16,
+    retry_after_ms: Option<u64>,
+    body: &[u8],
+) -> Result<Exchanged, ExchangeError> {
     match status {
         200..=299 => token_of(body).ok_or(ExchangeError::NoToken),
         401 | 403 => Err(ExchangeError::Refused { status }),
-        429 => Err(ExchangeError::RateLimited),
+        429 => Err(ExchangeError::RateLimited { retry_after_ms }),
         408 | 500..=599 => Err(ExchangeError::Unavailable { status }),
         _ => Err(ExchangeError::Unexpected { status }),
     }
 }
 
-/// The token and its lifetime in a `2xx` body: a flat JSON object with a usable `access_token` and
-/// `expires_in`, a positive whole number of seconds. Other members are ignored.
+/// The token and its lifetime in a `2xx` body: a JSON object with a usable `access_token` and
+/// `expires_in`, a positive number of seconds. Other members are skipped, nested ones included.
 fn token_of(body: &[u8]) -> Option<Exchanged> {
     let text = std::str::from_utf8(body).ok()?;
     let (mut token, mut lifetime_ms) = (None, None);
-    for (name, value) in parse_object(text).ok()? {
+    for (name, value) in parse_members(text).ok()? {
         match (name.as_str(), value) {
             ("access_token", Value::Text(t)) => token = super::usable(&t),
-            ("expires_in", Value::Number(n)) => {
-                lifetime_ms = whole(n).filter(|&s| s > 0).map(|s| s.saturating_mul(1000));
-            }
+            ("expires_in", Value::Number(seconds)) => lifetime_ms = lifetime(seconds),
             _ => {}
         }
     }
@@ -207,6 +232,16 @@ fn token_of(body: &[u8]) -> Option<Exchanged> {
         token: token?,
         lifetime_ms: lifetime_ms?,
     })
+}
+
+/// `expires_in` in whole milliseconds, rounded down: any positive number of seconds. One that
+/// gives under the earliest refresh is a short-lived token, which the schedule refuses (`key`).
+fn lifetime(seconds: f64) -> Option<u64> {
+    if seconds.is_nan() || seconds <= 0.0 {
+        return None;
+    }
+    let ms = Duration::try_from_secs_f64(seconds).ok()?.as_millis();
+    Some(u64::try_from(ms).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -221,28 +256,57 @@ mod tests {
     // A token answer gives the token and its lifetime in ms; anything else gives no token.
     #[test]
     fn a_token_answer_gives_the_token_and_its_lifetime() {
+        let ok = |token: &str, lifetime_ms| {
+            Ok(Exchanged {
+                token: token.to_owned(),
+                lifetime_ms,
+            })
+        };
         assert_eq!(
             answer(
                 200,
+                None,
                 br#"{"access_token": "t.1-x", "token_type": "Bearer", "expires_in": 900}"#
             ),
-            Ok(Exchanged {
-                token: "t.1-x".to_owned(),
-                lifetime_ms: 900_000,
-            })
+            ok("t.1-x", 900_000)
+        );
+        // Members the exchange does not read are skipped, nested ones too.
+        assert_eq!(
+            answer(
+                200,
+                None,
+                br#"{"scope": ["a", {"b": [1, {}]}], "access_token": "t1",
+                     "authorization_details": {"type": "x", "n": null}, "expires_in": 60}"#
+            ),
+            ok("t1", 60_000)
+        );
+        // Any positive number of seconds, rounded down to whole milliseconds.
+        assert_eq!(
+            answer(200, None, br#"{"access_token": "t1", "expires_in": 1.5}"#),
+            ok("t1", 1_500)
+        );
+        assert_eq!(
+            answer(
+                200,
+                None,
+                br#"{"access_token": "t1", "expires_in": 0.0004}"#
+            ),
+            ok("t1", 0)
         );
         for body in [
             &br#"{"expires_in": 900}"#[..],
             br#"{"access_token": "t1"}"#,
             br#"{"access_token": "two words", "expires_in": 900}"#,
             br#"{"access_token": "t1", "expires_in": 0}"#,
-            br#"{"access_token": "t1", "expires_in": 1.5}"#,
+            br#"{"access_token": "t1", "expires_in": -5}"#,
             br#"{"access_token": "t1", "expires_in": "900"}"#,
             br#"{"access_token": 1, "expires_in": 900}"#,
+            br#"{"access_token": {"t": "t1"}, "expires_in": 900}"#,
+            br#"{"access_token": "t1", "expires_in": 900, "x": [}"#,
             b"not json",
             b"",
         ] {
-            assert_eq!(answer(200, body), Err(ExchangeError::NoToken));
+            assert_eq!(answer(200, None, body), Err(ExchangeError::NoToken));
         }
     }
 
@@ -257,20 +321,32 @@ mod tests {
         let cases = [
             (401, refused(401), ErrorKind::Unauthorized),
             (403, refused(403), ErrorKind::Forbidden),
-            (429, ExchangeError::RateLimited, ErrorKind::RateLimited),
+            (
+                429,
+                ExchangeError::RateLimited {
+                    retry_after_ms: Some(3_000),
+                },
+                ErrorKind::RateLimited,
+            ),
             (408, unavailable(408), ErrorKind::Unavailable),
             (503, unavailable(503), ErrorKind::Unavailable),
             (302, unexpected(302), ErrorKind::Unavailable),
             (404, unexpected(404), ErrorKind::Unavailable),
         ];
         for (status, error, kind) in cases {
-            assert_eq!(answer(status, ok), Err(error.clone()), "{status}");
+            assert_eq!(
+                answer(status, Some(3_000), ok),
+                Err(error.clone()),
+                "{status}"
+            );
             assert_eq!(error.kind(), kind, "{status}");
             let permanent = matches!(status, 401 | 403 | 302 | 404);
             assert_eq!(error.permanent(), permanent, "{status}");
         }
         assert_eq!(ExchangeError::NoToken.kind(), ErrorKind::Unavailable);
         assert!(!ExchangeError::NoToken.permanent());
+        assert_eq!(ExchangeError::Panicked.kind(), ErrorKind::Internal);
+        assert!(ExchangeError::Panicked.permanent());
     }
 
     // The key goes only to an https:// endpoint, or an http:// one on a loopback host, and is

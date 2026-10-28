@@ -121,7 +121,8 @@
 //!   that snapshots or moves the process.
 //! - [`inspection`]: a host's read of every recorded root and every open root lock: the
 //!   unacknowledged bytes on disk, and whether the read is complete.
-//! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
+//! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests,
+//!   token answers, whose nested members it skips).
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
 //!   frames from the stream.
