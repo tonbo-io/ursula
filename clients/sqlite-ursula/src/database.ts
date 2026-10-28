@@ -72,8 +72,18 @@ export interface UrsulaStatus {
 	readonly closed: boolean;
 	/** The epoch this owner claimed, `null` before its claim is acknowledged. */
 	readonly epoch: number | null;
+	/** The `Ursula-Cluster-Id` of the deployment the local cache was built on. */
 	readonly cluster_id: string;
+	/**
+	 * The stream's history token (`Stream-Incarnation`) the binding works under. The stream changes it
+	 * whenever bytes it served may differ, after a delete and recreate, a restore or an accepted loss,
+	 * and a binding that keeps its cache across such a change takes the new one.
+	 */
 	readonly incarnation: string;
+	/**
+	 * The local cache's lineage, 32 hex digits, which names its commits in the stream. A resumed or
+	 * re-keyed cache keeps it, and a cache built from the stream starts a new one.
+	 */
 	readonly lineage: string;
 	readonly commits: {
 		/** The position of the last commit logged locally. */
@@ -85,7 +95,16 @@ export interface UrsulaStatus {
 		readonly pending: number;
 		readonly pending_bytes: number;
 	};
-	readonly replication: { readonly state: string; readonly condition: string | null };
+	/**
+	 * The replicator. `state` is `activating` while it claims the stream and catches up, `streaming`
+	 * once it appends under its claim, `reset` after a reset, and `none` for a reader cache, which
+	 * replicates nothing. `refused` and `stopped` end a binding before any database `open()` returned
+	 * reports them: `refused` when the open's takeover lost 16 claims in a row to other claimants,
+	 * which fails the open with `claim_races`, and `stopped` once the binding retired, after which
+	 * `status()` throws `not_bound`. `condition` names what holds replication back while it retries
+	 * (such as `retrying`, `unauthorized` or `wrong_cluster`), or `null`.
+	 */
+	readonly replication: { readonly state: "activating" | "streaming" | "reset" | "refused" | "stopped" | "none"; readonly condition: string | null };
 	/**
 	 * Where the open got the local database: a trusted local cache (`resumed`), a trusted local cache
 	 * kept across a history change of the stream that inherits it (`rekeyed`), or a build from the
@@ -159,6 +178,11 @@ export type ResetListener = (error: UrsulaResetError) => void;
 export class UrsulaDatabase extends DatabaseSync implements ResetTarget {
 	/** The stream's path, such as `/acme/notes`. */
 	readonly name: string;
+	/**
+	 * The local database file the extension bound, as `status().path` reports it: the `path` the
+	 * extension's SQL functions, such as `ursula_stats`, take. A read-only connection on the binding
+	 * its process owns has the owner's.
+	 */
 	readonly boundPath: string;
 	readonly #bound: boolean;
 	readonly #listeners = new Set<ResetListener>();

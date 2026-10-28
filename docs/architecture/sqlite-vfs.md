@@ -1533,7 +1533,7 @@ mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
 | `UrsulaUnavailableError` | `open()` when its signal fires (also while it waits for a token provider: `unavailable`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `invalid_name` (`/tonbo`), `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 Network failures never throw from statements or `synced()`. A refused write fails with
 `SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
@@ -1596,7 +1596,8 @@ and that open calls the provider.
   fails `invalid_api_key`, as `403` does with a message that the key cannot read the database. `429`
   waits for `Retry-After` but never less than the backoff, and `408`, `5xx` and network failures
   back off from 250 ms up to 2 s, until the open's signal fires: then `UrsulaUnavailableError` with
-  the last condition. An `active` database without a `url`, and any other status, fail
+  the last condition. A `200` whose body holds no database, or at the token endpoint no token,
+  is retried as `unavailable`. An `active` database without a `url`, and any other status, fail
   `invalid_argument` naming the option and variable of that origin.
 - The Streams token comes from the provider each open passes, a closure over that open's key, its
   source and the auth origin. The process holds one token whichever function minted it, so later
@@ -1612,7 +1613,9 @@ and that open calls the provider.
   `TONBO_AUTH_ORIGIN` set them when the options do not.
 - Errors are `TonboError`, kinds `missing_credentials`, `credentials_refused`, `invalid_api_key`
   and `database_not_found`, action `fix`, with `fix` (the variable or command, which ends the
-  message) and the API's `requestId`. No message carries a key or a token.
+  message) and the API's `requestId`. No message carries a key or a token. An empty name fails
+  `UrsulaSetupError` `invalid_name`, an `apiKey` option that cannot be sent `invalid_argument`, and
+  a login file that cannot be read `local_setup`.
 
 Tests: `test/tonbo.e2e.ts`, through the real `open` against the suite's servers. test/tonbo-api.ts
 stands in for the Management API and the token endpoint as their contracts document them, and
