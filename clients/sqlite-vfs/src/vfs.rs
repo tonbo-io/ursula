@@ -1476,16 +1476,17 @@ unsafe fn reset_after_panic(f: *mut ffi::sqlite3_file, entry: &'static str) {
 macro_rules! io_entry {
     ($entry:ident => $method:ident($file:ident $(, $arg:ident: $ty:ty)*) -> $ret:ty, $call:expr, $fails:expr) => {
         unsafe extern "C" fn $entry($file: *mut ffi::sqlite3_file $(, $arg: $ty)*) -> $ret {
+            let fails = || $fails;
             // SAFETY: `$file` is the open file SQLite called the method on.
             if unsafe { inherited($file) } {
-                return $fails;
+                return fails();
             }
             contain(
                 stringify!($method),
                 || {
                     // SAFETY: `$file` is the open file SQLite called the method on.
                     unsafe { reset_after_panic($file, stringify!($method)) };
-                    $fails
+                    fails()
                 },
                 || {
                     let call: Option<Call> = $call;
