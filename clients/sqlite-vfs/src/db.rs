@@ -27,7 +27,6 @@
 //! share while it is bound: a reader sees the stream as of the open that bound it, and the first
 //! read-only open after it retired catches up again.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -284,6 +283,9 @@ struct Registry {
     /// Opens that resolved and whose binding one caller is registering ([`register`]): another
     /// open of one waits on [`registered`] until it is registered.
     registering: HashSet<OpenKey>,
+    /// The process started the extension ([`start_process`]): a child forked from here on is
+    /// `forked` ([`crate::fork`]).
+    started: bool,
 }
 
 impl Registry {
@@ -341,23 +343,30 @@ fn registry() -> MutexGuard<'static, Registry> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-thread_local! {
-    /// The registry, held by the thread that forks from just before the fork to just after it, on
-    /// both sides (design: Forks).
-    static FORKING: Cell<Option<MutexGuard<'static, Registry>>> = const { Cell::new(None) };
+/// Marks the process started (design: Forks): a child forked from here on is `forked`. The SQL
+/// functions that make what lives on in the process (`ursula_open`, `ursula_events` and
+/// `ursula_import`: the driver and its threads, HTTP agents and their pooled connections, the
+/// resolver's cache, a token) call it before anything else. It marks under the registry, which
+/// every fork takes first, so a fork falls before the mark, and the child has none of what follows
+/// it, or after it, and the child is `forked`.
+pub(crate) fn start_process() {
+    registry().started = true;
+}
+
+/// The registry, held across a fork by the thread that forks ([`crate::fork`]).
+pub(crate) struct Held(MutexGuard<'static, Registry>);
+
+impl Held {
+    /// Whether the process had started the extension ([`start_process`]).
+    pub(crate) fn started(&self) -> bool {
+        self.0.started
+    }
 }
 
 /// Before a fork, on the thread that forks: takes the registry, so no other thread holds it at
-/// the fork and the child gets it whole ([`crate::fork`]). A thread whose thread-locals are being
-/// destroyed forks without it.
-pub(crate) fn hold_for_fork() {
-    let held = registry();
-    drop(FORKING.try_with(move |slot| slot.replace(Some(held))));
-}
-
-/// After a fork, in the parent and in the child: lets go of the registry [`hold_for_fork`] took.
-pub(crate) fn release_after_fork() {
-    drop(FORKING.try_with(Cell::take));
+/// the fork and the child gets it whole.
+pub(crate) fn hold_for_fork() -> Held {
+    Held(registry())
 }
 
 /// Signalled when a registration ends.

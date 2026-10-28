@@ -10,6 +10,8 @@ use std::ptr::NonNull;
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1243,7 +1245,7 @@ fn forked_child_checks(
     let names = NAMES.with_borrow_mut(std::mem::take);
     checks.push((
         "only another name reaches \"unix\"",
-        names == [("delete", other)],
+        names == [("delete", other.clone())],
     ));
     // A file of no bound database passes through.
     checks.push((
@@ -1256,24 +1258,90 @@ fn forked_child_checks(
         "a plain file's close",
         closed == ffi::SQLITE_OK && CLOSES.get() == 1,
     ));
+    // No part of the bound database opens, and another file opens over "unix": here a stand-in
+    // VFS, set in the child alone.
+    // SAFETY: as above.
+    let mut unix: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+    unix.xOpen = Some(stand_in_open);
+    let was = crate::host::UNIX.swap(&raw mut unix, Ordering::AcqRel);
+    for (name, flags, opens) in [
+        (b.path.clone(), ffi::SQLITE_OPEN_MAIN_DB, false),
+        (format!("{}-wal", b.path), ffi::SQLITE_OPEN_WAL, false),
+        (
+            format!("{}-journal", b.path),
+            ffi::SQLITE_OPEN_MAIN_JOURNAL,
+            false,
+        ),
+        (other.clone(), ffi::SQLITE_OPEN_MAIN_DB, true),
+    ] {
+        let c = CString::new(name).unwrap();
+        let mut f = unopened();
+        let mut out: c_int = 0;
+        let flags = flags | ffi::SQLITE_OPEN_READWRITE;
+        // SAFETY: a `File` as SQLite allocates one, a NUL-terminated name, a writable `out`, and
+        // a "unix" VFS that outlives the call.
+        let opened = unsafe {
+            c_open(
+                null_mut(),
+                c.as_ptr(),
+                (&raw mut f).cast(),
+                flags,
+                &raw mut out,
+            )
+        };
+        if opens {
+            checks.push(("another file opens", opened == ffi::SQLITE_OK));
+            // SAFETY: the file just opened, closed once.
+            let closed = unsafe { m.xClose.unwrap()((&raw mut f).cast()) };
+            checks.push((
+                "another file closes",
+                closed == ffi::SQLITE_OK && CLOSES.get() == 2,
+            ));
+        } else {
+            checks.push((
+                "no part of the bound database opens",
+                opened == ffi::SQLITE_CANTOPEN && f.base.pMethods.is_null(),
+            ));
+        }
+    }
+    crate::host::UNIX.store(was, Ordering::Release);
+    let names = NAMES.with_borrow_mut(std::mem::take);
+    checks.push((
+        "only another file's open reaches \"unix\"",
+        names == [("open", other)],
+    ));
     checks
 }
 
-// A child forked after the driver started (design: Forks) inherits the parent's bindings without
-// the threads that serve them, and a lock such a thread held at the fork stays held there: here a
-// thread of the parent holds the binding's state across the fork. In the child every method on a
-// file of the bound database answers its own error code without running (no "unix" method runs,
-// and nothing waits on the binding), a close leaves the file's state and its "unix" file as they
-// are, and `xAccess` and `xDelete` refuse the database's names, while a file of no bound database
-// and other names pass through. Another thread held the registry when this one forked: the fork
-// waited for it, so the child finds it whole and free. The parent is not forked, and its files
-// work on.
+unsafe extern "C" fn stand_in_open(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    file: *mut ffi::sqlite3_file,
+    _flags: c_int,
+    _out: *mut c_int,
+) -> c_int {
+    named("open", zname);
+    // SAFETY: the open passes the "unix" file inside its own, writable.
+    unsafe { (*file).pMethods = &raw const STAND_IN };
+    ffi::SQLITE_OK
+}
+
+// A child forked after its parent started the extension (design: Forks) inherits the parent's
+// bindings without the threads that serve them, and a lock such a thread held at the fork stays
+// held there: here a thread of the parent holds the binding's state across the fork. In the child
+// every method on a file of the bound database answers its own error code without running (no
+// "unix" method runs, and nothing waits on the binding), a close leaves the file's state and its
+// "unix" file as they are, and the database's names are refused: `xOpen` of its db file, its WAL
+// and its journal, `xAccess` and `xDelete`. A file of no bound database and other names pass
+// through. Another thread held the registry when this one forked: the fork waited for it, so the
+// child finds it whole and free. The parent is not forked, and its files work on.
 #[test]
 fn a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_holds() {
     let dir = TempDir::new("vfs-fork");
     let b = for_tests(dir.path());
     let registered = registered_for_tests(&b);
     crate::fork::watch();
+    crate::db::start_process();
     let mut main = file_of(&b, true, &raw const STAND_IN);
     let mut wal = file_of(&b, false, &raw const STAND_IN);
     let mut plain = File {
@@ -1350,5 +1418,170 @@ fn a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_
     for f in [m, w] {
         // SAFETY: the `Box`es `file_of` made, which nothing freed in this process.
         drop(unsafe { take_ext(f) });
+    }
+}
+
+/// The wal-index region the stand-in "unix" of [`SHM_STAND_IN`] maps.
+static SHM_REGION: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+unsafe extern "C" fn stand_in_shm_map(
+    _file: *mut ffi::sqlite3_file,
+    _pg: c_int,
+    _pgsz: c_int,
+    _extend: c_int,
+    pp: *mut *mut c_void,
+) -> c_int {
+    // SAFETY: the method under test passes SQLite's writable `pp`.
+    unsafe { *pp = SHM_REGION.load(Ordering::Acquire) };
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn stand_in_shm_unmap(_file: *mut ffi::sqlite3_file, _delete: c_int) -> c_int {
+    ffi::SQLITE_OK
+}
+
+/// A stand-in "unix" file that maps its wal-index at [`SHM_REGION`].
+static SHM_STAND_IN: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
+    iVersion: 2,
+    xClose: Some(stand_in_close),
+    xRead: None,
+    xWrite: None,
+    xTruncate: None,
+    xSync: None,
+    xFileSize: None,
+    xLock: None,
+    xUnlock: None,
+    xCheckReservedLock: None,
+    xFileControl: None,
+    xSectorSize: None,
+    xDeviceCharacteristics: None,
+    xShmMap: Some(stand_in_shm_map),
+    xShmLock: None,
+    xShmBarrier: None,
+    xShmUnmap: Some(stand_in_shm_unmap),
+    xFetch: None,
+    xUnfetch: None,
+};
+
+/// `len` bytes mapped shared, as "unix" maps a wal-index region, each `fill`.
+fn shared_region(len: usize, fill: u8) -> *mut c_void {
+    // SAFETY: a new anonymous mapping, at an address the kernel picks.
+    let region = unsafe {
+        libc::mmap(
+            null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        region,
+        libc::MAP_FAILED,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `region` is `len` writable bytes.
+    unsafe { std::ptr::write_bytes(region.cast::<u8>(), fill, len) };
+    region
+}
+
+/// Whether every one of the `len` bytes at `region` is `byte`.
+fn all(region: *mut c_void, len: usize, byte: u8) -> bool {
+    // SAFETY: `region` is `len` readable bytes.
+    unsafe { std::slice::from_raw_parts(region.cast::<u8>(), len) }
+        .iter()
+        .all(|b| *b == byte)
+}
+
+/// Forks a child that, as SQLite does through the pointers it cached, overwrites the `len` bytes
+/// at each of `regions` (each `was` before), and waits for it.
+fn fork_writing(regions: &[(*mut c_void, u8)], len: usize) {
+    // SAFETY: the child runs only the closure below and ends with `_exit`.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        // SAFETY: a plain libc call.
+        unsafe { libc::alarm(20) };
+        exit_with(|| {
+            let mut checks = vec![("forked", crate::fork::forked())];
+            for &(region, was) in regions {
+                checks.push(("the child's copy is the parent's", all(region, len, was)));
+                // SAFETY: `region` is `len` writable bytes in the child.
+                unsafe { std::ptr::write_bytes(region.cast::<u8>(), 0xEE, len) };
+            }
+            checks
+        });
+    }
+    let mut status: c_int = 0;
+    // SAFETY: waits for the child forked above.
+    assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status), "the forked child died");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "a check of the forked child failed"
+    );
+}
+
+// A write transaction open at a fork leaves the child with SQLite's pointers into the wal-index
+// regions "unix" mapped shared, and its rollback or close writes through them, calling no VFS
+// method (`sqlite3WalUndo` clears the hash entries above the index's last frame). So the child
+// gets a private copy, with the same bytes at the same address, of every region a main db handle
+// of a bound database mapped: what it writes there never reaches the parent (design: Forks). A
+// region of a file of no bound database stays shared, and so does a region whose handle unmapped
+// its wal-index before the fork.
+#[test]
+fn a_forked_child_writes_only_its_own_copy_of_a_bound_wal_index() {
+    let dir = TempDir::new("vfs-fork-shm");
+    let b = for_tests(dir.path());
+    let registered = registered_for_tests(&b);
+    crate::fork::watch();
+    crate::db::start_process();
+    let len = 32768usize;
+    let (bound, plain_region) = (shared_region(len, 0x11), shared_region(len, 0x22));
+    let mut main = file_of(&b, true, &raw const SHM_STAND_IN);
+    let mut plain = File {
+        base: ffi::sqlite3_file {
+            pMethods: &raw const METHODS,
+        },
+        ext: null_mut(),
+        fail_sync: false,
+        wal_name: null_mut(),
+        inner: ffi::sqlite3_file {
+            pMethods: &raw const SHM_STAND_IN,
+        },
+    };
+    let [m, p] = [&mut main, &mut plain].map(|f| (&raw mut *f).cast::<ffi::sqlite3_file>());
+    for (f, region) in [(m, bound), (p, plain_region)] {
+        SHM_REGION.store(region, Ordering::Release);
+        let mut got: *mut c_void = null_mut();
+        // SAFETY: an open file of this VFS over the stand-in, and a writable `got`.
+        let mapped = unsafe { METHODS.xShmMap.unwrap()(f, 0, 32768, 1, &raw mut got) };
+        assert_eq!((mapped, got), (ffi::SQLITE_OK, region));
+    }
+
+    fork_writing(&[(bound, 0x11), (plain_region, 0x22)], len);
+    assert!(all(bound, len, 0x11), "the child wrote its own copy");
+    assert!(
+        all(plain_region, len, 0xEE),
+        "a plain file's region stays shared"
+    );
+
+    // SAFETY: an open file of this VFS over the stand-in.
+    assert_eq!(unsafe { METHODS.xShmUnmap.unwrap()(m, 0) }, ffi::SQLITE_OK);
+    fork_writing(&[(bound, 0x11)], len);
+    assert!(
+        all(bound, len, 0xEE),
+        "an unmapped handle's region is the child's no longer"
+    );
+
+    drop(registered);
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { take_ext(m) });
+    for region in [bound, plain_region] {
+        // SAFETY: a mapping `shared_region` made, which nothing lists any more.
+        assert_eq!(unsafe { libc::munmap(region, len) }, 0);
     }
 }

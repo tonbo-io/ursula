@@ -44,12 +44,15 @@
 //! connection to an owner binding waits in `xShmLock` before its WAL write lock request goes on,
 //! at most 60 s, holding only its read mark ([`hold`], design: Hosts).
 //!
-//! In a child forked after the driver started (design: Forks, [`fork`]) every method on a file of
-//! a bound database fails without running, with the code it answers after a panic, and touches
-//! nothing: the binding's state, its log and its "unix" inode may be held by a thread that stayed
-//! in the parent. Closing such a file leaves its state and its "unix" file as they are. The child
-//! opens no file of a bound database (`SQLITE_CANTOPEN`), and `xAccess` and `xDelete` refuse their
-//! names. Every other file passes through.
+//! In a child forked after its parent started the extension (design: Forks, [`fork`]) every
+//! method on a file of a bound database fails without running, with the code it answers after a
+//! panic, and touches nothing: the binding's state, its log and its "unix" inode may be held by a
+//! thread that stayed in the parent. Closing such a file leaves its state and its "unix" file as
+//! they are. The child opens no file of a bound database (`SQLITE_CANTOPEN`), and `xAccess` and
+//! `xDelete` refuse their names. Every other file passes through. Whether a file is a bound
+//! database's is its own state for a file the child inherited, and the registry's answer for a name
+//! ([`Part`]). `xShmMap` lists the wal-index regions of main db handles, which the child gets as
+//! private copies.
 //!
 //! A reader binding's db file opens read-only whatever the connection asked (design: Readers), so
 //! SQLite refuses its writes with `SQLITE_READONLY`, and a write or truncate that reaches one of
@@ -217,10 +220,48 @@ impl WalName {
     }
 }
 
+/// A file SQLite opens for a database: the db file itself, its WAL (`<db>-wal`) or its rollback
+/// journal (`<db>-journal`). The one rule from a file's name to its database's, for `x_open`,
+/// [`uwal`] and a forked child's refusals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Db,
+    Wal,
+    Journal,
+}
+
+impl Part {
+    const ALL: [Part; 3] = [Part::Db, Part::Wal, Part::Journal];
+
+    /// The part `xOpen`'s `flags` open: `None` for a file of no database's (a temp file, a
+    /// statement journal, a super-journal).
+    fn opened(flags: c_int) -> Option<Part> {
+        if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 {
+            Some(Part::Db)
+        } else if flags & ffi::SQLITE_OPEN_WAL != 0 {
+            Some(Part::Wal)
+        } else if flags & ffi::SQLITE_OPEN_MAIN_JOURNAL != 0 {
+            Some(Part::Journal)
+        } else {
+            None
+        }
+    }
+
+    /// The db file `name` is this part of, when it is this part's name.
+    fn db_of(self, name: &str) -> Option<&str> {
+        match self {
+            Part::Db => Some(name),
+            Part::Wal => name.strip_suffix("-wal"),
+            Part::Journal => name.strip_suffix("-journal"),
+        }
+    }
+}
+
 /// The WAL's name for `name`, a name SQLite gives a WAL (`<db>-wal`), when `bound(<db>)`: the bound
 /// db's WAL is `<db>-uwal`. `None` for any other name, which passes unchanged.
 fn uwal(name: &str, bound: impl FnOnce(&str) -> bool) -> Option<String> {
-    name.strip_suffix("-wal")
+    Part::Wal
+        .db_of(name)
         .filter(|db| bound(db))
         .map(|db| format!("{db}-uwal"))
 }
@@ -294,32 +335,32 @@ unsafe fn ext<'a>(f: *mut ffi::sqlite3_file) -> Option<&'a Ext> {
     unsafe { ext.as_ref() }
 }
 
-/// Whether `f` is a file of a bound database in a child forked after the driver started (design:
-/// Forks): one it inherited, since the child opens none.
+/// Whether `f` is a file of a bound database in a forked child (design: Forks): one it inherited,
+/// since the child opens none. The first such refusal says so on stderr ([`fork::refused`]).
 ///
 /// # Safety
 ///
 /// `f` is an open file of this VFS.
 unsafe fn inherited(f: *mut ffi::sqlite3_file) -> bool {
     // SAFETY: the caller's contract.
-    fork::forked() && unsafe { ext(f) }.is_some()
+    let inherited = fork::forked() && unsafe { ext(f) }.is_some();
+    if inherited {
+        fork::refused();
+    }
+    inherited
 }
 
-/// Whether `name` is a file of a bound database: its db file, its WAL (`<db>-wal`) or its rollback
-/// journal (`<db>-journal`).
+/// Whether `name` is a part of a bound database ([`Part`]).
 fn of_bound(name: &str) -> bool {
-    [
-        Some(name),
-        name.strip_suffix("-wal"),
-        name.strip_suffix("-journal"),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|db| lookup(db).is_some())
+    Part::ALL
+        .into_iter()
+        .filter_map(|part| part.db_of(name))
+        .any(|db| lookup(db).is_some())
 }
 
-/// In a child forked after the driver started (design: Forks): whether `zname` names a file of a
-/// bound database, which `xAccess` and `xDelete` refuse there.
+/// In a forked child (design: Forks): whether `zname` names a part of a bound database, whose
+/// open, access check and delete it refuses. The first such refusal says so on stderr
+/// ([`fork::refused`]).
 ///
 /// # Safety
 ///
@@ -329,9 +370,13 @@ unsafe fn inherited_name(zname: *const c_char) -> bool {
         return false;
     }
     // SAFETY: the caller's contract.
-    unsafe { CStr::from_ptr(zname) }
+    let refused = unsafe { CStr::from_ptr(zname) }
         .to_str()
-        .is_ok_and(of_bound)
+        .is_ok_and(of_bound);
+    if refused {
+        fork::refused();
+    }
+    refused
 }
 
 /// fsyncs the "unix" file inside `file`, bypassing this VFS's `xSync`, which is a no-op for a
@@ -419,60 +464,56 @@ unsafe fn x_open(
         unsafe { CStr::from_ptr(zname) }.to_str().ok()
     };
     // A forked child opens no file of a bound database (design: Forks).
-    if fork::forked() && name.is_some_and(of_bound) {
+    // SAFETY: a non-null name is NUL-terminated (xOpen's contract).
+    if unsafe { inherited_name(zname) } {
         return ffi::SQLITE_CANTOPEN;
     }
-    // A rollback journal of a bound database would bypass the log: its db file has WAL format from
-    // the start, so no commit needs one.
-    if flags & ffi::SQLITE_OPEN_MAIN_JOURNAL != 0
-        && let Some(db) = name.and_then(|n| n.strip_suffix("-journal"))
-        && lookup(db).is_some()
-    {
-        log::emit(Level::Warn, "journal_refused", &[("file", &db)]);
-        return ffi::SQLITE_CANTOPEN;
-    }
+    let bound = name.zip(Part::opened(flags)).and_then(|(name, part)| {
+        let db = part.db_of(name)?;
+        Some((part, db, lookup(db)?))
+    });
     let mut connected = None;
-    let ext = match name {
-        Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => match lookup(name) {
-            Some(binding) => {
-                let holder = if PRIVATE.get() {
-                    Holder::Private
-                } else {
-                    Holder::Host
-                };
-                connected = binding.connect(holder);
-                if connected.is_none() {
-                    // The private connection is refused beside no connection of the host: the
-                    // snapshot attempt skips, nothing to report.
-                    if holder == Holder::Host {
-                        log::emit(Level::Warn, "open_refused", &[
-                            ("file", &name),
-                            ("reason", &"its binding retired: ursula_open it again"),
-                        ]);
-                    }
-                    return ffi::SQLITE_CANTOPEN;
+    let ext = match bound {
+        // A rollback journal of a bound database would bypass the log: its db file has WAL format
+        // from the start, so no commit needs one.
+        Some((Part::Journal, db, _)) => {
+            log::emit(Level::Warn, "journal_refused", &[("file", &db)]);
+            return ffi::SQLITE_CANTOPEN;
+        }
+        Some((Part::Db, name, binding)) => {
+            let holder = if PRIVATE.get() {
+                Holder::Private
+            } else {
+                Holder::Host
+            };
+            connected = binding.connect(holder);
+            if connected.is_none() {
+                // The private connection is refused beside no connection of the host: the
+                // snapshot attempt skips, nothing to report.
+                if holder == Holder::Host {
+                    log::emit(Level::Warn, "open_refused", &[
+                        ("file", &name),
+                        ("reason", &"its binding retired: ursula_open it again"),
+                    ]);
                 }
-                Some(Ext {
-                    binding,
-                    role: Role::Main {
-                        holder,
-                        state: Cell::new(HandleState::Idle),
-                        exclusive: Cell::new(false),
-                        marks: Cell::new(0),
-                        writing: Cell::new(None),
-                    },
-                })
+                return ffi::SQLITE_CANTOPEN;
             }
-            None => None,
-        },
-        Some(name) if flags & ffi::SQLITE_OPEN_WAL != 0 => name
-            .strip_suffix("-wal")
-            .and_then(lookup)
-            .map(|binding| Ext {
+            Some(Ext {
                 binding,
-                role: Role::Wal,
-            }),
-        _ => None,
+                role: Role::Main {
+                    holder,
+                    state: Cell::new(HandleState::Idle),
+                    exclusive: Cell::new(false),
+                    marks: Cell::new(0),
+                    writing: Cell::new(None),
+                },
+            })
+        }
+        Some((Part::Wal, _, binding)) => Some(Ext {
+            binding,
+            role: Role::Wal,
+        }),
+        None => None,
     };
     // Released when the open fails below, also when a panic unwinds through it.
     let mut counted = Counted(
@@ -1250,6 +1291,9 @@ unsafe fn x_device_characteristics(file: *mut ffi::sqlite3_file) -> c_int {
     fwd!(file, xDeviceCharacteristics)
 }
 
+/// Maps a wal-index region through "unix", which maps it shared with every process that has the
+/// file. A main db handle's region of a bound database is listed for a forked child, which makes
+/// its copy private (design: Forks, [`fork`]).
 unsafe fn x_shm_map(
     file: *mut ffi::sqlite3_file,
     pg: c_int,
@@ -1257,7 +1301,21 @@ unsafe fn x_shm_map(
     extend: c_int,
     pp: *mut *mut c_void,
 ) -> c_int {
-    fwd!(file, xShmMap, pg, pgsz, extend, pp)
+    let rc = fwd!(file, xShmMap, pg, pgsz, extend, pp);
+    // A read-only wal-index maps too, answering `SQLITE_READONLY`.
+    let mapped = rc == OK || (rc & 0xff) == ffi::SQLITE_READONLY;
+    // SAFETY: the module contract.
+    let main = unsafe { ext(file) }.is_some_and(Ext::is_main);
+    if mapped && main && !pp.is_null() {
+        // SAFETY: SQLite passes `pp` readable, and "unix" set it (null when it mapped nothing).
+        let region = unsafe { *pp };
+        if !region.is_null()
+            && let Ok(len) = usize::try_from(pgsz)
+        {
+            fork::mapped(file.expose_provenance(), region, len);
+        }
+    }
+    rc
 }
 
 /// Whether a WAL write lock request on `ext`, a main db handle, waits at the hold first (design:
@@ -1421,7 +1479,10 @@ unsafe fn x_shm_barrier(file: *mut ffi::sqlite3_file) {
     }
 }
 
+/// Unmaps the wal-index through "unix", after the handle's regions left the forked child's list,
+/// so each listed region is mapped ([`fork`]).
 unsafe fn x_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
+    fork::unmapping(file.expose_provenance());
     fwd!(file, xShmUnmap, delete)
 }
 
@@ -1567,6 +1628,9 @@ unsafe extern "C" fn c_close(file: *mut ffi::sqlite3_file) -> c_int {
     };
     if let Some(e) = &ext {
         let addr = file.expose_provenance();
+        // Its wal-index regions, if it still maps any, leave the forked child's list before "unix"
+        // unmaps them ([`fork`]).
+        fork::unmapping(addr);
         contain(
             "x_close_bookkeeping",
             || e.binding.reset(ResetKind::Internal, &"xClose panicked"),

@@ -85,7 +85,7 @@ pub(crate) enum ErrorKind {
     Cancelled,
     /// The path names no database bound in this process.
     NotBound,
-    /// The process is a child forked after the extension started its driver (design: Forks).
+    /// The process is a child forked after its parent started the extension (design: Forks).
     Forked,
     Internal,
 }
@@ -559,10 +559,8 @@ pub(crate) enum Error {
     Salvage(#[from] SalvageError),
     #[error(transparent)]
     Import(#[from] ImportError),
-    /// Every SQL function's failure in a child forked after the extension started its driver.
-    #[error(
-        "the process forked after the extension started its driver: open databases after the fork"
-    )]
+    /// Every SQL function's failure in a child forked after its parent started the extension.
+    #[error("the process forked after the extension started: open databases after the fork")]
     Forked,
 }
 

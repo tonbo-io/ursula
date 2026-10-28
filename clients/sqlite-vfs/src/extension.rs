@@ -373,10 +373,11 @@ unsafe fn fn_classify(
 
 /// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
 /// panic in it ends the call with an error instead of unwinding into SQLite, which aborts the host
-/// process. In a child forked after the driver started it fails `forked` without running (design:
-/// Forks).
+/// process. In a child forked after its parent started the extension it fails `forked` without
+/// running (design: Forks). A function that makes what lives on in the process names
+/// [`db::start_process`], which it calls first.
 macro_rules! sql_entry {
-    ($entry:ident => $body:ident, $name:literal) => {
+    ($entry:ident => $body:ident, $name:literal $(, $starts:path)?) => {
         unsafe extern "C" fn $entry(
             ctx: *mut ffi::sqlite3_context,
             argc: c_int,
@@ -387,6 +388,7 @@ macro_rules! sql_entry {
                 unsafe { result(ctx, $name, Err(&Error::Forked)) };
                 return;
             }
+            $($starts();)?
             contain(
                 $name,
                 || {
@@ -402,14 +404,14 @@ macro_rules! sql_entry {
     };
 }
 
-sql_entry!(c_ursula_open => fn_open, "ursula_open");
+sql_entry!(c_ursula_open => fn_open, "ursula_open", db::start_process);
 sql_entry!(c_synced => fn_synced, "ursula_synced");
-sql_entry!(c_events => fn_events, "ursula_events");
+sql_entry!(c_events => fn_events, "ursula_events", db::start_process);
 sql_entry!(c_cancel => fn_cancel, "ursula_cancel");
 sql_entry!(c_status => fn_status, "ursula_status");
 sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
-sql_entry!(c_import => fn_import, "ursula_import");
+sql_entry!(c_import => fn_import, "ursula_import", db::start_process);
 sql_entry!(c_classify => fn_classify, "ursula_classify");
 
 /// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
@@ -486,6 +488,8 @@ unsafe fn init(
     let Some(a) = api() else {
         return ffi::SQLITE_ERROR;
     };
+    // Before anything takes the registry (design: Forks). The extension loads for the process.
+    crate::fork::watch();
     if VFS.load(Ordering::Acquire).is_null() {
         let rc = register_vfs(a);
         if rc != OK {
@@ -670,13 +674,13 @@ mod tests {
         );
     }
 
-    // In a forked child every SQL function fails `forked`, to be fixed by opening after the fork.
+    // `forked` reads as every function error does, and its action is `fix` (open after the fork).
     #[test]
-    fn a_function_in_a_forked_child_fails_forked() {
+    fn forked_is_a_fix_in_the_function_error_format() {
         assert_eq!(
             function_error("ursula_synced", &Error::Forked),
-            "ursula_synced: forked: the process forked after the extension started its driver: \
-             open databases after the fork"
+            "ursula_synced: forked: the process forked after the extension started: open \
+             databases after the fork"
         );
         assert_eq!(Error::Forked.kind().action(), Action::Fix);
     }

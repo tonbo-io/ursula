@@ -1462,40 +1462,61 @@ checks that the extension opened it.
 
 ### Forks
 
-A child forked after the extension started its driver has the parent's bindings in its memory but
-none of the threads that serve them: the driver, its HTTP workers and the snapshot threads stay in
-the parent, and a lock one of them held at the fork stays held in the child. Using a binding there
-would stall `synced()`, or append to the parent's log. The driver's start registers fork handlers
-(`pthread_atfork`), and in such a child, and in every process forked from one:
+A process starts the extension with its first `ursula_open`, `ursula_events` or `ursula_import`,
+before any of them makes something that lives on in the process: the driver and its threads, the
+HTTP agents with their pooled connections, the resolver's cache, a token. A child forked after the
+start has all of it in its memory but none of the threads that serve it, and a lock one of them
+held at the fork stays held in the child. Using it there would stall `synced()`, append to the
+parent's log, or send on a TLS connection the parent also writes. So in such a child, and in every
+process forked from one:
 
 - Every SQL function fails `forked` (action `fix`: open after the fork).
 - Every method on a file of a bound database fails without running, with the code it answers after
   a panic: a read `SQLITE_IOERR_READ`, a write `SQLITE_IOERR_WRITE`, a lock `SQLITE_IOERR_LOCK`.
-  So every statement of an inherited connection fails with an I/O error, and nothing reaches the
-  binding, its log or its files.
+  So every statement of an inherited connection that reaches a file fails with an I/O error, and
+  nothing reaches the binding, its log, its db file or its WAL. A statement that reaches no file,
+  such as `SELECT 1`, runs.
+- SQLite reads and writes the wal-index (the `-shm` file, which "unix" maps shared) through
+  pointers it cached, calling no VFS method. When a write transaction was open at the fork, the
+  child's rollback of it, or the close of its connection, clears the wal-index entries above the
+  index's last frame. So the child gets a private copy of every wal-index region a main db handle
+  of a bound database mapped, with the same bytes at the same address, and what it writes there
+  never reaches the parent.
 - Closing such a file leaves its state and its "unix" file as they are, since unix's close takes
   locks of the inode that a thread of the parent may have held. The child keeps its copy of the
   descriptor. A close of an inherited connection checkpoints nothing and deletes nothing, because
   its locks fail.
 - The child opens no file of a bound database (`SQLITE_CANTOPEN`), and `xAccess` and `xDelete`
   refuse their names.
-- Every other file passes through to "unix", so other SQLite databases work in the child.
+- The first refused open or I/O writes one `forked` line to stderr with a single `write(2)`, so a
+  host can attribute the I/O error. The extension's logger takes the stderr lock, which a thread of
+  the parent may have held at the fork.
+- Every other file passes through to "unix".
 
-Whether a file is bound is the registry's answer, and other threads take the registry's lock. The
-thread that forks takes it before the fork and lets it go after it, in the parent and in the child,
-so the child gets the registry whole and unlocked. A child forked before the driver started has no
-binding and nothing to guard: it opens its databases as any process does. SQLite's own state is not
-guarded: a child forked while the snapshot thread was inside SQLite may block in SQLite.
+An inherited file's own state tells whether it belongs to a bound database. For a name, the
+registry tells, through one rule from a file's name to its database's. The extension registers
+fork handlers (`pthread_atfork`) when it loads, and before every fork the thread that forks takes
+the registry and the list of shared wal-index regions, and lets both go after it, in the parent and
+in the child. So the child gets both whole and unlocked, and a start falls wholly before the fork
+or after it, since a start marks the process under the registry. A child forked before the start
+has nothing to guard and opens its databases as any process does.
+
+SQLite's own state is not guarded. Its mutexes, the memory statistics mutex included, may be held
+by the snapshot thread at the fork, so a child may block in SQLite, on any database. With that
+caveat, other SQLite databases work in the child.
 
 Tests: `vfs/tests.rs`
 `a_forked_child_fails_every_io_on_a_bound_file_and_touches_nothing_the_parent_holds` (a real
 fork, with a thread of the parent holding the binding's state across it and another holding the
-registry as it starts), `extension.rs` `a_function_in_a_forked_child_fails_forked`, and
-`e2e/fork.py` in `clients/sqlite-vfs`, which forks a CPython host with the extension loaded: a
-child forked before the driver started opens and syncs its own database, one forked after it gets
-`forked` from every function and an I/O error from every statement of the inherited connection,
-cannot open the bound database, uses another database, and closes the inherited connection, and
-the parent then commits, syncs and reopens its rows.
+registry as it starts, and the child refusing to open the database's db file, WAL and journal),
+`a_forked_child_writes_only_its_own_copy_of_a_bound_wal_index`, and `e2e/fork.py` in
+`clients/sqlite-vfs`, which forks a CPython host with the extension loaded: a child forked before
+the start opens and syncs its own database, one forked after an import fails `forked`, and one
+forked after an open, while a write transaction with frames in the WAL is open, gets `forked` from
+all eight functions and an I/O error from every statement of the inherited connection, says
+`forked` once on stderr, cannot open the bound database, uses another database, and rolls back and
+closes the inherited connections. The parent then commits that transaction, passes an integrity
+check, syncs and reopens its rows.
 
 ## API
 
@@ -1645,8 +1666,11 @@ package fails there with `UrsulaSetupError` (`local_setup`).
 | `UrsulaUnavailableError` (`unavailable`) | `open()` when its signal fires (also while it waits for a token provider: `unavailable`, action `retry`), and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
 | `UrsulaSetupError` (`setup`) | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `invalid_name` (`/tonbo`), `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `forked`, `internal` |
 
-The extension's SQL functions also fail `forked` (`fix`) in a child forked after its driver started
-([Forks](#forks)). Node never forks a process that loaded it.
+The extension's SQL functions also fail `forked` (`fix`) in a child forked after its parent started
+the extension ([Forks](#forks)). Node never forks a process that loaded it. In such a child the
+statements of an inherited connection fail with SQLite's I/O codes, 266 and 778 among them, which
+elsewhere mean a reset. Every SQL function answers `forked` there, `ursula_status(path)` included,
+so a host that classifies an I/O error checks for `forked` before it reads the code as a reset.
 
 Network failures never throw from statements or `synced()`. A refused write fails with
 `SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
@@ -1801,8 +1825,8 @@ returns at once.
 - `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
   `ursula_set_token(path, token)`.
 
-The extension refuses to load into SQLite older than 3.50.4. In a child forked after the driver
-started, every function fails `forked` ([Forks](#forks)).
+The extension refuses to load into SQLite older than 3.50.4. In a child forked after its parent
+started the extension, every function fails `forked` ([Forks](#forks)).
 
 Tests: `test/core.e2e.ts` "loads into the running SQLite and registers the 0.8 functions only",
 `options.rs` `every_option`, `refusals_name_the_option`, `extension.rs` `the_floor_is_3_50_4`,
@@ -2054,8 +2078,8 @@ What CI runs (`.github/workflows/integration.yml`):
   and Node 22, and Pi conformance on the oldest supported Pi.
 - `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store (with `test/history-real.e2e.ts`) and three nodes behind the gateway with no cold tier (with `test/failover.e2e.ts`). Both report, without asserting, the open time of a fresh build, a stale catch-up and a stale rebuild from `test/stale.e2e.ts` in the job summary, at 1 MiB and, on one node, 16 MiB. That suite prints its seed, and `STALE_SEED` replays it.
 - `sqlite-vfs-e2e-ursula-parts`: `test/parts.e2e.ts`, `test/import.e2e.ts` and the snapshot-parts cases of `test/core.e2e.ts` (`-t "in parts"`) against three nodes behind a gateway started with `--max-request-body-bytes 4194304` (`E2E_GATEWAY_MAX_REQUEST_BYTES`), with the CI S3 as the cold store (`.github/actions/ci-s3`: AWS S3 on same-repo pull requests and main, MinIO otherwise). The gateway lowers HEAD's `Ursula-Max-Request-Bytes` to 4 MiB and passes the node's `Ursula-Max-Snapshot-Bytes` through, and the test setup refuses to start unless HEAD shows both, so every snapshot above 4 MiB goes up in parts through the gateway and is read back in 4 MiB ranges. 4 MiB is also the client's batch cap, so PART runs keep their sizes. Of the sqlite-vfs e2e jobs, only it has `id-token: write`, and it installs the package with `npm ci --ignore-scripts`. A suite that needs three nodes, the gateway and a cold store joins this job through its `SUITES` list.
-- `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13 against
-  the model server ([Forks](#forks)).
+- `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
+  0.13.6) against the model server ([Forks](#forks)).
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
   with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
@@ -2105,8 +2129,10 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
 - **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold store.
 - **Local durability.** A power loss drops unacknowledged commits since the last log fsync.
   Network filesystems and filesystems that ignore fsync are unsupported.
-- **Forks.** A child forked after the driver started cannot use the extension at all, not even for
-  a database of its own: it fails `forked` ([Forks](#forks)). Open after the fork.
+- **Forks.** A child forked after the first `ursula_open`, `ursula_events` or `ursula_import` cannot
+  use the extension at all, not even for a database of its own: it fails `forked` ([Forks](#forks)).
+  Open after the fork. A child forked while the snapshot thread was inside SQLite may block in
+  SQLite.
 - **Host alias on a fresh host.** With no local cluster id to compare, a misrouted alias opens the
   other deployment's stream.
 - **Import.** Opens of the stream fail with `stream_state` while an import runs, and a failed

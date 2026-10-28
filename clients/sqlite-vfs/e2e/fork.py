@@ -1,11 +1,13 @@
 """The fork guard (docs/architecture/sqlite-vfs.md, Forks) in a real host: CPython's sqlite3 with
 the extension loaded, against the model server.
 
-A child forked before the extension started its driver uses the extension as usual: it opens after
-the fork. A child forked after it fails every Ursula SQL function and every statement of the
-inherited bound database, opens none of its files, closes the inherited connection without
-touching what the parent holds, and uses another SQLite database as usual. The parent goes on
-committing and syncing, and its database reopens whole.
+A child forked before the process started the extension uses the extension as usual: it opens
+after the fork. An import starts the process as an open does. A child forked after the start fails
+every Ursula SQL function and every statement of the inherited bound database that reaches a file,
+says `forked` once on stderr, opens none of the database's files, rolls back and closes the
+inherited connections without touching what the parent holds (a write transaction open at the
+fork, with frames in the WAL, included), and uses another SQLite database as usual. The parent goes
+on committing and syncing, and its database reopens whole.
 
 Run with a CPython 3.11 or newer whose SQLite is 3.50.4 or newer and loads extensions (a uv-managed
 one does):
@@ -77,6 +79,20 @@ def in_child(run):
     return out["result"]
 
 
+def functions(path, cache, base, source):
+    """Every Ursula SQL function, with arguments it would run with."""
+    return [
+        ("ursula_open", "SELECT ursula_open(?, ?, '{}', 1000)", (base + "-other", cache)),
+        ("ursula_synced", "SELECT ursula_synced(?, 1000)", (path,)),
+        ("ursula_events", "SELECT ursula_events(0, 0)", ()),
+        ("ursula_cancel", "SELECT ursula_cancel(1)", ()),
+        ("ursula_status", "SELECT ursula_status(?)", (path,)),
+        ("ursula_stats", "SELECT ursula_stats(?)", (path,)),
+        ("ursula_set_token", "SELECT ursula_set_token(?, 'token')", (path,)),
+        ("ursula_import", "SELECT ursula_import(?, ?, '{}', 1000)", (base + "-again", source)),
+    ]
+
+
 def expect(what, got, want):
     if got != want:
         raise AssertionError(f"{what}: got {got!r}, want {want!r}")
@@ -91,7 +107,7 @@ def main():
     cache = tempfile.mkdtemp(prefix="sqlite-ursula-fork-")
     c = control()
 
-    # Before the driver started, a child opens and syncs a database of its own.
+    # Before the process started the extension, a child opens and syncs a database of its own.
     def opens_after_the_fork():
         own = control()
         opened = call(own, "SELECT ursula_open(?, ?, '{}', 20000)", base + "-child", cache)
@@ -102,7 +118,18 @@ def main():
         db.close()
         return synced
 
-    expect("a child forked before the driver started opens and syncs", in_child(opens_after_the_fork), True)
+    expect("a child forked before the process started opens and syncs", in_child(opens_after_the_fork), True)
+
+    # An import starts the process too: a child forked after it fails `forked`.
+    source = os.path.join(cache, "source.db")
+    plain_source = sqlite3.connect(source)
+    plain_source.execute("CREATE TABLE s(n)")
+    plain_source.execute("INSERT INTO s VALUES (5)")
+    plain_source.commit()
+    plain_source.close()
+    expect("the import", call(c, "SELECT ursula_import(?, ?, '{}', 20000)", base + "-imported", source)["done"], True)
+    code, message = in_child(lambda: failure(lambda: c.execute("SELECT ursula_open(?, ?, '{}', 1000)", (base + "-imported", cache)).fetchone()))
+    expect("a child forked after an import fails forked", (code, message.startswith("ursula_open: forked: ")), (1, True))
 
     opened = call(c, "SELECT ursula_open(?, ?, '{}', 20000)", base, cache)
     path = opened["path"]
@@ -112,14 +139,24 @@ def main():
     expect("the parent syncs", call(c, "SELECT ursula_synced(?, 20000)", path)["synced"], True)
     plain = os.path.join(cache, "plain.db")
 
-    def forked_after_the_driver_started():
+    # A write transaction open at the fork, whose frames a small page cache already spilled into the
+    # WAL: SQLite listed them in the wal-index, which the child's rollback would clear in the
+    # parent's if the child's copy were shared.
+    w = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    w.execute("PRAGMA cache_size = 4")
+    wal = path + "-uwal"
+    before = os.path.getsize(wal)
+    w.execute("BEGIN IMMEDIATE")
+    w.execute("CREATE TABLE big(i INTEGER PRIMARY KEY, b BLOB)")
+    for i in range(200):
+        w.execute("INSERT INTO big VALUES (?, randomblob(3000))", (i,))
+    expect("the open write transaction spilled into the WAL", os.path.getsize(wal) > before, True)
+
+    def forked_after_the_process_started():
+        said = tempfile.TemporaryFile()
+        os.dup2(said.fileno(), 2)
         seen = {}
-        for name, sql, args in [
-            ("ursula_synced", "SELECT ursula_synced(?, 1000)", (path,)),
-            ("ursula_status", "SELECT ursula_status(?)", (path,)),
-            ("ursula_events", "SELECT ursula_events(0, 0)", ()),
-            ("ursula_open", "SELECT ursula_open(?, ?, '{}', 1000)", (base + "-other", cache)),
-        ]:
+        for name, sql, args in functions(path, cache, base, source):
             seen[name] = failure(lambda: c.execute(sql, args).fetchone())
         seen["read"] = failure(lambda: db.execute("SELECT count(*) FROM t").fetchall())
         seen["write"] = failure(lambda: db.execute("INSERT INTO t VALUES (2)"))
@@ -130,17 +167,28 @@ def main():
         other.execute("INSERT INTO p VALUES (7)")
         seen["plain"] = other.execute("SELECT n FROM p").fetchall()
         other.close()
+        failure(lambda: w.execute("ROLLBACK"))
+        w.close()
         db.close()
+        said.seek(0)
+        seen["said"] = said.read().decode().count("event=forked")
         return seen
 
-    seen = in_child(forked_after_the_driver_started)
-    for name in ["ursula_synced", "ursula_status", "ursula_events", "ursula_open"]:
+    seen = in_child(forked_after_the_process_started)
+    for name, _, _ in functions(path, cache, base, source):
         code, message = seen[name]
         expect(f"{name} fails forked in the child", (code, message.startswith(f"{name}: forked: ")), (1, True))
     expect("a read of the inherited connection fails with an I/O error", seen["read"][0], 10)
     expect("a write of the inherited connection fails with an I/O error", seen["write"][0], 10)
     expect("the child cannot open the bound database", seen["connect"][0], 14)
     expect("another database works in the child", seen["plain"], [[7]])
+    expect("the child says forked once", seen["said"], 1)
+
+    w.execute("INSERT INTO big VALUES (1000, 'last')")
+    w.execute("COMMIT")
+    w.close()
+    expect("the parent's wal-index is whole after the child rolled back", db.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+    expect("the parent's open transaction commits whole", db.execute("SELECT count(*), sum(length(b)) FROM big").fetchone(), (201, 200 * 3000 + 4))
 
     db.execute("INSERT INTO t VALUES (3)")
     expect("the parent syncs after the child closed its copy", call(c, "SELECT ursula_synced(?, 20000)", path)["synced"], True)
