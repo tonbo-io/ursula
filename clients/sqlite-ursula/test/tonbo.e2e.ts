@@ -3,15 +3,19 @@
 // their published contracts document them, and serves databases whose URLs are streams of the
 // e2e server. In front of Ursula, the gate records which token each stream request carried. The
 // process holds one token across providers, so each test waits until the bindings it opened retired
-// and the provider stopped: the next test starts with none held.
+// and the provider stopped: the next test starts with none held. `resolveDatabase` runs with the `/pi`
+// entry's `openUrsulaPiStorage`, the opener it exists for.
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
-import { open as openByName, TonboError, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
+import { open as openByName, type ResolvedDatabase, resolveDatabase, TonboError, UrsulaSetupError, UrsulaUnavailableError } from "../src/tonbo.ts";
 import { ext, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
 import { type FixtureDatabase, TonboApi } from "./tonbo-api.ts";
 
@@ -45,6 +49,17 @@ const open: typeof openByName = async (nameOrUrl, options) => {
 	bound.push(db.boundPath);
 	return db;
 };
+
+/** Pi storage on what `resolveDatabase` handed out, recording the path it bound. */
+async function piStorage(resolved: ResolvedDatabase): Promise<SqliteStorage> {
+	const storage = await openUrsulaPiStorage(resolved.url, { dir: freshDir(), token: resolved.token });
+	bound.push((storage as unknown as { db: { database: { location(): string } } }).db.database.location());
+	return storage;
+}
+
+/** The SQLite facade under a Pi storage: the wrapped node driver. */
+const facade = (storage: SqliteStorage): { exec(sql: string): Promise<void>; all<T extends object>(sql: string): Promise<T[]> } =>
+	(storage as unknown as { db: { exec(sql: string): Promise<void>; all<T extends object>(sql: string): Promise<T[]> } }).db;
 
 beforeAll(async () => {
 	api = await TonboApi.start();
@@ -405,5 +420,53 @@ describe("open by name", () => {
 		expect(redirect.hits).toEqual([`GET /v1/databases/${d.name}`]);
 		expect(api.seen).toEqual([]);
 		await redirect.stop();
+	});
+});
+
+describe("resolveDatabase", () => {
+	it("resolves a name into the stream URL and a token provider, with which Pi storage opens and keeps its own Streams token", async () => {
+		const d = database("tonbo-pi");
+		const resolved = await resolveDatabase(d.name, { apiKey: "tbo_pi" });
+		expect(resolved.url).toBe(d.url);
+		expect(typeof resolved.token).toBe("function");
+		expect(api.of("management")).toMatchObject([{ name: d.name, authorization: "Bearer tbo_pi" }]);
+		// The open calls the provider: the resolve exchanged nothing for the stream.
+		expect(api.of("token")).toEqual([]);
+		const storage = await piStorage(resolved);
+		const db = facade(storage);
+		await db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		expect(await db.all("SELECT x FROM t")).toEqual([{ x: 1 }]);
+		const exchanges = api.of("token");
+		expect(exchanges).toMatchObject([{ authorization: "Bearer tbo_pi", audience: "https://streams.tonbo.dev" }]);
+		const issued = exchanges[0]?.issued as string;
+		const sent = await sentTokens(d.path);
+		if (sent !== undefined) {
+			expect(sent.length).toBeGreaterThan(0);
+			expect(sent.every((r) => r.authorization === `Bearer ${issued}`)).toBe(true);
+		}
+		await storage.close(BACKGROUND_CONTEXT);
+		expect(api.of("management")).toHaveLength(1);
+	});
+
+	it("fails as open does: missing_credentials, database_not_found, invalid_url, and invalid_api_key from the open that calls the provider", async () => {
+		const d = database("tonbo-pi-errors");
+		await tonboError(resolveDatabase(d.name), "missing_credentials", "Set TONBO_API_KEY, or run: tonbo login");
+		await tonboError(resolveDatabase("tonbo-pi-nope", { apiKey: "tbo_pi_errors" }), "database_not_found", "Run: tonbo database create tonbo-pi-nope");
+		const exposed = database("tonbo-pi-exposed", "active", { url: "http://streams.example.com/sqlite-e2e/exposed" });
+		const refused = await rejection(resolveDatabase(exposed.name, { apiKey: "tbo_pi_errors" }));
+		expect(refused).toBeInstanceOf(UrsulaSetupError);
+		expect(refused).toMatchObject({ kind: "invalid_url", action: "fix" });
+		// The lookup passes, and the open's call of the provider is refused a Streams token.
+		const resolved = await resolveDatabase(d.name, { apiKey: "tbo_nostreams" });
+		expect(resolved.url).toBe(d.url);
+		await tonboError(openUrsulaPiStorage(resolved.url, { dir: freshDir(), token: resolved.token }), "invalid_api_key", "Pass a valid apiKey");
+		expect(api.of("token")).toMatchObject([{ audience: "https://streams.tonbo.dev" }]);
+	});
+
+	it("takes a URL as it is, and passes an explicit token through with no key and no request", async () => {
+		const d = database("tonbo-pi-url");
+		expect(await resolveDatabase(d.url, { token: "explicit-pi" })).toEqual({ url: d.url, token: "explicit-pi" });
+		expect(await resolveDatabase(new URL(d.url), { token: "explicit-pi" })).toEqual({ url: d.url, token: "explicit-pi" });
+		expect(api.seen).toEqual([]);
 	});
 });

@@ -1,6 +1,9 @@
 // `@tonbo/sqlite-ursula/tonbo` (design: Tonbo): open a Tonbo database by name with a Tonbo API
 // key. It looks the name up in the Management API, then opens the database's stream with the root
 // entry's `open`, whose token provider exchanges the key for short-lived Streams tokens.
+// `resolveDatabase` is that first half on its own: the stream URL and the `token` to open it with,
+// which `open` passes to the root entry's `open` and a caller of another opener, such as the `/pi`
+// entry's `openUrsulaPiStorage`, passes to that.
 //
 // - The key: the `apiKey` option, else TONBO_API_KEY, else the file `tonbo login` writes (the
 //   Tonbo CLI's credentials contract, version 1: `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`,
@@ -90,14 +93,32 @@ export class TonboError extends UrsulaError {
 	}
 }
 
-/** {@link open}'s options: the root entry's, a Tonbo API key, and the Tonbo origins. */
-export interface TonboOpenOptions extends OpenOptions {
+/**
+ * {@link resolveDatabase}'s options: a Tonbo API key, the Tonbo origins, and the root entry's `token`
+ * and `signal`. A `token` serves the Streams requests instead of the key's, and the signal (30 s by
+ * default) bounds the lookup.
+ */
+export interface TonboResolveOptions extends Pick<OpenOptions, "token" | "signal"> {
 	/** The Tonbo API key. By default TONBO_API_KEY, else the key `tonbo login` saved. */
 	readonly apiKey?: string | undefined;
 	/** The Management API's origin. By default TONBO_API_ORIGIN, else `https://api.tonbo.dev`. */
 	readonly apiOrigin?: string | undefined;
 	/** The token endpoint's origin. By default TONBO_AUTH_ORIGIN, else `https://tonbo.dev`. */
 	readonly authOrigin?: string | undefined;
+}
+
+/** {@link open}'s options: the root entry's, a Tonbo API key, and the Tonbo origins. */
+export interface TonboOpenOptions extends OpenOptions, TonboResolveOptions {}
+
+/** What {@link resolveDatabase} hands out: the stream to open, and the `token` option to open it with. */
+export interface ResolvedDatabase {
+	/** The database's stream URL. */
+	readonly url: string;
+	/**
+	 * The `token` option of the open: the provider of Streams tokens for the key, the `token` the
+	 * resolve was given, or `undefined` when URSULA_VFS_TOKEN_FILE serves the Streams requests.
+	 */
+	readonly token: string | TokenProvider | undefined;
 }
 
 /** A key and where it came from, which says how to fix it. */
@@ -144,18 +165,42 @@ class Transient extends Error {
  */
 export async function open(nameOrUrl: string | URL, options: TonboOpenOptions = {}): Promise<UrsulaDatabase> {
 	const { apiKey, apiOrigin, authOrigin, ...rest } = options;
-	const until = rest.signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
+	const signal = rest.signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
+	const { url, token } = await resolveDatabase(nameOrUrl, { apiKey, apiOrigin, authOrigin, token: rest.token, signal });
+	return openStream(url, { ...rest, token, signal });
+}
+
+/**
+ * Resolves the Tonbo database `nameOrUrl` names into what opens it: its stream URL and the `token`
+ * option, as {@link open} does before it opens the stream. Hand both to another opener, such as
+ * the `/pi` entry's `openUrsulaPiStorage(url, { token })`, whose open then keeps the Streams tokens
+ * fresh with no refresher of the caller's own.
+ *
+ * A name is looked up in the Management API with the account's API key, and a URL (`https://...`)
+ * is taken as it is. The token is a provider of Streams tokens exchanged for the key, which the open
+ * calls: the resolve exchanges nothing for the stream. A `token`, or URSULA_VFS_TOKEN_FILE, serves
+ * the Streams requests instead, and then a URL needs no key. The signal (30 s by default) bounds the
+ * lookup.
+ *
+ * Throws as {@link open} does before the open of the stream: {@link TonboError} for a key or
+ * database to fix, {@link UrsulaUnavailableError} when the signal fired while the Tonbo API did not
+ * answer, and {@link UrsulaSetupError} `invalid_argument` or `invalid_url`. A key the token endpoint
+ * refuses a Streams token fails the open that calls the provider, with `invalid_api_key`.
+ */
+export async function resolveDatabase(nameOrUrl: string | URL, options: TonboResolveOptions = {}): Promise<ResolvedDatabase> {
+	const { apiKey, apiOrigin, authOrigin, token: given } = options;
+	const until = options.signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
 	const name = typeof nameOrUrl === "string" && !/^[a-z][a-z0-9+.-]*:\/\//i.test(nameOrUrl) ? nameOrUrl : undefined;
 	if (name !== undefined && name.length === 0) throw new UrsulaSetupError("invalid_name: the database name is empty", "invalid_name");
 	const api = originOf(apiOrigin, "apiOrigin", "TONBO_API_ORIGIN", DEFAULT_API_ORIGIN);
 	const auth = originOf(authOrigin, "authOrigin", "TONBO_AUTH_ORIGIN", DEFAULT_AUTH_ORIGIN);
 	// An explicit token, or the file the extension reads, serves the Streams requests.
-	const streamsToken = rest.token !== undefined || nonEmpty(process.env.URSULA_VFS_TOKEN_FILE) !== undefined;
+	const streamsToken = given !== undefined || nonEmpty(process.env.URSULA_VFS_TOKEN_FILE) !== undefined;
 	const key = name !== undefined || !streamsToken ? await apiKeyOf(apiKey) : undefined;
 	const url = name !== undefined && key !== undefined ? await lookUp(name, key, api, auth, until) : String(nameOrUrl);
 	if (!streamsToken && key !== undefined) refuseExposed(url, name);
-	const token = rest.token ?? (streamsToken || key === undefined ? undefined : streamsProvider(key, auth));
-	return openStream(url, { ...rest, token, signal: until });
+	const token = given ?? (streamsToken || key === undefined ? undefined : streamsProvider(key, auth));
+	return { url, token };
 }
 
 const nonEmpty = (value: string | undefined): string | undefined => (value === undefined || value.trim() === "" ? undefined : value.trim());

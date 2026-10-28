@@ -22,7 +22,8 @@
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-// - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key.
+// - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key, or
+//   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
