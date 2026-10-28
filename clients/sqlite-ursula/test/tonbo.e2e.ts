@@ -1,19 +1,20 @@
 // `@tonbo/sqlite-ursula/tonbo`'s `open` by name, through the real open against the e2e server
 // (test/stack.ts). test/tonbo-api.ts stands in for the Management API and the token endpoint, as
-// their published contracts document them, and serves databases whose URLs are streams of the
-// e2e server. In front of Ursula, the gate records which token each stream request carried. The
-// entry resolves through the extension's `tonbo_resolve`, and the process holds one API key for
-// Streams tokens: the tests that fetch one in this process share `KEY`, after the ones whose key
-// gets none, which give way to it, and the others give the Streams requests a token of their own.
-// Each test waits until the bindings it opened retired. The tests depend on their order, which is
-// the file's (vitest runs a file's tests in sequence): "a key that gets no Streams token" must run
-// before any test that fetches KEY's tokens, so never shuffle this file. `resolveDatabase` runs with the `/pi`
-// entry's `openUrsulaPiStorage`, the opener it exists for, and the `/tonbo/pi` entry runs both in one
-// call under Pi's own Harness. `tonbo_resolve` runs on its own against the same stand-in too, as
-// other hosts of its SQL functions call it: on this thread with `timeout_ms` 0 and its `resolved`
-// event, blocking in worker threads of this process (test/tonbo-resolve-thread.ts), which join the
-// resolves of this thread, and blocking in a process of its own (test/tonbo-resolve-child.ts), whose
-// stream requests carry the Streams token the resolve fetched for the key.
+// their published contracts document them, and serves databases whose URLs are streams of the e2e
+// server. In front of Ursula, the gate records which token each stream request carried. The entry
+// resolves through the extension's `tonbo_resolve`, and the process holds one API key for Streams
+// tokens: the tests that fetch one in this process share `KEY`, after the ones whose key gets none,
+// which give way to it, and the others give the Streams requests a token of their own. Each test
+// waits until the bindings it opened retired. The tests depend on their order, which is the file's
+// (vitest runs a file's tests in sequence): "a key that gets no Streams token" must run before any
+// test that fetches KEY's tokens, so never shuffle this file. `resolveDatabase` runs with the `/pi`
+// entry's `openUrsulaPiStorage`, the opener it exists for, and the `/tonbo/pi` entry runs both in
+// one call under Pi's own Harness. `tonbo_resolve` runs on its own against the same stand-in too,
+// as other hosts of its SQL functions call it: on this thread with `timeout_ms` 0 and its
+// `resolved` event, blocking in worker threads of this process (test/tonbo-resolve-thread.ts),
+// which join the resolves of this thread, and blocking in a process of its own
+// (test/tonbo-resolve-child.ts), whose stream requests carry the Streams token the resolve fetched
+// for the key.
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";

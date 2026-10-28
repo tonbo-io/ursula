@@ -1909,15 +1909,17 @@ names its kinds: the open, the registry and the driver never do.
 - Unless `own_token` is set or `URSULA_VFS_TOKEN_FILE` serves the Streams requests, the key becomes
   the process's key source ([Transport](#transport)), exchanged at `{auth origin}/api/iam/token` for
   the audience `https://streams.tonbo.dev`, and the call returns only once it holds the first token.
-  A key the token endpoint refuses fails there with `invalid_api_key`, before any open. Then the call
-  clears the token set (`ursula_set_token`, an open's `token`), so the key's tokens serve every
-  request of the process, and answers `key_tokens: true`. The process holds one key, so another one
-  fails `invalid_argument` while the first may serve. A key that only looks a name up (`own_token`,
-  the token file) is never refused. A cancel ends the waits at once, the one for the token with the
-  call's claim on the key. The stream URL must be one `ursula_open` takes, by the open's own check,
-  or the call fails `invalid_url` before any request: a URL given before the lookup, a URL looked up
-  before the token. With a Streams token for the key it must also be `https://`, or `http://` to a
-  loopback host. With `own_token`, a URL needs no key and the call sends nothing.
+  A key the token endpoint refuses fails there with `invalid_api_key`, before any open. Then the
+  call that takes the answer clears the token set (`ursula_set_token`, an open's `token`), so the
+  key's tokens serve every request of the process, and answers `key_tokens: true`. An answer nobody
+  takes, given up at a cancel or a call's timeout, clears nothing. The process holds one key, so
+  another one fails `invalid_argument` while the first may serve. A key that only looks a name up
+  (`own_token`, the token file) is never refused. A cancel ends the waits at once, the one for the
+  token with the call's claim on the key. The stream URL must be one `ursula_open` takes, by the
+  open's own check, or the call fails `invalid_url` before any request: a URL given before the
+  lookup, a URL looked up before the token. With a Streams token for the key it must also be
+  `https://`, or `http://` to a loopback host. With `own_token`, a URL needs no key and the call
+  sends nothing.
 - It returns `{done: true, url, name, key_tokens}`, `name` `null` for a URL, and `{done: true,
   error: {kind, action, class, message, fix, request_id}}` for a failure, the fields a cancel
   reports. Only a malformed `timeout_ms` fails the SQL call itself. With `timeout_ms` 0 it returns
@@ -1934,9 +1936,10 @@ names its kinds: the open, the registry and the driver never do.
   call that returned at once starts another resolve, whose outcome that call is owed instead. A
   blocking call whose time runs out leaves the resolve to the other calls it owes, and gives it up
   only as the last. `ursula_cancel(request)` gives it up for the host that cancels: it goes on while
-  a blocking call waits for it, and otherwise ends. The cancel reports what the resolve came to:
-  `null` for an answer, the failure it ended with, or `cancelled` with the last condition, as
-  `{kind, action, class, message, fix, request_id}`. A call that gives up names what the resolve
+  a blocking call waits for it, and otherwise ends. The cancel reports at once what the resolve
+  came to, never waiting for a request in flight: `null` for an answer, the failure it ended with,
+  or `cancelled` with the last condition while it runs, as `{kind, action, class, message, fix,
+  request_id}`. A call that gives up names what the resolve
   waited for then, the lookup or the Streams token, with the last condition met while waiting for
   it. A call that finds the resolve it waited for given up starts another and names its request.
 - An outcome goes only to calls made before it arrived, and leaves with the last of them, with two

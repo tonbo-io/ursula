@@ -180,6 +180,11 @@ export async function resolveDatabase(nameOrUrl: string | URL, options: TonboRes
 		// Never the value itself: it may be a key.
 		if (value !== undefined && typeof value !== "string") throw new UrsulaSetupError(`invalid_argument: ${name} must be a string, not ${value === null ? "null" : typeof value}`, "invalid_argument");
 	}
+	// Before any request, as the open of the stream would refuse it only after the lookup.
+	const given: unknown = token;
+	if (given !== undefined && typeof given !== "string" && typeof given !== "function") {
+		throw new UrsulaSetupError(`invalid_argument: token must be a string or a token provider function, not ${given === null ? "null" : typeof given}`, "invalid_argument");
+	}
 	const until = options.signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
 	// `undefined` members are left out: the extension's defaults apply.
 	const settings = JSON.stringify({ api_key: apiKey, api_origin: apiOrigin, auth_origin: authOrigin, own_token: token !== undefined, timeout_ms: EXTENSION_RESOLVE_MS });

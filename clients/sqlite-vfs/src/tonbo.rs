@@ -26,9 +26,10 @@
 //!   `{auth origin}/api/iam/token` with the audience [`STREAMS_AUDIENCE`], and its tokens are
 //!   refreshed in the background while requests may carry them. They go only to a stream URL that
 //!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Once the key
-//!   holds its first token, the resolve clears the token set (`ursula_set_token`, an open's
-//!   `token`), so the key's tokens serve every request of the process from then on, and its answer
-//!   says so (`key_tokens`).
+//!   holds its first token, the call that takes the answer clears the token set
+//!   (`ursula_set_token`, an open's `token`), so the key's tokens serve every request of the
+//!   process from then on, and the answer says so (`key_tokens`). An answer nobody takes, one a
+//!   cancel or a call's timeout gave up, clears nothing.
 //! - Every wait is bounded by the time the resolve has left and ends at once at a cancel. Every
 //!   request gets that time too, at most 10 s (`lookup`): a request in flight at a cancel ends
 //!   within them, and one the API never answers fails as unreachable and goes again.
@@ -115,8 +116,6 @@ const DEFAULT_RESOLVE_MS: u64 = 30_000;
 /// How much longer than the resolve's own time a blocking call waits, so the resolve's own failure
 /// (the last condition) is what it reports.
 const GRACE_MS: u64 = 1_000;
-/// How long `ursula_cancel` waits for what a resolve it gave up ended with.
-const CANCEL_REPORT_MS: u64 = 1_000;
 /// The longest wait, a year: a timeout too large for the clock waits this long.
 const FOREVER: Duration = Duration::from_secs(31_536_000);
 
@@ -126,8 +125,9 @@ const FOREVER: Duration = Duration::from_secs(31_536_000);
 pub(crate) struct Resolved {
     pub(crate) url: String,
     pub(crate) name: Option<String>,
-    /// The resolve made the key the source of the process's Streams tokens and cleared the token
-    /// set: a host stops any token source of its own that would set one again.
+    /// The resolve made the key the source of the process's Streams tokens, and the call that took
+    /// the answer cleared the token set: a host stops any token source of its own that would set
+    /// one again.
     pub(crate) key_tokens: bool,
 }
 
@@ -643,9 +643,6 @@ impl Plan {
         if let Some(key) = &self.streams {
             until.waits_for(Subject::Token(url.clone()));
             streams_token(key, &self.auth, &url, until)?;
-            // The key's tokens serve every request of the process from now on: a token an
-            // earlier open set would go on serving in their place.
-            crate::auth::set_token(None);
         }
         Ok(Resolved {
             url,
@@ -885,24 +882,9 @@ impl Run {
         self.changed.notify_all();
     }
 
-    /// How it ended, waiting at most `wait`.
-    fn ended_within(&self, wait: Duration) -> Option<Outcome> {
-        let deadline = after(Instant::now(), wait);
-        let mut state = lock(&self.state);
-        loop {
-            if let Some(outcome) = &state.ended {
-                return Some(outcome.clone());
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            state = self
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
+    /// How it ended, `None` while it runs.
+    fn ended(&self) -> Option<Outcome> {
+        lock(&self.state).ended.clone()
     }
 
     /// The failure of a call that gave up on it: what it waited for, and the last condition it
@@ -1021,7 +1003,7 @@ pub(crate) fn resolve(
                     run.extend(time);
                     return Ok(Resolution::Pending(request));
                 }
-                Arrival::Take(outcome) => return outcome.map(Resolution::Done),
+                Arrival::Take(outcome) => return taken(outcome).map(Resolution::Done),
                 Arrival::Wait(request, run) => {
                     run.extend(time);
                     Some(request)
@@ -1045,13 +1027,13 @@ pub(crate) fn resolve(
             let plan = Plan::new(name_or_url, options).map_err(Arc::new)?;
             if !plan.sends() {
                 let until = Until::new(Run::new(subject(name_or_url), Duration::ZERO));
-                return plan.run(&until).map(Resolution::Done).map_err(Arc::new);
+                return taken(plan.run(&until).map_err(Arc::new)).map(Resolution::Done);
             }
             planned = Some((plan, driver().request_id()));
             continue;
         };
         if let Some(outcome) = wait(id, request, timeout_ms) {
-            return outcome.map(Resolution::Done);
+            return taken(outcome).map(Resolution::Done);
         }
         // Its resolve left the table: the call starts again.
     }
@@ -1068,6 +1050,16 @@ fn resolve_ms(options: &str, timeout_ms: u64) -> u64 {
         .ok()
         .and_then(|options| options.timeout_ms)
         .unwrap_or(DEFAULT_RESOLVE_MS)
+}
+
+/// A call takes `outcome`. An answer whose key's tokens serve clears the token set: a token an
+/// earlier open set would go on serving in their place. Only the call that hands the answer out
+/// clears it, so a resolve given up before anyone took its answer leaves the token set alone.
+fn taken(outcome: Outcome) -> Outcome {
+    if outcome.as_ref().is_ok_and(|resolved| resolved.key_tokens) {
+        crate::auth::set_token(None);
+    }
+    outcome
 }
 
 /// What a resolve of `name_or_url` waits for first.
@@ -1146,7 +1138,9 @@ fn wait(id: Id, request: u64, timeout_ms: u64) -> Option<Outcome> {
 /// `ursula_cancel(request)` of a resolve: `None` when `request` names none. Otherwise what it
 /// came to for the host that cancels: `Some(None)` when it resolved before the cancel, the failure
 /// it ended with, or `cancelled` with the last condition it met. A resolve a blocking call waits
-/// for goes on for that call. One given up is waited for at most [`CANCEL_REPORT_MS`].
+/// for goes on for that call. One given up reports at once what it ended with, or `cancelled` while
+/// it runs, so the cancel never waits for a request in flight. An answer it reports was taken by
+/// nobody, so it clears no token (`taken`).
 pub(crate) fn cancel(request: u64) -> Option<Option<Arc<TonboError>>> {
     let step = table().cancel(request)?;
     Some(match step {
@@ -1154,7 +1148,7 @@ pub(crate) fn cancel(request: u64) -> Option<Option<Arc<TonboError>>> {
         Cancelled::Left(run) => Some(run.gave_up(true)),
         Cancelled::Abandoned(run) => {
             run.cancel();
-            match run.ended_within(Duration::from_millis(CANCEL_REPORT_MS)) {
+            match run.ended() {
                 Some(outcome) => outcome.err(),
                 None => Some(run.gave_up(true)),
             }

@@ -337,8 +337,8 @@ pub(crate) fn resolution_json(outcome: Result<&Resolution, &TonboError>) -> Stri
     }
 }
 
-/// What `ursula_cancel` of a resolve reports it ended with: `{kind, action, class, message, fix,
-/// request_id}`.
+/// A resolve's failure, as `ursula_cancel` of a resolve reports it and as the `error` of
+/// `tonbo_resolve`'s `{done: true, error}`: `{kind, action, class, message, fix, request_id}`.
 pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
     with_kind(&[], e.kind(), Surface::Open, &[
         ("message", json_str(&e.report().to_string())),
