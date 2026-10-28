@@ -736,7 +736,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			const parent = realpathSync(freshDir());
 			const dir = join(parent, "cache");
 			mkdirSync(dir);
-			const holder = new Child(stream(`host-h14-${how}`).url, dir, env);
+			const holder = new Child(stream(`host-h14-${how.replace(" ", "-")}`).url, dir, env);
 			await holder.opened();
 			await holder.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
 			const before = await inspect(host, [holder.pid]);

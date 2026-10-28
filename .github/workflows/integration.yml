@@ -244,7 +244,6 @@ jobs:
             python3 -c '
           import json, sys
           r, want = json.loads(sys.argv[1]), sys.argv[2]
-          assert r["dir"] == "/var/lib/sqlite-ursula/host", r
           if want == "clean":
               assert r["complete"] is True and r["clean"] is True and r["incomplete"] is None, r
           else:
@@ -253,7 +252,9 @@ jobs:
           }
           sudo install -d -o root -g root -m 0755 /var/lib/sqlite-ursula
           sudo install -d -o root -g root -m 1777 /var/lib/sqlite-ursula/host
-          expect "$(sudo "$bin" inspect --pid $$)" clean
+          out=$(sudo "$bin" inspect --pid $$)
+          expect "$out" clean
+          python3 -c 'import json, sys; assert json.loads(sys.argv[1])["dir"] == "/var/lib/sqlite-ursula/host"' "$out"
           # The same directory through another spelling is checked as strictly.
           expect "$(sudo "$bin" inspect --dir /var/lib/sqlite-ursula/../sqlite-ursula/host --pid $$)" clean
           sudo chmod 0777 /var/lib/sqlite-ursula/host
