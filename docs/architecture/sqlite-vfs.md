@@ -8,7 +8,8 @@ durable once the stream acknowledges it, and `await db.synced()` is the output g
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
 `clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
 event pump, `gate`, the Pi Durable adapter in the `/pi` entry, Tonbo's open by name in the `/tonbo`
-entry, the e2e suites and the benchmark). The server
+entry, Pi storage on a Tonbo database by name in the `/tonbo/pi` entry, the e2e suites and the
+benchmark). The server
 contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
 docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
@@ -1454,6 +1455,16 @@ is `resolveDatabase(nameOrUrl, options)`, exported on its own: it returns `{ url
 one implementation. A caller of another opener, such as `openUrsulaPiStorage`, passes both to it,
 and that open calls the provider.
 
+The `/tonbo/pi` entry (`tonbo-pi.ts`) is that composition for Pi: its `openUrsulaPiStorage(nameOrUrl,
+options)` is `resolveDatabase` followed by the `/pi` entry's `openUrsulaPiStorage`, under one signal
+(30 s by default) for both, so `Harness.open(await openUrsulaPiStorage("harness-1"), ...)` persists a
+Pi harness in one line. It is an entry of its own because `/tonbo` must not import
+`@earendil-works/pi-durable`, an optional peer only Pi users install, and `/pi` knows nothing of
+Tonbo. It adds no logic: name resolution, the key sources and the provider stay in `tonbo.ts`, and
+the adapter in `pi.ts`. Pi's `Harness.close` closes the storage it was opened with (Pi 1.0 to 1.3:
+`Session.close` calls `Storage.close`, and `SqliteStorage.close` the driver's `close`, which the
+adapter wraps), so the caller keeps no reference for the close.
+
 - The key is the `apiKey` option, else `TONBO_API_KEY`, else the login `tonbo login` saves (the
   Tonbo CLI's credentials contract, version 1): `${XDG_CONFIG_HOME:-$HOME/.config}/tonbo/credentials.json`,
   `{version, account_id, key_id, key, expires_at}`. A symlink, a non-regular file or a file with a
@@ -1497,7 +1508,10 @@ next starts with no token held. `URSULA_VFS_TOKEN_FILE` runs in a process of its
 (test/tonbo-child.ts), on a stream and cache root of its own with a token no other test uses, where
 no open set a token first, and the gate shows every request carried the file's token.
 `resolveDatabase` runs with `openUrsulaPiStorage`: the gate shows the Pi storage's stream requests
-carried the token the provider exchanged for the key.
+carried the token the provider exchanged for the key. "opens Pi storage by name in one call for
+Harness.open, whose close closes it, and its Streams requests carry the token exchanged for the key"
+runs the `/tonbo/pi` entry under Pi's `Harness`, and its binding retires once `harness.close`
+returned.
 
 ### SQL functions
 
