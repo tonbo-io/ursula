@@ -4,9 +4,8 @@ on it, ``classify``, and what a fork leaves of the process's state.
 The registry of bound databases and the replication driver are the process's: one control
 connection serves every thread. Its calls are short, since every call that could wait is made with
 timeout 0, or on a connection of its own outside the lock (:func:`call_waiting`), so one lock
-serializes them. The events thread
-(``_events``) takes the same lock while it applies events, so a request or a ticket is registered
-before any event about it applies.
+serializes them. The events thread (``_events``) takes the same lock while it applies events, so a
+request or a ticket is registered before any event about it applies.
 
 A fork copies the process without its threads. A child forked after the parent started the
 extension (an open or an import) is marked forked, and the package's calls in it (``open``,
