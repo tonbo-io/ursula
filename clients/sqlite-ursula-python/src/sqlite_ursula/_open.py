@@ -1,6 +1,9 @@
 """``open``, ``aopen``, ``import_sqlite`` and ``set_token``: the root module's calls of the
 extension.
 
+An open with a token provider first waits for its token from the token source (``_token``),
+within its ``timeout``, then binds under it.
+
 An open binds with ``ursula_open`` at timeout 0 and waits on the events thread while the bind
 goes on, as Node's does: ``open`` on a ``threading.Event``, ``aopen`` on the event loop. The
 extension shares one bind between concurrent opens of a stream, from any thread or task. Its own
@@ -27,6 +30,7 @@ from typing import Any
 
 from . import _control
 from . import _events
+from . import _token
 from ._args import flag
 from ._args import invalid
 from ._args import seconds
@@ -57,30 +61,51 @@ def _url(url: object) -> str:
     return url
 
 
-def _token(token: object) -> str | None:
+def _string(token: object, call: str, why: str) -> str | None:
     if token is not None and not isinstance(token, str):
-        raise invalid(
-            f"token must be a string, not {type(token).__name__}: for a token that changes, call "
-            "set_token() with each new one"
-        )
+        raise invalid(f"{call}'s token must be a string, not {type(token).__name__}: {why}")
     return token
+
+
+def _token_of(token: object) -> str | _token.TokenProvider | None:
+    if token is None or isinstance(token, str):
+        return token
+    provider = _token.provider_of(token)
+    if provider is None:
+        raise invalid(
+            f"token must be a string or a token provider, not {type(token).__name__}: a "
+            "provider is a callable provider(*, previous, timeout) that returns a BearerToken"
+        )
+    if _token.asynchronous(provider):
+        raise invalid(
+            "the token provider must be synchronous, not an async function: it runs on a thread "
+            "of the package, never on an event loop, and aopen() waits for its token on the loop"
+        )
+    if not _token.takes_keywords(provider):
+        raise invalid(
+            "the token provider must take the keywords previous and timeout: "
+            "provider(*, previous, timeout) returns a BearerToken"
+        )
+    return provider
 
 
 def set_token(token: str | None) -> None:
     """Sets the bearer token every request of the process carries from now on. ``None`` or ``""``
     goes back to ``URSULA_VFS_TOKEN_FILE``, the file the extension reads the token from, when set.
-    A change resends the requests a 401 refused.
+    A change resends the requests a 401 refused. It stops the token provider an open named.
 
     One token per process: the last call's, or the last ``open()``'s with a ``token``, applies.
     """
-    chosen = _token(token)
-    _control.call("SELECT ursula_set_token('', ?)", chosen or "")
+    chosen = _string(
+        token, "set_token()", "for a token that changes, pass a token provider to open()"
+    )
+    _token.source.use_string(chosen or "")
 
 
 def open(  # noqa: A001 - the package's entry point, as Node's `open`
     url: str,
     *,
-    token: str | None = None,
+    token: str | _token.TokenProvider | None = None,
     dir: str | os.PathLike[str] | None = None,  # noqa: A002 - the option's name, as Node's
     read_only: bool = False,
     recreate: bool = False,
@@ -96,7 +121,12 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
     connection on the same binding, with no network. Concurrent opens, from any thread, share one
     bind and its outcome.
 
-    - ``token``: the bearer token requests carry, applied with :func:`set_token` before the open.
+    - ``token``: the bearer token requests carry, applied with :func:`set_token` before the open,
+      or a token provider, ``provider(*, previous, timeout)`` returning a :class:`BearerToken`,
+      which the package calls on a thread of its own before the open's first request, ahead of
+      each expiry and at once after a 401 (:class:`TokenProvider`). The token is one per process,
+      whichever provider minted it: an open with another provider names the one the next call
+      runs.
     - ``dir``: the cache root, created when missing. By default ``<user cache>/sqlite-ursula/0.8``.
     - ``read_only``: claims nothing, so it never fences the owner, and writes fail with
       ``SQLITE_READONLY``. In a process that owns the stream it is a read-only connection on the
@@ -133,7 +163,23 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
         busy_timeout,
         connect_kwargs,
     )
-    bind = _Bind(plan)
+    deadline = time.monotonic() + plan.timeout
+    if plan.provider is None:
+        return _bound(plan, deadline)
+    opening = _token.source.begin(plan.provider, threading.Event())
+    try:
+        opening.wait(plan.stream, deadline, plan.timeout)
+        try:
+            return _bound(plan, deadline)
+        except UrsulaError as error:
+            raise opening.refused_with(error)  # noqa: B904 - the open's own error
+    finally:
+        opening.end()
+
+
+def _bound(plan: _Plan, deadline: float) -> UrsulaConnection:
+    """``open``'s bind, waiting on the calling thread until ``deadline``."""
+    bind = _Bind(plan, deadline)
     while True:
         waiter = threading.Event()
         try:
@@ -153,7 +199,7 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
 async def aopen(
     url: str,
     *,
-    token: str | None = None,
+    token: str | _token.TokenProvider | None = None,
     dir: str | os.PathLike[str] | None = None,  # noqa: A002 - the option's name, as Node's
     read_only: bool = False,
     recreate: bool = False,
@@ -167,6 +213,9 @@ async def aopen(
 
     Cancelling it, as ``asyncio.timeout`` around it does, cancels the bind (``ursula_cancel``) and
     raises ``CancelledError``, so no bind goes on to claim the stream after the caller gave up.
+
+    A token provider runs on the package's own thread, never on the event loop: the open waits for
+    its token on the loop.
     """
     plan = _plan(
         url,
@@ -179,7 +228,23 @@ async def aopen(
         busy_timeout,
         connect_kwargs,
     )
-    bind = _Bind(plan)
+    deadline = time.monotonic() + plan.timeout
+    if plan.provider is None:
+        return await _abound(plan, deadline)
+    opening = _token.source.begin(plan.provider, _events.LoopEvent())
+    try:
+        await opening.await_(plan.stream, deadline, plan.timeout)
+        try:
+            return await _abound(plan, deadline)
+        except UrsulaError as error:
+            raise opening.refused_with(error)  # noqa: B904 - the open's own error
+    finally:
+        opening.end()
+
+
+async def _abound(plan: _Plan, deadline: float) -> UrsulaConnection:
+    """``aopen``'s bind, waiting on the event loop until ``deadline``."""
+    bind = _Bind(plan, deadline)
     while True:
         waiter = _events.LoopEvent()
         try:
@@ -202,6 +267,8 @@ class _Plan:
 
     stream: str
     root: str | None
+    #: The token provider the open names, if any.
+    provider: _token.TokenProvider | None
     #: ``ursula_open``'s options.
     options: str
     timeout: float
@@ -222,9 +289,9 @@ def _plan(
     busy_timeout: object,
     connect_kwargs: dict[str, Any],
 ) -> _Plan:
-    """Checks an open's arguments, starts the extension and applies the token."""
+    """Checks an open's arguments, starts the extension and applies a string token."""
     stream = _url(url)
-    chosen = _token(token)
+    chosen = _token_of(token)
     settings: dict[str, object] = {"timeout_ms": EXTENSION_OPEN_MS}
     if max_pending_bytes is not None:
         if (
@@ -253,11 +320,16 @@ def _plan(
         raise invalid(f"factory must be a subclass of UrsulaConnection, not {factory!r}")
     root = None if dir is None else os.fspath(dir)
     _control.start()
-    # The token is applied once, here, never in `ursula_open`'s options, which a bind sends
-    # again on each of its retries, over a token applied meanwhile.
-    if chosen is not None:
-        set_token(chosen)
-    return _Plan(stream, root, json.dumps(settings), limit, ro, busy, factory, connect_kwargs)
+    # The token is applied once, here or by the token source, never in `ursula_open`'s options,
+    # which a bind sends again on each of its retries, over a token applied meanwhile.
+    provider = None
+    if isinstance(chosen, str):
+        _token.source.use_string(chosen)
+    elif chosen is not None:
+        provider = chosen
+    return _Plan(
+        stream, root, provider, json.dumps(settings), limit, ro, busy, factory, connect_kwargs
+    )
 
 
 class _Bind:
@@ -271,9 +343,9 @@ class _Bind:
     cancel: that bind then runs to the extension's own deadline.
     """
 
-    def __init__(self, plan: _Plan) -> None:
+    def __init__(self, plan: _Plan, deadline: float) -> None:
         self._plan = plan
-        self._deadline = time.monotonic() + plan.timeout
+        self._deadline = deadline
         # The request of the last reply that was not done: concurrent opens of a stream, and each
         # pass of this one, share it until it resolves.
         self._known: int | None = None
@@ -375,6 +447,8 @@ def _connect(plan: _Plan, binding: dict[str, Any]) -> UrsulaConnection:
             cause=error,
         ) from error
     conn._bind(str(binding["name"]), path, plan.read_only, plan.busy)
+    # Whatever token the open named: the process's token serves every binding.
+    _token.source.bound(path)
     return conn
 
 
@@ -411,7 +485,11 @@ def import_sqlite(
     claim.
     """
     stream = _url(url)
-    chosen = _token(token)
+    chosen = _string(
+        token,
+        "import_sqlite()",
+        "it blocks its thread, so nothing could refresh a token provider's token meanwhile",
+    )
     limit = seconds("timeout", timeout, positive=True)
     source = os.fspath(file)
     settings = {} if chosen is None else {"token": chosen}

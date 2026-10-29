@@ -345,13 +345,13 @@ describe("a token provider", () => {
 			// least 0.3 s past the expiry. The gate refuses it from its expiry on and takes the next one,
 			// armed before the call hands it out. It still takes the first, which a request in flight
 			// may carry.
-			const minted: { token: string; expiresAt: number }[] = [];
+			const minted: { token: string; expiresAt: number; at: number }[] = [];
 			let evicted = false;
 			const cached: TokenProvider = async () => {
 				const held = minted.at(-1);
 				if (held !== undefined && held.expiresAt > Date.now() && !evicted) return held;
 				evicted = false;
-				const next = { token: `expiring-${minted.length + 1}`, expiresAt: Date.now() + (minted.length === 1 ? 1_200 : 3_600_000) };
+				const next = { token: `expiring-${minted.length + 1}`, expiresAt: Date.now() + (minted.length === 1 ? 1_200 : 3_600_000), at: 0 };
 				if (minted.length === 1) {
 					const r = await fetch(`${g.control}/auth`, {
 						method: "PUT",
@@ -359,6 +359,7 @@ describe("a token provider", () => {
 					});
 					expect(r.status, await r.text()).toBe(204);
 				}
+				next.at = Date.now();
 				minted.push(next);
 				return next;
 			};
@@ -375,12 +376,13 @@ describe("a token provider", () => {
 			await db.synced();
 			expect(minted.map((m) => m.token)).toEqual(["expiring-1", "expiring-2"]);
 			const expiry = (minted[1] as { expiresAt: number }).expiresAt;
+			// The cache mints the next token only from the expiry on: the retry due at the expiry takes
+			// it, rather than one after the backoff alone, 0.3 s or more past it.
+			await until("the call at the expiry", () => minted.length === 3);
+			expect((minted[2] as { at: number }).at - expiry).toBeLessThan(300);
+			// The source set the token in the step that took it, before this task ran again: every
+			// append from here on carries it.
 			const before = (await requests(g.control, s.path)).length;
-			// Still before the expiry, so every request from here on goes out across it.
-			expect(Date.now()).toBeLessThan(expiry);
-			// A commit 100 ms past the expiry goes out under the next token, which the retry due at
-			// the expiry took.
-			await sleep(expiry + 100 - Date.now());
 			db.exec("INSERT INTO t VALUES (2)");
 			await db.synced();
 			expect(minted.map((m) => m.token)).toEqual(["expiring-1", "expiring-2", "expiring-3"]);

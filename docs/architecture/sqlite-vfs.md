@@ -2081,10 +2081,12 @@ on its own, its database left open", `test/workers.e2e.ts`.
 
 ### Tokens
 
-`open()`'s `token` is a string or a provider, an async function that returns `{ token, expiresAt }`
-(`token.ts`). The extension knows only the process's token, which the package sets with
-`ursula_set_token` for both kinds, once per open. No token goes into `ursula_open`'s options, which
-a bind sends again on each of its retries and would put back a token older than one applied
+`open()`'s `token` is a string or a provider. In TypeScript the provider is an async function that
+returns `{ token, expiresAt }` (`token.ts`). In Python it is a synchronous callable
+`provider(*, previous, timeout)` that returns `BearerToken(token, expires_at)` (`_token.py`), for
+`open()` and `aopen()` alike. The extension knows only the process's token, which the package sets
+with `ursula_set_token` for both kinds, once per open. No token goes into `ursula_open`'s options,
+which a bind sends again on each of its retries and would put back a token older than one applied
 meanwhile. So the last open that names a token sets it.
 
 The extension carries the token and classifies refusals. The package decides when to call the
@@ -2167,6 +2169,38 @@ The TypeScript package's source of tokens:
   retires, the source stops if no path is bound and no open waits for it or is binding.
 - `importSqlite` takes a string only: it blocks its thread, so nothing could refresh it meanwhile.
 
+The Python package's source of tokens follows the same rules, and the TypeScript package's, with
+these differences:
+
+- One source per process rather than one per JavaScript thread, since a provider is a plain
+  callable with no thread of its own. It follows every path the process bound. An open with a
+  string, or `set_token()`, stops it.
+- A daemon thread, `sqlite-ursula-token-source`, keeps the schedule, and each call of the provider
+  runs on a daemon thread of its own, `sqlite-ursula-token`, never on an event loop: `aopen()`
+  waits for its token on the loop. A call is handed `previous` (`None` when there is none) and
+  `timeout`, the 30 s the source waits for it. Python cannot abandon a call from outside, so a call
+  that has not returned by then counts as failed, a call cut off by a stop has its answer
+  discarded, and either is left to finish on its thread while the next call runs on a thread of
+  its own. A call cut off before it started never reaches the provider. An exception of any kind,
+  `SystemExit` included, is a failed call.
+- A callable that does not take the keywords `previous` and `timeout`, and an async function, are
+  `invalid_argument` at the open, before any call.
+- `expires_at` is a timezone-aware `datetime` or seconds since the epoch, as `time.time()` and a
+  JWT's `exp` count them: a naive `datetime`, a number below 10^9 (a lifetime) and one at or above
+  10^11 (milliseconds) are `invalid_argument`.
+- An open waits within its `timeout`, with no signal: when it passes, the open raises
+  `UrsulaUnavailableError` `unavailable`, action `retry`, whose `__cause__` is the last failure, or
+  none when no call failed.
+- A failure for good is copied only when its class is one of the package's own, since another
+  constructor may take other arguments. A subclass of `UrsulaError` defined elsewhere is raised as
+  the package's class it derives from, with its message, kind, action and fix, and itself as the
+  `__cause__`.
+- The events thread, not a pump, delivers the `condition`, `gap` and `retired` events, and is
+  replaced while a provider serves the process. The source's threads are daemons, so they never
+  keep the process alive.
+- A child forked from the process starts with no source, no thread and no token held
+  ([Python](#python)).
+
 Tests: `test/token.e2e.ts` "is called again for the next open after an open was refused with 401",
 "is called before the open's first request, again ahead of each expiry, and no more once no binding
 uses it", "is called once for concurrent opens, and a later open with the same function reuses its
@@ -2193,12 +2227,35 @@ carried. Neither e2e server checks tokens, so the `401`s are scripted faults (th
 gate's), or come from a gate of the test's own that refuses each token from its expiry on, as an
 authorizer does.
 
+Python tests: `tests/test_token.py` "is called on its own thread before the open and again ahead of
+each expiry", "is called once for concurrent opens and a later open reuses its token", "hands the
+bindings it served to the provider of a later open, which shares the token held", "stops once a
+string token replaced it", "serves the token it holds at once, expired too, while its refresh
+fails", "waits for the refresh in flight rather than serve an expired token while healthy", "keeps
+refreshing while a binding opened with a string token is bound", "fails the open with its own error
+when it fails for good", "retries any other failure with backoff", "fails the open at its timeout
+with unavailable retry when it handed out no token", "refuses an answer it cannot use with
+invalid_argument", "is called again at once when a request is refused with 401", "handing out the
+previous token again counts as a failed call", "is asked again at the expiry of a token its cache
+hands back", "starts its backoff again at the expiry of the token it hands back", "takes back a
+dropped token once the database that reported it closed", "takes back a dropped token once its
+database closed while another stays bound", "counts a binding it cannot find as retired and a
+condition with no path as clear", "takes the token a condition dropped again once its binding is
+unblocked", "an open refused with 401 drops its token and the next open uses the next", "abandons a
+call that does not return once the provider is replaced", "aopen runs the provider on the package
+thread and waits on the loop", "aopen fails with the provider's permanent error" and "stops once no
+binding uses it and the next open calls it again", against the model server and one real `ursula`
+node behind the same gate, with the same checks of `previous` and of the tokens requests carried,
+and `tests/test_fork.py` "a child forked while a provider serves is forked and the parent's goes
+on".
+
 ### Python
 
 `clients/sqlite-ursula-python` is the `sqlite-ursula` package (import `sqlite_ursula`) for CPython
 3.11 or newer, free-threaded builds included. It is host glue over the same SQL functions as the
-TypeScript package: `open(url, ...)`, `import_sqlite` and `set_token` at the root, and the error
-classes, whose class, kind and action come from `ursula_classify`.
+TypeScript package: `open(url, ...)`, `import_sqlite` and `set_token` at the root, `BearerToken`
+for token providers ([Tokens](#tokens)), and the error classes, whose class, kind and action come
+from `ursula_classify`.
 
 - **Loading.** The extension loads into the stdlib `sqlite3` module's SQLite at the first call,
   on an in-memory control connection, with extension loading enabled only for the load. It becomes
@@ -2240,7 +2297,8 @@ classes, whose class, kind and action come from `ursula_classify`.
   tickets were rejected. A failed thread is replaced while tickets wait or
   connections are open, and the new one starts with a gap: tickets asked for again and resets read
   from status. After three failures in a row waits fail `internal`.
-- **Forks.** `os.register_at_fork`, where the platform has it, marks a child forked after the
+- **Forks.** `os.register_at_fork`, where the platform has it, gives every child a token source
+  of its own, with no provider, no thread and no token held, and marks a child forked after the
   parent started the extension (an open or an import). There `open`, `aopen`, `import_sqlite`
   and `set_token` raise `UrsulaSetupError` `forked` (`fix`), and so do the overridden calls of a
   connection the parent made: statements, transactions, `synced()`, `asynced()`, `status()`, the
@@ -2256,8 +2314,9 @@ classes, whose class, kind and action come from `ursula_classify`.
   drops the other tickets. `synced()` and `asynced()` are the same wait on one database.
 
 Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_async.py`, `tests/test_gate.py`,
-`tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py` and `tests/test_host.py`,
-against the model server and against one real `ursula` node ([Verification](#verification)).
+`tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py`, `tests/test_token.py` and
+`tests/test_host.py`, against the model server and against one real `ursula` node behind
+test/gate.mjs ([Verification](#verification)).
 
 ### LangGraph
 
@@ -2472,8 +2531,9 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
   `python:3.13-alpine`, and the Python suites run there.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
-  in-memory cold store, with the newest supported LangGraph. The tests that script faults skip
-  there.
+  in-memory cold store, behind test/gate.mjs, with the newest supported LangGraph. The token tests
+  script their `401`s on the gate and check the tokens it recorded. The tests that read the
+  model's frames or were written for its faults skip there.
 - `sqlite-ursula-python-wheels.yml`, on pull requests that change the Python package or the
   workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
   builds it for npm (it loads on glibc 2.28 or newer, musl linked dynamically, macOS 11.0), packed

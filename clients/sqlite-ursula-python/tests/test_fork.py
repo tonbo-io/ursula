@@ -1,7 +1,10 @@
 """Forks: a child forked after the parent opened a database raises ``forked`` from the package's
 calls and from the inherited connection's, whose ``close()`` closes nothing, while the parent goes
 on. A child forked before the parent started the extension opens databases as any process does:
-import at module level, open in the worker."""
+import at module level, open in the worker. A child of a parent whose token provider serves its
+databases raises ``forked`` from an open with that provider, while the parent's keeps refreshing.
+The child's token source also starts empty, but that reset is defensive: ``forked`` comes first,
+so nothing public shows it."""
 
 from __future__ import annotations
 
@@ -11,12 +14,15 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import warnings
 
 import pytest
 from conftest import env
 
 import sqlite_ursula
+from sqlite_ursula import BearerToken
 from sqlite_ursula import UrsulaSetupError
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork on this platform")
@@ -127,3 +133,36 @@ def test_a_child_forked_before_the_extension_started_opens_as_any_process(stream
     )
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == [[1]]
+
+
+def test_a_child_forked_while_a_provider_serves_is_forked_and_the_parents_goes_on(stream, fresh):
+    calls: list[str] = []
+
+    def provider(*, previous: str | None, timeout: float) -> BearerToken:
+        calls.append(threading.current_thread().name)
+        return BearerToken(f"fork-{len(calls)}", time.time() + 2)
+
+    sqlite_ursula.set_token(None)
+    db = sqlite_ursula.open(stream.url, dir=fresh(), token=provider, isolation_level=None)
+    db.execute("CREATE TABLE t(x)")
+    db.synced()
+    assert calls == ["sqlite-ursula-token"]
+
+    def child() -> list[str]:
+        try:
+            sqlite_ursula.open(stream.url + "-child", dir=fresh(), token=provider)
+        except UrsulaSetupError as e:
+            return [e.kind, e.action]
+        return ["returned"]
+
+    assert in_child(child) == ["forked", "fix"]
+    # The parent's provider keeps refreshing: the 2 s token's refresh is due 1.4 to 1.6 s after it
+    # arrived.
+    deadline = time.monotonic() + 10
+    while len(calls) < 2:
+        assert time.monotonic() < deadline, "the parent's refresh"
+        time.sleep(0.02)
+    db.execute("INSERT INTO t VALUES (1)")
+    db.synced()
+    sqlite_ursula.set_token(None)
+    db.close()

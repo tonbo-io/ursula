@@ -513,7 +513,7 @@ jobs:
           uvx ruff@0.17.1 check
           uvx ruff@0.17.1 format --check
 
-      - name: e2e (open, synced and the events thread, asyncio, gates, errors, forks, import, the host check)
+      - name: e2e (open, synced and the events thread, asyncio, gates, errors, forks, import, token providers, the host check)
         timeout-minutes: 10
         working-directory: clients/sqlite-ursula-python
         run: |
@@ -816,9 +816,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The Python suites against one release `ursula` node with an in-memory cold store, with the
-  # newest LangGraph the `langgraph` extra supports. The tests that script faults, which only the
-  # model takes, skip.
+  # The Python suites against one release `ursula` node with an in-memory cold store, behind
+  # clients/sqlite-ursula/test/gate.mjs, with the newest LangGraph the `langgraph` extra supports.
+  # The token tests script their 401s on the gate and check the tokens it recorded. The tests that
+  # read the model's frames or were written for its faults skip.
   sqlite-ursula-python-ursula:
     name: sqlite-ursula-python (ursula, 1 node, CPython 3.14)
     needs: [build-ursula, sqlite-vfs]
@@ -838,6 +839,12 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.6"
+
+      # Runs clients/sqlite-ursula/test/gate.mjs in front of the node (tests/conftest.py).
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
 
       - name: Download ursula
         uses: actions/download-artifact@v7

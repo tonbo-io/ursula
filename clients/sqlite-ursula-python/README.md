@@ -49,7 +49,7 @@ On macOS, use uv or Homebrew.
 `open(url, *, token, dir, read_only, recreate, max_pending_bytes, timeout, busy_timeout, **connect_kwargs)` returns an `UrsulaConnection`, a `sqlite3.Connection` subclass, so every library that takes one takes it.
 
 - The first open of a stream in the process binds its cache in `dir` (by default `<user cache>/sqlite-ursula/0.8`), catches it up and claims the stream: the last open that reaches the stream owns it. Later opens in the process return another connection on the same binding, with no network. Concurrent opens from any thread share one.
-- `token` is the bearer token requests carry. One token per process: `set_token(token)` replaces it, and `set_token(None)` goes back to `URSULA_VFS_TOKEN_FILE`.
+- `token` is the bearer token requests carry, or a [token provider](#token-providers) for tokens that expire. One token per process: `set_token(token)` replaces it, and `set_token(None)` goes back to `URSULA_VFS_TOKEN_FILE`.
 - The open gives up after `timeout` seconds (30 by default) with `UrsulaUnavailableError`, whose kind is the last condition it met. Ctrl-C cancels it too.
 - `busy_timeout` is `sqlite3.connect`'s `timeout`, 5 seconds by default, since a binding's connections share its files. The other keywords go to `sqlite3.connect`. `check_same_thread` is `False` unless given.
 - `autocommit=False` (Python 3.12 or newer) is refused with `invalid_argument`. In that mode the connection is always in a transaction: CPython's own `ROLLBACK` after a refused `COMMIT` would hide the refusal, and a connection kept open would hold a read snapshot that stops checkpoints. Use the default transaction control, `isolation_level=None` or `autocommit=True`.
@@ -65,7 +65,37 @@ other = sqlite3.connect(db.path)  # a framework's own connection: it replicates 
 
 `synced()` covers every connection of the process on this database (`db.path`), a framework's included, and no other: gate each database an output depends on. A negative or non-numeric `timeout` is `invalid_argument`. It raises `TimeoutError` after `timeout` seconds while the commits keep replicating, and `UrsulaResetError` on a reset. Network failures never raise from it: it waits. Ctrl-C interrupts it.
 
-`import_sqlite(url, file, *, token, timeout)` makes a plain SQLite file with 4096-byte pages the first snapshot of a new stream, then `open()` it as any other.
+`import_sqlite(url, file, *, token, timeout)` makes a plain SQLite file with 4096-byte pages the first snapshot of a new stream, then `open()` it as any other. Its `token` is a string: the import blocks its thread, so nothing could refresh it meanwhile.
+
+## Token providers
+
+For short-lived tokens, pass a provider as `token` instead of running a refresher: a synchronous callable that takes the keywords `previous` and `timeout` and returns a `BearerToken(token, expires_at)`. `expires_at` is seconds since the epoch, as `time.time()` and a JWT's `exp` count them, or a timezone-aware `datetime`.
+
+```python
+import json
+import time
+import urllib.request
+
+import sqlite_ursula
+from sqlite_ursula import BearerToken
+
+
+def token(*, previous: str | None, timeout: float) -> BearerToken:
+    with urllib.request.urlopen("https://auth.example.com/token", timeout=timeout) as r:
+        answer = json.load(r)
+    return BearerToken(answer["access_token"], time.time() + answer["expires_in"])
+
+
+db = sqlite_ursula.open("https://ursula.example.com/acme/notes", token=token)
+```
+
+- The package calls the provider before an open's first request when it holds no valid token, again after 70 to 80% of each token's lifetime, and again at once when a request was refused with `401`. Concurrent opens share one call, and a later open gets a valid token held at once.
+- Each call runs on a daemon thread of the package, `sqlite-ursula-token`, never on your event loop: `aopen()` takes the same provider and waits for its token on the loop. So the provider is synchronous: an async function is `invalid_argument` at the open.
+- Each call is handed `previous`, the token the provider last handed out, exactly as it handed it out, when the package will not take it again: the current one at a scheduled refresh, or the one the server refused after a `401`. It is `None` before the first call and after the provider stopped, except that a token an open's bind was refused under, or one a database still bound and blocked was refused under, stays `previous` across a stop, until the provider hands out another one or a string token or `set_token()` stops the provider. When `previous` is set, hand out a different token, and refill a cache that holds it. The extension takes an equal token as no change, so an answer equal to `previous`, compared without surrounding whitespace, counts as a failed call. A failed call is retried with backoff, and by the expiry of `previous` at the latest, so a cache that hands its token back until it expires is asked again as it turns over. From that expiry on only the failures since it count, so the backoff starts again at 1 s. When the provider hands back the token a database's replication was refused under, the package takes it again once each database that reported the refusal is closed and retired, with every commit acknowledged, or no longer blocked. A retry already scheduled then runs at once. A token that never changes belongs in a string `token` or in `URSULA_VFS_TOKEN_FILE`, not in a provider.
+- `timeout` is the 30 s the package waits for the answer. A call that has not returned by then counts as failed, and a call cut off by a stop (a string token, `set_token()`, the last database retired) has its answer discarded, or never reaches the provider when it had not started. Either is left to finish on its thread, and the next call runs on a thread of its own.
+- An exception whose `action` is `"fix"` fails for good, and the package calls the provider again only for the next open. An open waiting for the token raises it when it is an `UrsulaError`, such as `UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized", "fix")`, or the package's class it derives from, with the same message, kind and action and it as the `__cause__`, when it is a subclass of your own. Any other such exception, say a library's own, is the `__cause__` of an `UrsulaUnavailableError` `unauthorized` (action `fix`). Other exceptions are retried with backoff, from 1 s up to 30 s, while the token held keeps serving. An open whose `timeout` passes while it waits raises `UrsulaUnavailableError` `unavailable` (action `retry`), whose `__cause__` is the provider's last error, or none when no call failed. A token that is not printable ASCII without spaces, a naive `datetime`, or an `expires_at` that is not seconds since the epoch fails the open with `invalid_argument`, and so does a provider that does not take the keywords `previous` and `timeout`, before any call.
+- The token is one per process, whichever provider minted it. An open with another provider only names the one the next call runs, and shares the token held and the call in flight. An open with a string token, or `set_token()`, stops the provider. So does the retirement of the last database the process has bound, closed with every commit acknowledged, while no open with a provider is under way. A forked child starts with no provider.
+- No token is logged, and the `repr` of a `BearerToken` leaves it out. The package keeps a provider's tokens out of the locals of the frames its errors pass through, which error reporters may record.
 
 ## asyncio
 
