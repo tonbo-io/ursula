@@ -211,7 +211,7 @@ Without `dir` it uses the default cache root. On Pi 1.0 to 1.3, `harness.close(c
 
 ## Tonbo databases by name
 
-Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, and pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can be a provider (see [TLS and tokens](#tls-and-tokens)).
+Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. `/tonbo` now exports only `open` and `resolveDatabase`, and `/tonbo/pi` only `openUrsulaPiStorage`. Import `gate`, `UrsulaDatabase`, the error classes and the token types from `@tonbo/sqlite-ursula` and drop `TonboError`, or the import fails when the module loads. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, and pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can be a provider (see [TLS and tokens](#tls-and-tokens)).
 
 ## Other hosts
 

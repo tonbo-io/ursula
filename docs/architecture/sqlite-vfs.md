@@ -1714,13 +1714,13 @@ job also checks that each usage error exits 2 with nothing on stdout.
 
 ### Forks
 
-A process starts the extension with its first `ursula_open`, `ursula_events` or `ursula_import`,
-or with a host's drain, before any of them makes something that lives on in the
-process: the driver and its threads, the HTTP agents with their pooled connections, the resolver's
-cache, a token. A child forked after the start has all of it in its memory but none of the threads
-that serve it, and a lock one of them held at the fork stays held in the child. Using it there would
-stall `synced()`, append to the parent's log, or send on a TLS connection the parent also writes. So
-in such a child, and in every process forked from one:
+A process starts the extension with its first `ursula_open`, `ursula_events` or `ursula_import`, or
+with a host's drain, before any of them makes something that lives on in the process: the driver and
+its threads, the HTTP agents with their pooled connections, the resolver's cache, a token. A child
+forked after the start has all of it in its memory but none of the threads that serve it, and a lock
+one of them held at the fork stays held in the child. Using it there would stall `synced()`, append
+to the parent's log, or send on a TLS connection the parent also writes. So in such a child, and in
+every process forked from one:
 
 - Every SQL function fails `forked` (action `fix`: open after the fork).
 - Every method on a file of a bound database fails without running, with the code it answers after
@@ -2000,7 +2000,8 @@ its stream URL with a token, as any stream does. The `/tonbo` and `/tonbo/pi` en
 TypeScript package (`tonbo.ts`, `tonbo-pi.ts`) stay in the 0.11 line only to say where opening by
 name went. Their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with a plain `Error`
 that names the entry, says it was removed in 0.11.3 and moved to the Tonbo SDK, and shows the open
-by URL with a token. They import nothing and send nothing. Both entries go in 0.12.
+by URL with a token. They import nothing and send nothing. `/tonbo` exports only `open` and
+`resolveDatabase`, and `/tonbo/pi` only `openUrsulaPiStorage`.
 
 Tests: `test/open.e2e.ts` "reject every call with where opening a Tonbo database by name moved",
 and `scripts/smoke.mjs` on the packed package's entries.
@@ -2082,9 +2083,9 @@ anything is sent".
 Main-thread calls into the extension return at once (timeout 0). The package starts one unref'd
 worker per JavaScript thread that uses it. The worker loads the extension the process already holds,
 shares its registry, and loops on `SELECT ursula_events(cursor, 1000)`, posting events that resolve
-`synced()`, complete `open()`, and fire `reset` listeners. No
-native addon is needed. What still blocks is what blocks plain SQLite: local I/O and the busy
-handler. `importSqlite` blocks its thread for at most its timeout.
+`synced()`, complete `open()`, and fire `reset` listeners. No native addon is needed. What still
+blocks is what blocks plain SQLite: local I/O and the busy handler. `importSqlite` blocks its thread
+for at most its timeout.
 
 Tests: `test/synced.e2e.ts` "waits without blocking the event loop while the stream holds its
 answer back", "asks again for what a gap in the events may have dropped", "keeps the process alive

@@ -152,7 +152,7 @@ Every transaction and statement resolves only after `synced()`, so a Pi commit r
 
 ## Tonbo databases by name
 
-Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, the `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` entries stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. They send nothing. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, then pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can also be a [token provider](#tokens).
+Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, the `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` entries stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. They send nothing. `/tonbo` now exports only `open` and `resolveDatabase`, and `/tonbo/pi` only `openUrsulaPiStorage`. Import `gate`, `UrsulaDatabase`, the error classes and the token types from `@tonbo/sqlite-ursula` and drop `TonboError`, or the import fails when the module loads. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, then pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can also be a [token provider](#tokens).
 
 ## SQL functions
 

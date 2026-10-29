@@ -1,8 +1,5 @@
 // Waiting under an AbortSignal, as `open()` and the token provider (token.ts) both do.
 
-/** How long an open may take without a signal: the root entry's default. */
-export const DEFAULT_OPEN_MS = 30_000;
-
 /** `promise`, or `signal`'s reason when it fires first. */
 export function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 	return new Promise((resolve, reject) => {

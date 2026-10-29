@@ -13,7 +13,7 @@
 //! binding's step it resets that binding `internal`.
 //!
 //! A token change reaches the core as [`Core::token_changed`] ([`token_changed`]): from
-//! `ursula_set_token` at once, from the token file when a read finds a new token in it, a
+//! `ursula_set_token` at once, and from the token file when a read finds a new token in it, a
 //! request's or the driver thread's own check every [`crate::auth::FILE_CHECK_MS`] while requests
 //! carry the file's token and an open or a writer may send them.
 //!
@@ -225,7 +225,7 @@ pub(crate) fn driver() -> &'static Driver {
         crate::db::expect_started("driver");
         let transports: Transports =
             Arc::new(|url: &str| Arc::new(HttpTransport::new(url)) as Arc<dyn Transport>);
-        Driver::launch(transports, seed())
+        Driver::start(transports, seed())
     })
 }
 
@@ -255,14 +255,8 @@ fn seed() -> [u8; 32] {
 }
 
 impl Driver {
-    /// Starts a driver of a test's own, beside the process's.
-    #[cfg(test)]
-    pub(crate) fn start(transports: Transports, seed: [u8; 32]) -> Self {
-        Self::launch(transports, seed)
-    }
-
     /// Starts the driver thread.
-    fn launch(transports: Transports, seed: [u8; 32]) -> Self {
+    pub(crate) fn start(transports: Transports, seed: [u8; 32]) -> Self {
         let (commands, inbox) = mpsc::channel::<Command>();
         let shared = Arc::new(Shared {
             state: Mutex::new(Published::default()),

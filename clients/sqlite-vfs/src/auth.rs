@@ -110,8 +110,7 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
     if let Some(token) = lock(&SET).clone() {
         return Some(token);
     }
-    let path = token_file()?;
-    let read = file_token(path, refresh, &FILE);
+    let read = file_token(token_file()?, refresh, &FILE);
     if read.changed {
         changed();
     }
@@ -230,7 +229,7 @@ fn stat(path: &str) -> (Option<SystemTime>, Option<u64>) {
 
 /// A token as `Authorization: Bearer` carries it: trimmed, non-empty, printable ASCII without
 /// spaces.
-pub(crate) fn usable(token: &str) -> Option<String> {
+fn usable(token: &str) -> Option<String> {
     let token = token.trim();
     (!token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())).then(|| token.to_owned())
 }
