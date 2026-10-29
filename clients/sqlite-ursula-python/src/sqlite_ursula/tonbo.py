@@ -23,11 +23,12 @@ opens the stream as the root module's ``open`` does.
 - An explicit ``token`` serves the Streams requests instead of the key's tokens, and so does
   ``URSULA_VFS_TOKEN_FILE``, which the extension reads.
 - ``timeout`` bounds the whole open, the lookup included. At the timeout one last pass takes an
-  outcome that arrived. Otherwise, as on Ctrl-C, a cancellation or any other exception, the call
-  leaves the resolve to the other calls that share it and reports ``cancelled``, and the last one
-  cancels it (``ursula_cancel``) and reports the last condition it met. A Ctrl-C that lands inside
-  the first ``tonbo_resolve`` call of a resolve, before its reply is read, can miss the cancel:
-  that resolve then runs to the extension's own deadline.
+  outcome that arrived. Otherwise the call leaves the resolve to the other calls that share it and
+  reports ``cancelled``, and the last one cancels it (``ursula_cancel``) and reports the last
+  condition it met. On Ctrl-C, a cancellation or another exception, the call leaves the resolve
+  the same way and raises that exception. A Ctrl-C that lands inside the first ``tonbo_resolve``
+  call of a resolve, before its reply is read, can miss the cancel: that resolve then runs to the
+  extension's own deadline.
 
 Nothing here logs, no error message carries a key or a token, and the options a resolve sends,
 which may hold a key, never show in a ``repr``.
@@ -101,7 +102,8 @@ class TonboError(UrsulaError):
     - ``credentials_refused``: the login file is a symlink, not a regular file, or open to group
       or others.
     - ``invalid_api_key``: the Tonbo API refused the key, the key cannot read the database (403),
-      or the login expired or is not one the extension reads.
+      ``TONBO_API_KEY`` holds no usable key, or the login file expired or is not one the extension
+      reads.
     - ``database_not_found``: the account has no database of that name, or it is being deleted.
     """
 
@@ -210,8 +212,10 @@ class _Resolve:
 
     The extension owes a host one outcome for its calls that returned at once, so the calls of the
     process share one :class:`_Shared` by their arguments: the first back takes the outcome for
-    all. A call that gives up, at its timeout or at an exception, leaves the resolve to the others
-    and reports ``cancelled``, and the last one cancels it."""
+    all. A call joins it in its first pass, under the lock, so a call counted is one that leaves.
+    A call that gives up, at its timeout or at an exception, leaves the resolve to the others, and
+    the last one cancels it. At the timeout it reports ``cancelled`` or what the cancel reports,
+    and at an exception the exception is raised."""
 
     def __init__(self, target: str, options: _Options, timeout: float, deadline: float) -> None:
         self._target = target
@@ -223,17 +227,26 @@ class _Resolve:
         self._request: int | None = None
         #: The call took the outcome or left the resolve.
         self._done = False
-        with _control.lock():
-            shared = _inflight.get(options.digest)
-            if shared is None:
-                shared = _inflight[options.digest] = _Shared()
-            shared.calls += 1
-        self._shared = shared
+        #: The resolve the call shares, from its first pass on.
+        self._joined: _Shared | None = None
+
+    @property
+    def _shared(self) -> _Shared:
+        shared = self._joined
+        assert shared is not None, "a pass joins the resolve first"
+        return shared
 
     def ask(self, waiter: _events.Waiter) -> dict[str, Any] | None:
         """One pass: the answer when the resolve is done, else ``None`` with ``waiter`` registered
-        for the request's ``resolved`` event. Raises the resolve's failure."""
+        for the request's ``resolved`` event. Raises the resolve's failure. The first pass joins
+        the resolve the process's calls with the same arguments share."""
         with _control.lock():
+            if self._joined is None:
+                shared = _inflight.get(self._options.digest)
+                if shared is None:
+                    shared = _inflight[self._options.digest] = _Shared()
+                shared.calls += 1
+                self._joined = shared
             self._forget()
             if self._shared.outcome is None:
                 # The thread first, so its cursor precedes the request, and the waiter registered
@@ -255,7 +268,7 @@ class _Resolve:
         leaves the resolve, and the last one cancels it."""
         with _control.lock():
             self._forget()
-            if not self._done:
+            if self._joined is not None and not self._done:
                 self._leave()
         return False
 

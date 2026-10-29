@@ -23,9 +23,10 @@ Module map:
 - ``_control``: the process's control connection, calls of the extension's SQL functions,
   ``classify``, which asks the extension (``ursula_classify``) what a failure is, and the fork
   state.
-- ``_events``: the events thread, which waits for the extension's events and resolves
-  ``synced()`` and ``asynced()``, completes ``open()`` and ``aopen()``, and runs the reset
-  callbacks.
+- ``_events``: the events thread, which waits for the extension's events, resolves ``synced()``
+  and ``asynced()``, wakes the opens and the Tonbo resolves, and runs the reset callbacks, and the
+  one wait loop of a call that waits for a request of the extension (``Step``, ``wait_for`` and
+  ``await_for``).
 - ``_connection``: :class:`UrsulaConnection`, the ``sqlite3.Connection`` subclass ``open``
   returns, and its cursor, whose statements classify their errors.
 - ``_open``: :func:`open`, :func:`aopen`, :func:`import_sqlite` and :func:`set_token`.

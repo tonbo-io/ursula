@@ -2628,9 +2628,8 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
   3.14 and 3.14t, with Node 22 for the Tonbo stand-in, ruff, the wheel's own library found
   without `SQLITE_URSULA_VFS`, the wheel hosted by a uv-managed CPython on `debian:trixie-slim` as
-  `recipes/Dockerfile.uv` installs it,
-  and on `python:3.13-slim`, whose SQLite is older than the extension supports,
-  `python -m sqlite_ursula` failing with `host_unsupported`.
+  `recipes/Dockerfile.uv` installs it, and on `python:3.13-slim`, whose SQLite is older than the
+  extension supports, `python -m sqlite_ursula` failing with `host_unsupported`.
 - `sqlite-ursula-python-windows`: on Windows, which has no VFS, `import sqlite_ursula` works, and
   `python -m sqlite_ursula` and `open()` fail with `host_unsupported`, whose fix is WSL.
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in

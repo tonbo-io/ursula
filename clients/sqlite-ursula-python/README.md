@@ -127,7 +127,7 @@ Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`
 | --- | --- | --- |
 | `missing_credentials` | no `api_key`, no `TONBO_API_KEY` and no login file | `Set TONBO_API_KEY, or run: tonbo login` |
 | `credentials_refused` | the login file is a symlink, not a regular file, or open to group or others | `Run: chmod 600 <path>`, or replace the file |
-| `invalid_api_key` | the API refused the key, the key cannot read the database, or the login expired | a valid key for the key's source, or `Run: tonbo login` |
+| `invalid_api_key` | the API refused the key, the key cannot read the database, `TONBO_API_KEY` holds no usable key, or the login file expired or is not one the extension reads | a valid key for the key's source, or `Run: tonbo login` |
 | `database_not_found` | the account has no database of that name, or it is being deleted | `Run: tonbo database create <name>` |
 
 Past its timeout while the Tonbo API did not answer, or while the database was still being created, `open()` raises `UrsulaUnavailableError` (`unreachable`, `unavailable` or `rate_limited`, action `retry`). A call that gives up while other calls share its lookup leaves the lookup to them and raises `cancelled`, and the last one cancels it. An origin it cannot use, an answer outside the APIs' contracts or a second key for Streams tokens raise `UrsulaSetupError` `invalid_argument`. A stream URL it cannot take, or one that would get the key's Streams tokens over plain `http://` to another host, raises `invalid_url`, an empty name `invalid_name`, and a login file it cannot read `local_setup`.
