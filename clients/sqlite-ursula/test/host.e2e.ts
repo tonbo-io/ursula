@@ -66,7 +66,7 @@
 // - H22: of two orphans of one stream in two cache roots, in either scan order, the later claimant
 //   drains and the older is fenced. Orphans of two streams, one recorded and one scanned, both drain
 //   under `--concurrency` 1 and 2.
-// - H23: an orphan whose log segment has another format's magic, which the per-root read refuses,
+// - H24: an orphan whose log segment has another format's magic, which the per-root read refuses,
 //   is `unreadable`, with no kind, no counts and no claim. With its magic back the next drain
 //   drains it.
 //
@@ -1399,7 +1399,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			});
 		}
 
-		it("H23: a root whose log the per-root read refuses is unreadable, nothing is claimed, and once readable it drains", async () => {
+		it("H24: a root whose log the per-root read refuses is unreadable, nothing is claimed, and once readable it drains", async () => {
 			const o = await orphan("host-h23");
 			const before = await claims(o.s.path);
 			// Another format's magic in the first segment of the generation's log: refused, not cut as torn.
