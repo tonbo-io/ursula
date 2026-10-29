@@ -2,51 +2,62 @@
 
 The only module of the package that imports LangGraph, through the ``langgraph`` extra
 (``pip install 'sqlite-ursula[langgraph]'``), which pins ``langgraph-checkpoint-sqlite`` to the
-releases CI tests. Each class is a subclass of LangGraph's own, unmodified but for its writes::
+releases CI tests. Each class is a subclass of LangGraph's own, unmodified but for its connection
+and its writes::
 
     from sqlite_ursula.langgraph import UrsulaSaver
 
     db = sqlite_ursula.open(url)
-    graph = builder.compile(checkpointer=UrsulaSaver(db))
-    reply = graph.invoke(inputs, {"configurable": {"thread_id": "1"}})
+    with UrsulaSaver(db) as saver:
+        graph = builder.compile(checkpointer=saver)
+        reply = graph.invoke(inputs, {"configurable": {"thread_id": "1"}})
     send(reply)  # every checkpoint of the run is in the stream
 
-- :class:`UrsulaSaver` is ``SqliteSaver`` on ``db`` itself, and :class:`UrsulaStore` is
-  ``SqliteStore`` on ``db``, which needs a connection without implicit transactions, as
-  ``SqliteStore``'s own are: ``open(url, isolation_level=None)``.
-- :class:`AsyncUrsulaSaver` and :class:`AsyncUrsulaStore` are ``AsyncSqliteSaver`` and
-  ``AsyncSqliteStore`` on an aiosqlite connection to ``db.path`` that ``open(db)`` makes. That
-  connection is on ``db``'s binding as ``db`` is, so its errors are the package's too.
-  ``aclose()``, or ``async with``, closes it.
+Each class runs on a connection of its own on ``db``'s binding, which it opens and closes:
+``close()`` or ``with`` for :class:`UrsulaSaver` and :class:`UrsulaStore`, ``aclose()`` or
+``async with`` for :class:`AsyncUrsulaSaver` and :class:`AsyncUrsulaStore`, which ``open(db)``
+makes on an aiosqlite connection. LangGraph writes checkpoints from threads of its own while the
+graph's nodes run, so a connection the application also writes on would share its transactions.
+The savers' connections keep SQLite's default transaction control, which makes each checkpoint,
+each task's writes and each deleted thread one transaction, and the stores' open no transactions
+of their own, since ``SqliteStore`` runs its own ``BEGIN`` and ``COMMIT``. Each is bound as ``db``
+is, so its errors are the package's too.
 
-Every write returns only once ``db.synced()`` (``asynced()``) returned after it: the setup that
-creates the tables, which LangGraph runs before the first read too, a checkpoint, a task's writes,
-a deleted thread, a store batch with a put or a delete, a TTL sweep. So a graph's
-``invoke`` returns once the checkpoints of its run are in the stream, since LangGraph waits for its
-background checkpoint writes before it returns. Reads do not wait. A write refused with
-``backlog_full`` committed nothing: it waits for ``synced()`` and runs again. A reset raises the
-:class:`~sqlite_ursula.UrsulaResetError` itself, from a write or a read. Keep ``db`` open while the
-graph runs.
+Every write returns only once ``db.synced()`` (``asynced()``) returned after it: a checkpoint, a
+task's writes, a deleted thread, a store put or delete, a store get or search that refreshes TTLs,
+a TTL sweep. So a graph's ``invoke`` returns once the checkpoints of its run are in the stream,
+since LangGraph waits for its background checkpoint writes before it returns. Reads do not wait,
+and neither does the setup that creates the tables: the next write's wait covers it. A write
+refused with ``backlog_full`` committed nothing: it waits for ``synced()`` and runs again, which
+is safe because each of these writes is one transaction. LangGraph's setup commits its statements
+one by one, and a store's migrations are not safe to run twice, so there each refused statement
+waits and runs again by itself. A reset raises the :class:`~sqlite_ursula.UrsulaResetError`
+itself, from a write or a read. Keep ``db`` open while the graph runs.
 """
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Sequence
 from typing import Any
 from typing import Self
 from typing import TypeVar
+from typing import cast
 
 import aiosqlite
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.store.base import GetOp
 from langgraph.store.base import Op
 from langgraph.store.base import PutOp
 from langgraph.store.base import Result
+from langgraph.store.base import SearchOp
 from langgraph.store.sqlite import AsyncSqliteStore
 from langgraph.store.sqlite import SqliteStore
 
@@ -61,103 +72,193 @@ __all__ = ["AsyncUrsulaSaver", "AsyncUrsulaStore", "UrsulaSaver", "UrsulaStore"]
 
 T = TypeVar("T")
 
+#: How long a store's ``close()`` or ``aclose()`` waits for its TTL sweeper to stop, since a sweep
+#: that waits for the stream during an outage would not stop by itself. ``aclose()`` then cancels
+#: it.
+SWEEPER_STOP_S = 1.0
+
 
 def _backlog_full(error: UrsulaWriteRefusedError) -> bool:
     return error.kind == "backlog_full"
 
 
-def _gated(db: UrsulaConnection, write: Callable[..., T], *args: Any) -> T:
-    """``write(*args)``'s result once ``db.synced()`` returned after it. A ``backlog_full`` refusal
-    committed nothing, and the extension admits any commit while nothing is pending: it runs again
-    once ``synced()`` returned."""
+def _gated(db: UrsulaConnection, writes: bool, call: Callable[..., T], *args: Any) -> T:
+    """``call(*args)``'s result, once ``db.synced()`` returned after it when it ``writes``. A
+    ``backlog_full`` refusal committed nothing, since ``call`` runs one transaction, and the
+    extension admits any commit while nothing is pending: it runs again once ``synced()``
+    returned."""
     while True:
         try:
-            result = write(*args)
+            result = call(*args)
         except UrsulaWriteRefusedError as error:
             if not _backlog_full(error):
                 raise
         else:
-            db.synced()
+            if writes:
+                db.synced()
             return result
         db.synced()
 
 
-async def _agated(db: UrsulaConnection, write: Callable[..., Awaitable[T]], *args: Any) -> T:
+async def _agated(
+    db: UrsulaConnection, writes: bool, call: Callable[..., Awaitable[T]], *args: Any, **kw: Any
+) -> T:
     """:func:`_gated` for a coroutine function, on ``db.asynced()``."""
     while True:
         try:
-            result = await write(*args)
+            result = await call(*args, **kw)
         except UrsulaWriteRefusedError as error:
             if not _backlog_full(error):
                 raise
         else:
-            await db.asynced()
+            if writes:
+                await db.asynced()
             return result
         await db.asynced()
+
+
+class _Connection(UrsulaConnection):
+    """An adapter's own connection on its database's binding.
+
+    LangGraph's ``setup`` commits its statements one by one, and a store's migrations are not safe
+    to run twice: run again after its ``INSERT INTO store_migrations`` was refused, an
+    ``ALTER TABLE ... ADD COLUMN`` fails with "duplicate column name". So while ``setting_up``, a
+    statement run outside a transaction that is refused with ``backlog_full``, which committed
+    nothing, waits for ``synced()`` and runs again by itself. Each of setup's scripts is one
+    statement, or statements that are safe to run twice (``CREATE TABLE IF NOT EXISTS``)."""
+
+    setting_up = False
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        return self._admitted(super().execute, sql, parameters)
+
+    def executescript(self, script: str, /) -> Any:
+        return self._admitted(super().executescript, script)
+
+    def _admitted(self, run: Callable[..., T], *args: Any) -> T:
+        if not self.setting_up or self._in_transaction():
+            return run(*args)
+        while True:
+            try:
+                return run(*args)
+            except UrsulaWriteRefusedError as error:
+                if not _backlog_full(error):
+                    raise
+            self.synced()
+
+
+@contextlib.contextmanager
+def _setting_up(conn: _Connection) -> Iterator[None]:
+    conn.setting_up = True
+    try:
+        yield
+    finally:
+        conn.setting_up = False
+
+
+def _connect(db: UrsulaConnection, **kwargs: Any) -> _Connection:
+    """A connection of an adapter's own on ``db``'s binding, which any thread may use."""
+    database, binding = on_binding(db, _Connection)
+    conn = sqlite3.connect(database, check_same_thread=False, **binding, **kwargs)
+    return cast(_Connection, conn)
+
+
+async def _aconnect(
+    db: UrsulaConnection, **kwargs: Any
+) -> tuple[aiosqlite.Connection, _Connection]:
+    """An aiosqlite connection of an adapter's own on ``db``'s binding, and the sqlite3
+    connection it made on its thread."""
+    database, binding = on_binding(db, _Connection)
+    bind = binding.pop("factory")
+    made: list[_Connection] = []
+
+    def factory(*args: Any, **kw: Any) -> UrsulaConnection:
+        conn = cast(_Connection, bind(*args, **kw))
+        made.append(conn)
+        return conn
+
+    conn = await aiosqlite.connect(database, factory=factory, **binding, **kwargs)
+    return conn, made[0]
+
+
+def _refreshes(ttl: Any, refresh_ttl: bool | None) -> bool:
+    """Whether a get or a search with ``refresh_ttl`` (``None``: the store's default) writes:
+    ``SqliteStore`` refreshes the TTLs of what it reads when its ``ttl`` sets
+    ``refresh_on_read``."""
+    return bool(ttl and ttl.get("refresh_on_read", False)) and refresh_ttl is not False
+
+
+def _writes(ops: Sequence[Op], ttl: Any) -> bool:
+    """Whether a store batch writes: a put, a delete, or a get or a search that refreshes TTLs."""
+    return any(
+        isinstance(op, PutOp)
+        or (isinstance(op, (GetOp, SearchOp)) and _refreshes(ttl, op.refresh_ttl))
+        for op in ops
+    )
 
 
 def _no_conn_string(cls: type, use: str) -> UrsulaSetupError:
     return invalid(f"{cls.__name__} replicates a database open() made, not a file: use {use}")
 
 
-def _autocommits(db: UrsulaConnection) -> bool:
-    """Whether ``db`` opens no transaction of its own: ``isolation_level=None``, or
-    ``autocommit=True`` (Python 3.12 or newer)."""
-    legacy = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", None)
-    mode = getattr(db, "autocommit", legacy)
-    return mode is True or (mode == legacy and db.isolation_level is None)
-
-
-async def _connect(db: UrsulaConnection, **kwargs: Any) -> aiosqlite.Connection:
-    """An aiosqlite connection on ``db``'s binding."""
-    database, binding = on_binding(db)
-    return await aiosqlite.connect(database, **binding, **kwargs)
-
-
-def _writes(ops: Sequence[Op]) -> bool:
-    """Whether a store batch writes: a put or a delete."""
-    return any(isinstance(op, PutOp) for op in ops)
-
-
 class UrsulaSaver(SqliteSaver):
-    """LangGraph's ``SqliteSaver`` on ``db``, a connection ``open()`` made: ``put``,
-    ``put_writes`` and ``delete_thread`` return once ``db.synced()`` returned after them, and a
-    ``backlog_full`` refusal runs again after ``synced()``.
+    """LangGraph's ``SqliteSaver`` on a connection of its own on ``db``'s binding, ``db`` a
+    connection ``open()`` made: ``put``, ``put_writes`` and ``delete_thread`` return once
+    ``db.synced()`` returned after them, and a ``backlog_full`` refusal runs again after
+    ``synced()``.
 
     LangGraph runs a graph's checkpoint writes in the background and waits for them before
     ``invoke`` returns, so ``invoke``'s return is gated in every durability mode.
     ``durability="sync"`` also gates what a node does after the step before it, at one round trip
-    per step.
+    per step. ``close()``, or ``with``, closes its connection. ``db`` stays open.
     """
+
+    conn: _Connection
 
     def __init__(self, db: UrsulaConnection, *, serde: SerializerProtocol | None = None) -> None:
         self.db = bound(db, type(self).__name__)
-        super().__init__(self.db, serde=serde)
+        conn = _connect(self.db)
+        try:
+            super().__init__(conn, serde=serde)
+        except BaseException:
+            conn.close()
+            raise
 
     @classmethod
     def from_conn_string(cls, conn_string: str) -> Any:
         raise _no_conn_string(cls, f"{cls.__name__}(sqlite_ursula.open(url))")
 
     def setup(self) -> None:
-        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
         if not self.is_setup:
-            _gated(self.db, super().setup)
+            with _setting_up(self.conn):
+                super().setup()
 
     def put(self, config: Any, checkpoint: Any, metadata: Any, new_versions: Any) -> Any:
-        return _gated(self.db, super().put, config, checkpoint, metadata, new_versions)
+        return _gated(self.db, True, super().put, config, checkpoint, metadata, new_versions)
 
     def put_writes(
         self, config: Any, writes: Sequence[tuple[str, Any]], task_id: str, task_path: str = ""
     ) -> None:
-        _gated(self.db, super().put_writes, config, writes, task_id, task_path)
+        _gated(self.db, True, super().put_writes, config, writes, task_id, task_path)
 
     def delete_thread(self, thread_id: str) -> None:
-        _gated(self.db, super().delete_thread, thread_id)
+        _gated(self.db, True, super().delete_thread, thread_id)
+
+    def close(self) -> None:
+        """Closes the saver's connection, after the call that holds it. ``db`` stays open."""
+        with self.lock:
+            self.conn.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 class AsyncUrsulaSaver(AsyncSqliteSaver):
-    """LangGraph's ``AsyncSqliteSaver`` on ``db``'s database, through an aiosqlite connection on
-    its binding: ``aput``, ``aput_writes`` and ``adelete_thread`` return once ``db.asynced()``
+    """LangGraph's ``AsyncSqliteSaver`` on an aiosqlite connection of its own on ``db``'s
+    binding: ``aput``, ``aput_writes`` and ``adelete_thread`` return once ``db.asynced()``
     returned after them, and a ``backlog_full`` refusal runs again after ``asynced()``. Its
     synchronous calls, which LangGraph runs from other threads, are those.
 
@@ -170,18 +271,21 @@ class AsyncUrsulaSaver(AsyncSqliteSaver):
         conn: aiosqlite.Connection,
         *,
         serde: SerializerProtocol | None = None,
+        _own: _Connection,
     ) -> None:
-        """``conn`` is the aiosqlite connection :meth:`open` made on ``db``'s binding."""
+        """Made by :meth:`open`: ``conn`` is the aiosqlite connection it made on ``db``'s
+        binding, and ``_own`` the sqlite3 connection under it."""
         self.db = bound(db, type(self).__name__)
+        self._own = _own
         super().__init__(conn, serde=serde)
 
     @classmethod
     async def open(cls, db: UrsulaConnection, *, serde: SerializerProtocol | None = None) -> Self:
         """The saver of ``db``, a connection ``open()`` or ``aopen()`` made."""
         checked = bound(db, cls.__name__)
-        conn = await _connect(checked)
+        conn, own = await _aconnect(checked)
         try:
-            return cls(checked, conn, serde=serde)
+            return cls(checked, conn, serde=serde, _own=own)
         except BaseException:
             await conn.close()
             raise
@@ -191,23 +295,25 @@ class AsyncUrsulaSaver(AsyncSqliteSaver):
         raise _no_conn_string(cls, f"await {cls.__name__}.open(sqlite_ursula.open(url))")
 
     async def setup(self) -> None:
-        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
         if not self.is_setup:
-            await _agated(self.db, super().setup)
+            with _setting_up(self._own):
+                await super().setup()
 
     async def aput(self, config: Any, checkpoint: Any, metadata: Any, new_versions: Any) -> Any:
-        return await _agated(self.db, super().aput, config, checkpoint, metadata, new_versions)
+        return await _agated(
+            self.db, True, super().aput, config, checkpoint, metadata, new_versions
+        )
 
     async def aput_writes(
         self, config: Any, writes: Sequence[tuple[str, Any]], task_id: str, task_path: str = ""
     ) -> None:
-        await _agated(self.db, super().aput_writes, config, writes, task_id, task_path)
+        await _agated(self.db, True, super().aput_writes, config, writes, task_id, task_path)
 
     async def adelete_thread(self, thread_id: str) -> None:
-        await _agated(self.db, super().adelete_thread, thread_id)
+        await _agated(self.db, True, super().adelete_thread, thread_id)
 
     async def aclose(self) -> None:
-        """Closes the aiosqlite connection. ``db`` stays open."""
+        """Closes the saver's connection. ``db`` stays open."""
         await self.conn.close()
 
     async def __aenter__(self) -> Self:
@@ -218,10 +324,14 @@ class AsyncUrsulaSaver(AsyncSqliteSaver):
 
 
 class UrsulaStore(SqliteStore):
-    """LangGraph's ``SqliteStore`` on ``db``, a connection ``open()`` made without implicit
-    transactions (``isolation_level=None``), as ``SqliteStore``'s own connections are: a batch with
-    a put or a delete, and a TTL sweep, return once ``db.synced()`` returned after them, and a
-    ``backlog_full`` refusal runs again after ``synced()``."""
+    """LangGraph's ``SqliteStore`` on a connection of its own on ``db``'s binding, ``db`` a
+    connection ``open()`` made, without implicit transactions as ``SqliteStore``'s own
+    connections are: a batch that writes (a put, a delete, a get or a search that refreshes TTLs)
+    and a TTL sweep return once ``db.synced()`` returned after them, and a ``backlog_full`` refusal
+    runs again after ``synced()``. ``close()``, or ``with``, stops its TTL sweeper and closes its
+    connection. ``db`` stays open."""
+
+    conn: _Connection
 
     def __init__(
         self,
@@ -231,39 +341,52 @@ class UrsulaStore(SqliteStore):
         index: Any = None,
         ttl: Any = None,
     ) -> None:
-        checked = bound(db, type(self).__name__)
-        if not _autocommits(checked):
-            raise invalid(
-                f"{type(self).__name__} runs its own BEGIN and COMMIT, so it needs a connection "
-                "without implicit transactions: open(url, isolation_level=None)"
-            )
-        self.db = checked
-        super().__init__(checked, deserializer=deserializer, index=index, ttl=ttl)
+        self.db = bound(db, type(self).__name__)
+        conn = _connect(self.db, isolation_level=None)
+        try:
+            super().__init__(conn, deserializer=deserializer, index=index, ttl=ttl)
+        except BaseException:
+            conn.close()
+            raise
 
     @classmethod
     def from_conn_string(cls, conn_string: str, **kwargs: Any) -> Any:
-        raise _no_conn_string(cls, f"{cls.__name__}(sqlite_ursula.open(url, isolation_level=None))")
+        raise _no_conn_string(cls, f"{cls.__name__}(sqlite_ursula.open(url))")
 
     def setup(self) -> None:
-        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
         if not self.is_setup:
-            _gated(self.db, super().setup)
+            with _setting_up(self.conn):
+                super().setup()
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         listed = list(ops)
-        if not _writes(listed):
-            return super().batch(listed)
-        return _gated(self.db, super().batch, listed)
+        return _gated(self.db, _writes(listed, self.ttl_config), super().batch, listed)
 
     def sweep_ttl(self) -> int:
-        return _gated(self.db, super().sweep_ttl)
+        return _gated(self.db, True, super().sweep_ttl)
+
+    def close(self) -> None:
+        """Stops the TTL sweeper, waiting at most a second for it, and closes the store's
+        connection after the call that holds it. ``db`` stays open."""
+        self.stop_ttl_sweeper(timeout=SWEEPER_STOP_S)
+        with self.lock:
+            self.conn.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 class AsyncUrsulaStore(AsyncSqliteStore):
-    """LangGraph's ``AsyncSqliteStore`` on ``db``'s database, through an aiosqlite connection on
-    its binding without implicit transactions: a batch with a put or a delete, and a TTL sweep,
-    return once ``db.asynced()`` returned after them, and a ``backlog_full`` refusal runs again
-    after ``asynced()``.
+    """LangGraph's ``AsyncSqliteStore`` on an aiosqlite connection of its own on ``db``'s binding,
+    without implicit transactions: ``aput`` and ``adelete``, an ``aget`` or ``asearch`` that
+    refreshes TTLs, and a TTL sweep return once ``db.asynced()`` returned after them, and each
+    call refused with ``backlog_full`` (a read batched with a refused write is too) runs again
+    after ``asynced()``. The waits are the callers', so the task that runs the store's batches
+    never waits for the stream, and a read never waits behind another call's write. ``abatch``
+    and ``batch``, which take operations, are LangGraph's own: call ``db.asynced()`` after them.
 
     Make it with :meth:`open`, and close it with :meth:`aclose` or ``async with``, which also stop
     its TTL sweeper.
@@ -277,9 +400,12 @@ class AsyncUrsulaStore(AsyncSqliteStore):
         deserializer: Callable[[Any], dict[str, Any]] | None = None,
         index: Any = None,
         ttl: Any = None,
+        _own: _Connection,
     ) -> None:
-        """``conn`` is the aiosqlite connection :meth:`open` made on ``db``'s binding."""
+        """Made by :meth:`open`: ``conn`` is the aiosqlite connection it made on ``db``'s
+        binding, and ``_own`` the sqlite3 connection under it."""
         self.db = bound(db, type(self).__name__)
+        self._own = _own
         super().__init__(conn, deserializer=deserializer, index=index, ttl=ttl)
 
     @classmethod
@@ -291,12 +417,11 @@ class AsyncUrsulaStore(AsyncSqliteStore):
         index: Any = None,
         ttl: Any = None,
     ) -> Self:
-        """The store of ``db``, a connection ``open()`` or ``aopen()`` made, whatever its own
-        transaction control."""
+        """The store of ``db``, a connection ``open()`` or ``aopen()`` made."""
         checked = bound(db, cls.__name__)
-        conn = await _connect(checked, isolation_level=None)
+        conn, own = await _aconnect(checked, isolation_level=None)
         try:
-            return cls(checked, conn, deserializer=deserializer, index=index, ttl=ttl)
+            return cls(checked, conn, deserializer=deserializer, index=index, ttl=ttl, _own=own)
         except BaseException:
             await conn.close()
             raise
@@ -306,22 +431,34 @@ class AsyncUrsulaStore(AsyncSqliteStore):
         raise _no_conn_string(cls, f"await {cls.__name__}.open(sqlite_ursula.open(url))")
 
     async def setup(self) -> None:
-        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
         if not self.is_setup:
-            await _agated(self.db, super().setup)
+            with _setting_up(self._own):
+                await super().setup()
 
-    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
-        listed = list(ops)
-        if not _writes(listed):
-            return await super().abatch(listed)
-        return await _agated(self.db, super().abatch, listed)
+    async def aget(self, *args: Any, **kwargs: Any) -> Any:
+        writes = _refreshes(self.ttl_config, kwargs.get("refresh_ttl"))
+        return await _agated(self.db, writes, super().aget, *args, **kwargs)
+
+    async def asearch(self, *args: Any, **kwargs: Any) -> Any:
+        writes = _refreshes(self.ttl_config, kwargs.get("refresh_ttl"))
+        return await _agated(self.db, writes, super().asearch, *args, **kwargs)
+
+    async def alist_namespaces(self, *args: Any, **kwargs: Any) -> Any:
+        return await _agated(self.db, False, super().alist_namespaces, *args, **kwargs)
+
+    async def aput(self, *args: Any, **kwargs: Any) -> None:
+        await _agated(self.db, True, super().aput, *args, **kwargs)
+
+    async def adelete(self, *args: Any, **kwargs: Any) -> None:
+        await _agated(self.db, True, super().adelete, *args, **kwargs)
 
     async def sweep_ttl(self) -> int:
-        return await _agated(self.db, super().sweep_ttl)
+        return await _agated(self.db, True, super().sweep_ttl)
 
     async def aclose(self) -> None:
-        """Stops the TTL sweeper and closes the aiosqlite connection. ``db`` stays open."""
-        await self.stop_ttl_sweeper()
+        """Stops the TTL sweeper, cancelling it after a second, and closes the store's
+        connection. ``db`` stays open."""
+        await self.stop_ttl_sweeper(timeout=SWEEPER_STOP_S)
         await self.conn.close()
 
     async def __aexit__(self, *exc: object) -> None:

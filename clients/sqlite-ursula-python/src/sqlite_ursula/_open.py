@@ -374,7 +374,7 @@ def _connect(plan: _Plan, binding: dict[str, Any]) -> UrsulaConnection:
             "fix",
             cause=error,
         ) from error
-    conn._bind(str(binding["name"]), path, plan.read_only)
+    conn._bind(str(binding["name"]), path, plan.read_only, plan.busy)
     return conn
 
 

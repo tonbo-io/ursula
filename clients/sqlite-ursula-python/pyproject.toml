@@ -42,12 +42,13 @@ artifacts = ["src/sqlite_ursula/_lib/*"]
 [dependency-groups]
 test = ["pytest==9.1.1"]
 # The LangGraph releases CI runs tests/test_langgraph.py on (scripts/langgraph_releases.py): the
-# oldest the `langgraph` extra supports, with the oldest LangGraph and checkpoint base it takes,
-# and the newest.
+# oldest the `langgraph` extra supports, with the oldest LangGraph, checkpoint base and aiosqlite it
+# takes, and the newest.
 langgraph-oldest = [
   "langgraph-checkpoint-sqlite==3.0.3",
   "langgraph-checkpoint==3.0.0",
   "langgraph==1.0.1",
+  "aiosqlite==0.20.0",
 ]
 langgraph-newest = [
   "langgraph-checkpoint-sqlite==3.1.2",
