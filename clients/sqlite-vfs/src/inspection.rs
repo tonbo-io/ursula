@@ -421,7 +421,10 @@ pub(crate) fn walk_for_drain(
 ) -> Option<WalkError> {
     let deadline = Deadline { at, budget };
     let mut unrecognized = Vec::new();
-    let (wanted, listed_host) = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
+    let Wanted {
+        dirs: wanted,
+        host: listed_host,
+    } = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
     let error = listed_host.err();
     let mut dirs = Vec::new();
     let walked = walk(wanted, deadline, &mut dirs, |id, root| {
@@ -729,7 +732,10 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
         unrecognized: Vec::new(),
         errors: Vec::new(),
     };
-    let (wanted, listed_host) = wanted(
+    let Wanted {
+        dirs: wanted,
+        host: listed_host,
+    } = wanted(
         Some(&dir),
         &request.scans,
         strict,
@@ -816,20 +822,25 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
     inspection
 }
 
+/// The directories a pass reads for roots ([`wanted`]), and what it listed in the host directory.
+struct Wanted {
+    /// Each directory with where it came from.
+    dirs: Vec<(PathBuf, Source)>,
+    /// What the pass listed in the host directory besides its records, `None` when it was given
+    /// none, or why it could not read it.
+    host: Result<Option<HostListing>, PassError>,
+}
+
 /// The directories a pass reads for roots: those the records of the host directory `host` name,
 /// in record name order, then `scans` in their order, with what it listed in the host directory
-/// besides its records (`None` when no `host` is given). Names and records of the host directory
-/// it does not know go to `unrecognized`, and a host directory that could not be read is the
-/// error.
+/// besides its records. Names and records of the host directory it does not know go to
+/// `unrecognized`.
 fn wanted(
     host: Option<&Path>,
     scans: &[PathBuf],
     strict: Strict<'_>,
     unrecognized: &mut Vec<Unrecognized>,
-) -> (
-    Vec<(PathBuf, Source)>,
-    Result<Option<HostListing>, PassError>,
-) {
+) -> Wanted {
     let mut wanted = Vec::new();
     let mut listed = Ok(None);
     if let Some(host) = host {
@@ -847,7 +858,10 @@ fn wanted(
         }
     }
     wanted.extend(scans.iter().map(|d| (d.clone(), Source::Scan)));
-    (wanted, listed)
+    Wanted {
+        dirs: wanted,
+        host: listed,
+    }
 }
 
 /// The walk of a pass (steps 2 and 3 up to each root's read): every directory of `wanted` once per
