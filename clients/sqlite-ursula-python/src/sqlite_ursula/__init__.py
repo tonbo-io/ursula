@@ -13,6 +13,9 @@ in the background. ``db.synced()`` is the output gate::
     db.commit()
     db.synced()  # this database's commits are in the stream, and this process still owns it
 
+``aopen`` and ``db.asynced()`` are the same calls for asyncio, and ``gate`` / ``agate`` wrap a
+block of work in the gate.
+
 Module map:
 
 - ``_host``: where the extension is, whether this Python can load it (``host_unsupported``), and
@@ -21,10 +24,12 @@ Module map:
   ``classify``, which asks the extension (``ursula_classify``) what a failure is, and the fork
   state.
 - ``_events``: the events thread, which waits for the extension's events and resolves
-  ``synced()``, completes ``open()`` and runs the reset callbacks.
+  ``synced()`` and ``asynced()``, completes ``open()`` and ``aopen()``, and runs the reset
+  callbacks.
 - ``_connection``: :class:`UrsulaConnection`, the ``sqlite3.Connection`` subclass ``open``
   returns, and its cursor, whose statements classify their errors.
-- ``_open``: :func:`open`, :func:`import_sqlite` and :func:`set_token`.
+- ``_open``: :func:`open`, :func:`aopen`, :func:`import_sqlite` and :func:`set_token`.
+- ``_gate``: :func:`gate` and :func:`agate`, which hold a block's outcome until ``synced()``.
 - ``_args``: the checks of their arguments, and of ``synced()``'s, as ``invalid_argument``.
 - ``_doctor``: ``python -m sqlite_ursula``, which says whether this Python can host the extension.
 - ``errors``: the four error classes.
@@ -34,7 +39,10 @@ from __future__ import annotations
 
 from ._connection import UrsulaConnection
 from ._connection import UrsulaCursor
+from ._gate import agate
+from ._gate import gate
 from ._open import Imported
+from ._open import aopen
 from ._open import import_sqlite
 from ._open import open  # noqa: A004 - the package's entry point, as Node's `open`
 from ._open import set_token
@@ -58,6 +66,9 @@ __all__ = [
     "UrsulaUnavailableError",
     "UrsulaWriteRefusedError",
     "__version__",
+    "agate",
+    "aopen",
+    "gate",
     "import_sqlite",
     "open",
     "set_token",

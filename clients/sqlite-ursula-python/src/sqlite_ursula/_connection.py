@@ -5,8 +5,8 @@ one (LangGraph's ``SqliteSaver`` among them) takes it, and ``isinstance`` holds.
 ``cursor()``, so the subclass overrides them along with ``cursor``, and its cursor overrides
 ``execute*`` and ``fetch*``. Each raises what ``classify`` (``_control``) makes of its error: an
 :class:`UrsulaError` for a failure of the extension, every other error unchanged. On top of
-``sqlite3.Connection`` it has ``name``, ``path``, ``synced()``, ``status()`` and the reset
-callbacks.
+``sqlite3.Connection`` it has ``name``, ``path``, ``synced()``, ``asynced()``, ``status()`` and the
+reset callbacks.
 
 A refused write or a reset is one of SQLite's I/O errors, on which SQLite rolls back the whole
 transaction. A transaction helper's ``ROLLBACK`` then fails with "cannot rollback - no transaction
@@ -217,6 +217,20 @@ class UrsulaConnection(sqlite3.Connection):
             raise again(self._reset)
         try:
             _events.synced(self.path, timeout)
+        except UrsulaResetError as error:
+            if self._reset is None:
+                self._reset = error
+            raise
+
+    async def asynced(self, timeout: float | None = None) -> None:
+        """:meth:`synced` for asyncio: the same guarantee and the same errors, and it waits on the
+        event loop instead of blocking it. Cancelling it ends the wait, while the commits keep
+        replicating."""
+        self._check_fork()
+        if self._reset is not None:
+            raise again(self._reset)
+        try:
+            await _events.asynced(self.path, timeout)
         except UrsulaResetError as error:
             if self._reset is None:
                 self._reset = error

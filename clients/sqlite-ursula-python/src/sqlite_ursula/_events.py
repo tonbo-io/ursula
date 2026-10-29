@@ -17,6 +17,10 @@ control lock:
 - ``opened {request}`` wakes the opens waiting for it, which call ``ursula_open`` again to
   collect the result.
 
+A waiter is a ``threading.Event`` for ``synced()`` and ``open()``, and a :class:`LoopEvent` for
+``asynced()`` and ``aopen()``, which the thread wakes through its event loop's
+``call_soon_threadsafe``. Nothing runs on the loop's default executor.
+
 The thread takes its cursor before any request or ticket is handed out, and requests and tickets
 are registered under the lock in the same step that asks for them, so no event about one applies
 before it is registered. A thread that fails is replaced while tickets wait or connections are
@@ -26,6 +30,8 @@ failures in a row, waits fail ``internal``.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -51,14 +57,48 @@ MAX_FAILURES = 3
 POLL_MS = 1000
 
 
+class LoopEvent:
+    """What a coroutine waits on where a thread waits on a ``threading.Event``: :meth:`set` from any
+    thread wakes it on its event loop. Made on the loop, by the coroutine that waits."""
+
+    __slots__ = ("_future", "_loop")
+
+    def __init__(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._future: asyncio.Future[None] = self._loop.create_future()
+
+    def set(self) -> None:
+        # A loop that closed raises RuntimeError: nothing waits on it any more.
+        with contextlib.suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self._settle)
+
+    def _settle(self) -> None:
+        # A waiter that gave up (its timeout, a cancellation) cancelled the future.
+        if not self._future.done():
+            self._future.set_result(None)
+
+    async def wait(self, timeout: float | None) -> bool:
+        """Whether it was set within ``timeout`` seconds (``None``: no limit). Cancelling the
+        coroutine ends the wait."""
+        try:
+            async with asyncio.timeout(timeout):
+                await self._future
+        except TimeoutError:
+            return False
+        return True
+
+
+Waiter = threading.Event | LoopEvent
+
+
 class Ticket:
-    """A ``synced()`` call waiting for its ticket."""
+    """A ``synced()`` or ``asynced()`` call waiting for its ticket."""
 
     __slots__ = ("done", "error", "path")
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, done: Waiter) -> None:
         self.path = path
-        self.done = threading.Event()
+        self.done = done
         self.error: BaseException | None = None
 
     def resolve(self) -> None:
@@ -143,20 +183,18 @@ class Events:
         # answered by an event this thread sees, and no event of an earlier binding is taken for a
         # later one's.
         self._cursor = int(_control.call("SELECT ursula_events(0, 0)")["cursor"])
-        self._opens: dict[int, set[threading.Event]] = {}
+        self._opens: dict[int, set[Waiter]] = {}
         self._failed = False
         self.conn: Any = None
         self._thread = threading.Thread(target=self._run, name="sqlite-ursula-events", daemon=True)
         self._thread.start()
 
-    def wait_open(self, request: int) -> threading.Event:
-        """A waiter for open ``request``, woken by its ``opened`` event, a gap, or the thread's end.
-        Called with the lock held, in the step that got the request."""
-        waiter = threading.Event()
+    def wait_open(self, request: int, waiter: Waiter) -> None:
+        """Wakes ``waiter`` for open ``request`` at its ``opened`` event, a gap, or the thread's
+        end. Called with the lock held, in the step that got the request."""
         self._opens.setdefault(request, set()).add(waiter)
-        return waiter
 
-    def forget_open(self, request: int, waiter: threading.Event) -> None:
+    def forget_open(self, request: int, waiter: Waiter) -> None:
         with _control.lock():
             found = self._opens.get(request)
             if found is not None:
@@ -285,30 +323,71 @@ def events() -> Events:
         return _current
 
 
-def synced(path: str, timeout: float | None) -> None:
-    """Waits until the stream holds every commit of the database at ``path`` that the process
-    logged before the call, for at most ``timeout`` seconds (``None``: no limit). Raises
-    ``TimeoutError`` on the timeout, and the reset error on a reset."""
-    limit = None if timeout is None else _args.seconds("timeout", timeout, positive=False)
+def _limit(timeout: object) -> float | None:
+    return None if timeout is None else _args.seconds("timeout", timeout, positive=False)
+
+
+def _ask(path: str, waiter: type[Waiter]) -> Ticket | None:
+    """Asks for a ticket of the database at ``path`` (``ursula_synced``, timeout 0): ``None`` when
+    it is synced already, else the ticket, registered in the same step, with a new ``waiter``."""
     with _control.lock():
         # Started before the call, so its events cursor precedes the ticket.
         events()
         answer = _control.call("SELECT ursula_synced(?, 0)", path)
         if answer["synced"]:
-            return
-        t = Ticket(path)
+            return None
+        t = Ticket(path, waiter())
         _tickets[int(answer["ticket"])] = t
+        return t
+
+
+def _drop(t: Ticket) -> None:
+    """The call of ``t`` gave up: no event resolves it any more."""
+    with _control.lock():
+        for ticket, pending in list(_tickets.items()):
+            if pending is t:
+                del _tickets[ticket]
+
+
+def _timed_out(timeout: float | None) -> TimeoutError:
+    return TimeoutError(
+        f"synced() gave up after {timeout} s: the commits keep replicating, so call it again to "
+        "wait for them"
+    )
+
+
+def synced(path: str, timeout: float | None) -> None:
+    """Waits until the stream holds every commit of the database at ``path`` that the process
+    logged before the call, for at most ``timeout`` seconds (``None``: no limit). Raises
+    ``TimeoutError`` on the timeout, and the reset error on a reset."""
+    limit = _limit(timeout)
+    t = _ask(path, threading.Event)
+    if t is None:
+        return
+    assert isinstance(t.done, threading.Event)
     try:
         if not t.done.wait(limit):
-            raise TimeoutError(
-                f"synced() gave up after {timeout} s: the commits keep replicating, so call it "
-                "again to wait for them"
-            )
+            raise _timed_out(timeout)
     except BaseException:
-        with _control.lock():
-            for ticket, pending in list(_tickets.items()):
-                if pending is t:
-                    del _tickets[ticket]
+        _drop(t)
+        raise
+    if t.error is not None:
+        raise again(t.error)
+
+
+async def asynced(path: str, timeout: float | None) -> None:
+    """:func:`synced` for a coroutine: it waits on the event loop, and cancelling it ends the wait
+    while the commits keep replicating."""
+    limit = _limit(timeout)
+    t = _ask(path, LoopEvent)
+    if t is None:
+        return
+    assert isinstance(t.done, LoopEvent)
+    try:
+        if not await t.done.wait(limit):
+            raise _timed_out(timeout)
+    except BaseException:
+        _drop(t)
         raise
     if t.error is not None:
         raise again(t.error)

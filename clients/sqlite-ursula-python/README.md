@@ -13,7 +13,7 @@ db.synced()  # this database's commits are in the stream, and this process still
 send(reply)
 ```
 
-**The one rule:** before anything outside the process acts on what you wrote or read (a response, a queue acknowledgement, a call to another service), call `db.synced()`.
+**The one rule:** before anything outside the process acts on what you wrote or read (a response, a queue acknowledgement, a call to another service), call `db.synced()`, `await db.asynced()`, or wrap the work in `with gate(db)` or `async with agate(db)`.
 
 A commit is local. The extension appends it to a log it owns and replicates the log to the stream in the background, on threads of its own. `synced()` returns once the stream holds every commit the process made on that database before the call, and a round trip that started after the call found this process still the owner. Scripts call it before they exit.
 
@@ -56,7 +56,7 @@ On macOS, use uv or Homebrew.
 - `read_only=True` claims nothing and never fences the owner, and writes fail with `SQLITE_READONLY`.
 - `db.close()` closes the connection. Once a binding's last connection closes, replication drains in the background and the binding retires. Keep `db` open while a framework uses `db.path`.
 
-`UrsulaConnection` adds `name` (the stream's path, such as `/acme/notes`), `path` (the local database file, which frameworks open by path), `synced(timeout=None)`, `status()` and `on_reset(callback)` / `off_reset(callback)`.
+`UrsulaConnection` adds `name` (the stream's path, such as `/acme/notes`), `path` (the local database file, which frameworks open by path), `synced(timeout=None)`, `asynced(timeout=None)` ([asyncio](#asyncio)), `status()` and `on_reset(callback)` / `off_reset(callback)`.
 
 ```python
 db = sqlite_ursula.open(url)
@@ -67,6 +67,42 @@ other = sqlite3.connect(db.path)  # a framework's own connection: it replicates 
 
 `import_sqlite(url, file, *, token, timeout)` makes a plain SQLite file with 4096-byte pages the first snapshot of a new stream, then `open()` it as any other.
 
+## asyncio
+
+`aopen()` takes the arguments `open()` takes and returns the same `UrsulaConnection`, and `db.asynced(timeout=None)` is `synced()`. Both wait on the event loop instead of blocking it, and neither uses the loop's default executor.
+
+```python
+db = await sqlite_ursula.aopen(url)
+db.execute("INSERT INTO notes(body) VALUES (?)", ("hello",))
+db.commit()
+await db.asynced()
+send(reply)
+```
+
+Cancelling `asynced()`, as `asyncio.timeout` around it does, ends the wait while the commits keep replicating. Cancelling `aopen()` cancels the bind, so it never goes on to claim the stream. Statements still run on the calling thread, as they do with `sqlite3`.
+
+## Gates
+
+`gate(*dbs, timeout=None)` and `agate(*dbs, timeout=None)` wrap a block of work: leaving the block waits for a `synced()` call made after it ended, on every database given, before the result or the block's error goes on.
+
+```python
+with sqlite_ursula.gate(db):
+    reply = handle(request)
+send(reply)
+
+async with sqlite_ursula.agate(db, other):
+    reply = await handle(request)
+await send(reply)
+```
+
+- A block that only read waits too, since it may have read another connection's pending commit.
+- An `UrsulaError` the block raises passes at once, also when a library wrapped it (as `__cause__`, as SQLAlchemy's `.orig`, or in an `ExceptionGroup`). So does a raw `sqlite3` error of a framework's own connection that the extension classifies as a refused write or a reset. It then raises as that `UrsulaError`.
+- Every other error waits as a result does, then passes. Ctrl-C and cancellations pass at once.
+- A reset during the wait raises the `UrsulaResetError` instead of the outcome.
+- `timeout` bounds the wait, not the block, and raises `TimeoutError`.
+
+Effects inside the block, such as a call to another service, are not gated: call `db.synced()` before them.
+
 ## Errors
 
 Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose cause (`__cause__`) is the SQLite error they replace. Branch on `action`. The extension says which failure is which (`ursula_classify`).
@@ -74,9 +110,9 @@ Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose 
 | class | raised by | kinds |
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported`, `too_large` |
-| `UrsulaResetError` | every statement after a reset, `synced()`, `on_reset` callbacks | `fenced` (`stop`), `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
-| `UrsulaUnavailableError` | `open()` past its timeout | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` |
-| `UrsulaSetupError` | `open()`, `import_sqlite()`, the calls the package guards in a forked child ([Forks](#forks)) | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |
+| `UrsulaResetError` | every statement after a reset, `synced()`, `asynced()`, a gate, `on_reset` callbacks | `fenced` (`stop`), `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
+| `UrsulaUnavailableError` | `open()` or `aopen()` past its timeout | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` |
+| `UrsulaSetupError` | `open()`, `aopen()`, `import_sqlite()`, the calls the package guards in a forked child ([Forks](#forks)) | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |
 
 `UrsulaWriteRefusedError` and `UrsulaResetError` are also `sqlite3.OperationalError`, as the error they replace was, so existing `except sqlite3.OperationalError` clauses keep catching them, and `sqlite_errorcode` and `sqlite_errorname` are SQLite's. A transaction helper's `ROLLBACK` after one, which finds no transaction since SQLite rolled it back, does not hide it.
 
@@ -84,7 +120,7 @@ A reset rejects the database's pending `synced()` calls first, then runs its `on
 
 ## Forks
 
-Open databases after a fork, never before: the extension's replication does not survive `fork()`. In a child forked after its parent opened a database, `open()`, `import_sqlite()` and `set_token()` raise `forked`, and so do the statements, transactions, `synced()`, `status()` and `on_reset()` of an inherited `UrsulaConnection`, whose `close()` does nothing. Its other `sqlite3.Connection` methods (`backup`, `blobopen`, `serialize` and the like) and a framework's own connections on `db.path` are not the package's to guard: the extension fails their I/O on a bound file in the child. Importing the package before the fork is fine. Use gunicorn's `post_fork` hook, Celery's `worker_process_init` signal, or multiprocessing's `spawn` or `forkserver` start method.
+Open databases after a fork, never before: the extension's replication does not survive `fork()`. In a child forked after its parent opened a database, `open()`, `aopen()`, `import_sqlite()` and `set_token()` raise `forked`, and so do the statements, transactions, `synced()`, `asynced()`, `status()` and `on_reset()` of an inherited `UrsulaConnection`, whose `close()` does nothing. Its other `sqlite3.Connection` methods (`backup`, `blobopen`, `serialize` and the like) and a framework's own connections on `db.path` are not the package's to guard: the extension fails their I/O on a bound file in the child. Importing the package before the fork is fine. Use gunicorn's `post_fork` hook, Celery's `worker_process_init` signal, or multiprocessing's `spawn` or `forkserver` start method.
 
 ## The extension
 
