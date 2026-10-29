@@ -48,6 +48,7 @@ if expect == "ok":
     db.close()
 else:
     fix, why = rest
+    assert fix and why, (fix, why)
     assert doctor.returncode == 1
     assert f"result: {expect}:" in doctor.stdout
     (reason,) = [line for line in doctor.stdout.splitlines() if line.startswith("why: ")]

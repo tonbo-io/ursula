@@ -12,9 +12,10 @@ name: PyPI Publish
 #
 # A release publishes only from its tag: without `dev`, the run must be dispatched on the tag
 # v<release> that names the commit it builds (gh workflow run pypi-publish.yml --ref v<release>
-# -f ref=v<release> -f dry_run=false). A `.devN` pre-release publishes from any ref, `main` for
-# dogfooding. A version already on PyPI fails the run before anything is built, since PyPI never
-# takes a version twice. Running a failed run's failed jobs again skips the wheels already uploaded.
+# -f ref=v<release> -f dry_run=false). A `.devN` pre-release builds any ref and publishes from a run
+# on `main`, the one branch the `pypi` environment admits, for dogfooding. A version already on PyPI
+# fails the run before anything is built, since PyPI never takes a version twice. Running a failed
+# run's failed jobs again skips the wheels already uploaded.
 #
 # publish uses trusted publishing: PyPI's publisher for `sqlite-ursula` trusts this workflow
 # (pypi-publish.yml) in the `pypi` environment, and pypa/gh-action-pypi-publish trades the job's

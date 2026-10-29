@@ -2374,7 +2374,8 @@ What CI runs (`.github/workflows/integration.yml`):
 - `pypi-publish.yml`, by hand only: these wheels, published to PyPI through trusted publishing
   from the `pypi` environment. A release's version publishes only from its tag `v<release>`,
   which must name the commit built, and `-patchN` releases carry `.postN`
-  (`scripts/python-version.sh`). A `.devN` pre-release of the next patch publishes from any ref.
+  (`scripts/python-version.sh`). A `.devN` pre-release of the next patch publishes from a run on
+  `main`, the one branch the `pypi` environment admits.
   A version PyPI already has fails the run before the build.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
   with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
