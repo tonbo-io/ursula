@@ -97,7 +97,7 @@ describe("the 0.8 core on node:sqlite", () => {
 	it("loads into the running SQLite and registers the 0.8 functions only", () => {
 		const control = loadUrsulaVfs(ext);
 		const names = control
-			.prepare("SELECT DISTINCT name FROM pragma_function_list WHERE name LIKE 'ursula!_%' ESCAPE '!' OR name LIKE 'tonbo!_%' ESCAPE '!' ORDER BY name")
+			.prepare("SELECT DISTINCT name FROM pragma_function_list WHERE name LIKE 'ursula!_%' ESCAPE '!' ORDER BY name")
 			.all()
 			.map((row) => (row as { name: string }).name);
 		expect(names).toEqual(["ursula_cancel", "ursula_classify", "ursula_events", "ursula_import", "ursula_open", "ursula_set_token", "ursula_stats", "ursula_status", "ursula_synced"]);

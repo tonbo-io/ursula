@@ -23,8 +23,6 @@
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-// - tonbo.ts and tonbo-pi.ts: the `/tonbo` and `/tonbo/pi` entries, which opened Tonbo databases
-//   by name until 0.11.3 and now only throw an error that says where that moved. They go in 0.12.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
