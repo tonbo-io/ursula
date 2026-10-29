@@ -2105,16 +2105,18 @@ package:
 - Each call is handed `previous`, the token the provider last handed out, exactly as it handed it
   out, when the package will not take it again: the current one at a scheduled refresh, or the one
   the server refused after a `401`. It is none before the first call and after the provider stopped,
-  except that a refused one stays across a stop, since the extension still carries it, until the
-  provider hands out another token or a string token replaces it. When `previous` is set, the
+  except that one a bind was refused under, or one a binding still bound and blocked was refused
+  under, stays across a stop, since the extension still carries it, until the provider hands out
+  another token or a string token replaces it. When `previous` is set, the
   provider hands out a different token, and refills a cache that holds it. The extension takes an
   equal token as no change and would not send a refused request again, so an answer equal to
   `previous`, compared without surrounding whitespace, counts as a failed call. A token that never
   changes belongs in a string `token` or in `URSULA_VFS_TOKEN_FILE`, not in a provider.
 - A failed call is retried after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, and by the
   expiry of `previous` at the latest, so a provider that hands its token back until it expires is
-  asked again as its cache turns over. From that expiry on, `n` counts only the failures after it,
-  so a cache that still hands the token back at the call on its expiry is asked again within 1 s.
+  asked again as its cache turns over. Once `previous` has expired, `n` counts only the failures
+  from its expiry on, whichever retry they came from, so a cache that still hands the token back
+  at the call on its expiry is asked again within 1 s.
   A token that expires within 1 s counts as a failed call, so backoff bounds how often a provider
   with a skewed clock is called.
 - A provider error whose `action` is `fix` fails for good, whatever its class: the waiting opens
@@ -2132,8 +2134,13 @@ package:
   condition only once that request went out again, so a condition can arrive after the token that
   ends it was set. When the provider hands back a token such a condition dropped, it is taken
   again once none of the bindings that reported the condition is still bound and blocked: a
-  binding that retired is no longer blocked. A stop forgets such a token as it forgets one in use,
-  so the next call is not handed it as `previous`, unless one of them is still bound and blocked.
+  binding that retired is no longer blocked, and neither is one whose condition carries no path,
+  since the process no longer has it. A binding whose status cannot be read for another reason may
+  still be blocked. When a reporter retires or its condition changes, or an open waits, while a
+  retry is scheduled after the provider handed such a token back, the retry runs at once. A stop
+  forgets such a token as it forgets one in use, so the next call is not handed it as `previous`,
+  unless one of them is still bound and blocked: then the token stays dropped across the stop, and
+  is taken once they are clear.
   The driver reports conditions of bound bindings only, so a bind refused with `401` reaches the
   package when the open fails `unauthorized` at its signal: the refused token is dropped and a call
   starts, unless a newer token is held already. A token a bind refused stays refused.
