@@ -808,6 +808,8 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 0.11.1 upgrades 0.11.0 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.11.1 release notes](/docs/release-notes#0111).
 
+0.11.2 upgrades 0.11.0 or 0.11.1 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.11.2 release notes](/docs/release-notes#0112).
+
 ## Upgrading to 0.10
 
 **0.10.0 is a breaking release.** It moves the storage and protocol format to format epoch 6, for the meta group and placement. A 0.10 node refuses epoch-5 Raft WAL directories and object-storage prefixes at startup and refuses 0.9 peers, and a 0.9 node refuses 0.10 peers. The backup format stays 5, so the data moves by backup and restore: `ursulactl restore` of 0.10 restores a 0.9 backup into a fresh 0.10 cluster. There is no in-place upgrade, no rolling upgrade and no rollback. If you cannot move your data yet, stay on 0.9.
