@@ -69,6 +69,9 @@
 // - H24: an orphan whose log segment has another format's magic, which the per-root read refuses,
 //   is `unreadable`, with no kind, no counts and no claim. With its magic back the next drain
 //   drains it.
+// - H25: a drain as root (through `sudo -n`) of an orphan the suite's user owns leaves it
+//   `pending`, `not_owner`, `later: fix`, with the owner's uid and no claim. Its owner's drain then
+//   drains it.
 //
 // The hold, `ursula-vfs-host hold`, which takes the host directory's `hold` file exclusively:
 // - H9: a writer thread that commits every 5 ms with busy_timeout 0 stops within one transaction,
@@ -522,6 +525,17 @@ interface Drained {
 	roots: DrainedRoot[];
 	error: string | null;
 }
+
+/** The command that runs a program as root: none when the suite is root, `sudo -n` when it may, else undefined. */
+const asRoot = ((): readonly string[] | undefined => {
+	if (process.getuid?.() === 0) return [];
+	try {
+		execFileSync("sudo", ["-n", "true"], { stdio: "ignore" });
+		return ["sudo", "-n"];
+	} catch {
+		return undefined;
+	}
+})();
 
 const DRAINED_KEYS = ["v", "origin", "uid", "dir", "roots", "error"];
 const DRAINED_ROOT_KEYS = ["id", "root", "stream", "cluster", "uid", "outcome", "kind", "later", "before_bytes", "unacknowledged_bytes", "commits", "salvaged", "error"];
@@ -1113,12 +1127,15 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			return (await ownedFrames(path)).flatMap((f) => (f.kind === "claim" ? [f.epoch] : []));
 		}
 
-		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget: its result, checked by the output's rules, and how long it ran. */
-		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string; concurrency?: number } = {}): Promise<{ drained: Drained; ms: number }> {
+		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget, as root with `root`: its result, checked by the output's rules, and how long it ran. */
+		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string; concurrency?: number; root?: boolean } = {}): Promise<{ drained: Drained; ms: number }> {
 			const args = ["drain", "--origin", options.origin ?? front.url, "--budget-ms", String(options.budgetMs ?? 20_000), ...(options.scans ?? []).flatMap((s) => ["--scan", s])];
 			if (options.concurrency !== undefined) args.push("--concurrency", String(options.concurrency));
+			// As root, sudo resets the environment, so `env` passes the children's variables on.
+			const pairs = Object.entries(env).flatMap(([k, v]) => (v === undefined ? [] : [`${k}=${v}`]));
+			const command = options.root === true ? [...(asRoot ?? []), "env", ...pairs, hostBin(), ...args] : [hostBin(), ...args];
 			const started = Date.now();
-			const { stdout } = await run(hostBin(), args, { env: { ...process.env, ...env } });
+			const { stdout } = await run(command[0] as string, command.slice(1), { env: { ...process.env, ...env } });
 			const ms = Date.now() - started;
 			return { drained: drainedLine(stdout), ms };
 		}
@@ -1410,7 +1427,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 		}
 
 		it("H24: a root whose log the per-root read refuses is unreadable, nothing is claimed, and once readable it drains", async () => {
-			const o = await orphan("host-h23");
+			const o = await orphan("host-h24");
 			const before = await claims(o.s.path);
 			// Another format's magic in the first segment of the generation's log: refused, not cut as torn.
 			const gen = readdirSync(o.root.root).find((n) => /^gen-[0-9a-f]{32}$/.test(n));
@@ -1454,6 +1471,33 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			patch(magic);
 			const again = onlyDrained((await drain(o.env)).drained);
 			expect(again).toMatchObject({ outcome: "drained", before_bytes: o.root.unacknowledged_bytes, unacknowledged_bytes: 0 });
+			expect(await claims(o.s.path)).toEqual([...before, (before.at(-1) as number) + 1]);
+		});
+
+		// A suite run as root owns its orphans as root, so it cannot see another owner. Outside CI a run without sudo skips it.
+		it.skipIf(process.getuid?.() === 0 || (asRoot === undefined && process.env.CI === undefined))("H25: a drain as another user than the root's owner leaves the orphan pending, not_owner, and claims nothing", async () => {
+			expect(asRoot, "H25 drains as root: allow sudo -n").toEqual(["sudo", "-n"]);
+			const o = await orphan("host-h25");
+			const before = await claims(o.s.path);
+			const { drained } = await drain(o.env, { root: true });
+			expect(drained).toMatchObject({ origin: front.url, uid: 0, dir: o.host, error: null });
+			const root = onlyDrained(drained);
+			expect(root, JSON.stringify(drained)).toMatchObject({
+				id: o.root.id,
+				root: o.root.root,
+				stream: o.s.path,
+				uid: process.getuid?.(),
+				outcome: "pending",
+				kind: "not_owner",
+				later: "fix",
+				before_bytes: o.root.unacknowledged_bytes,
+				unacknowledged_bytes: o.root.unacknowledged_bytes,
+			});
+			expect(root.error, JSON.stringify(drained)).toMatch(/^not_owner: /);
+			// Not opened: no claim went out.
+			expect(await claims(o.s.path)).toEqual(before);
+			// The owner's drain drains it.
+			expect(onlyDrained((await drain(o.env)).drained)).toMatchObject({ outcome: "drained", before_bytes: o.root.unacknowledged_bytes, unacknowledged_bytes: 0 });
 			expect(await claims(o.s.path)).toEqual([...before, (before.at(-1) as number) + 1]);
 		});
 	});
@@ -1515,17 +1559,6 @@ interface Pruned {
 	tmp_removed: string[];
 	error: string | null;
 }
-
-/** The command that runs a program as root: none when the suite is root, `sudo -n` when it may, else undefined. */
-const asRoot = ((): readonly string[] | undefined => {
-	if (process.getuid?.() === 0) return [];
-	try {
-		execFileSync("sudo", ["-n", "true"], { stdio: "ignore" });
-		return ["sudo", "-n"];
-	} catch {
-		return undefined;
-	}
-})();
 
 // Outside CI a run without root skips the prune. CI must run it.
 describe.skipIf(asRoot === undefined && process.env.CI === undefined)("the host's prune (ursula-vfs-host prune)", () => {
