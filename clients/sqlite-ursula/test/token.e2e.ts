@@ -2,8 +2,10 @@
 // the open's first request, again ahead of each token's expiry and at once after a 401, shares one
 // call between concurrent opens, whatever functions they passed, stops once no binding of the thread
 // is bound or an open with a string replaced it, and never keeps the process alive. Each call is
-// handed the token held as `previous`, and an answer equal to it is retried. Its failures are typed. The 401s are scripted faults (the
-// model's, or test/gate.mjs's in front of Ursula), since neither server checks tokens. In front of
+// handed the token it last handed out as `previous`, and an answer equal to it is retried, by that
+// token's expiry at the latest. Its failures are typed. The 401s are scripted faults (the model's,
+// or test/gate.mjs's in front of Ursula), since neither server checks tokens, or a gate of a test's
+// own that refuses every token but one, as an authorizer refuses an expired token. In front of
 // Ursula the gate records each request's `Authorization` header (`sentTokens`), so there the suite
 // also checks which token each request carried. The token is one per process, so each test closes
 // its databases and waits until the provider stopped (`closeAll`): the next test starts with none held.
@@ -11,7 +13,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type BearerToken, loadUrsulaVfs, open, type TokenProvider, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
-import { ext, fault, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
+import { ext, fault, freshDir, gate, rejection, retired, sentTokens, stream, ursulaUrl } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -258,6 +260,48 @@ describe("a token provider", () => {
 			expect(posts.slice(-3, -1)).toEqual(["Bearer cached-1", "Bearer cached-1"]);
 		}
 		await closeAll(db);
+	});
+
+	it("is asked again as the token it hands back until expiry expires, and replication goes on under the next one", async () => {
+		// A gate of the test's own refuses every token but the one it requires, as an authorizer
+		// refuses an expired token.
+		const g = await gate(ursulaUrl());
+		const requireToken = async (token: string): Promise<void> => {
+			const r = await fetch(`${g.control}/auth`, { method: "PUT", body: JSON.stringify({ token }) });
+			expect(r.status, await r.text()).toBe(204);
+		};
+		try {
+			// A cache that hands its token out until it expires, whatever `previous` says.
+			const cache: { held?: BearerToken & { expiresAt: number } } = {};
+			const minted: number[] = [];
+			const cached: TokenProvider = async () => {
+				if (cache.held === undefined || cache.held.expiresAt <= Date.now()) {
+					minted.push(Date.now());
+					cache.held = { token: `expiring-${minted.length}`, expiresAt: Date.now() + 6_000 };
+				}
+				return cache.held;
+			};
+			await requireToken("expiring-1");
+			const s = stream("token-expiring");
+			const db = await open(`${g.url}${s.path}`, { dir: freshDir(), token: cached });
+			db.exec("CREATE TABLE t(x)");
+			await db.synced();
+			const expiry = cache.held?.expiresAt ?? 0;
+			// The refresh due 4.2 to 4.8 s in gets the same token back, and so does each retry until
+			// it expires: the retry is due by then at the latest, when the cache turns over.
+			await until("the next token", () => minted.length === 2, 15_000);
+			expect((minted[1] as number) - expiry).toBeLessThan(500);
+			await requireToken("expiring-2");
+			// A commit after the expiry goes out under the next token, never blocked `unauthorized`.
+			const wrote = Date.now();
+			db.exec("INSERT INTO t VALUES (1)");
+			await db.synced();
+			expect(Date.now() - wrote).toBeLessThan(2_000);
+			expect(db.status().replication.condition).toBeNull();
+			await closeAll(db);
+		} finally {
+			await g.stop();
+		}
 	});
 
 	it("fails the open with its own error when it fails for good, and is retried after any other failure", async () => {
