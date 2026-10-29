@@ -32,6 +32,13 @@
 //! Pre-check). Without a trusted generation, or without a claim to continue, the open retries until
 //! its deadline.
 //!
+//! A host's drain of a root ([`OwnerMode::Drain`]) runs the owner's local steps, then decides by
+//! the drain's rows ([`table::decide_drain`]): it binds provisionally, as the unreachable row does,
+//! even when the stream answers, so it only ever continues the root's own claim behind the
+//! pre-check and never takes the stream over. It never creates the stream or builds a generation,
+//! and a root it cannot continue, or one with nothing to send, it declines
+//! ([`OpenError::Declined`]) with nothing sent but the HEAD.
+//!
 //! A read-only open ([`Access::Reader`]) runs the same steps in a reader directory of its own
 //! ([`Root::reader`]) and decides by the reader rows ([`table::decide_reader`], [`reader`]): it
 //! builds a reader generation, catches a trusted one of the stream's token up in place, and binds
@@ -39,7 +46,8 @@
 //!
 //! Module map:
 //!
-//! - [`table`]: the open table (design: Open), one pure function, and its reader rows.
+//! - [`table`]: the open table (design: Open), one pure function, and its unreachable, reader and
+//!   drain rows.
 //! - [`reader`]: a reader's open after its HEAD: its catch-up in place and its unreachable row.
 
 pub(crate) mod reader;
@@ -59,6 +67,7 @@ use std::sync::Arc;
 use ursula_headers::ByteSpan;
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
+use ursula_headers::HeaderError;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
@@ -71,6 +80,8 @@ use self::reader::Applying;
 use self::reader::CatchUp;
 use self::reader::ReaderReady;
 use self::table::Asked;
+use self::table::Declined;
+use self::table::DrainRow;
 use self::table::HeadSeen;
 use self::table::Local;
 use self::table::LocalSummary;
@@ -115,6 +126,7 @@ use crate::materialize::LocalError;
 use crate::materialize::Materialized;
 use crate::materialize::holds_data;
 use crate::options::Access;
+use crate::options::OwnerMode;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
 use crate::replicator::LocalState;
@@ -161,7 +173,7 @@ pub(crate) struct OpenSpec {
     pub(crate) max_commit_bytes: u64,
     /// How long the open may take, from its start.
     pub(crate) timeout_ms: u64,
-    /// An owner's open (with `recreate` or not) or a reader's.
+    /// An owner's open (with `recreate` or not, or a host's drain) or a reader's.
     pub(crate) access: Access,
 }
 
@@ -274,6 +286,14 @@ pub(crate) enum LocalSetup {
     Log(#[from] LogError),
     #[error("the generation is of stream {found:?}, not {expected:?}")]
     OtherStream { found: String, expected: String },
+    /// The log's segment header names a cluster id that does not parse. The open wrote it, so this
+    /// is a broken invariant ([`OpenError::Internal`]).
+    #[error("the log's segment header names the cluster id {found:?}: {source}")]
+    ClusterId {
+        found: String,
+        #[source]
+        source: HeaderError,
+    },
     /// The host directory exists and cannot take the record of the cache directory (design:
     /// Hosts).
     #[error(transparent)]
@@ -345,6 +365,13 @@ pub(crate) enum OpenError {
     GaveUp(GaveUp),
     #[error("{}: the takeover reset", .0.kind())]
     Reset(ResetKind),
+    /// A drain's open found nothing it could continue ([`table::decide_drain`]). No SQL function
+    /// opens as a drain, so none meets it. Unlike every other variant, its message starts with the
+    /// decline's own token ([`Declined::kind`], the token a drain reports), not with its
+    /// [`OpenError::error_kind`]: `replaced` is not an [`crate::error::ErrorKind`], so its kind is
+    /// `internal`.
+    #[error("{}: the drain declined the root: {0}", .0.kind())]
+    Declined(Declined),
     #[error("cancelled")]
     Cancelled,
 }
@@ -361,9 +388,10 @@ pub(crate) enum GaveUp {
     Missing,
 }
 
-/// A local failure: a gap or malformed record under valid checksums is the extension's own bug
-/// (`internal`), a commit or snapshot from the stream whose page 1 is not a SQLite database's is
-/// the stream's (`stream_state`), anything else `local_setup`.
+/// A local failure: a gap or malformed record under valid checksums, or a segment header's cluster
+/// id that does not parse, is the extension's own bug (`internal`), a commit or snapshot from the
+/// stream whose page 1 is not a SQLite database's is the stream's (`stream_state`), anything else
+/// `local_setup`.
 pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
     let e = e.into();
     if let LocalSetup::Local(l) = &e
@@ -376,6 +404,7 @@ pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
         LocalSetup::Local(LocalError::Log(log))
         | LocalSetup::Log(log)
         | LocalSetup::Generation(GenerationError::Log(log)) => bug(log),
+        LocalSetup::ClusterId { .. } => true,
         LocalSetup::Local(_)
         | LocalSetup::Generation(_)
         | LocalSetup::OtherStream { .. }
@@ -1372,6 +1401,16 @@ pub(crate) fn prepare_locked(root: Arc<Root>, spec: &OpenSpec) -> Result<Prepare
     Ok(Prepared { root, found })
 }
 
+/// The cluster id the trusted generation's segment header names, which a provisional bind checks
+/// the pre-check's answers against.
+fn header_cluster_id(m: &Materialized) -> Result<ClusterId, LocalSetup> {
+    let found = &m.recovered.header.cluster_id;
+    ClusterId::new(found.as_str()).map_err(|source| LocalSetup::ClusterId {
+        found: found.clone(),
+        source,
+    })
+}
+
 /// What the open table reads of a trusted local generation.
 fn summary(m: &Materialized) -> LocalSummary {
     let r = &m.recovered;
@@ -1550,9 +1589,10 @@ pub(crate) enum OpenStep {
         job: DiskJob,
     },
     Takeover(Box<Ready>),
-    /// The stream is unreachable and the trusted generation holds a CLAIM record: bind now, and
-    /// send the log's latest claim `claim` again once the stream answered and the pre-check found
-    /// nothing foreign (design: Open, Pre-check).
+    /// Bind the trusted generation now, and send the log's latest claim `claim` again once the
+    /// stream answered and the pre-check found nothing foreign (design: Open, Pre-check): the
+    /// stream is unreachable and the generation holds a CLAIM record, or a host's drain continues
+    /// the generation's claim whether the stream answers or not.
     Provisional {
         ready: Box<Ready>,
         claim: (Epoch, Activation),
@@ -1727,9 +1767,13 @@ impl Opening {
                 // A build that started over after a history change takes over with its token.
                 let head = read.unwrap_or(head);
                 match self.spec.access {
-                    Access::Owner { .. } => {
-                        self.takeover(m, cluster_id, &head, highest, attach, None)
-                    }
+                    Access::Owner {
+                        mode: OwnerMode::Open { .. },
+                    } => self.takeover(m, cluster_id, &head, highest, attach, None),
+                    // No drain row builds a generation.
+                    Access::Owner {
+                        mode: OwnerMode::Drain,
+                    } => OpenStep::Fail(OpenError::Panicked),
                     Access::Reader => {
                         let (incarnation, closed) = (head.incarnation(), head.closed());
                         self.reader_ready(m, cluster_id.as_str(), incarnation, closed, attach)
@@ -1949,8 +1993,17 @@ impl Opening {
             stream: stream.as_ref(),
             content_type: answer.content_type.as_deref(),
         };
+        let recreate = match self.spec.access {
+            Access::Owner {
+                mode: OwnerMode::Open { recreate },
+            } => recreate,
+            Access::Owner {
+                mode: OwnerMode::Drain,
+            } => return self.drain(table::decide_drain(local, seen)),
+            Access::Reader => false,
+        };
         let asked = Asked {
-            recreate: matches!(self.spec.access, Access::Owner { recreate: true }),
+            recreate,
             created: self.created,
         };
         match table::decide(local, asked, seen) {
@@ -2014,21 +2067,40 @@ impl Opening {
             return OpenStep::Fail(OpenError::Panicked);
         };
         let local = std::mem::replace(&mut prepared.found, Local::None);
+        if matches!(self.spec.access, Access::Owner {
+            mode: OwnerMode::Drain
+        }) {
+            return self.drain(table::decide_drain_unreachable(local));
+        }
         let back = match table::decide_unreachable(local) {
             // A cluster id the header holds is one the open wrote: one that does not parse leaves
             // nothing a claim could be checked against, so the open waits.
-            UnreachableRow::Provisional { local: m, claim } => {
-                match ClusterId::new(&m.recovered.header.cluster_id) {
-                    Ok(cluster_id) => return self.provisional(m, cluster_id, claim),
-                    Err(_unparsed) => Local::Trusted(summary(&m), m),
-                }
-            }
+            UnreachableRow::Provisional { local: m, claim } => match header_cluster_id(&m) {
+                Ok(cluster_id) => return self.provisional(m, cluster_id, claim),
+                Err(_unparsed) => Local::Trusted(summary(&m), m),
+            },
             UnreachableRow::Wait { local } => local,
         };
         if let Some(prepared) = &mut self.prepared {
             prepared.found = back;
         }
         self.failed(exchange, now_ms)
+    }
+
+    /// Carries out a drain's row: a continue binds provisionally, anything else fails with nothing
+    /// sent but the HEAD and the local files as they were.
+    fn drain(self: Box<Self>, row: DrainRow<Box<Materialized>, Replaced>) -> OpenStep {
+        match row {
+            // A cluster id the header holds is one the open wrote, and a HEAD that answered named
+            // the same: one that does not parse leaves nothing a claim could be checked against,
+            // and a drain does not wait for the deadline as an owner's open does.
+            DrainRow::Continue { local: m, claim } => match header_cluster_id(&m) {
+                Ok(cluster_id) => self.provisional(m, cluster_id, claim),
+                Err(e) => OpenStep::Fail(local(e)),
+            },
+            DrainRow::Decline { declined, .. } => OpenStep::Fail(OpenError::Declined(declined)),
+            DrainRow::Refuse { refused, .. } => OpenStep::Fail(refused.into()),
+        }
     }
 
     /// Binds the trusted generation `m` now, under the log's token, its claim `claim` deferred

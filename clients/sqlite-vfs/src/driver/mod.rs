@@ -411,8 +411,8 @@ impl BindingHandle {
         Ok(Arc::clone(self.salvage.get_or_init(|| listed)))
     }
 
-    /// Whether the binding is still provisional: opened on an unreachable stream, no claim of it
-    /// applied yet.
+    /// Whether the binding is still provisional: opened on an unreachable stream, or by a host's
+    /// drain, and no claim of it applied yet.
     pub(crate) fn provisional(&self) -> bool {
         self.provisional.load(Ordering::Acquire)
     }
@@ -726,8 +726,17 @@ impl BindingHandle {
         }
     }
 
-    /// Whether the binding still holds the root and its generation (tests).
-    #[cfg(test)]
+    /// Whether the binding still holds the root and its generation. A binding releases them once
+    /// it retired cleanly, after its exact ACK is fsynced, or once it reset and its last connection
+    /// closed, after its latest ACK: a host's drain waits for this, not for [`Life::Retired`],
+    /// which a clean retire marks before that ACK is written.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only a host's drain waits for the release, and no command runs one yet"
+        )
+    )]
     pub(crate) fn holds_root(&self) -> bool {
         self.root
             .lock()
