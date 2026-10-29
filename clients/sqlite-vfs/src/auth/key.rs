@@ -700,7 +700,10 @@ mod tests {
     #[test]
     fn only_a_refusal_stops_a_key_serving() {
         for failure in [
-            ExchangeError::Unexpected { status: 404 },
+            ExchangeError::Unexpected {
+                status: 404,
+                problem: Box::default(),
+            },
             ExchangeError::Panicked,
             ExchangeError::Unavailable { status: 503 },
         ] {
