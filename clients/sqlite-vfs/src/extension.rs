@@ -299,11 +299,13 @@ unsafe fn fn_cancel(
     unsafe { result(ctx, "ursula_cancel", outcome.as_ref().map(Clone::clone)) };
 }
 
-/// `tonbo_resolve(name_or_url, options_json, timeout_ms)` (design: Tonbo): `{done, url, name}`
-/// once the stream URL of the Tonbo database `name_or_url` names is known and, when the API key's
-/// tokens serve the Streams requests, the first of them is held. `{done: false, request}` while it
-/// goes on: a `resolved` event of `ursula_events` ends it, and a call with the same arguments then
-/// takes its outcome. `timeout_ms` 0 returns at once.
+/// `tonbo_resolve(name_or_url, options_json, timeout_ms)` (design: Tonbo): `{done, url, name,
+/// key_tokens}` once the stream URL of the Tonbo database `name_or_url` names is known and, when
+/// the API key's tokens serve the Streams requests, the first of them is held. `{done: true,
+/// error}` when the resolve failed, with the fields `ursula_cancel` reports. `{done: false,
+/// request}` while it goes on: a `resolved` event of `ursula_events` ends it, and a call with the
+/// same arguments then takes its outcome. `timeout_ms` 0 returns at once. Only a malformed
+/// `timeout_ms` fails the call.
 unsafe fn fn_tonbo_resolve(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -314,10 +316,9 @@ unsafe fn fn_tonbo_resolve(
     // SAFETY: as above.
     let options = unsafe { arg(argc, argv, 1) };
     // SAFETY: as above.
-    let outcome = unsafe { arg_count(argc, argv, 2, "timeout_ms") }.and_then(|timeout| {
-        crate::tonbo::resolve(&name_or_url, &options, timeout)
-            .map(|resolution| status::resolution_json(&resolution))
-            .map_err(Error::Tonbo)
+    let outcome = unsafe { arg_count(argc, argv, 2, "timeout_ms") }.map(|timeout| {
+        let resolved = crate::tonbo::resolve(&name_or_url, &options, timeout);
+        status::resolution_json(resolved.as_ref().map_err(|e| e.as_ref()))
     });
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "tonbo_resolve", outcome.as_ref().map(Clone::clone)) };

@@ -24,7 +24,6 @@ use crate::options::OptionsError;
 use crate::replicator::ResetKind;
 use crate::salvage::SalvageError;
 use crate::snapshotter::SnapshotFailure;
-use crate::tonbo::TonboError;
 
 /// What a caller does about an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,8 +588,6 @@ pub(crate) enum Error {
     /// Every SQL function's failure in a child forked after its parent started the extension.
     #[error("the process forked after the extension started: open databases after the fork")]
     Forked,
-    #[error("{}", .0.report())]
-    Tonbo(#[source] Arc<TonboError>),
 }
 
 impl Error {
@@ -605,7 +602,6 @@ impl Error {
             Error::Salvage(_) => ErrorKind::LocalSetup,
             Error::Import(e) => e.kind(),
             Error::Forked => ErrorKind::Forked,
-            Error::Tonbo(e) => e.kind(),
         }
     }
 }

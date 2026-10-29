@@ -319,23 +319,26 @@ pub(crate) fn opened_json(opened: &Opened) -> String {
     }
 }
 
-/// `tonbo_resolve`'s result: `{done, url, name}`, `name` `null` for a URL, or `{done: false,
-/// request}` while the resolve goes on.
-pub(crate) fn resolution_json(resolution: &Resolution) -> String {
-    match resolution {
-        Resolution::Done(resolved) => object(&[
+/// `tonbo_resolve`'s result: `{done: true, url, name, key_tokens}`, `name` `null` for a URL,
+/// `{done: true, error}` for a failure, `error` as [`tonbo_error_json`] writes it, or `{done:
+/// false, request}` while the resolve goes on.
+pub(crate) fn resolution_json(outcome: Result<&Resolution, &TonboError>) -> String {
+    match outcome {
+        Ok(Resolution::Done(resolved)) => object(&[
             ("done", "true".into()),
             ("url", json_str(&resolved.url)),
             ("name", resolved.name.as_deref().map_or_else(null, json_str)),
+            ("key_tokens", resolved.key_tokens.to_string()),
         ]),
-        Resolution::Pending(request) => {
+        Ok(Resolution::Pending(request)) => {
             object(&[("done", "false".into()), ("request", request.to_string())])
         }
+        Err(e) => object(&[("done", "true".into()), ("error", tonbo_error_json(e))]),
     }
 }
 
-/// What `ursula_cancel` of a resolve reports it ended with: `{kind, action, class, message, fix,
-/// request_id}`.
+/// A resolve's failure, as `ursula_cancel` of a resolve reports it and as the `error` of
+/// `tonbo_resolve`'s `{done: true, error}`: `{kind, action, class, message, fix, request_id}`.
 pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
     with_kind(&[], e.kind(), Surface::Open, &[
         ("message", json_str(&e.report().to_string())),

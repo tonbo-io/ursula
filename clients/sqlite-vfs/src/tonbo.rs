@@ -1,9 +1,9 @@
 //! Tonbo databases by name (design: Tonbo): `tonbo_resolve(name_or_url, options_json, timeout_ms)`
 //! turns the name of a database of a Tonbo account into its stream URL, with the account's API
 //! key, and fetches the first Streams token for the key before it returns, so a host opens the URL
-//! with `ursula_open` next. Only `extension` calls into this module, and `status` and `error`
-//! render what it returns: the open, the registry and the driver know nothing of Tonbo, and a host
-//! that never calls `tonbo_resolve` never runs it.
+//! with `ursula_open` next. Only `extension` calls into this module, `status` renders what it
+//! returns and `error` names its kinds: the open, the registry and the driver know nothing of
+//! Tonbo, and a host that never calls `tonbo_resolve` never runs it.
 //!
 //! - A name is anything without a scheme (`https://...`): an empty one fails `invalid_name`. A URL
 //!   is taken as it is, and no lookup runs. A stream URL `ursula_open` would refuse fails
@@ -25,25 +25,35 @@
 //!   time runs out. The Streams token is the process's key source (`auth`): the key goes to
 //!   `{auth origin}/api/iam/token` with the audience [`STREAMS_AUDIENCE`], and its tokens are
 //!   refreshed in the background while requests may carry them. They go only to a stream URL that
-//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Every wait is
-//!   bounded by the time the resolve has left, and every request by that and the agent's 10 s. A
-//!   cancel ends the waits at once, and a request in flight within its 10 s.
+//!   is `https://`, or `http://` to a loopback host: another fails `invalid_url`. Once the key
+//!   holds its first token, the call that takes the answer clears the token set
+//!   (`ursula_set_token`, an open's `token`), so the key's tokens serve every request of the
+//!   process from then on, and the answer says so (`key_tokens`). An answer nobody takes, one a
+//!   cancel or a call's timeout gave up, clears nothing.
+//! - Every wait is bounded by the time the resolve has left and ends at once at a cancel. Every
+//!   request gets that time too, at most 10 s (`lookup`): a request in flight at a cancel ends
+//!   within them, and one the API never answers fails as unreachable and goes again.
 //! - A resolve goes on for the time of the latest call that joined it, and a call that gives up
 //!   on it reports what it waited for last: the lookup, or the Streams token.
 //! - With `timeout_ms` 0 the call returns `{done: false, request}` at once, and the resolve goes on
 //!   on a thread of its own, for `timeout_ms` of the options (30 s by default). Its end is a
 //!   `resolved` event (`ursula_events`), always, after which the host calls again with the same
-//!   arguments and takes the outcome: the answer, or the error. Calls with the same arguments
-//!   join one resolve, and `ursula_cancel(request)` gives it up for the host that cancels
-//!   (`requests` says which call takes what). A call that finds its resolve given up starts one,
-//!   with another request to wait for.
+//!   arguments and takes the outcome: the answer, or the failure. Blocking calls with the same
+//!   arguments join one resolve, and so does a host's call that returns at once: the calls that
+//!   return at once count as one host's, whose first call back takes the outcome, so a host joins
+//!   its own concurrent calls. `ursula_cancel(request)` gives the resolve up for the host that
+//!   cancels (`requests` says which call takes what). A call that finds its resolve given up
+//!   starts one, with another request to wait for.
 //! - A timeout too large for the clock waits a year: a host's "forever".
 //!
-//! Every failure is a [`TonboError`], reported as [`TonboError::report`] writes it: `<kind>:
-//! <what>`, then ` (request <id>)` for the Tonbo API's request id when an answer failed, then
-//! `. <fix>` when there is something to run or set. Messages name options in words every host's
+//! Every failure is a [`TonboError`], which the call returns as its outcome, `{done: true, error:
+//! {kind, action, class, message, fix, request_id}}`, the fields `ursula_cancel` reports, so a
+//! host reads them and parses no message. The message is what [`TonboError::report`] writes:
+//! `<kind>: <what>`, then ` (request <id>)` for the Tonbo API's request id when an answer failed,
+//! then `. <fix>` when there is something to run or set. Messages name options in words every host's
 //! spelling of them fits ("the API key option"): only a malformed `options_json` names its
-//! members. No message carries a key or a token, and nothing here logs.
+//! members. No message carries a key or a token, and nothing here logs. Only a malformed argument
+//! of the call itself (a `timeout_ms` that is not a count) fails the SQL call.
 //!
 //! Module map:
 //!
@@ -106,16 +116,19 @@ const DEFAULT_RESOLVE_MS: u64 = 30_000;
 /// How much longer than the resolve's own time a blocking call waits, so the resolve's own failure
 /// (the last condition) is what it reports.
 const GRACE_MS: u64 = 1_000;
-/// How long `ursula_cancel` waits for what a resolve it gave up ended with.
-const CANCEL_REPORT_MS: u64 = 1_000;
 /// The longest wait, a year: a timeout too large for the clock waits this long.
 const FOREVER: Duration = Duration::from_secs(31_536_000);
 
-/// What a resolve hands out: the stream URL, and the database's name when it was looked up.
+/// What a resolve hands out: the stream URL, the database's name when it was looked up, and
+/// whether the key's Streams tokens serve the process's requests from then on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resolved {
     pub(crate) url: String,
     pub(crate) name: Option<String>,
+    /// The resolve made the key the source of the process's Streams tokens, and the call that took
+    /// the answer cleared the token set: a host stops any token source of its own that would set
+    /// one again.
+    pub(crate) key_tokens: bool,
 }
 
 /// What `tonbo_resolve` came to.
@@ -626,11 +639,16 @@ impl Plan {
             // Checked when planned.
             Target::Url(url) => (url.clone(), None),
         };
+        let key_tokens = self.streams.is_some();
         if let Some(key) = &self.streams {
             until.waits_for(Subject::Token(url.clone()));
             streams_token(key, &self.auth, &url, until)?;
         }
-        Ok(Resolved { url, name })
+        Ok(Resolved {
+            url,
+            name,
+            key_tokens,
+        })
     }
 }
 
@@ -864,24 +882,9 @@ impl Run {
         self.changed.notify_all();
     }
 
-    /// How it ended, waiting at most `wait`.
-    fn ended_within(&self, wait: Duration) -> Option<Outcome> {
-        let deadline = after(Instant::now(), wait);
-        let mut state = lock(&self.state);
-        loop {
-            if let Some(outcome) = &state.ended {
-                return Some(outcome.clone());
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            state = self
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
+    /// How it ended, `None` while it runs.
+    fn ended(&self) -> Option<Outcome> {
+        lock(&self.state).ended.clone()
     }
 
     /// The failure of a call that gave up on it: what it waited for, and the last condition it
@@ -1000,7 +1003,7 @@ pub(crate) fn resolve(
                     run.extend(time);
                     return Ok(Resolution::Pending(request));
                 }
-                Arrival::Take(outcome) => return outcome.map(Resolution::Done),
+                Arrival::Take(outcome) => return taken(outcome).map(Resolution::Done),
                 Arrival::Wait(request, run) => {
                     run.extend(time);
                     Some(request)
@@ -1024,13 +1027,13 @@ pub(crate) fn resolve(
             let plan = Plan::new(name_or_url, options).map_err(Arc::new)?;
             if !plan.sends() {
                 let until = Until::new(Run::new(subject(name_or_url), Duration::ZERO));
-                return plan.run(&until).map(Resolution::Done).map_err(Arc::new);
+                return taken(plan.run(&until).map_err(Arc::new)).map(Resolution::Done);
             }
             planned = Some((plan, driver().request_id()));
             continue;
         };
         if let Some(outcome) = wait(id, request, timeout_ms) {
-            return outcome.map(Resolution::Done);
+            return taken(outcome).map(Resolution::Done);
         }
         // Its resolve left the table: the call starts again.
     }
@@ -1047,6 +1050,16 @@ fn resolve_ms(options: &str, timeout_ms: u64) -> u64 {
         .ok()
         .and_then(|options| options.timeout_ms)
         .unwrap_or(DEFAULT_RESOLVE_MS)
+}
+
+/// A call takes `outcome`. An answer whose key's tokens serve clears the token set: a token an
+/// earlier open set would go on serving in their place. Only the call that hands the answer out
+/// clears it, so a resolve given up before anyone took its answer leaves the token set alone.
+fn taken(outcome: Outcome) -> Outcome {
+    if outcome.as_ref().is_ok_and(|resolved| resolved.key_tokens) {
+        crate::auth::set_token(None);
+    }
+    outcome
 }
 
 /// What a resolve of `name_or_url` waits for first.
@@ -1125,7 +1138,9 @@ fn wait(id: Id, request: u64, timeout_ms: u64) -> Option<Outcome> {
 /// `ursula_cancel(request)` of a resolve: `None` when `request` names none. Otherwise what it
 /// came to for the host that cancels: `Some(None)` when it resolved before the cancel, the failure
 /// it ended with, or `cancelled` with the last condition it met. A resolve a blocking call waits
-/// for goes on for that call. One given up is waited for at most [`CANCEL_REPORT_MS`].
+/// for goes on for that call. One given up reports at once what it ended with, or `cancelled` while
+/// it runs, so the cancel never waits for a request in flight. An answer it reports was taken by
+/// nobody, so it clears no token (`taken`).
 pub(crate) fn cancel(request: u64) -> Option<Option<Arc<TonboError>>> {
     let step = table().cancel(request)?;
     Some(match step {
@@ -1133,7 +1148,7 @@ pub(crate) fn cancel(request: u64) -> Option<Option<Arc<TonboError>>> {
         Cancelled::Left(run) => Some(run.gave_up(true)),
         Cancelled::Abandoned(run) => {
             run.cancel();
-            match run.ended_within(Duration::from_millis(CANCEL_REPORT_MS)) {
+            match run.ended() {
                 Some(outcome) => outcome.err(),
                 None => Some(run.gave_up(true)),
             }
