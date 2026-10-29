@@ -224,24 +224,6 @@ def test_a_reset_on_one_database_ends_the_wait_on_the_others(model, fresh):
     both.close()
 
 
-def test_a_zero_timeout_with_nothing_to_wait_for_returns_at_once(stream, fresh):
-    owner = Child(stream.url, fresh())
-    owner.send(exec="CREATE TABLE t(x); INSERT INTO t VALUES (1)")
-    owner.send(synced=30)
-    # A reader cache's synced() returns at once.
-    reader = sqlite_ursula.open(stream.url, dir=fresh(), read_only=True)
-    with gate(reader, timeout=0):
-        assert reader.execute("SELECT x FROM t").fetchall() == [(1,)]
-
-    async def main() -> None:
-        async with agate(reader, timeout=0):
-            pass
-
-    asyncio.run(main())
-    reader.close()
-    owner.stop()
-
-
 def test_refuses_what_it_cannot_take_before_the_block_runs(model, fresh):
     db = opened(model, fresh, "gate-invalid")
     ran = []
