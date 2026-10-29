@@ -1348,8 +1348,8 @@ until the root is opened where it now is.
 `ursula-vfs-host` is a binary of the extension's crate that never loads SQLite. `inspect`
 (`inspection::inspect`) is the host's read of the disk, and never writes a file or takes a lock.
 `drain` is a process of the extension that locks roots and writes their logs and claims
-([Draining](#draining)), so a host that tells its helpers apart by executable must tell a drain apart
-by its first argument. A host runs `inspect` as root, so that it can read every root and every
+([Draining](#draining)), so a host that tells its helpers apart by executable must tell a drain
+apart by its first argument. A host runs `inspect` as root, so that it can read every root and every
 process's descriptors. One pass reads:
 
 1. The host directory: the one `--dir` names, or the compiled-in path. The inspector never reads
@@ -1590,12 +1590,12 @@ latest, its opens and its waits for a binding ending 250 ms before. It exits 0 w
 a usage error and 1 when it could not write, and it exits without waiting for its workers. A host
 bounds its run at `--budget-ms` plus 2 s at the earliest and waits for its exit in any case.
 
-A drain never reads stdin, so a host passes `/dev/null`. Its stdout carries only the one line, printed
-at the end. Its stderr carries the extension's log lines (logfmt) and a usage error's message, and a
-host drains or redirects it: a full stderr pipe blocks the extension's logging, and with it the
-driver. An exit by a signal, or a panic's 101, is no result, and a host takes a result only from
-exit 0 with one complete line. A host passes the drain exactly the VFS variables its workload runs
-with, and nothing else.
+A drain never reads stdin, so a host passes `/dev/null`. Its stdout carries only the one line,
+printed at the end. Its stderr carries the extension's log lines (logfmt) and a usage error's
+message, and a host drains or redirects it: a full stderr pipe blocks the extension's logging, and
+with it the driver. An exit by a signal, or a panic's 101, is no result, and a host takes a result
+only from exit 0 with one complete line. A host passes the drain exactly the VFS variables its
+workload runs with, and nothing else.
 
 What a drain guarantees is what the pre-check guarantees. Its claim applies only above the root's
 own latest claim, and only after a read found no other owner's frame between the root's
@@ -1630,14 +1630,15 @@ commits it came to send if that owner wrote.
   came with no condition to name, or before the root's turn) and `reopened` (yes: another process
   logged commits in the root after the drain released it, or the binding's retire could not write
   its exact ACK, which the drain's log lines name as `ack_lost`). `internal` also covers a panic in
-  the drain. A token has one `later` whatever produced it. Kinds may grow within a line, and a host decides one it does not know by its
-  `later`.
+  the drain. A token has one `later` whatever produced it. Kinds may grow within a line, and a host
+  decides one it does not know by its `later`.
 - `uid` is the drain's effective uid, read from `/proc/self/status`, and null when it could not be
   read: the drain then opens nothing. A root's `uid` is its directory's owner. `dir` is the host
   directory the drain read, null without one. `before_bytes` is the first read's bytes, and
   `unacknowledged_bytes`, `commits` and `salvaged` are the last completed read's, as the inspection
   counts them. `error` is a message for a person, at the top when the pass could not read
-  everything, the effective uid could not be read or the driver did not start.
+  everything, the effective uid could not be read, the driver did not start or the drain's pass
+  panicked.
 - Within `v` 1 the keys, their order, the outcomes and the `later` values are fixed, and a change to
   any of them is a new `v`. A host may refuse any other shape, acts on `outcome` and `later`, and
   never parses `error`.
