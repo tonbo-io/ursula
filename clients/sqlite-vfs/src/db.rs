@@ -348,7 +348,7 @@ fn registry() -> MutexGuard<'static, Registry> {
 /// Marks the process started (design: Forks): a child forked from here on is `forked`. The SQL
 /// functions that make what lives on in the process (`ursula_open`, `ursula_events` and
 /// `ursula_import`: the driver and its threads, HTTP agents and their pooled connections, the
-/// resolver's cache, a token) call it before anything else. It marks under the registry, which
+/// resolver's cache, a token) call it before anything else, and so does a host's drain. It marks under the registry, which
 /// every fork takes first, so a fork falls before the mark, and the child has none of what follows
 /// it, or after it, and the child is `forked`.
 pub(crate) fn start_process() {

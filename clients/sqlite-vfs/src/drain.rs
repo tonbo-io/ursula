@@ -39,6 +39,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::config;
+use crate::db;
 use crate::driver::Bound;
 use crate::driver::runtime::Driver;
 use crate::driver::runtime::driver;
@@ -335,7 +336,8 @@ impl Undrained {
 }
 
 /// `later` of an [`ErrorKind`]. A drain cannot meet the kinds of SQL, of commits, of the registry,
-/// of takeovers or of `synced()`, and they map to `no`, so the function is total.
+/// of takeovers, of `synced()`, of a forked child or of `tonbo_resolve`, and they map to `no`, so
+/// the function is total.
 fn later_of(kind: ErrorKind) -> Later {
     match kind {
         ErrorKind::InUse
@@ -370,7 +372,13 @@ fn later_of(kind: ErrorKind) -> Later {
         | ErrorKind::BoundElsewhere
         | ErrorKind::ClaimRaces
         | ErrorKind::Cancelled
-        | ErrorKind::NotBound => Later::No,
+        | ErrorKind::NotBound
+        | ErrorKind::Forked
+        | ErrorKind::InvalidName
+        | ErrorKind::MissingCredentials
+        | ErrorKind::CredentialsRefused
+        | ErrorKind::InvalidApiKey
+        | ErrorKind::DatabaseNotFound => Later::No,
     }
 }
 
@@ -742,6 +750,9 @@ pub struct Drained {
 /// the stream has not acknowledged, and returns once every root has an outcome, or once
 /// `request.budget` passed (design: Hosts, Draining).
 pub fn drain(request: &Drain) -> Drained {
+    // The drain makes the driver and its HTTP agents, which live on in the process, so it marks
+    // the process started first, as the SQL functions that make them do (design: Forks).
+    db::start_process();
     let start = Instant::now();
     let deadline = start.checked_add(request.budget);
     let shared = Arc::new(Shared::default());
