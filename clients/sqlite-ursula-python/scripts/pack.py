@@ -12,9 +12,12 @@ included. A ``py3-none-any`` wheel without a library lets the package install an
 is the package's own version, or a ``.devN`` pre-release, which the wheels carry as
 ``__version__``. Every wheel must hold exactly the files it should.
 
+The workflow then grafts libgcc_s into the musl wheel with ``auditwheel repair``: the library links
+it for unwinding, musllinux allows none from the host, and ``python:3.13-alpine`` has none.
+
 ``check`` runs ``auditwheel show`` on each Linux wheel, which must find the library consistent with
-the wheel's tag and needing no library outside the tag's policy, and ``twine check --strict`` on
-every wheel.
+the wheel's tag and needing no library outside the tag's policy, checks that only the musl wheel
+carries a grafted library, libgcc_s, and runs ``twine check --strict`` on every wheel.
 
 It needs uv on ``PATH`` and only the standard library.
 """
@@ -41,6 +44,9 @@ PLATFORMS = [
     ("linux-x64-musl", "libsqlite_ursula_vfs.so", "musllinux_1_2_x86_64"),
     ("darwin-arm64", "libsqlite_ursula_vfs.dylib", "macosx_11_0_arm64"),
 ]
+
+#: The one library auditwheel grafts, into the musl wheel.
+GRAFTED = r"sqlite_ursula\.libs/libgcc_s-[0-9a-f]+\.so\.1"
 
 AUDITWHEEL = "auditwheel==6.8.2"
 TWINE = "twine==7.0.0"
@@ -181,6 +187,14 @@ def check(out: Path) -> None:
             )
         if report["external_libs"] or report["unsupported_isa"]:
             raise SystemExit(f"{wheel.name}: needs libraries outside its policy, or ISA extensions")
+    for wheel in wheels:
+        grafted = sorted(n for n in names(wheel) if n.startswith("sqlite_ursula.libs/"))
+        if "-musllinux_" in wheel.name:
+            ok = len(grafted) == 1 and re.fullmatch(GRAFTED, grafted[0]) is not None
+        else:
+            ok = not grafted
+        if not ok:
+            raise SystemExit(f"{wheel.name} carries the grafted libraries {grafted}")
     run("uvx", TWINE, "check", "--strict", *wheels)
 
 

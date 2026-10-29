@@ -2362,7 +2362,9 @@ What CI runs (`.github/workflows/integration.yml`):
   workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
   builds it for npm (glibc 2.28 at most, musl linked dynamically, macOS 11.0), packed into one
   `py3-none` wheel per platform and the `py3-none-any` wheel without a library
-  (`scripts/pack.py`), `auditwheel show` finding each Linux wheel within its tag, `twine check`,
+  (`scripts/pack.py`), `auditwheel repair` grafting libgcc_s, which musllinux does not allow from
+  the host, into the musl wheel, `auditwheel show` finding each Linux wheel within its tag,
+  `twine check`,
   and the wheels installed from their directory alone (`scripts/smoke.sh`): uv-managed CPython
   3.11, 3.14 and 3.14t on Debian 11 x64 and arm64 and on macOS, Homebrew's Python on macOS and
   `python:3.13-alpine` host the library their wheel carries, and `python:3.13-slim` and the

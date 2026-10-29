@@ -7,8 +7,8 @@ name: sqlite-ursula-python Wheels
 # build (the extension, sqlite-vfs-build.yml) -> pack -> smoke. pack makes one py3-none wheel per
 # platform with its library under sqlite_ursula/_lib/ (manylinux_2_28_x86_64,
 # manylinux_2_28_aarch64, musllinux_1_2_x86_64, macosx_11_0_arm64) and the py3-none-any wheel
-# without one, then runs auditwheel show on the Linux wheels and twine check on all of them
-# (scripts/pack.py). The wheels are the artifact `python-wheels`. smoke installs them, picking the
+# without one (scripts/pack.py), grafts libgcc_s into the musl wheel with auditwheel repair, then
+# runs auditwheel show on the Linux wheels and twine check on all of them. The wheels are the artifact `python-wheels`. smoke installs them, picking the
 # one that fits, from that directory alone (scripts/smoke.sh): uv-managed CPython 3.11, 3.14 and
 # 3.14t on Debian 11 (glibc 2.31) x64 and arm64 and on macOS, Homebrew's Python on macOS and
 # python:3.13-alpine (Alpine 3.23, musl) host the extension. python:3.13-slim, whose SQLite is older
@@ -95,11 +95,19 @@ jobs:
       - name: Pack and check the wheels
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          MUSLLINUX: quay.io/pypa/musllinux_1_2_x86_64:2026.10.03-1@sha256:ff786af69d772d7ac3e318c00a2b682428a352cc822d6175f6a0d4b431c0d44d
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/python-wheels"
           pack=clients/sqlite-ursula-python/scripts/pack.py
           uv run --no-project --python 3.14 "$pack" pack "$RUNNER_TEMP/extension" "$out" "$VERSION"
+          # musllinux allows no libgcc_s from the host, which the library links for unwinding as
+          # npm ships it, and python:3.13-alpine lacks: auditwheel grafts it into the musl wheel.
+          docker run --rm -v "$out:/wheels" "$MUSLLINUX" sh -euxc '
+            auditwheel --version
+            auditwheel repair --plat musllinux_1_2_x86_64 --only-plat -w /tmp/repaired /wheels/*-py3-none-musllinux_1_2_x86_64.whl
+            mv -f /tmp/repaired/*.whl /wheels/
+          '
           uv run --no-project --python 3.14 "$pack" check "$out"
           {
             echo "sqlite-ursula $VERSION"
