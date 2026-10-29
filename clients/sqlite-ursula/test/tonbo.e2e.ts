@@ -608,6 +608,7 @@ async function until(ready: () => boolean, what: string): Promise<void> {
 interface CancelReport {
 	readonly kind: string;
 	readonly action: string;
+	readonly class: string;
 	readonly message: string;
 	readonly fix: string | null;
 	readonly request_id: string | null;
@@ -868,6 +869,7 @@ describe("the extension's tonbo_resolve", () => {
 		expect(report).toEqual({
 			kind: "unavailable",
 			action: "retry",
+			class: "unavailable",
 			message: `unavailable: the lookup of database "${d.name}" gave up when it was cancelled: database "${d.name}" is creating`,
 			fix: null,
 			request_id: null,

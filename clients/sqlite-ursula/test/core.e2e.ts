@@ -158,6 +158,7 @@ describe("the 0.8 core on node:sqlite", () => {
 			["open", new UrsulaSetupError("", "claim_races")],
 			["open", new UrsulaSetupError("", "not_bound")],
 			["open", new UrsulaSetupError("", "internal")],
+			["open", new UrsulaSetupError("", "invalid_name")],
 		];
 		for (const [fn, error] of made) {
 			const message = `ursula_${fn}: ${error.kind}: x`;
@@ -167,8 +168,6 @@ describe("the 0.8 core on node:sqlite", () => {
 			expect({ kind: named.kind, action: named.action }, message).toEqual({ kind: error.kind, action: error.action });
 			expect(errorOf(named, message, undefined).constructor, message).toBe(error.constructor);
 		}
-		// `invalid_name` is the `/tonbo` entry's own: the extension has no such kind.
-		expect(classify("ursula_open: invalid_name: x", SQLITE_ERROR)).toBeNull();
 	});
 
 	it("commits locally, confirms each commit, and synced() waits for the stream to hold them", async () => {
