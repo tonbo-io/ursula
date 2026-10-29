@@ -96,9 +96,9 @@ await send(reply)
 ```
 
 - A block that only read waits too, since it may have read another connection's pending commit.
-- An `UrsulaError` the block raises passes at once, also when a library wrapped it (as `__cause__`, as SQLAlchemy's `.orig`, or in an `ExceptionGroup`). So does a raw `sqlite3` error of a framework's own connection that the extension classifies as a refused write or a reset. It then raises as that `UrsulaError`.
+- An `UrsulaError` the block raises passes at once, as the block raised it, also when a library wrapped it (as `__cause__`, as SQLAlchemy's `.orig`, or in an `ExceptionGroup`). So does a raw `sqlite3` error of a framework's own connection that the extension classifies, also wrapped. With one database, a bare raw error that the extension names a refused write or a reset raises as that `UrsulaError`, which is a `sqlite3.OperationalError` too.
 - Every other error waits as a result does, then passes. Ctrl-C and cancellations pass at once.
-- A reset during the wait raises the `UrsulaResetError` instead of the outcome.
+- The wait covers every database at once. A reset during it raises the `UrsulaResetError` instead of the outcome, and a failure on one database ends the wait on the others.
 - `timeout` bounds the wait, not the block, and raises `TimeoutError`.
 
 Effects inside the block, such as a call to another service, are not gated: call `db.synced()` before them.
@@ -109,7 +109,7 @@ Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose 
 
 | class | raised by | kinds |
 | --- | --- | --- |
-| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported`, `too_large` |
+| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed, and a gate for a framework connection's refusal | `backlog_full` (`retry` after `synced()`), `unsupported`, `too_large` |
 | `UrsulaResetError` | every statement after a reset, `synced()`, `asynced()`, a gate, `on_reset` callbacks | `fenced` (`stop`), `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` or `aopen()` past its timeout | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` |
 | `UrsulaSetupError` | `open()`, `aopen()`, `import_sqlite()`, the calls the package guards in a forked child ([Forks](#forks)) | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |

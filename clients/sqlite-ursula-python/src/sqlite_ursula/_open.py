@@ -334,9 +334,10 @@ class _Bind:
 
 def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:
     """The open gave up: cancels ``request``, and the error is the last condition it met, or
-    ``cancelled``."""
+    ``cancelled``. The cancel waits up to a second for a disk job of the open, so it runs on a
+    connection of its own."""
     try:
-        ended = _control.call("SELECT ursula_cancel(?)", request)
+        ended = _control.call_waiting("SELECT ursula_cancel(?)", request)
     except UrsulaError:
         # It resolved meanwhile and its result was taken.
         ended = None
@@ -412,21 +413,14 @@ def import_sqlite(
     source = os.fspath(file)
     settings = {} if chosen is None else {"token": chosen}
     _control.start()
-    # A connection of its own: the import blocks for as long as it takes.
-    conn = _control.connection()
-    try:
-        row = conn.execute(
-            "SELECT ursula_import(?, ?, ?, ?)",
-            (stream, source, json.dumps(settings), max(1, round(limit * 1000))),
-        ).fetchone()
-    except sqlite3.Error as error:
-        classified = _control.classify(error, None)
-        if classified is error:
-            raise
-        raise classified from error
-    finally:
-        conn.close()
-    done = _control.parsed(row[0])
+    # On a connection of its own: the import blocks for as long as it takes.
+    done = _control.call_waiting(
+        "SELECT ursula_import(?, ?, ?, ?)",
+        stream,
+        source,
+        json.dumps(settings),
+        max(1, round(limit * 1000)),
+    )
     return Imported(
         offset=int(done["offset"]),
         digest=str(done["digest"]),

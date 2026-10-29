@@ -2,8 +2,8 @@
 made after it ended, on every database given, a block that only read included. The block's own
 error waits as a result does, while a refused write passes at once, also wrapped, and so does the
 raw refusal of a framework's own connection, which the extension classifies. A reset during the
-wait replaces the outcome, the timeout bounds the wait alone, and a cancelled ``agate`` leaves no
-ticket."""
+wait replaces the outcome the block finished with, a reset on one database ends the wait on the
+others, the timeout bounds the wait alone, and a cancelled ``agate`` leaves no ticket."""
 
 from __future__ import annotations
 
@@ -73,6 +73,7 @@ def test_holds_the_block_until_the_stream_acknowledged_what_it_wrote_or_read(mod
 
 def test_holds_the_blocks_own_error_and_passes_a_refused_write_at_once(model, fresh):
     db = opened(model, fresh, "gate-errors", max_pending_bytes=1)
+    other = opened(model, fresh, "gate-errors-other")
     # The next append's answer comes late: its commit stays pending, and holds the backlog full.
     model.fault("delay 3000", 1, "POST")
     db.execute("INSERT INTO t VALUES (1)")
@@ -106,6 +107,26 @@ def test_holds_the_blocks_own_error_and_passes_a_refused_write_at_once(model, fr
     assert not isinstance(classified.value.__cause__, sqlite_ursula.UrsulaError)
     assert classified.value.__cause__.sqlite_errorcode == SQLITE_IOERR_AUTH
     plain.rollback()
+
+    # Wrapped, the raw refusal passes as the library raised it, and with several databases, whose
+    # state alone names a statement's I/O error, the bare one passes unchanged.
+    def refused_raw() -> sqlite3.OperationalError:
+        plain.execute("INSERT INTO t VALUES (5)")
+        try:
+            plain.commit()
+        except sqlite3.OperationalError as error:
+            return error
+        finally:
+            plain.rollback()
+        raise AssertionError("the commit was not refused")
+
+    with pytest.raises(Wrapper) as wrapper, gate(db):
+        raise Wrapper(refused_raw())
+    assert not isinstance(wrapper.value.orig, sqlite_ursula.UrsulaError)
+    with pytest.raises(sqlite3.OperationalError) as bare, gate(db, other):
+        raise refused_raw()
+    assert not isinstance(bare.value, sqlite_ursula.UrsulaError)
+    assert bare.value.sqlite_errorcode == SQLITE_IOERR_AUTH
     # None of them waited for the delayed append.
     assert time.monotonic() - started < 2
 
@@ -116,6 +137,7 @@ def test_holds_the_blocks_own_error_and_passes_a_refused_write_at_once(model, fr
     assert time.monotonic() - started >= 2.5
     assert db.status()["commits"]["pending"] == 0
     plain.close()
+    other.close()
     db.close()
 
 
@@ -130,7 +152,8 @@ def test_a_takeover_replaces_the_outcome_with_the_reset(stream, fresh):
             released.append(db.execute("SELECT count(*) FROM t").fetchall())
         released.append("after the gate")
     assert (reset.value.kind, reset.value.action) == ("fenced", "stop")
-    assert "after the gate" not in released
+    # The block finished: the wait's reset replaced its outcome.
+    assert released == [[(0,)]]
     taker.stop()
     db.close()
 
@@ -161,6 +184,62 @@ def test_with_two_databases_waits_for_both(model, fresh):
     assert fast.status()["commits"]["pending"] == 0
     fast.close()
     slow.close()
+
+
+class Fenced:
+    """A database whose stream another process took over, and one whose next append is answered
+    3 s late."""
+
+    def __init__(self, model, fresh) -> None:
+        self.slow = opened(model, fresh, "gate-slow-reset")
+        s = new_stream(model, "gate-fenced")
+        self.fenced = sqlite_ursula.open(s.url, dir=fresh(), isolation_level=None)
+        self.fenced.execute("CREATE TABLE t(x)")
+        self.fenced.synced()
+        self.taker = Child(s.url, fresh())
+        model.fault("delay 3000", 1, "POST")
+        self.slow.execute("INSERT INTO t VALUES (1)")
+        self.started = time.monotonic()
+
+    def check(self, reset: UrsulaResetError) -> None:
+        assert reset.kind == "fenced"
+        # It did not wait for the slow database first.
+        assert time.monotonic() - self.started < 2
+        assert waiting(self.slow) == 0
+
+    def close(self) -> None:
+        self.slow.synced()
+        self.taker.stop()
+        self.fenced.close()
+        self.slow.close()
+
+
+def test_a_reset_on_one_database_ends_the_wait_on_the_others(model, fresh):
+    both = Fenced(model, fresh)
+    released = []
+    with pytest.raises(UrsulaResetError) as reset, gate(both.slow, both.fenced, timeout=30):
+        released.append(both.fenced.execute("SELECT count(*) FROM t").fetchall())
+    assert released == [[(0,)]]
+    both.check(reset.value)
+    both.close()
+
+
+def test_a_zero_timeout_with_nothing_to_wait_for_returns_at_once(stream, fresh):
+    owner = Child(stream.url, fresh())
+    owner.send(exec="CREATE TABLE t(x); INSERT INTO t VALUES (1)")
+    owner.send(synced=30)
+    # A reader cache's synced() returns at once.
+    reader = sqlite_ursula.open(stream.url, dir=fresh(), read_only=True)
+    with gate(reader, timeout=0):
+        assert reader.execute("SELECT x FROM t").fetchall() == [(1,)]
+
+    async def main() -> None:
+        async with agate(reader, timeout=0):
+            pass
+
+    asyncio.run(main())
+    reader.close()
+    owner.stop()
 
 
 def test_refuses_what_it_cannot_take_before_the_block_runs(model, fresh):
@@ -244,10 +323,12 @@ def test_agate_passes_a_refused_write_at_once_and_raises_a_reset(stream, server,
         db.execute("CREATE TABLE t(x)")
         await db.asynced()
         taker = Child(stream.url, fresh())
+        released = []
         with pytest.raises(UrsulaResetError) as reset:
             async with agate(db, timeout=30):
-                db.execute("SELECT 1").fetchall()
+                released.append(db.execute("SELECT 1").fetchall())
         assert reset.value.kind == "fenced"
+        assert released == [[(1,)]]
         taker.stop()
         db.close()
 
@@ -263,5 +344,19 @@ def test_agate_passes_a_refused_write_at_once_and_raises_a_reset(stream, server,
         assert time.monotonic() - started < 2
         await refusing.asynced()
         refusing.close()
+
+    asyncio.run(main())
+
+
+def test_agate_ends_every_wait_at_the_first_reset(model, fresh):
+    async def main() -> None:
+        both = Fenced(model, fresh)
+        released = []
+        with pytest.raises(UrsulaResetError) as reset:
+            async with agate(both.slow, both.fenced, timeout=30):
+                released.append(both.fenced.execute("SELECT count(*) FROM t").fetchall())
+        assert released == [[(0,)]]
+        both.check(reset.value)
+        both.close()
 
     asyncio.run(main())

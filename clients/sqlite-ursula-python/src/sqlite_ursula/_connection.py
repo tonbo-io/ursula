@@ -212,29 +212,13 @@ class UrsulaConnection(sqlite3.Connection):
         replicating, and an :class:`UrsulaResetError` on a reset. Network failures never raise: it
         waits. Ctrl-C interrupts it. On a reader cache it returns at once.
         """
-        self._check_fork()
-        if self._reset is not None:
-            raise again(self._reset)
-        try:
-            _events.synced(self.path, timeout)
-        except UrsulaResetError as error:
-            if self._reset is None:
-                self._reset = error
-            raise
+        _events.synced((self,), timeout)
 
     async def asynced(self, timeout: float | None = None) -> None:
         """:meth:`synced` for asyncio: the same guarantee and the same errors, and it waits on the
         event loop instead of blocking it. Cancelling it ends the wait, while the commits keep
         replicating."""
-        self._check_fork()
-        if self._reset is not None:
-            raise again(self._reset)
-        try:
-            await _events.asynced(self.path, timeout)
-        except UrsulaResetError as error:
-            if self._reset is None:
-                self._reset = error
-            raise
+        await _events.asynced((self,), timeout)
 
     def status(self) -> dict[str, Any]:
         """``ursula_status`` of the database (design: Status)."""
@@ -259,8 +243,7 @@ class UrsulaConnection(sqlite3.Connection):
 
     def _reset_by(self, error: UrsulaResetError) -> None:
         """The database was reset: its callbacks run once."""
-        if self._reset is None:
-            self._reset = error
+        self._remember(error)
         if self._fired or self._closed:
             return
         self._fired = True
@@ -288,6 +271,18 @@ class UrsulaConnection(sqlite3.Connection):
         if self._inherited():
             raise _control.forked_error()
 
+    def _usable(self) -> None:
+        """Before a wait: raises ``forked`` in a forked child, and the reset the connection knows
+        of."""
+        self._check_fork()
+        if self._reset is not None:
+            raise again(self._reset)
+
+    def _remember(self, error: UrsulaResetError) -> None:
+        """The first reset the connection learns of, which every later wait raises."""
+        if self._reset is None:
+            self._reset = error
+
     def _in_transaction(self) -> bool:
         try:
             return self.in_transaction
@@ -298,8 +293,8 @@ class UrsulaConnection(sqlite3.Connection):
         if not self._bound:
             return error
         classified = _control.classify(error, self.path)
-        if isinstance(classified, UrsulaResetError) and self._reset is None:
-            self._reset = classified
+        if isinstance(classified, UrsulaResetError):
+            self._remember(classified)
         return classified
 
     def _run(

@@ -17,9 +17,11 @@ control lock:
 - ``opened {request}`` wakes the opens waiting for it, which call ``ursula_open`` again to
   collect the result.
 
-A waiter is a ``threading.Event`` for ``synced()`` and ``open()``, and a :class:`LoopEvent` for
-``asynced()`` and ``aopen()``, which the thread wakes through its event loop's
-``call_soon_threadsafe``. Nothing runs on the loop's default executor.
+A waiter is a ``threading.Event`` for ``synced()``, ``gate`` and ``open()``, and a
+:class:`LoopEvent` for ``asynced()``, ``agate`` and ``aopen()``, which the thread wakes through its
+event loop's ``call_soon_threadsafe``. Nothing runs on the loop's default executor. One wait
+covers the tickets of every database it was given, with one waiter that each ticket's outcome
+wakes: it ends once every ticket resolved, or at the first that failed, and drops the rest.
 
 The thread takes its cursor before any request or ticket is handed out, and requests and tickets
 are registered under the lock in the same step that asks for them, so no event about one applies
@@ -35,7 +37,9 @@ import contextlib
 import logging
 import os
 import threading
+import time
 import weakref
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -72,6 +76,12 @@ class LoopEvent:
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._settle)
 
+    def clear(self) -> None:
+        """On the loop: the next :meth:`set` wakes the waiter again. A wake already on its way may
+        still come, which only makes the waiter look again."""
+        if self._future.done():
+            self._future = self._loop.create_future()
+
     def _settle(self) -> None:
         # A waiter that gave up (its timeout, a cancellation) cancelled the future.
         if not self._future.done():
@@ -91,22 +101,40 @@ class LoopEvent:
 Waiter = threading.Event | LoopEvent
 
 
+class Wait:
+    """One ``synced()``, ``asynced()`` or gate call waiting for the tickets of its databases. Its
+    state changes under the lock, and each change wakes ``waiter``."""
+
+    __slots__ = ("failed", "left", "waiter")
+
+    def __init__(self, waiter: Waiter) -> None:
+        self.waiter = waiter
+        #: The tickets not resolved yet.
+        self.left = 0
+        #: The path and the error of the first ticket that failed.
+        self.failed: tuple[str, BaseException] | None = None
+
+    def done(self) -> bool:
+        return self.failed is not None or self.left == 0
+
+
 class Ticket:
-    """A ``synced()`` or ``asynced()`` call waiting for its ticket."""
+    """The ticket of one database of a :class:`Wait`."""
 
-    __slots__ = ("done", "error", "path")
+    __slots__ = ("path", "wait")
 
-    def __init__(self, path: str, done: Waiter) -> None:
+    def __init__(self, path: str, wait: Wait) -> None:
         self.path = path
-        self.done = done
-        self.error: BaseException | None = None
+        self.wait = wait
 
     def resolve(self) -> None:
-        self.done.set()
+        self.wait.left -= 1
+        self.wait.waiter.set()
 
     def reject(self, error: BaseException) -> None:
-        self.error = error
-        self.done.set()
+        if self.wait.failed is None:
+            self.wait.failed = (self.path, error)
+        self.wait.waiter.set()
 
 
 #: The pending tickets of the process, by ticket: kept across threads.
@@ -323,74 +351,113 @@ def events() -> Events:
         return _current
 
 
-def _limit(timeout: object) -> float | None:
-    return None if timeout is None else _args.seconds("timeout", timeout, positive=False)
-
-
-def _ask(path: str, waiter: type[Waiter]) -> Ticket | None:
-    """Asks for a ticket of the database at ``path`` (``ursula_synced``, timeout 0): ``None`` when
-    it is synced already, else the ticket, registered in the same step, with a new ``waiter``."""
+def _ask(dbs: Sequence[UrsulaConnection], waiter: type[Waiter]) -> Wait | None:
+    """Asks for a ticket of every database in ``dbs`` (``ursula_synced``, timeout 0), in one step
+    under the lock: ``None`` when every one is synced already, else the :class:`Wait` of the
+    tickets, registered in the same step, with a new ``waiter``."""
+    for db in dbs:
+        db._usable()
     with _control.lock():
-        # Started before the call, so its events cursor precedes the ticket.
+        # Started before the calls, so its events cursor precedes the tickets.
         events()
-        answer = _control.call("SELECT ursula_synced(?, 0)", path)
-        if answer["synced"]:
-            return None
-        t = Ticket(path, waiter())
-        _tickets[int(answer["ticket"])] = t
-        return t
+        wait = Wait(waiter())
+        try:
+            for db in dbs:
+                try:
+                    answer = _control.call("SELECT ursula_synced(?, 0)", db.path)
+                except UrsulaResetError as error:
+                    db._remember(error)
+                    raise
+                if not answer["synced"]:
+                    _tickets[int(answer["ticket"])] = Ticket(db.path, wait)
+                    wait.left += 1
+        except BaseException:
+            _drop(wait)
+            raise
+    return wait if wait.left else None
 
 
-def _drop(t: Ticket) -> None:
-    """The call of ``t`` gave up: no event resolves it any more."""
+def _drop(wait: Wait) -> None:
+    """The call of ``wait`` ended: no event resolves its tickets any more."""
     with _control.lock():
         for ticket, pending in list(_tickets.items()):
-            if pending is t:
+            if pending.wait is wait:
                 del _tickets[ticket]
 
 
-def _timed_out(timeout: float | None) -> TimeoutError:
+def _settled(wait: Wait) -> bool:
+    """Whether ``wait`` is over, else its waiter cleared for the next change: under the lock, so no
+    change falls between the two."""
+    with _control.lock():
+        if wait.done():
+            return True
+        wait.waiter.clear()
+        return False
+
+
+def _left(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _outcome(wait: Wait, dbs: Sequence[UrsulaConnection]) -> None:
+    """Raises the first failure of ``wait``, if any, and the connections of its path remember a
+    reset."""
+    if wait.failed is None:
+        return
+    path, error = wait.failed
+    if isinstance(error, UrsulaResetError):
+        for db in dbs:
+            if db.path == path:
+                db._remember(error)
+    raise again(error)
+
+
+def _timed_out(call: str, timeout: float | None) -> TimeoutError:
     return TimeoutError(
-        f"synced() gave up after {timeout} s: the commits keep replicating, so call it again to "
-        "wait for them"
+        f"{call} gave up after {timeout} s: the commits keep replicating, so call it again to wait "
+        "for them"
     )
 
 
-def synced(path: str, timeout: float | None) -> None:
-    """Waits until the stream holds every commit of the database at ``path`` that the process
-    logged before the call, for at most ``timeout`` seconds (``None``: no limit). Raises
-    ``TimeoutError`` on the timeout, and the reset error on a reset."""
-    limit = _limit(timeout)
-    t = _ask(path, threading.Event)
-    if t is None:
+def synced(dbs: Sequence[UrsulaConnection], timeout: float | None) -> None:
+    """Waits until the stream of each database in ``dbs`` holds every commit the process logged on
+    it before the call, for at most ``timeout`` seconds (``None``: no limit). Raises
+    ``TimeoutError`` on the timeout, and the first failure, such as a reset, at once."""
+    limit = _args.limit(timeout)
+    wait = _ask(dbs, threading.Event)
+    if wait is None:
         return
-    assert isinstance(t.done, threading.Event)
+    assert isinstance(wait.waiter, threading.Event)
+    deadline = None if limit is None else time.monotonic() + limit
     try:
-        if not t.done.wait(limit):
-            raise _timed_out(timeout)
-    except BaseException:
-        _drop(t)
-        raise
-    if t.error is not None:
-        raise again(t.error)
+        while not _settled(wait):
+            left = _left(deadline)
+            if left == 0.0:
+                raise _timed_out("synced()", timeout)
+            wait.waiter.wait(left)
+    finally:
+        _drop(wait)
+    _outcome(wait, dbs)
 
 
-async def asynced(path: str, timeout: float | None) -> None:
+async def asynced(dbs: Sequence[UrsulaConnection], timeout: float | None) -> None:
     """:func:`synced` for a coroutine: it waits on the event loop, and cancelling it ends the wait
     while the commits keep replicating."""
-    limit = _limit(timeout)
-    t = _ask(path, LoopEvent)
-    if t is None:
+    limit = _args.limit(timeout)
+    wait = _ask(dbs, LoopEvent)
+    if wait is None:
         return
-    assert isinstance(t.done, LoopEvent)
+    assert isinstance(wait.waiter, LoopEvent)
+    deadline = None if limit is None else time.monotonic() + limit
     try:
-        if not await t.done.wait(limit):
-            raise _timed_out(timeout)
-    except BaseException:
-        _drop(t)
-        raise
-    if t.error is not None:
-        raise again(t.error)
+        while not _settled(wait):
+            left = _left(deadline)
+            if left == 0.0:
+                raise _timed_out("asynced()", timeout)
+            await wait.waiter.wait(left)
+    finally:
+        _drop(wait)
+    _outcome(wait, dbs)
 
 
 def _after_fork_in_child() -> None:
