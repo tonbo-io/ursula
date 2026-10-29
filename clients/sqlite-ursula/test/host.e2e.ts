@@ -66,6 +66,9 @@
 // - H22: of two orphans of one stream in two cache roots, in either scan order, the later claimant
 //   drains and the older is fenced. Orphans of two streams, one recorded and one scanned, both drain
 //   under `--concurrency` 1 and 2.
+// - H23: an orphan whose log segment has another format's magic, which the per-root read refuses,
+//   is `unreadable`, with no kind, no counts and no claim. With its magic back the next drain
+//   drains it.
 //
 // The hold, `ursula-vfs-host hold`, which takes the host directory's `hold` file exclusively:
 // - H9: a writer thread that commits every 5 ms with busy_timeout 0 stops within one transaction,
@@ -1395,6 +1398,54 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 				expect(await inspect(b.host, [process.pid])).toMatchObject({ complete: true, clean: true });
 			});
 		}
+
+		it("H23: a root whose log the per-root read refuses is unreadable, nothing is claimed, and once readable it drains", async () => {
+			const o = await orphan("host-h23");
+			const before = await claims(o.s.path);
+			// Another format's magic in the first segment of the generation's log: refused, not cut as torn.
+			const gen = readdirSync(o.root.root).find((n) => /^gen-[0-9a-f]{32}$/.test(n));
+			expect(gen).toBeDefined();
+			const log = join(o.root.root, gen as string, "log");
+			const segment = join(log, readdirSync(log).sort()[0] as string);
+			const magic = readFileSync(segment).subarray(0, 4);
+			const patch = (bytes: Buffer): void => {
+				const fd = openSync(segment, "r+");
+				try {
+					writeSync(fd, bytes, 0, 4, 0);
+				} finally {
+					closeSync(fd);
+				}
+			};
+			patch(Buffer.from("XXXX"));
+			const { drained } = await drain(o.env);
+			// An unreadable root is the root's outcome, not the pass's error.
+			expect(drained).toMatchObject({ origin: front.url, dir: o.host, error: null });
+			const root = onlyDrained(drained);
+			expect(root, JSON.stringify(drained)).toMatchObject({
+				id: o.root.id,
+				root: o.root.root,
+				stream: null,
+				cluster: null,
+				outcome: "unreadable",
+				kind: null,
+				later: null,
+				before_bytes: null,
+				unacknowledged_bytes: null,
+				commits: null,
+				salvaged: null,
+			});
+			expect(root.error, JSON.stringify(drained)).toEqual(expect.any(String));
+			expect(root.error).not.toBe("");
+			// Not opened: no claim went out.
+			expect(await claims(o.s.path)).toEqual(before);
+			expect(onlyRoot(await inspect(o.host, [process.pid]))).toMatchObject({ state: "unreadable", unacknowledged_bytes: null });
+
+			// The drain left the root as it was: with its magic back, the next drain drains every byte the orphan held.
+			patch(magic);
+			const again = onlyDrained((await drain(o.env)).drained);
+			expect(again).toMatchObject({ outcome: "drained", before_bytes: o.root.unacknowledged_bytes, unacknowledged_bytes: 0 });
+			expect(await claims(o.s.path)).toEqual([...before, (before.at(-1) as number) + 1]);
+		});
 	});
 
 	// The npm copy is 0.11.0: a server or model of a later line refuses it (`protocol_mismatch`),
