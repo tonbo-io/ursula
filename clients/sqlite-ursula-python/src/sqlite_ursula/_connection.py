@@ -10,12 +10,14 @@ reset callbacks.
 
 A refused write or a reset is one of SQLite's I/O errors, on which SQLite rolls back the whole
 transaction. A transaction helper's ``ROLLBACK`` then fails with "cannot rollback - no transaction
-is active", which would replace the error the caller needs. So the connection remembers an
-:class:`UrsulaError` after which no transaction is open, until a statement succeeds. A ``ROLLBACK``
-run through ``execute`` that finds no transaction then succeeds, since nothing is left to roll
-back. Through ``executescript``, which may hold more statements after it, it raises the remembered
-error instead, and so does a ``ROLLBACK TO`` or ``RELEASE`` that finds no savepoint. The legacy
-``rollback()`` method runs no ROLLBACK when no transaction is open. ``open()`` refuses
+is active", and one that runs ``COMMIT`` in a ``finally`` block, as LangGraph's ``SqliteStore``
+does, fails with "cannot commit - no transaction is active". Either would replace the error the
+caller needs. So the connection remembers an :class:`UrsulaError` after which no transaction is
+open, until a statement succeeds. A ``ROLLBACK`` run through ``execute`` that finds no transaction
+then succeeds, since nothing is left to roll back. Through ``executescript``, which may hold more
+statements after it, it raises the remembered error instead, and so do a ``COMMIT`` or ``END`` that
+finds no transaction and a ``ROLLBACK TO`` or ``RELEASE`` that finds no savepoint. The legacy
+``rollback()`` and ``commit()`` methods run nothing when no transaction is open. ``open()`` refuses
 ``autocommit=False``, the mode in which the connection is always in a transaction (see ``_open``),
 and so does setting ``autocommit`` to ``False`` on a connection ``open()`` made.
 
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 from typing import TypeVar
@@ -44,9 +47,10 @@ log = logging.getLogger("sqlite_ursula")
 
 #: SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function.
 SQLITE_ERROR = 1
-#: SQLite's message for a ROLLBACK, and the start of its message for a ROLLBACK TO or RELEASE,
-#: that finds nothing to undo.
+#: SQLite's message for a ROLLBACK and for a COMMIT or END, and the start of its message for a
+#: ROLLBACK TO or RELEASE, that finds no transaction or savepoint.
 NO_TRANSACTION = "cannot rollback - no transaction is active"
+NO_COMMIT = "cannot commit - no transaction is active"
 NO_SAVEPOINT = "no such savepoint: "
 
 T = TypeVar("T")
@@ -65,6 +69,12 @@ def autocommit_false() -> UrsulaError:
 
 
 ResetCallback = Callable[[UrsulaResetError], object]
+
+
+def database_of(path: str, read_only: bool) -> str:
+    """``sqlite3.connect``'s ``database`` for the bound file ``path``: a ``mode=ro`` URI, which
+    takes ``uri=True``, for a read-only connection."""
+    return f"file:{urllib.parse.quote(path)}?mode=ro" if read_only else path
 
 
 class UrsulaCursor(sqlite3.Cursor):
@@ -126,6 +136,8 @@ class UrsulaConnection(sqlite3.Connection):
         self.name = ""
         self.path = str(database)
         self._bound = False
+        self._read_only = False
+        self._busy = 5.0
         self._generation = _control.generation()
         self._closed = False
         self._listeners: list[ResetCallback] = []
@@ -135,12 +147,14 @@ class UrsulaConnection(sqlite3.Connection):
         #: An UrsulaError after which no transaction was open, until a statement succeeds.
         self._rolled_back: UrsulaError | None = None
 
-    def _bind(self, name: str, path: str) -> None:
+    def _bind(self, name: str, path: str, read_only: bool, busy: float) -> None:
         """``open()``: the connection is on the binding of stream ``name``, whose file is
-        ``path``."""
+        ``path``, read-only when ``read_only``, with the busy timeout ``busy`` in seconds."""
         self.name = name
         self.path = path
         self._bound = True
+        self._read_only = read_only
+        self._busy = busy
         _events.track(self)
 
     if _AUTOCOMMIT is not None:
@@ -314,7 +328,7 @@ class UrsulaConnection(sqlite3.Connection):
                 if message == NO_TRANSACTION and rolled_back is not None:
                     self._rolled_back = None
                     return rolled_back()
-                if message == NO_TRANSACTION or message.startswith(NO_SAVEPOINT):
+                if message in (NO_TRANSACTION, NO_COMMIT) or message.startswith(NO_SAVEPOINT):
                     raise again(remembered) from remembered.__cause__
             classified = self._classify(error)
             if isinstance(classified, UrsulaError) and not self._in_transaction():
@@ -324,3 +338,31 @@ class UrsulaConnection(sqlite3.Connection):
             raise classified from error
         self._rolled_back = None
         return result
+
+
+def bound(db: object, caller: str) -> UrsulaConnection:
+    """``db``, which ``caller`` (a gate, an adapter) takes: ``invalid_argument`` unless ``open()``
+    made it, and ``forked`` in a child forked after the parent made it."""
+    if not isinstance(db, UrsulaConnection) or not db._bound:
+        raise invalid(f"{caller} takes connections open() made, not {db!r}")
+    db._check_fork()
+    return db
+
+
+def on_binding(db: UrsulaConnection, cls: type[UrsulaConnection]) -> tuple[str, dict[str, Any]]:
+    """``sqlite3.connect``'s ``database`` and keywords for another connection on the binding of
+    ``db``, for an adapter's own connection, also one a library makes on a thread of its own, as
+    aiosqlite does.
+
+    The connection is of class ``cls``, a subclass of ``UrsulaConnection``, and bound as ``db``
+    is, so its statements raise what their errors classify as and it learns of a reset, it is
+    read-only when ``db`` is, and its busy timeout is ``db``'s. Like any connection on
+    ``db.path``, it keeps the binding while it is open."""
+    name, path, read_only, busy = db.name, db.path, db._read_only, db._busy
+
+    def factory(*args: Any, **kwargs: Any) -> UrsulaConnection:
+        conn = cls(*args, **kwargs)
+        conn._bind(name, path, read_only, busy)
+        return conn
+
+    return database_of(path, read_only), {"factory": factory, "uri": read_only, "timeout": busy}

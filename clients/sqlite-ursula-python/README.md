@@ -40,7 +40,7 @@ Switch the base image in one line:
 +FROM python:3.13-alpine
 ```
 
-[`recipes/Dockerfile`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile) is a complete example. To keep a Debian base, or on arm64, run a uv-managed CPython instead, as [`recipes/Dockerfile.uv`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile.uv) does.
+[`recipes/Dockerfile`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile) is a complete example. To keep a Debian base, on arm64, or with the [`langgraph` extra](#langgraph), which does not install on Alpine, run a uv-managed CPython instead, as [`recipes/Dockerfile.uv`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile.uv) does.
 
 On macOS, use uv or Homebrew.
 
@@ -103,6 +103,40 @@ await send(reply)
 
 Effects inside the block, such as a call to another service, are not gated: call `db.synced()` before them.
 
+## LangGraph
+
+`sqlite_ursula.langgraph` holds LangGraph's SQLite checkpointers and stores on a replicated database. Install it with the `langgraph` extra, which pins `langgraph-checkpoint-sqlite` to the releases CI tests (3.0.3 up to 3.2):
+
+```sh
+pip install 'sqlite-ursula[langgraph]'
+```
+
+```python
+import sqlite_ursula
+from sqlite_ursula.langgraph import UrsulaSaver
+
+db = sqlite_ursula.open(url)
+with UrsulaSaver(db) as saver:
+    graph = builder.compile(checkpointer=saver)
+    reply = graph.invoke(inputs, {"configurable": {"thread_id": "1"}})
+send(reply)  # every checkpoint of the run is in the stream
+```
+
+| class | LangGraph's | closed by |
+| --- | --- | --- |
+| `UrsulaSaver(db)` | `SqliteSaver` | `close()` or `with` |
+| `await AsyncUrsulaSaver.open(db)` | `AsyncSqliteSaver` | `aclose()` or `async with` |
+| `UrsulaStore(db)` | `SqliteStore` | `close()` or `with` |
+| `await AsyncUrsulaStore.open(db)` | `AsyncSqliteStore` | `aclose()` or `async with` |
+
+- Each class opens a connection of its own on `db`'s binding, the async ones through aiosqlite, and closing it closes that connection. LangGraph writes checkpoints from threads of its own while the graph's nodes run, so the application keeps `db` for its own statements. The savers' connections keep SQLite's default transaction control, which makes each checkpoint, each task's writes and each deleted thread one transaction, whatever `db`'s is. The stores' connections open no transactions of their own, since `SqliteStore` runs its own `BEGIN` and `COMMIT`. Each connection is bound as `db` is: read-only when `db` is, with `db`'s busy timeout, and its errors are the package's.
+- Every write returns once `db.synced()` (or `asynced()`) returned after it: a checkpoint, a task's writes, a deleted thread, a store put or delete, a store get or search that refreshes TTLs (`refresh_on_read`), a TTL sweep. LangGraph waits for a run's checkpoint writes before `invoke` returns, so the return is gated in every durability mode. With `durability="sync"`, each step also waits for the one before it, so what a node does rests on acknowledged checkpoints.
+- Reads do not wait, and neither does the setup that creates the tables, which LangGraph runs before the first read: the next write's wait covers it. `AsyncUrsulaStore` waits in `aput` and `adelete`, not in the task that runs its batches, so a read never waits behind another call's write. Its `abatch` and `batch`, which take operations, are LangGraph's own: call `db.asynced()` after them.
+- `stream()` and `astream()` yield a step's chunks before that step's checkpoint is acknowledged, and only the end of the iteration is gated. Call `db.synced()` or `await db.asynced()` before acting on a chunk.
+- A write refused with `backlog_full` committed nothing: it waits for `synced()` and runs again. That is safe because each of these writes is one transaction. An `AsyncUrsulaStore` read batched with a refused write runs again at once. LangGraph's setup commits its statements one by one, and a store's migrations are not safe to run twice, so there each refused statement waits and runs again by itself. In the async adapters that wait blocks aiosqlite's thread until the stream acknowledges the commits pending before it, even when the caller of the setup is cancelled.
+- A reset raises the `UrsulaResetError`, from a write or a read. Keep `db` open while the graph runs.
+- `sqlite-vec`, which `langgraph-checkpoint-sqlite` requires, has no wheel for musl, so the extra does not install on Alpine. Use a Debian base with a uv-managed CPython, as [`recipes/Dockerfile.uv`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile.uv) does.
+
 ## Errors
 
 Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose cause (`__cause__`) is the SQLite error they replace. Branch on `action`. The extension says which failure is which (`ursula_classify`).
@@ -114,7 +148,7 @@ Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose 
 | `UrsulaUnavailableError` | `open()` or `aopen()` past its timeout | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` |
 | `UrsulaSetupError` | `open()`, `aopen()`, `import_sqlite()`, the calls the package guards in a forked child ([Forks](#forks)) | `host_unsupported`, `forked`, `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, and the rest of the extension's |
 
-`UrsulaWriteRefusedError` and `UrsulaResetError` are also `sqlite3.OperationalError`, as the error they replace was, so existing `except sqlite3.OperationalError` clauses keep catching them, and `sqlite_errorcode` and `sqlite_errorname` are SQLite's. A transaction helper's `ROLLBACK` after one, which finds no transaction since SQLite rolled it back, does not hide it.
+`UrsulaWriteRefusedError` and `UrsulaResetError` are also `sqlite3.OperationalError`, as the error they replace was, so existing `except sqlite3.OperationalError` clauses keep catching them, and `sqlite_errorcode` and `sqlite_errorname` are SQLite's. A transaction helper's `ROLLBACK` after one, or its `COMMIT` in a `finally` block, which finds no transaction since SQLite rolled it back, does not hide it.
 
 A reset rejects the database's pending `synced()` calls first, then runs its `on_reset` callbacks once, on a thread of the package's.
 

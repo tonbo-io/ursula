@@ -7,7 +7,8 @@
 #   -FROM python:3.13-slim
 #   +FROM python:3.13-alpine
 #
-# The prebuilt extension for musl is x64 only: on arm64, use Dockerfile.uv.
+# The prebuilt extension for musl is x64 only: on arm64, use Dockerfile.uv. So does the langgraph
+# extra, which needs sqlite-vec, and sqlite-vec has no wheel for musl.
 FROM python:3.13-alpine
 
 WORKDIR /app

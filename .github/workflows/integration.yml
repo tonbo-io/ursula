@@ -5,7 +5,8 @@ name: Integration
 # model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three,
 # its parts suites through three nodes behind the gateway with an S3 cold store, and the Python
 # package's suites against the model on uv-managed CPython and Alpine and against one `ursula` node,
-# with its host check on Windows.
+# its LangGraph adapters on the oldest and the newest LangGraph it supports, and its host check on
+# Windows.
 # S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
 # PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
@@ -469,6 +470,8 @@ jobs:
   # The Python package (clients/sqlite-ursula-python) against the model server, on uv-managed
   # CPython, whose SQLite is new enough and loads extensions: the oldest supported minor, the
   # newest, and the newest free-threaded. uv is pinned, and with it the Python builds it installs.
+  # The 3.11 leg runs the LangGraph adapters on the oldest LangGraph the `langgraph` extra supports,
+  # and the 3.14 leg on the newest (pyproject.toml's langgraph-oldest and langgraph-newest groups).
   # The 3.14 leg also lints, checks that a wheel finds the library it carries and that a
   # uv-managed CPython on Debian hosts it as recipes/Dockerfile.uv installs it, and checks that
   # python:3.13-slim, whose SQLite is older than the extension's floor, fails with
@@ -517,6 +520,26 @@ jobs:
           chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
           E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" \
             uv run --no-project --python "${{ matrix.python }}" --with pytest==9.1.1 python -m pytest -v
+
+      # tests/test_langgraph.py, which skips above where LangGraph is not installed, on the releases
+      # of a dependency group that scripts/langgraph_releases.py checks against the extra's range.
+      # SQLITE_URSULA_LANGGRAPH names the langgraph-checkpoint-sqlite release: the suite then never
+      # skips and checks that release is the one installed.
+      - name: LangGraph adapters on the ${{ matrix.python == '3.11' && 'oldest' || 'newest' }} supported LangGraph
+        if: matrix.python != '3.14t'
+        timeout-minutes: 10
+        working-directory: clients/sqlite-ursula-python
+        env:
+          WHICH: ${{ matrix.python == '3.11' && 'oldest' || 'newest' }}
+        run: |
+          set -euo pipefail
+          requirements=$(python3 scripts/langgraph_releases.py requirements "$WHICH")
+          release=$(python3 scripts/langgraph_releases.py release "$WHICH")
+          with=()
+          while read -r requirement; do with+=(--with "$requirement"); done <<<"$requirements"
+          echo "LangGraph adapters on langgraph-checkpoint-sqlite $release, the $WHICH supported: ${with[*]}"
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" SQLITE_URSULA_LANGGRAPH="$release" \
+            uv run --no-project --python "${{ matrix.python }}" --with pytest==9.1.1 "${with[@]}" python -m pytest -v tests/test_langgraph.py
 
       - name: A wheel finds the library it carries
         if: matrix.python == '3.14'
@@ -793,8 +816,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The Python suites against one release `ursula` node with an in-memory cold store. The tests
-  # that script faults, which only the model takes, skip.
+  # The Python suites against one release `ursula` node with an in-memory cold store, with the
+  # newest LangGraph the `langgraph` extra supports. The tests that script faults, which only the
+  # model takes, skip.
   sqlite-ursula-python-ursula:
     name: sqlite-ursula-python (ursula, 1 node, CPython 3.14)
     needs: [build-ursula, sqlite-vfs]
@@ -831,9 +855,14 @@ jobs:
         timeout-minutes: 10
         working-directory: clients/sqlite-ursula-python
         run: |
+          set -euo pipefail
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
-          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" \
-            uv run --no-project --python 3.14 --with pytest==9.1.1 python -m pytest -v
+          requirements=$(python3 scripts/langgraph_releases.py requirements newest)
+          release=$(python3 scripts/langgraph_releases.py release newest)
+          with=()
+          while read -r requirement; do with+=(--with "$requirement"); done <<<"$requirements"
+          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" SQLITE_URSULA_LANGGRAPH="$release" \
+            uv run --no-project --python 3.14 --with pytest==9.1.1 "${with[@]}" python -m pytest -v
 
       - name: Upload the server log
         if: failure()

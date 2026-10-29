@@ -33,6 +33,8 @@ Module map:
 - ``_args``: the checks of their arguments, and of ``synced()``'s, as ``invalid_argument``.
 - ``_doctor``: ``python -m sqlite_ursula``, which says whether this Python can host the extension.
 - ``errors``: the four error classes.
+- ``langgraph``: LangGraph's SQLite checkpointers and stores on a replicated database, for the
+  ``langgraph`` extra. The package never imports it.
 """
 
 from __future__ import annotations
