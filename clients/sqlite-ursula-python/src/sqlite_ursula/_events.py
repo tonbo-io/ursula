@@ -1,10 +1,10 @@
 """The events thread (design: Pump): this process's view of the extension's events.
 
-Calls into the extension never wait on the network: ``ursula_open`` and ``ursula_synced`` are
-made with timeout 0 and either answer at once or hand back a request or a ticket, which an event
-later resolves. One daemon thread, ``sqlite-ursula-events``, started at the first open or
-``synced()``, waits for those events on a connection of its own and applies them under the
-control lock:
+Calls into the extension never wait on the network: ``ursula_open``, ``tonbo_resolve`` and
+``ursula_synced`` are made with timeout 0 and either answer at once or hand back a request or a
+ticket, which an event later resolves. One daemon thread, ``sqlite-ursula-events``, started at
+the first open, resolve or ``synced()``, waits for those events on a connection of its own and
+applies them under the control lock:
 
 - ``synced {path, through}`` resolves every ticket of the path up to ``through``. The extension
   keeps only the latest watermark of a binding in its queue, so any number of waiters costs one
@@ -13,15 +13,17 @@ control lock:
 - ``reset {path}`` fails the path's tickets, then runs the ``on_reset`` callbacks of its
   connections on a thread of their own, so a callback may call into the package.
 - ``gap`` (events fell out of the queue) asks for every pending ticket again under a new ticket,
-  wakes every open, and reads resets from status.
-- ``opened {request}`` wakes the opens waiting for it, which call ``ursula_open`` again to
-  collect the result.
+  wakes every open and resolve, and reads resets from status.
+- ``opened {request}`` and ``resolved {request}`` wake the opens and the resolves waiting for it,
+  which call ``ursula_open`` or ``tonbo_resolve`` again to collect the result. Their requests
+  never collide.
 
-A waiter is a ``threading.Event`` for ``synced()``, ``gate`` and ``open()``, and a
-:class:`LoopEvent` for ``asynced()``, ``agate`` and ``aopen()``, which the thread wakes through its
-event loop's ``call_soon_threadsafe``. Nothing runs on the loop's default executor. One wait
-covers the tickets of every database it was given, with one waiter that each ticket's outcome
-wakes: it ends once every ticket resolved, or at the first that failed, and drops the rest.
+A waiter is a ``threading.Event`` for ``synced()``, ``gate``, ``open()`` and the sync calls of
+``tonbo``, and a :class:`LoopEvent` for ``asynced()``, ``agate``, ``aopen()`` and the async calls
+of ``tonbo``, which the thread wakes through its event loop's ``call_soon_threadsafe``. Nothing
+runs on the loop's default executor. One wait covers the tickets of every database it was given,
+with one waiter that each ticket's outcome wakes: it ends once every ticket resolved, or at the
+first that failed, and drops the rest.
 
 The thread takes its cursor before any request or ticket is handed out, and requests and tickets
 are registered under the lock in the same step that asks for them, so no event about one applies
@@ -211,27 +213,29 @@ class Events:
         # answered by an event this thread sees, and no event of an earlier binding is taken for a
         # later one's.
         self._cursor = int(_control.call("SELECT ursula_events(0, 0)")["cursor"])
-        self._opens: dict[int, set[Waiter]] = {}
+        #: The opens and resolves waiting, by request.
+        self._requests: dict[int, set[Waiter]] = {}
         self._failed = False
         self.conn: Any = None
         self._thread = threading.Thread(target=self._run, name="sqlite-ursula-events", daemon=True)
         self._thread.start()
 
-    def wait_open(self, request: int, waiter: Waiter) -> None:
-        """Wakes ``waiter`` for open ``request`` at its ``opened`` event, a gap, or the thread's
-        end. Called with the lock held, in the step that got the request."""
-        self._opens.setdefault(request, set()).add(waiter)
+    def wait_request(self, request: int, waiter: Waiter) -> None:
+        """Wakes ``waiter`` for ``request`` of ``ursula_open`` or ``tonbo_resolve`` at its
+        ``opened`` or ``resolved`` event, a gap, or the thread's end. Called with the lock held, in
+        the step that got the request."""
+        self._requests.setdefault(request, set()).add(waiter)
 
-    def forget_open(self, request: int, waiter: Waiter) -> None:
+    def forget_request(self, request: int, waiter: Waiter) -> None:
         with _control.lock():
-            found = self._opens.get(request)
+            found = self._requests.get(request)
             if found is not None:
                 found.discard(waiter)
                 if not found:
-                    del self._opens[request]
+                    del self._requests[request]
 
     def _wake(self, request: int) -> None:
-        for waiter in self._opens.pop(request, ()):
+        for waiter in self._requests.pop(request, ()):
             waiter.set()
 
     def _run(self) -> None:
@@ -256,7 +260,7 @@ class Events:
         """A batch of events, in order. Called with the lock held."""
         for event in events:
             kind = event.get("event")
-            if kind == "opened":
+            if kind in ("opened", "resolved"):
                 self._wake(int(event["request"]))
             elif kind == "synced":
                 through = int(event["through"])
@@ -295,9 +299,9 @@ class Events:
     def _gap(self) -> None:
         """Events fell out of the queue before the thread read them. Every pending ticket is asked
         for again under a new ticket, which no watermark of the batch covers, so a ticket whose
-        failure the gap dropped never passes for resolved. Opens ask again, and resets are read
-        from status."""
-        for request in list(self._opens):
+        failure the gap dropped never passes for resolved. Opens and resolves ask again, and resets
+        are read from status."""
+        for request in list(self._requests):
             self._wake(request)
         _reissue()
         hit = []
@@ -308,10 +312,10 @@ class Events:
         _fire(hit)
 
     def _fail(self) -> None:
-        """The thread is gone: pending opens ask again, and while tickets wait or connections are
-        open a new thread starts with a gap, since events may have passed between the two. After
-        :data:`MAX_FAILURES` failures in a row the tickets fail instead, and so does every later
-        call."""
+        """The thread is gone: pending opens and resolves ask again, and while tickets wait or
+        connections are open a new thread starts with a gap, since events may have passed between
+        the two. After :data:`MAX_FAILURES` failures in a row the tickets fail instead, and so
+        does every later call."""
         global _current, _failures
         with _control.lock():
             if self._failed:
@@ -320,7 +324,7 @@ class Events:
             _failures += 1
             if _current is self:
                 _current = None
-            for request in list(self._opens):
+            for request in list(self._requests):
                 self._wake(request)
             if not _tickets and not _live():
                 return

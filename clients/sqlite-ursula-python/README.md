@@ -103,6 +103,35 @@ await send(reply)
 
 Effects inside the block, such as a call to another service, are not gated: call `db.synced()` before them.
 
+## Tonbo
+
+`sqlite_ursula.tonbo` opens a database of a Tonbo account by name, with a Tonbo API key. It is the peer of the npm entry `@tonbo/sqlite-ursula/tonbo`, and the extension does the work for both.
+
+```python
+from sqlite_ursula import tonbo
+
+db = tonbo.open("notes")  # or the database's https:// URL, which skips the lookup
+db = await tonbo.aopen("notes")
+```
+
+- `open(name_or_url, *, api_key, api_origin, auth_origin, token, **options)` takes the root `open()`'s arguments and returns the same `UrsulaConnection`. `timeout` (30 s by default) bounds the whole open, the lookup included. `aopen()` is the same for asyncio, and cancelling it cancels the lookup.
+- The key comes from `api_key`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`, which must be a regular file with mode `0600`.
+- Streams requests carry tokens the extension exchanges for the key and refreshes in the background, beside replication. The open waits for the first one. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead: then opening a URL needs no key. The process holds one key for Streams tokens.
+- `api_origin` (or `TONBO_API_ORIGIN`) and `auth_origin` (or `TONBO_AUTH_ORIGIN`) name other origins for the Management API and the token endpoint. Each must be `https://`, or `http://` to a loopback host.
+- `resolve_database(name_or_url, *, api_key, api_origin, auth_origin, token, timeout)` and `aresolve_database()` resolve a database without opening it, for another opener: `ResolvedDatabase(url, name, token)`. Concurrent calls with the same arguments, from any thread or task, share one lookup.
+- `api_key`, `api_origin` and `auth_origin` must be strings when given. No key or token is logged, and no error message or `repr` carries one.
+
+Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`, `fix` (the variable to set or the command to run, which ends the message) and `request_id` (the Tonbo API's, when it answered):
+
+| kind | when | fix |
+| --- | --- | --- |
+| `missing_credentials` | no `api_key`, no `TONBO_API_KEY` and no login file | `Set TONBO_API_KEY, or run: tonbo login` |
+| `credentials_refused` | the login file is a symlink, not a regular file, or open to group or others | `Run: chmod 600 <path>`, or replace the file |
+| `invalid_api_key` | the API refused the key, the key cannot read the database, or the login expired | a valid key for the key's source, or `Run: tonbo login` |
+| `database_not_found` | the account has no database of that name, or it is being deleted | `Run: tonbo database create <name>` |
+
+Past its timeout while the Tonbo API did not answer, or while the database was still being created, `open()` raises `UrsulaUnavailableError` (`unreachable`, `unavailable` or `rate_limited`, action `retry`). An origin it cannot use, an answer outside the APIs' contracts or a second key for Streams tokens raise `UrsulaSetupError` `invalid_argument`.
+
 ## Errors
 
 Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose cause (`__cause__`) is the SQLite error they replace. Branch on `action`. The extension says which failure is which (`ursula_classify`).

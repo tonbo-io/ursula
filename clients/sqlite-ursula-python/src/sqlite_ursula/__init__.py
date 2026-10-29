@@ -29,6 +29,10 @@ Module map:
 - ``_connection``: :class:`UrsulaConnection`, the ``sqlite3.Connection`` subclass ``open``
   returns, and its cursor, whose statements classify their errors.
 - ``_open``: :func:`open`, :func:`aopen`, :func:`import_sqlite` and :func:`set_token`.
+- ``tonbo``: Tonbo databases opened by name with a Tonbo API key, through the extension's
+  ``tonbo_resolve``: ``tonbo.open``, ``tonbo.aopen``, ``tonbo.resolve_database`` and
+  ``tonbo.aresolve_database``, and ``TonboError``. Imported on its own
+  (``from sqlite_ursula import tonbo``).
 - ``_gate``: :func:`gate` and :func:`agate`, which hold a block's outcome until ``synced()``.
 - ``_args``: the checks of their arguments, and of ``synced()``'s, as ``invalid_argument``.
 - ``_doctor``: ``python -m sqlite_ursula``, which says whether this Python can host the extension.

@@ -2470,10 +2470,24 @@ classes, whose class, kind and action come from `ursula_classify`.
   under the lock and wait on one waiter that each ticket's outcome wakes, a `threading.Event` or a
   future of the loop. They return once every ticket resolved and raise the first failure, which
   drops the other tickets. `synced()` and `asynced()` are the same wait on one database.
+- **Tonbo.** `sqlite_ursula.tonbo` is the `/tonbo` entry's peer ([Tonbo](#tonbo)): `open`,
+  `aopen`, `resolve_database` and `aresolve_database` take `api_key`, `api_origin` and
+  `auth_origin`, pass them to `tonbo_resolve` as they are, and then open the stream URL it returns
+  as the root `open` does, within the one `timeout`. The key's source, the login file, the lookup
+  and the Streams tokens are the extension's. `tonbo_resolve` runs at timeout 0 under the control
+  lock, and its `resolved` event wakes the waiter on the events thread, as `opened` does for an
+  open. The process's concurrent calls with the same arguments, from any thread or task, share one
+  resolve, since the extension owes a host one outcome for its calls that return at once: the
+  first call back takes it for all, and the last call that gives up cancels it. The four Tonbo
+  kinds raise `TonboError` with `fix` and `request_id`, and the others the class `ursula_classify`
+  names.
 
 Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_async.py`, `tests/test_gate.py`,
-`tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py` and `tests/test_host.py`,
-against the model server and against one real `ursula` node ([Verification](#verification)).
+`tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py`, `tests/test_host.py` and
+`tests/test_tonbo.py`, against the model server and against one real `ursula` node
+([Verification](#verification)). `tests/test_tonbo.py` runs the TypeScript suite's stand-in for
+the Tonbo APIs (`test/tonbo-api.ts`) in a Node process of its own (`tests/tonbo-api-process.mts`),
+and skips without Node.
 
 ## Status
 
@@ -2610,16 +2624,17 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
   0.13.6) against the model server ([Forks](#forks)).
 - `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
-  3.14 and 3.14t, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, the wheel
+  3.14 and 3.14t, with Node 22 for the Tonbo stand-in, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, the wheel
   hosted by a uv-managed CPython on `debian:trixie-slim` as `recipes/Dockerfile.uv` installs it,
   and on `python:3.13-slim`, whose SQLite is older than the extension supports,
   `python -m sqlite_ursula` failing with `host_unsupported`.
 - `sqlite-ursula-python-windows`: on Windows, which has no VFS, `import sqlite_ursula` works, and
   `python -m sqlite_ursula` and `open()` fail with `host_unsupported`, whose fix is WSL.
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
-  `python:3.13-alpine`, and the Python suites run there.
+  `python:3.13-alpine`, and the Python suites run there, the Tonbo tests skipping without Node.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
-  in-memory cold store. The tests that script faults skip there.
+  in-memory cold store, with Node 22 for the Tonbo stand-in. The tests that script faults skip
+  there.
 - `sqlite-ursula-python-wheels.yml`, on pull requests that change the Python package or the
   workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
   builds it for npm (it loads on glibc 2.28 or newer, musl linked dynamically, macOS 11.0), packed
