@@ -212,9 +212,12 @@ pub(crate) enum RootError {
 }
 
 /// Where a directory to read came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
-    Record,
+    /// The record of this name.
+    Record {
+        name: String,
+    },
     Scan,
 }
 
@@ -246,7 +249,7 @@ pub(crate) struct DirError {
 }
 
 /// A file's identity: its device and inode.
-type FileId = (u64, u64);
+pub(crate) type FileId = (u64, u64);
 
 /// What a pass found in one root, with the identity of its `lock` when it has one.
 #[derive(Debug, Clone)]
@@ -320,6 +323,9 @@ struct Unrecognized {
 #[derive(Debug)]
 pub struct Inspection {
     dir: PathBuf,
+    /// What it listed in the host directory, `None` when it could not list it, which makes it
+    /// incomplete (`host_dir`).
+    listing: Option<HostListing>,
     dirs: Vec<DirReport>,
     roots: Vec<RootReport>,
     unread_locks: Vec<UnreadLock>,
@@ -415,7 +421,11 @@ pub(crate) fn walk_for_drain(
 ) -> Option<WalkError> {
     let deadline = Deadline { at, budget };
     let mut unrecognized = Vec::new();
-    let (wanted, error) = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
+    let Wanted {
+        dirs: wanted,
+        host: listed_host,
+    } = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
+    let error = listed_host.err();
     let mut dirs = Vec::new();
     let walked = walk(wanted, deadline, &mut dirs, |id, root| {
         if let RootRead::Listed { state, .. } = read_root(&root, None, deadline)? {
@@ -492,6 +502,40 @@ impl Inspection {
             .fold(0, u64::saturating_add)
     }
 
+    /// The host directory it read: the one the host named, or the compiled-in one.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// What the pass listed in the host directory, `None` when it could not list it. A pass
+    /// without it is incomplete, so a complete one always has it.
+    pub(crate) fn listing(&self) -> Option<&HostListing> {
+        self.listing.as_ref()
+    }
+
+    /// The records whose directory the pass found absent (`dirs[]` with `from: "record"` and
+    /// `present: false`): nothing at the path, or something that is not a directory. Each comes
+    /// with its record's name, in name order.
+    pub(crate) fn absent_records(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.dirs.iter().filter_map(|d| match (&d.from, &d.state) {
+            (Source::Record { name }, DirState::Absent) => Some((name.as_str(), d.dir.as_path())),
+            _ => None,
+        })
+    }
+
+    /// The reason it is incomplete as JSON names it (`incomplete`), `None` when it is complete.
+    pub(crate) fn incomplete(&self) -> Option<&'static str> {
+        self.reason().map(Reason::as_str)
+    }
+
+    /// The message of the highest-precedence pass-level failure (`error`).
+    pub(crate) fn error(&self) -> Option<String> {
+        self.errors
+            .iter()
+            .min_by_key(|e| e.reason())
+            .map(ToString::to_string)
+    }
+
     /// The first reason, in precedence order, that the inspection is incomplete.
     fn reason(&self) -> Option<Reason> {
         let unreadable = self
@@ -503,6 +547,7 @@ impl Inspection {
                 .iter()
                 .any(|d| matches!(d.state, DirState::Unlistable(_)));
         let found = [
+            self.listing.is_none().then_some(Reason::HostDir),
             (!self.unrecognized.is_empty()).then_some(Reason::Unrecognized),
             (!self.unread_locks.is_empty()).then_some(Reason::UnreadLock),
             unreadable.then_some(Reason::Unreadable),
@@ -557,11 +602,7 @@ impl Inspection {
             })
             .collect();
         let reason = self.reason();
-        let error = self
-            .errors
-            .iter()
-            .min_by_key(|e| e.reason())
-            .map_or_else(json::null, |e| json::str(&e.to_string()));
+        let error = self.error().map_or_else(json::null, |e| json::str(&e));
         json::object(&[
             ("v", VERSION.to_string()),
             ("dir", path(&self.dir)),
@@ -586,7 +627,7 @@ impl Inspection {
 
 fn dir_json(d: &DirReport, path: &dyn Fn(&Path) -> String) -> String {
     let from = match d.from {
-        Source::Record => "record",
+        Source::Record { .. } => "record",
         Source::Scan => "scan",
     };
     let (present, error) = match &d.state {
@@ -684,19 +725,26 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
         .unwrap_or_else(|| strict.path.to_owned());
     let mut inspection = Inspection {
         dir: dir.clone(),
+        listing: None,
         dirs: Vec::new(),
         roots: Vec::new(),
         unread_locks: Vec::new(),
         unrecognized: Vec::new(),
         errors: Vec::new(),
     };
-    let (wanted, error) = wanted(
+    let Wanted {
+        dirs: wanted,
+        host: listed_host,
+    } = wanted(
         Some(&dir),
         &request.scans,
         strict,
         &mut inspection.unrecognized,
     );
-    inspection.errors.extend(error);
+    match listed_host {
+        Ok(listing) => inspection.listing = listing,
+        Err(e) => inspection.errors.push(e),
+    }
     // Every root lock the pass read, with the listed roots it is the lock of: one lock may be
     // reached through two paths.
     let mut locks: HashMap<FileId, Vec<usize>> = HashMap::new();
@@ -774,25 +822,46 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
     inspection
 }
 
+/// The directories a pass reads for roots ([`wanted`]), and what it listed in the host directory.
+struct Wanted {
+    /// Each directory with where it came from.
+    dirs: Vec<(PathBuf, Source)>,
+    /// What the pass listed in the host directory besides its records, `None` when it was given
+    /// none, or why it could not read it.
+    host: Result<Option<HostListing>, PassError>,
+}
+
 /// The directories a pass reads for roots: those the records of the host directory `host` name,
-/// in record name order, then `scans` in their order. Names and records of the host directory it
-/// does not know go to `unrecognized`, and a host directory that could not be read is the error.
+/// in record name order, then `scans` in their order, with what it listed in the host directory
+/// besides its records. Names and records of the host directory it does not know go to
+/// `unrecognized`.
 fn wanted(
     host: Option<&Path>,
     scans: &[PathBuf],
     strict: Strict<'_>,
     unrecognized: &mut Vec<Unrecognized>,
-) -> (Vec<(PathBuf, Source)>, Option<PassError>) {
+) -> Wanted {
     let mut wanted = Vec::new();
-    let mut error = None;
+    let mut listed = Ok(None);
     if let Some(host) = host {
         match records(host, strict, unrecognized) {
-            Ok(recorded) => wanted.extend(recorded.into_iter().map(|d| (d, Source::Record))),
-            Err(e) => error = Some(e),
+            Ok(listing) => {
+                wanted.extend(
+                    listing
+                        .recorded
+                        .into_iter()
+                        .map(|(name, d)| (d, Source::Record { name })),
+                );
+                listed = Ok(Some(listing.host));
+            }
+            Err(e) => listed = Err(e),
         }
     }
     wanted.extend(scans.iter().map(|d| (d.clone(), Source::Scan)));
-    (wanted, error)
+    Wanted {
+        dirs: wanted,
+        host: listed,
+    }
 }
 
 /// The walk of a pass (steps 2 and 3 up to each root's read): every directory of `wanted` once per
@@ -807,20 +876,20 @@ fn walk(
     let mut seen = HashSet::new();
     for (path, from) in wanted {
         // One entry per real path, or per path when nothing is there.
-        let (state, roots) = match fs::canonicalize(&path) {
-            Ok(real) => {
+        let (state, roots) = match locate(&path) {
+            Located::Real(real) => {
                 if !seen.insert(real.clone()) {
                     continue;
                 }
                 list_roots(&real, deadline)?
             }
-            Err(e) if not_there(&e) => {
+            Located::Nothing => {
                 if !seen.insert(path.clone()) {
                     continue;
                 }
                 (DirState::Absent, Vec::new())
             }
-            Err(source) => (
+            Located::Unresolvable(source) => (
                 DirState::Unlistable(DirError {
                     op: "resolve",
                     path: path.clone(),
@@ -852,6 +921,63 @@ fn not_there(e: &std::io::Error) -> bool {
     )
 }
 
+/// Where a path of a directory to read leads.
+#[derive(Debug)]
+enum Located {
+    /// Its real path.
+    Real(PathBuf),
+    /// Nothing is there.
+    Nothing,
+    /// It could not be resolved.
+    Unresolvable(std::io::Error),
+}
+
+fn locate(path: &Path) -> Located {
+    match fs::canonicalize(path) {
+        Ok(real) => Located::Real(real),
+        Err(e) if not_there(&e) => Located::Nothing,
+        Err(e) => Located::Unresolvable(e),
+    }
+}
+
+/// Whether a directory is at the real path `real`: false when nothing is there, or another file.
+fn directory(real: &Path) -> std::io::Result<bool> {
+    match fs::metadata(real) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if not_there(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a pass would find the directory at `path` absent (`present: false` with no error):
+/// nothing there, or something that is not a directory.
+pub(crate) fn absent(path: &Path) -> bool {
+    match locate(path) {
+        Located::Real(real) => matches!(directory(&real), Ok(false)),
+        Located::Nothing => true,
+        Located::Unresolvable(_) => false,
+    }
+}
+
+/// What a pass listed in the host directory besides its records.
+#[derive(Debug)]
+pub(crate) struct HostListing {
+    /// The host directory's identity (device and inode), which the listing and the records are
+    /// of.
+    pub(crate) id: FileId,
+    /// Its temp files (`.tmp-<pid>-<16 hex>`) by name, in name order, which a pass otherwise
+    /// ignores.
+    pub(crate) tmps: Vec<String>,
+}
+
+/// What a pass listed in the host directory.
+#[derive(Debug)]
+struct Listing {
+    host: HostListing,
+    /// The directories its records name, with each record's name, in name order.
+    recorded: Vec<(String, PathBuf)>,
+}
+
 /// Checks the host directory `dir` (design: Hosts) and reads its records: the directories they
 /// name, in name order. Names it does not know, and records it does not read, go to
 /// `unrecognized`.
@@ -859,7 +985,7 @@ fn records(
     dir: &Path,
     strict: Strict<'_>,
     unrecognized: &mut Vec<Unrecognized>,
-) -> Result<Vec<PathBuf>, PassError> {
+) -> Result<Listing, PassError> {
     let checked = check_host_dir(dir, strict)?;
     let io = |op: &'static str, path: &Path| {
         let (dir, path) = (dir.to_owned(), path.to_owned());
@@ -887,6 +1013,7 @@ fn records(
     }
     names.sort();
     let mut recorded = Vec::new();
+    let mut tmps = Vec::new();
     for name in names {
         let Some(text) = name.to_str() else {
             unrecognized.push(Unrecognized {
@@ -896,22 +1023,21 @@ fn records(
             continue;
         };
         match hostdir::entry(text) {
-            Entry::Tmp | Entry::Host => {}
+            Entry::Tmp => tmps.push(text.to_owned()),
+            Entry::Host => {}
             Entry::Unrecognized => unrecognized.push(Unrecognized {
                 name: text.to_owned(),
                 error: None,
             }),
             Entry::Record => {
-                let existing = match hostdir::read(&handle, text) {
-                    Ok(existing) => existing,
+                let read = match read_record(&handle, text) {
+                    Ok(read) => read,
                     // A host deleted it since the listing.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    // A link, which is never followed.
-                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Existing::NotAFile,
                     Err(e) => return Err(io("read", &dir.join(text))(e)),
                 };
-                match record(text, existing) {
-                    Ok(cache) => recorded.push(cache),
+                match read {
+                    Ok(cache) => recorded.push((text.to_owned(), cache)),
                     Err(error) => unrecognized.push(Unrecognized {
                         name: text.to_owned(),
                         error: Some(error),
@@ -920,7 +1046,25 @@ fn records(
             }
         }
     }
-    Ok(recorded)
+    Ok(Listing {
+        host: HostListing { id: checked, tmps },
+        recorded,
+    })
+}
+
+/// Reads the record `name` through the open host directory `dir`, never through a link: the
+/// directory it holds by [`record`], with a link read as [`Existing::NotAFile`]. Errors are the
+/// read's own.
+pub(crate) fn read_record(
+    dir: &fs::File,
+    name: &str,
+) -> std::io::Result<Result<PathBuf, RecordError>> {
+    let existing = match hostdir::read(dir, name) {
+        // A link, which is never followed.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Existing::NotAFile,
+        read => read?,
+    };
+    Ok(record(name, existing))
 }
 
 /// The directory the record `name` holds, `existing`: a record of this line (`v` 1) naming an
@@ -1037,10 +1181,9 @@ fn list_roots(
             Vec::new(),
         ))
     };
-    match fs::metadata(dir) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Ok((DirState::Absent, Vec::new())),
-        Err(e) if not_there(&e) => return Ok((DirState::Absent, Vec::new())),
+    match directory(dir) {
+        Ok(true) => {}
+        Ok(false) => return Ok((DirState::Absent, Vec::new())),
         Err(e) => return unlistable("stat", dir, e),
     }
     let entries = match fs::read_dir(dir) {
@@ -1398,15 +1541,21 @@ fn descriptors(
     Ok(Fds::Listed(listed))
 }
 
+/// `pid` as a process id `kill` can probe. `None` for 0, which names the caller's process group,
+/// and for an id above `pid_t`'s maximum, which no process has.
+pub(crate) fn process_id(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 /// Whether the process `pid` is alive, as `kill(pid, 0)` tells: it is unless no process has that
-/// id (`ESRCH`). A process another user owns is alive (`EPERM`).
+/// id (`ESRCH`). A process another user owns is alive (`EPERM`). An id `kill` cannot probe
+/// ([`process_id`]) is no process.
 #[expect(
     unsafe_code,
     reason = "probing a process with signal 0 has no safe std API"
 )]
-fn alive(pid: u32) -> bool {
-    // 0 names this process's group, and an id above `pid_t`'s range no process.
-    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) else {
+pub(crate) fn alive(pid: u32) -> bool {
+    let Some(pid) = process_id(pid) else {
         return false;
     };
     // SAFETY: `kill` with signal 0 sends nothing and touches no memory of ours.

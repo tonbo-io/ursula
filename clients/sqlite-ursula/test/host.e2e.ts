@@ -82,8 +82,18 @@
 //   commit in a fresh build.
 // - H11: with the stream blackholed, until-clean never reports clean and the proof reports the
 //   bytes. Once the stream answers they drain.
+//
+// The prune, `ursula-vfs-host prune`, run as root (directly, or through `sudo -n`), since its lock
+// check reads every process:
+// - H23: the record of a deleted cache directory goes and a present directory's stays. A dead
+//   writer's temp file goes only with `--tmp`, and a live one's stays. An owner open in the
+//   recreated directory records it again before its first commit. `--pid` is a usage error. An
+//   unrecognized name, or a root held under a renamed cache directory (an unread lock), removes
+//   nothing. Negative control for the host's condition that an absent directory is gone for good:
+//   a directory moved away, pruned and moved back holding an orphan is read only when a `--scan`
+//   names it.
 import { blake3 } from "@noble/hashes/blake3.js";
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { type ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
@@ -1492,5 +1502,161 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			const exited = onlyRoot(await inspect(host, [process.pid], { scans: [dir] }));
 			expect(exited).toMatchObject({ state: "pending", held: false, unacknowledged_bytes: root.unacknowledged_bytes });
 		});
+	});
+});
+
+/** What `ursula-vfs-host prune` prints. */
+interface Pruned {
+	v: number;
+	dir: string;
+	pruned: boolean;
+	incomplete: string | null;
+	removed: { name: string; dir: string }[];
+	tmp_removed: string[];
+	error: string | null;
+}
+
+/** The command that runs a program as root: none when the suite is root, `sudo -n` when it may, else undefined. */
+const asRoot = ((): readonly string[] | undefined => {
+	if (process.getuid?.() === 0) return [];
+	try {
+		execFileSync("sudo", ["-n", "true"], { stdio: "ignore" });
+		return ["sudo", "-n"];
+	} catch {
+		return undefined;
+	}
+})();
+
+// Outside CI a run without root skips the prune. CI must run it.
+describe.skipIf(asRoot === undefined && process.env.CI === undefined)("the host's prune (ursula-vfs-host prune)", () => {
+	beforeAll(() => {
+		expect(asRoot, "the prune runs as root: run the suite as root or allow sudo -n").toBeDefined();
+	});
+
+	/** `ursula-vfs-host prune` of the host directory `host`, as root. */
+	async function prune(host: string, options: { scans?: readonly string[]; tmp?: boolean } = {}): Promise<Pruned> {
+		const args = ["prune", "--dir", host, ...(options.scans ?? []).flatMap((s) => ["--scan", s])];
+		if (options.tmp === true) args.push("--tmp");
+		const command = [...(asRoot ?? []), hostBin(), ...args];
+		const { stdout } = await run(command[0] as string, command.slice(1));
+		expect(stdout.endsWith("\n") && !stdout.slice(0, -1).includes("\n"), stdout).toBe(true);
+		const pruned = JSON.parse(stdout) as Pruned;
+		expect(Object.keys(pruned)).toEqual(["v", "dir", "pruned", "incomplete", "removed", "tmp_removed", "error"]);
+		expect(pruned.v).toBe(1);
+		return pruned;
+	}
+
+	/** A cache directory in which an owner of a new stream committed and exited, recorded in the host directory of `env`: its real path, its record's name and the stream's URL. */
+	async function recorded(label: string, env: NodeJS.ProcessEnv): Promise<{ dir: string; name: string; url: string }> {
+		const dir = realpathSync(freshDir());
+		const { url } = stream(label);
+		await ownerCommits(url, dir, env);
+		return { dir, name: recordName(dir), url };
+	}
+
+	/** A temp file's name, as an owner open publishing a record names it, of the writer `pid`. */
+	const tmpName = (pid: number): string => `.tmp-${pid}-${createHash("sha256").update(String(pid)).digest("hex").slice(0, 16)}`;
+
+	it("H23: removes the record of a deleted cache directory and keeps a present one's, a dead writer's temp file only with --tmp, and an open in the recreated directory records it again before its first commit", async () => {
+		const { host, env } = hostDir();
+		const kept = await recorded("host-h23-kept", env);
+		const gone = await recorded("host-h23-gone", env);
+		rmSync(gone.dir, { recursive: true, force: true });
+		// A writer that no longer runs, a PID above the kernel's `pid_max`, which `kill(pid, 0)`
+		// answers `ESRCH`, and one that runs: this process.
+		const dead = Number(readFileSync("/proc/sys/kernel/pid_max", "utf8").trim()) + 1;
+		const deadTmp = tmpName(dead);
+		const liveTmp = tmpName(process.pid);
+		writeFileSync(join(host, deadTmp), recordLine(kept.dir));
+		writeFileSync(join(host, liveTmp), recordLine(kept.dir));
+
+		const first = await prune(host);
+		expect(first, JSON.stringify(first)).toEqual({ v: 1, dir: host, pruned: true, incomplete: null, removed: [{ name: gone.name, dir: gone.dir }], tmp_removed: [], error: null });
+		expect(names(host)).toEqual([deadTmp, liveTmp, kept.name].sort());
+		const seen = await inspect(host, [process.pid]);
+		expect(seen, JSON.stringify(seen)).toMatchObject({ complete: true, dirs: [{ dir: kept.dir, from: "record", present: true }] });
+
+		const tmps = await prune(host, { tmp: true });
+		expect(tmps, JSON.stringify(tmps)).toMatchObject({ pruned: true, incomplete: null, removed: [], tmp_removed: [deadTmp], error: null });
+		expect(names(host)).toEqual([liveTmp, kept.name].sort());
+		// Nothing left to remove.
+		expect(await prune(host, { tmp: true })).toMatchObject({ pruned: true, removed: [], tmp_removed: [] });
+		rmSync(join(host, liveTmp));
+
+		// The directory comes back: an owner open records it before it can log.
+		mkdirSync(gone.dir);
+		const reopened = new Child(gone.url, gone.dir, env);
+		await reopened.opened();
+		expect(names(host)).toEqual([gone.name, kept.name].sort());
+		expect(readFileSync(join(host, gone.name), "utf8")).toBe(recordLine(gone.dir));
+		await reopened.exec("INSERT INTO t VALUES (2)");
+		await synced(reopened);
+		await reopened.stop();
+		expect(await prune(host)).toMatchObject({ pruned: true, removed: [] });
+		expect(names(host)).toEqual([gone.name, kept.name].sort());
+	});
+
+	it("H23: refuses --pid, and removes nothing after an incomplete pass: an unrecognized name, or a root held under a renamed cache directory", async () => {
+		const { host, env } = hostDir();
+		const refused = await run(hostBin(), ["prune", "--dir", host, "--pid", String(process.pid)]).then(
+			() => undefined,
+			(e: unknown) => e as { code: number; stdout: string; stderr: string },
+		);
+		expect(refused?.code).toBe(2);
+		expect(refused?.stdout).toBe("");
+		expect(refused?.stderr).toContain("--pid");
+
+		const gone = await recorded("host-h23-incomplete", env);
+		rmSync(gone.dir, { recursive: true, force: true });
+		writeFileSync(join(host, "stray"), "");
+		const stray = await prune(host);
+		expect(stray, JSON.stringify(stray)).toMatchObject({ pruned: false, incomplete: "unrecognized", removed: [], tmp_removed: [] });
+		expect(names(host)).toEqual([gone.name, "stray"]);
+		rmSync(join(host, "stray"));
+
+		// A root held by a live process whose cache directory was renamed: its record names an absent
+		// directory, and its lock is unread.
+		const parent = realpathSync(freshDir());
+		const cache = join(parent, "cache");
+		mkdirSync(cache);
+		const holder = new Child(stream("host-h23-held").url, cache, env);
+		await holder.opened();
+		await holder.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		const heldName = recordName(cache);
+		renameSync(cache, join(parent, "moved"));
+		const held = await prune(host);
+		expect(held, JSON.stringify(held)).toMatchObject({ pruned: false, incomplete: "unread_lock", removed: [], tmp_removed: [] });
+		expect(names(host)).toEqual([gone.name, heldName].sort());
+
+		await holder.stop();
+		const after = await prune(host);
+		expect(after, JSON.stringify(after)).toMatchObject({ pruned: true, incomplete: null, error: null });
+		expect(after.removed.map((r) => r.dir).sort()).toEqual([gone.dir, cache].sort());
+		expect(names(host)).toEqual([]);
+	});
+
+	it("H23: a directory moved away, pruned and moved back holding an orphan is read only when a --scan names it", async () => {
+		const { host, env } = hostDir();
+		const dir = realpathSync(freshDir());
+		const s = stream("host-h23-back");
+		await crashTables(s.url, dir, env);
+		await crash(s.url, dir, env, "logged:2");
+		const orphan = onlyRoot(await inspect(host, [process.pid]));
+		expect(orphan).toMatchObject({ state: "pending", held: false });
+		expect(orphan.unacknowledged_bytes).toBeGreaterThan(0);
+
+		const name = recordName(dir);
+		const away = `${dir}-away`;
+		renameSync(dir, away);
+		const pruned = await prune(host);
+		expect(pruned, JSON.stringify(pruned)).toMatchObject({ pruned: true, removed: [{ name, dir }] });
+		renameSync(away, dir);
+
+		// Back at its path with its commits, and out of every inspection that does not scan it.
+		const unseen = await inspect(host, [process.pid]);
+		expect(unseen, JSON.stringify(unseen)).toMatchObject({ complete: true, clean: true, dirs: [], roots: [] });
+		const scanned = await inspect(host, [process.pid], { scans: [dir] });
+		expect(scanned, JSON.stringify(scanned)).toMatchObject({ complete: true, clean: false, dirs: [{ dir, from: "scan", present: true }] });
+		expect(onlyRoot(scanned)).toMatchObject({ state: "pending", unacknowledged_bytes: orphan.unacknowledged_bytes });
 	});
 });

@@ -322,7 +322,42 @@ jobs:
           sudo install -o root -g root -m 0644 /dev/null /var/lib/sqlite-ursula/host/hold
           test "$(sudo "$bin" hold < /dev/null)" = held
           expect "$(sudo "$bin" inspect --pid $$)" clean
-          sudo rm -rf /var/lib/sqlite-ursula
+          # The prune, its lock check over every process: the record of a missing directory goes,
+          # a present one's stays, and --pid is a usage error. A record's name is the first 32 hex
+          # digits of the BLAKE3 of the path it records (hostdir::record_name).
+          plant() {
+            printf '{"v":1,"dir":"%s"}\n' "$2" | sudo tee "/var/lib/sqlite-ursula/host/$1" > /dev/null
+            sudo chmod 0444 "/var/lib/sqlite-ursula/host/$1"
+          }
+          sudo install -d -o root -g root -m 0755 /var/lib/sqlite-ursula-prune/present
+          plant dir-b3256741c278d7b318686b22cd2b2dd9 /var/lib/sqlite-ursula-prune/present
+          plant dir-d748b9bd0bde08ab27f26a3c26d1ad7f /var/lib/sqlite-ursula-prune/missing
+          expect "$(sudo "$bin" inspect --pid $$)" clean
+          # As another user the lock check of every process cannot run, so nothing goes.
+          out=$("$bin" prune)
+          echo "$out"
+          python3 -c '
+          import json, sys
+          r = json.loads(sys.argv[1])
+          assert r["pruned"] is False and r["incomplete"] == "unread_lock", r
+          assert r["removed"] == [] and r["tmp_removed"] == [] and isinstance(r["error"], str), r
+          ' "$out"
+          test "$(sudo ls /var/lib/sqlite-ursula/host | tr '\n' ' ')" = "dir-b3256741c278d7b318686b22cd2b2dd9 dir-d748b9bd0bde08ab27f26a3c26d1ad7f hold "
+          out=$(sudo "$bin" prune)
+          echo "$out"
+          python3 -c '
+          import json, sys
+          r = json.loads(sys.argv[1])
+          assert list(r) == ["v", "dir", "pruned", "incomplete", "removed", "tmp_removed", "error"], r
+          assert r == {"v": 1, "dir": "/var/lib/sqlite-ursula/host", "pruned": True, "incomplete": None,
+                       "removed": [{"name": "dir-d748b9bd0bde08ab27f26a3c26d1ad7f", "dir": "/var/lib/sqlite-ursula-prune/missing"}],
+                       "tmp_removed": [], "error": None}, r
+          ' "$out"
+          test "$(sudo ls /var/lib/sqlite-ursula/host | tr '\n' ' ')" = "dir-b3256741c278d7b318686b22cd2b2dd9 hold "
+          status=0
+          sudo "$bin" prune --pid $$ || status=$?
+          test "$status" -eq 2
+          sudo rm -rf /var/lib/sqlite-ursula /var/lib/sqlite-ursula-prune
 
   sqlite-vfs-e2e:
     name: sqlite-vfs e2e (model server, Node ${{ matrix.node }})
