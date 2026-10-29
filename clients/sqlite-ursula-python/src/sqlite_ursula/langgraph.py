@@ -103,7 +103,9 @@ def _gated(db: UrsulaConnection, writes: bool, call: Callable[..., T], *args: An
 async def _agated(
     db: UrsulaConnection, writes: bool, call: Callable[..., Awaitable[T]], *args: Any, **kw: Any
 ) -> T:
-    """:func:`_gated` for a coroutine function, on ``db.asynced()``."""
+    """:func:`_gated` for a coroutine function, on ``db.asynced()``. ``AsyncSqliteStore`` runs the
+    calls of one tick as one batch, so a call that does not write is refused only with a write of
+    another call: it runs again at once, and that call waits."""
     while True:
         try:
             result = await call(*args, **kw)
@@ -114,7 +116,8 @@ async def _agated(
             if writes:
                 await db.asynced()
             return result
-        await db.asynced()
+        if writes:
+            await db.asynced()
 
 
 class _Connection(UrsulaConnection):
@@ -125,7 +128,11 @@ class _Connection(UrsulaConnection):
     ``ALTER TABLE ... ADD COLUMN`` fails with "duplicate column name". So while ``setting_up``, a
     statement run outside a transaction that is refused with ``backlog_full``, which committed
     nothing, waits for ``synced()`` and runs again by itself. Each of setup's scripts is one
-    statement, or statements that are safe to run twice (``CREATE TABLE IF NOT EXISTS``)."""
+    statement, or statements that are safe to run twice (``CREATE TABLE IF NOT EXISTS``).
+
+    For the async adapters that wait blocks aiosqlite's thread, which cancelling the setup's caller
+    does not end: the connection's other statements and ``aclose()`` wait behind it until the
+    stream acknowledges the commits pending before it."""
 
     setting_up = False
 
@@ -383,10 +390,12 @@ class AsyncUrsulaStore(AsyncSqliteStore):
     """LangGraph's ``AsyncSqliteStore`` on an aiosqlite connection of its own on ``db``'s binding,
     without implicit transactions: ``aput`` and ``adelete``, an ``aget`` or ``asearch`` that
     refreshes TTLs, and a TTL sweep return once ``db.asynced()`` returned after them, and each
-    call refused with ``backlog_full`` (a read batched with a refused write is too) runs again
-    after ``asynced()``. The waits are the callers', so the task that runs the store's batches
-    never waits for the stream, and a read never waits behind another call's write. ``abatch``
-    and ``batch``, which take operations, are LangGraph's own: call ``db.asynced()`` after them.
+    write refused with ``backlog_full`` runs again after ``asynced()``. A read batched with a
+    refused write runs again at once. The waits are the callers', so the task that runs the store's
+    batches never waits for the stream, and a read never waits behind another call's write. A
+    statement of the setup refused with ``backlog_full`` is the exception: it waits on aiosqlite's
+    thread (``_Connection``). ``abatch`` and ``batch``, which take operations, are LangGraph's own:
+    call ``db.asynced()`` after them.
 
     Make it with :meth:`open`, and close it with :meth:`aclose` or ``async with``, which also stop
     its TTL sweeper.

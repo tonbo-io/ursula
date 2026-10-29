@@ -2516,13 +2516,16 @@ module of the package that imports LangGraph.
   and runs again, and the extension admits any commit while nothing is pending. Running a write
   again is safe only when it is one transaction or safe to run twice. A checkpoint, a task's
   writes, a deleted thread and a store batch are each one transaction, and a store batch is listed
-  before its first run, so it runs again whole. In the async store each call refused, a read
-  batched with a refused write too, runs again. LangGraph's setup commits its statements one by
+  before its first run, so it runs again whole. `AsyncSqliteStore` runs the calls of one tick as
+  one batch, so a read is refused only with another call's write: the read runs again at once,
+  and the write waits for `asynced()` first. LangGraph's setup commits its statements one by
   one, and a store's migrations are not safe to run twice: an `ALTER TABLE ... ADD COLUMN` run
   again after its `INSERT INTO store_migrations` was refused fails with "duplicate column name".
   So while setup runs, the adapter's connection runs again, by itself, each statement outside a
   transaction that is refused. Each of setup's scripts is one statement or statements safe to run
-  twice.
+  twice. In the async adapters that wait blocks aiosqlite's thread, and cancelling the caller of
+  the setup does not end it: the connection's other statements and `aclose()` wait behind it until
+  the stream acknowledges the commits pending before it.
 - **Resets.** A reset raises the `UrsulaResetError` from the write or the read that met it. A
   statement's reset rolls the store's transaction back, and the `COMMIT` that `SqliteStore` runs
   in a `finally` block then finds none: the connection raises the remembered reset instead of
@@ -2546,8 +2549,9 @@ connections open made" run against the model server and against one real `ursula
 waits for a late acknowledgement", "ainvoke waits for a late acknowledgement", "the store waits
 for a late acknowledgement", "the async store reads without waiting behind a write", "a write
 refused with backlog_full runs again once synced", "an async write refused with backlog_full runs
-again once synced" and "a store write refused with backlog_full runs again once synced" script a
-late acknowledgement, which only the model server takes.
+again once synced", "a store write refused with backlog_full runs again once synced" and "an
+async store read batched with a refused write does not wait" script a late acknowledgement, which
+only the model server takes.
 
 ## Status
 

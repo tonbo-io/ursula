@@ -175,7 +175,9 @@ def test_a_write_refused_with_backlog_full_runs_again_once_synced(model, stream,
         model.fault("delay 2000", 1, "POST")
         db.execute("INSERT INTO t VALUES (1)")
         db.commit()
+        started = time.monotonic()
         assert graph.invoke({"n": 5}, config) == {"n": 6}
+        assert time.monotonic() - started >= 1.5
         assert graph.get_state(config).values == {"n": 6}
         assert db.status()["commits"]["pending"] == 0
     db.close()
@@ -256,7 +258,9 @@ def test_an_async_write_refused_with_backlog_full_runs_again_once_synced(model, 
             model.fault("delay 2000", 1, "POST")
             db.execute("INSERT INTO t VALUES (1)")
             db.commit()
+            started = time.monotonic()
             assert await graph.ainvoke({"n": 5}, config) == {"n": 6}
+            assert time.monotonic() - started >= 1.5
             assert db.status()["commits"]["pending"] == 0
         db.close()
 
@@ -424,6 +428,39 @@ def test_the_async_store_reads_without_waiting_behind_a_write(model, stream, fre
             assert time.monotonic() - started < 0.8
             await put
             assert time.monotonic() - started >= 0.9
+            assert db.status()["commits"]["pending"] == 0
+        db.close()
+
+    asyncio.run(main())
+
+
+def test_an_async_store_read_batched_with_a_refused_write_does_not_wait(model, stream, fresh):
+    async def main() -> None:
+        db = await sqlite_ursula.aopen(stream.url, dir=fresh(), max_pending_bytes=1)
+        async with await AsyncUrsulaStore.open(db) as store:
+            await store.aput(("users", "1"), "prefs", {"theme": "dark"})
+            # While this commit is pending, the batch of the put and the get is refused: the get
+            # runs again at once, and the put once asynced() returned.
+            model.fault("delay 2000", 1, "POST")
+            db.execute("CREATE TABLE t(x)")
+            started = time.monotonic()
+
+            async def get() -> tuple[Any, float]:
+                item = await store.aget(("users", "1"), "prefs")
+                return item, time.monotonic() - started
+
+            refusals = Refusals(db)
+            try:
+                _, (item, read_s) = await asyncio.gather(
+                    store.aput(("users", "2"), "prefs", {"theme": "light"}), get()
+                )
+            finally:
+                seen = refusals.stop()
+            assert "backlog_full" in seen
+            assert item is not None
+            assert item.value == {"theme": "dark"}
+            assert read_s < 1.0
+            assert time.monotonic() - started >= 1.5
             assert db.status()["commits"]["pending"] == 0
         db.close()
 
