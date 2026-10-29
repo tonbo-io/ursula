@@ -1,9 +1,11 @@
-"""``open``, ``import_sqlite`` and ``set_token``: the root module's calls of the extension.
+"""``open``, ``aopen``, ``import_sqlite`` and ``set_token``: the root module's calls of the
+extension.
 
 An open binds with ``ursula_open`` at timeout 0 and waits on the events thread while the bind
-goes on, as Node's does. The extension shares one bind between concurrent opens of a stream,
-from any thread. Its own deadline for the bind is far past ``timeout``, which governs the open: on
-the timeout, or on Ctrl-C or any other exception once a reply named the request, the open cancels
+goes on, as Node's does: ``open`` on a ``threading.Event``, ``aopen`` on the event loop. The
+extension shares one bind between concurrent opens of a stream, from any thread or task. Its own
+deadline for the bind is far past ``timeout``, which governs the open: on the timeout, or on
+Ctrl-C, a cancellation or any other exception once a reply named the request, the open cancels
 the bind (``ursula_cancel``). A Ctrl-C inside the first ``ursula_open`` call, before its reply is
 read, can miss the cancel.
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -119,6 +122,107 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
     this Python cannot load the extension), and :class:`UrsulaUnavailableError` when the timeout
     passed first: the last condition the open met, or ``cancelled`` when it met none.
     """
+    plan = _plan(
+        url,
+        token,
+        dir,
+        read_only,
+        recreate,
+        max_pending_bytes,
+        timeout,
+        busy_timeout,
+        connect_kwargs,
+    )
+    bind = _Bind(plan)
+    while True:
+        waiter = threading.Event()
+        try:
+            binding = bind.ask(waiter)
+            if binding is not None:
+                return _connect(plan, binding)
+            left = bind.left()
+            woke = left > 0 and waiter.wait(left)
+        except BaseException as error:
+            if bind.again(error):
+                continue
+            raise
+        if not woke:
+            raise bind.timed_out()
+
+
+async def aopen(
+    url: str,
+    *,
+    token: str | None = None,
+    dir: str | os.PathLike[str] | None = None,  # noqa: A002 - the option's name, as Node's
+    read_only: bool = False,
+    recreate: bool = False,
+    max_pending_bytes: int | None = None,
+    timeout: float = DEFAULT_OPEN_S,
+    busy_timeout: float = DEFAULT_BUSY_S,
+    **connect_kwargs: Any,
+) -> UrsulaConnection:
+    """:func:`open` for asyncio: the same arguments, the same :class:`UrsulaConnection` and the same
+    errors, and it waits for the bind on the event loop instead of blocking it.
+
+    Cancelling it, as ``asyncio.timeout`` around it does, cancels the bind (``ursula_cancel``) and
+    raises ``CancelledError``, so no bind goes on to claim the stream after the caller gave up.
+    """
+    plan = _plan(
+        url,
+        token,
+        dir,
+        read_only,
+        recreate,
+        max_pending_bytes,
+        timeout,
+        busy_timeout,
+        connect_kwargs,
+    )
+    bind = _Bind(plan)
+    while True:
+        waiter = _events.LoopEvent()
+        try:
+            binding = bind.ask(waiter)
+            if binding is not None:
+                return _connect(plan, binding)
+            left = bind.left()
+            woke = left > 0 and await waiter.wait(left)
+        except BaseException as error:
+            if bind.again(error):
+                continue
+            raise
+        if not woke:
+            raise bind.timed_out()
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """An open's checked arguments."""
+
+    stream: str
+    root: str | None
+    #: ``ursula_open``'s options.
+    options: str
+    timeout: float
+    read_only: bool
+    busy: float
+    factory: type[UrsulaConnection]
+    connect_kwargs: dict[str, Any]
+
+
+def _plan(
+    url: object,
+    token: object,
+    dir: str | os.PathLike[str] | None,  # noqa: A002 - the option's name
+    read_only: object,
+    recreate: object,
+    max_pending_bytes: object,
+    timeout: object,
+    busy_timeout: object,
+    connect_kwargs: dict[str, Any],
+) -> _Plan:
+    """Checks an open's arguments, starts the extension and applies the token."""
     stream = _url(url)
     chosen = _token(token)
     settings: dict[str, object] = {"timeout_ms": EXTENSION_OPEN_MS}
@@ -134,7 +238,8 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
         settings["max_pending_bytes"] = max_pending_bytes
     if flag("recreate", recreate):
         settings["recreate"] = True
-    if flag("read_only", read_only):
+    ro = flag("read_only", read_only)
+    if ro:
         # With `recreate` too, the extension refuses it: `invalid_argument`.
         settings["read_only"] = True
     limit = seconds("timeout", timeout, positive=True)
@@ -152,63 +257,87 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
     # again on each of its retries, over a token applied meanwhile.
     if chosen is not None:
         set_token(chosen)
-    binding = _bind(stream, root, json.dumps(settings), limit)
-    return _connect(binding, read_only, busy, factory, connect_kwargs)
+    return _Plan(stream, root, json.dumps(settings), limit, ro, busy, factory, connect_kwargs)
 
 
-def _bind(stream: str, root: str | None, options: str, timeout: float) -> dict[str, Any]:
-    """Binds ``stream``: ``ursula_open`` with timeout 0, waiting on the events thread while it goes
-    on.
+class _Bind:
+    """One open's bind of its stream: ``ursula_open`` with timeout 0, asked again each time its
+    waiter wakes, until it is done. ``open`` waits on a ``threading.Event`` and ``aopen`` on a
+    :class:`_events.LoopEvent`, through the same steps.
 
     Any exception once a reply named the request cancels it, in a later pass too (one a gap or a
     lost events thread woke), so no bind goes on to claim the stream after the open gave up. A
     Ctrl-C that lands inside the first ``ursula_open`` call, before its reply is read, can miss the
     cancel: that bind then runs to the extension's own deadline.
     """
-    deadline = time.monotonic() + timeout
-    # The request of the last reply that was not done: concurrent opens of a stream, and each pass
-    # of this one, share it until it resolves.
-    known: int | None = None
-    while True:
-        ev: _events.Events | None = None
-        waiter = None
-        try:
-            with _control.lock():
-                # The thread first, so its cursor precedes the request, and the waiter registered
-                # in the step that got the request, before any event about it applies.
-                ev = _events.events()
-                opened = _control.call("SELECT ursula_open(?, ?, ?, 0)", stream, root, options)
-                if opened["done"]:
-                    return opened
-                known = int(opened["request"])
-                waiter = ev.wait_open(known)
-            left = deadline - time.monotonic()
-            woke = left > 0 and waiter.wait(left)
-        except BaseException as error:
-            # Another thread's open of the stream, which this one shared, was cancelled.
-            if (
-                isinstance(error, UrsulaUnavailableError)
-                and error.kind == "cancelled"
-                and time.monotonic() < deadline
-            ):
-                known = None
-                continue
-            if known is not None:
-                if ev is not None and waiter is not None:
-                    ev.forget_open(known, waiter)
-                # One that resolved meanwhile is no longer a request: the cancel finds nothing.
-                _give_up(stream, known, timeout)
-            raise
-        if not woke:
-            ev.forget_open(known, waiter)
-            raise _give_up(stream, known, timeout)
+
+    def __init__(self, plan: _Plan) -> None:
+        self._plan = plan
+        self._deadline = time.monotonic() + plan.timeout
+        # The request of the last reply that was not done: concurrent opens of a stream, and each
+        # pass of this one, share it until it resolves.
+        self._known: int | None = None
+        self._ev: _events.Events | None = None
+        self._waiter: _events.Waiter | None = None
+
+    def ask(self, waiter: _events.Waiter) -> dict[str, Any] | None:
+        """One pass: the binding when the bind is done, else ``None`` with ``waiter`` registered
+        for the request's completion."""
+        plan = self._plan
+        self._ev = None
+        self._waiter = None
+        with _control.lock():
+            # The thread first, so its cursor precedes the request, and the waiter registered in
+            # the step that got the request, before any event about it applies.
+            self._ev = _events.events()
+            opened = _control.call(
+                "SELECT ursula_open(?, ?, ?, 0)", plan.stream, plan.root, plan.options
+            )
+            if opened["done"]:
+                return opened
+            self._known = int(opened["request"])
+            self._ev.wait_open(self._known, waiter)
+            self._waiter = waiter
+        return None
+
+    def left(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def again(self, error: BaseException) -> bool:
+        """A pass raised ``error``: whether to ask anew, when another open's bind of the stream,
+        which this one shared, was cancelled. Otherwise the request is cancelled and the caller
+        raises ``error``."""
+        if (
+            isinstance(error, UrsulaUnavailableError)
+            and error.kind == "cancelled"
+            and time.monotonic() < self._deadline
+        ):
+            self._known = None
+            return True
+        if self._known is not None:
+            self._forget()
+            # One that resolved meanwhile is no longer a request: the cancel finds nothing.
+            _give_up(self._plan.stream, self._known, self._plan.timeout)
+        return False
+
+    def timed_out(self) -> UrsulaError:
+        """The timeout passed: the request is cancelled, and the error is the last condition it
+        met, or ``cancelled``."""
+        assert self._known is not None
+        self._forget()
+        return _give_up(self._plan.stream, self._known, self._plan.timeout)
+
+    def _forget(self) -> None:
+        if self._ev is not None and self._waiter is not None and self._known is not None:
+            self._ev.forget_open(self._known, self._waiter)
 
 
 def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:
     """The open gave up: cancels ``request``, and the error is the last condition it met, or
-    ``cancelled``."""
+    ``cancelled``. The cancel waits up to a second for a disk job of the open, so it runs on a
+    connection of its own."""
     try:
-        ended = _control.call("SELECT ursula_cancel(?)", request)
+        ended = _control.call_waiting("SELECT ursula_cancel(?)", request)
     except UrsulaError:
         # It resolved meanwhile and its result was taken.
         ended = None
@@ -224,20 +353,15 @@ def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:
     )
 
 
-def _connect(
-    binding: dict[str, Any],
-    read_only: bool,
-    busy: float,
-    factory: type[UrsulaConnection],
-    connect_kwargs: dict[str, Any],
-) -> UrsulaConnection:
+def _connect(plan: _Plan, binding: dict[str, Any]) -> UrsulaConnection:
     """A connection to what ``ursula_open`` bound."""
     path = str(binding["path"])
-    connect_kwargs.setdefault("check_same_thread", False)
-    database = f"file:{urllib.parse.quote(path)}?mode=ro" if read_only else path
+    kwargs = dict(plan.connect_kwargs)
+    kwargs.setdefault("check_same_thread", False)
+    database = f"file:{urllib.parse.quote(path)}?mode=ro" if plan.read_only else path
     try:
         conn = sqlite3.connect(
-            database, timeout=busy, factory=factory, uri=read_only, **connect_kwargs
+            database, timeout=plan.busy, factory=plan.factory, uri=plan.read_only, **kwargs
         )
     except (sqlite3.Error, TypeError, ValueError) as error:
         raise UrsulaSetupError(
@@ -289,21 +413,14 @@ def import_sqlite(
     source = os.fspath(file)
     settings = {} if chosen is None else {"token": chosen}
     _control.start()
-    # A connection of its own: the import blocks for as long as it takes.
-    conn = _control.connection()
-    try:
-        row = conn.execute(
-            "SELECT ursula_import(?, ?, ?, ?)",
-            (stream, source, json.dumps(settings), max(1, round(limit * 1000))),
-        ).fetchone()
-    except sqlite3.Error as error:
-        classified = _control.classify(error, None)
-        if classified is error:
-            raise
-        raise classified from error
-    finally:
-        conn.close()
-    done = _control.parsed(row[0])
+    # On a connection of its own: the import blocks for as long as it takes.
+    done = _control.call_waiting(
+        "SELECT ursula_import(?, ?, ?, ?)",
+        stream,
+        source,
+        json.dumps(settings),
+        max(1, round(limit * 1000)),
+    )
     return Imported(
         offset=int(done["offset"]),
         digest=str(done["digest"]),

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import copy
 import sqlite3
+from collections import deque
+from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 from typing import Literal
@@ -129,6 +131,35 @@ def error_of(named: Mapping[str, Any], message: str, cause: BaseException | None
 
 
 E = TypeVar("E", bound=BaseException)
+T = TypeVar("T")
+
+#: How many errors of a chain :func:`find_wrapped` visits at most.
+MAX_WRAPPED = 16
+
+
+def find_wrapped(error: BaseException, match: Callable[[BaseException], T | None]) -> T | None:
+    """The first value ``match`` returns for an error in the chain of ``error``, which a library
+    may have wrapped: ``error`` itself, the errors an ``ExceptionGroup`` holds, and the errors they
+    wrap (``__cause__``, and SQLAlchemy's ``.orig``), in that order. Each error is visited once, and
+    at most :data:`MAX_WRAPPED` are. ``None`` when ``match`` returns it for every one."""
+    pending: deque[BaseException] = deque([error])
+    seen: set[int] = set()
+    while pending and len(seen) < MAX_WRAPPED:
+        next_ = pending.popleft()
+        if id(next_) in seen:
+            continue
+        seen.add(id(next_))
+        found = match(next_)
+        if found is not None:
+            return found
+        if isinstance(next_, BaseExceptionGroup):
+            pending.extend(next_.exceptions)
+        if next_.__cause__ is not None:
+            pending.append(next_.__cause__)
+        orig = getattr(next_, "orig", None)
+        if isinstance(orig, BaseException):
+            pending.append(orig)
+    return None
 
 
 def again(error: E) -> E:

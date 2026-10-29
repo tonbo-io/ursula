@@ -5,6 +5,7 @@ import at module level, open in the worker."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -53,6 +54,16 @@ def test_a_child_forked_after_an_open_raises_forked_and_the_parent_goes_on(strea
 
     def calls() -> dict[str, list[str]]:
         seen: dict[str, list[str]] = {}
+        ran: list[str] = []
+
+        def gated() -> None:
+            with sqlite_ursula.gate(db):
+                ran.append("gate")
+
+        async def agated() -> None:
+            async with sqlite_ursula.agate(db):
+                ran.append("agate")
+
         for name, call in {
             "open": lambda: sqlite_ursula.open(stream.url + "-other", dir=fresh()),
             "statement": lambda: db.execute("INSERT INTO t VALUES (2)"),
@@ -61,12 +72,16 @@ def test_a_child_forked_after_an_open_raises_forked_and_the_parent_goes_on(strea
             "on_reset": lambda: db.on_reset(print),
             "commit": lambda: db.commit(),
             "set_token": lambda: sqlite_ursula.set_token("t"),
+            "gate": gated,
+            "agate": lambda: asyncio.run(agated()),
         }.items():
             try:
                 call()
                 seen[name] = ["returned"]
             except UrsulaSetupError as e:
                 seen[name] = [e.kind, e.action]
+        # The gates raise before their block runs.
+        seen["blocks run"] = ran
         # Closing the inherited connection touches nothing of the parent's.
         db.close()
         seen["close"] = ["returned"]
@@ -74,6 +89,7 @@ def test_a_child_forked_after_an_open_raises_forked_and_the_parent_goes_on(strea
 
     seen = in_child(calls)
     assert seen.pop("close") == ["returned"]
+    assert seen.pop("blocks run") == []
     assert seen == {name: ["forked", "fix"] for name in seen}
     db.execute("INSERT INTO t VALUES (1)")
     db.synced()

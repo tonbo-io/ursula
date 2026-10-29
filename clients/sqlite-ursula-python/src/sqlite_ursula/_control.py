@@ -2,10 +2,10 @@
 on it, ``classify``, and what a fork leaves of the process's state.
 
 The registry of bound databases and the replication driver are the process's: one control
-connection serves every thread. Its calls are short (every call that could wait is made with
-timeout 0, or on a connection of its own), so one lock serializes them. The events thread
-(``_events``) takes the same lock while it applies events, so a request or a ticket is registered
-before any event about it applies.
+connection serves every thread. Its calls are short, since every call that could wait is made with
+timeout 0, or on a connection of its own outside the lock (:func:`call_waiting`), so one lock
+serializes them. The events thread (``_events``) takes the same lock while it applies events, so a
+request or a ticket is registered before any event about it applies.
 
 A fork copies the process without its threads. A child forked after the parent started the
 extension (an open or an import) is marked forked, and the package's calls in it (``open``,
@@ -21,12 +21,14 @@ import json
 import os
 import sqlite3
 import threading
+from collections.abc import Sequence
 from typing import Any
 
 from . import _host
 from .errors import UrsulaError
 from .errors import UrsulaSetupError
 from .errors import error_of
+from .errors import find_wrapped
 
 _lock = threading.RLock()
 _control: sqlite3.Connection | None = None
@@ -112,9 +114,24 @@ def call(sql: str, *args: object) -> Any:
     """One of the extension's SQL functions on the control connection: its JSON result, or its
     error as what :func:`classify` makes of it."""
     db = control()
+    with _lock:
+        return _result(db, sql, args)
+
+
+def call_waiting(sql: str, *args: object) -> Any:
+    """:func:`call` for a function that can wait (``ursula_cancel`` while a disk job of the open
+    runs, ``ursula_import``): on a connection of its own, outside the lock, so the events thread
+    and the other calls go on meanwhile."""
+    db = connection()
     try:
-        with _lock:
-            row = db.execute(sql, args).fetchone()
+        return _result(db, sql, args)
+    finally:
+        db.close()
+
+
+def _result(db: sqlite3.Connection, sql: str, args: tuple[object, ...]) -> Any:
+    try:
+        row = db.execute(sql, args).fetchone()
     except sqlite3.Error as error:
         classified = classify(error, None)
         if classified is error:
@@ -146,6 +163,25 @@ def classify(error: BaseException, path: str | None) -> BaseException:
     if not isinstance(named, dict):
         return error
     return error_of(named, str(named.get("message", error)), error)
+
+
+def classify_wrapped(error: BaseException, paths: Sequence[str | None]) -> BaseException:
+    """:func:`classify` for an error a library may have wrapped: the first error of the chain
+    :func:`find_wrapped` walks that is an :class:`UrsulaError`, or that the extension classifies
+    on one of ``paths`` (the first that names it), as that :class:`UrsulaError`. So a failure of the
+    extension never passes for the wrapper's own kind of error. ``error`` itself otherwise."""
+
+    def match(next_: BaseException) -> UrsulaError | None:
+        if isinstance(next_, UrsulaError):
+            return next_
+        for path in paths:
+            classified = classify(next_, path)
+            if isinstance(classified, UrsulaError):
+                return classified
+        return None
+
+    found = find_wrapped(error, match)
+    return error if found is None else found
 
 
 def _after_fork_in_child() -> None:

@@ -28,6 +28,11 @@ def seconds(name: str, value: object, *, positive: bool) -> float:
     return float(value)
 
 
+def limit(timeout: object) -> float | None:
+    """A wait's ``timeout``: zero or more seconds, or ``None`` for no limit."""
+    return None if timeout is None else seconds("timeout", timeout, positive=False)
+
+
 def flag(name: str, value: object) -> bool:
     if not isinstance(value, bool):
         raise invalid(f"{name} must be a boolean, not {value!r}")

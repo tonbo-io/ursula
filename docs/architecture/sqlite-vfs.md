@@ -1905,7 +1905,7 @@ calls through one watermark while the stream holds its answer back".
 
 ### Gates
 
-A gate holds back what leaves the process until `synced()` says it may. It is the one definition of output gating: `gate` (`src/gate.ts`) implements it, and any later gate (a `node:http` helper, an in-guest HTTP gate) implements the same table. The gate is `synced()` itself: a gate only decides when to call it and what to hold, and adds no wire field, extension call or dependency. Gating twice is safe and costs at most one more round trip.
+A gate holds back what leaves the process until `synced()` says it may. It is the one definition of output gating: `gate` (`src/gate.ts`) implements it, and any later gate (a `node:http` helper, an in-guest HTTP gate) implements the same table. The gate is `synced()` itself: a gate only decides when to call it and what to hold, and adds no wire field or dependency, and no extension call but the Python gates' `ursula_classify` (below). Gating twice is safe and costs at most one more round trip.
 
 | what is held | released when | if a reset comes first | if `signal` fires first |
 | --- | --- | --- | --- |
@@ -1921,6 +1921,8 @@ A gate holds back what leaves the process until `synced()` says it may. It is th
 7. **Cancellation.** Cancelling a gated body cancels its source and aborts the wait in flight, so no ticket outlives the body ([Pump](#pump)).
 
 A returned `Response` comes back as a new `Response` with the same status, status text and headers. Its `url`, `type` and `redirected` are not carried, since a handler's response has none of them.
+
+The Python package's `gate` and `agate` ([Python](#python)) implement the first row as context managers: the block's result or error is the outcome, and `timeout` takes the place of `signal`. Python has no one response type, so they have no second row. A framework's own `sqlite3` connection raises SQLite's error unclassified, so they also ask `ursula_classify` about each SQLite error in the chain of what the block raised, on each database given (`classify_wrapped`, through the same `find_wrapped` that walks `__cause__`, SQLAlchemy's `.orig` and `ExceptionGroup`). An error the extension names passes at once, as the block raised it. Only a bare SQLite error that the state of the one database given names a refused write or a reset raises as that `UrsulaError`, which is a `sqlite3.OperationalError` too. With several databases a statement's I/O error does not say whose it is, so it passes unchanged.
 
 What a gate does not cover: effects inside `work` before it returns, such as an outbound call or a manual acknowledgement in the middle of a handler, which need `await db.synced()` first; WebSocket frames, raw sockets, `node:http` responses written outside the gate, timers, background jobs and child processes; exactly-once effects, since a crash after the release but before an acknowledgement repeats the work, so effects need idempotency keys and message ids recorded in the same transaction; and anything beyond what `synced()` means.
 
@@ -2442,25 +2444,36 @@ classes, whose class, kind and action come from `ursula_classify`.
   `ursula_synced` run at timeout 0 under the same lock, with their request or ticket registered in
   that step. `synced(timeout)` covers the database at the connection's path, the target
   `ursula_synced` takes, and waits on a `threading.Event`, which Ctrl-C interrupts, and raises
-  `TimeoutError` while replication goes on. An open past its `timeout`, or interrupted by any
-  exception once a reply named its request, Ctrl-C included, cancels the request, in a later pass
-  too. A Ctrl-C inside the first `ursula_open` call, before its reply is read, can miss the cancel,
-  and that bind runs to the extension's own deadline. Reset callbacks run on a thread of their own
-  after the path's tickets were rejected. A failed thread is replaced while tickets wait or
+  `TimeoutError` while replication goes on. `aopen` and `asynced` take the same steps and wait on
+  a future of their event loop, which the thread resolves through `call_soon_threadsafe`, so
+  nothing runs on the loop's default executor. A cancelled `asynced` drops its ticket, and a
+  cancelled `aopen` cancels its request as a timed-out open does. An open past its `timeout`, or
+  interrupted by any exception once a reply named its request, Ctrl-C included, cancels the
+  request, in a later pass too. `ursula_cancel` waits up to a second for a disk job of the open, so
+  it runs on a connection of its own, outside the lock, as `ursula_import` does. A Ctrl-C inside
+  the first `ursula_open` call, before its reply is read, can miss the cancel, and that bind runs
+  to the extension's own deadline. Reset callbacks run on a thread of their own after the path's
+  tickets were rejected. A failed thread is replaced while tickets wait or
   connections are open, and the new one starts with a gap: tickets asked for again and resets read
   from status. After three failures in a row waits fail `internal`.
 - **Forks.** `os.register_at_fork`, where the platform has it, marks a child forked after the
-  parent started the extension (an open or an import). There `open`, `import_sqlite` and
-  `set_token` raise `UrsulaSetupError` `forked` (`fix`), and so do the overridden calls of a
-  connection the parent made: statements, transactions, `synced()`, `status()` and the reset
-  callbacks. Its `close()` closes nothing, and the child keeps the parent's connections so that
-  collecting one closes nothing either. Its other `sqlite3.Connection` methods and a framework's
-  own connections on the path rely on the extension, which fails their I/O on a bound file in the
-  child. A child forked before the extension started loads it as any process does.
+  parent started the extension (an open or an import). There `open`, `aopen`, `import_sqlite`
+  and `set_token` raise `UrsulaSetupError` `forked` (`fix`), and so do the overridden calls of a
+  connection the parent made: statements, transactions, `synced()`, `asynced()`, `status()`, the
+  reset callbacks and the gates. Its `close()` closes nothing, and the child keeps the parent's
+  connections so that collecting one closes nothing either. Its other `sqlite3.Connection`
+  methods and a framework's own connections on the path rely on the extension, which fails their
+  I/O on a bound file in the child. A child forked before the extension started loads it as any
+  process does.
+- **Gates.** `gate(*dbs, timeout)` and `agate(*dbs, timeout)` are context managers that apply
+  [Gates](#gates)' first row. At the block's end both ask for every database's ticket in one step
+  under the lock and wait on one waiter that each ticket's outcome wakes, a `threading.Event` or a
+  future of the loop. They return once every ticket resolved and raise the first failure, which
+  drops the other tickets. `synced()` and `asynced()` are the same wait on one database.
 
-Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_errors.py`, `tests/test_fork.py`,
-`tests/test_import.py` and `tests/test_host.py`, against the model server and against one real
-`ursula` node ([Verification](#verification)).
+Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_async.py`, `tests/test_gate.py`,
+`tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py` and `tests/test_host.py`,
+against the model server and against one real `ursula` node ([Verification](#verification)).
 
 ## Status
 
