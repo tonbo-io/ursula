@@ -21,6 +21,11 @@ classifiers = [
   "Topic :: Database",
 ]
 
+[project.optional-dependencies]
+# sqlite_ursula.langgraph: the langgraph-checkpoint-sqlite releases CI tests, from the oldest
+# (the langgraph-oldest group below) to the newest (langgraph-newest).
+langgraph = ["langgraph-checkpoint-sqlite>=3.0.3,<3.2"]
+
 [project.urls]
 Homepage = "https://ursula.tonbo.io/docs/examples/sqlite-vfs"
 Repository = "https://github.com/tonbo-io/ursula"
@@ -36,6 +41,19 @@ artifacts = ["src/sqlite_ursula/_lib/*"]
 
 [dependency-groups]
 test = ["pytest==9.1.1"]
+# The LangGraph releases CI runs tests/test_langgraph.py on (scripts/langgraph_releases.py): the
+# oldest the `langgraph` extra supports, with the oldest LangGraph and checkpoint base it takes,
+# and the newest.
+langgraph-oldest = [
+  "langgraph-checkpoint-sqlite==3.0.3",
+  "langgraph-checkpoint==3.0.0",
+  "langgraph==1.0.1",
+]
+langgraph-newest = [
+  "langgraph-checkpoint-sqlite==3.1.2",
+  "langgraph-checkpoint==4.3.1",
+  "langgraph==1.2.18",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

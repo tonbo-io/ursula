@@ -103,6 +103,37 @@ await send(reply)
 
 Effects inside the block, such as a call to another service, are not gated: call `db.synced()` before them.
 
+## LangGraph
+
+`sqlite_ursula.langgraph` holds LangGraph's SQLite checkpointers and stores on a replicated database. Install it with the `langgraph` extra, which pins `langgraph-checkpoint-sqlite` to the releases CI tests (3.0.3 up to 3.2):
+
+```sh
+pip install 'sqlite-ursula[langgraph]'
+```
+
+```python
+import sqlite_ursula
+from sqlite_ursula.langgraph import UrsulaSaver
+
+db = sqlite_ursula.open(url)
+graph = builder.compile(checkpointer=UrsulaSaver(db))
+reply = graph.invoke(inputs, {"configurable": {"thread_id": "1"}})
+send(reply)  # every checkpoint of the run is in the stream
+```
+
+| class | LangGraph's | on |
+| --- | --- | --- |
+| `UrsulaSaver(db)` | `SqliteSaver` | `db` |
+| `await AsyncUrsulaSaver.open(db)` | `AsyncSqliteSaver` | an aiosqlite connection to `db.path` |
+| `UrsulaStore(db)` | `SqliteStore` | `db`, opened with `isolation_level=None` |
+| `await AsyncUrsulaStore.open(db)` | `AsyncSqliteStore` | an aiosqlite connection to `db.path`, without implicit transactions |
+
+- Every write returns once `db.synced()` (or `asynced()`) returned after it: a checkpoint, a task's writes, a deleted thread, a store put or delete, a TTL sweep. LangGraph waits for a run's checkpoint writes before `invoke` returns, so the return is gated in every durability mode. With `durability="sync"`, each step also waits for the one before it, so what a node does rests on acknowledged checkpoints. Reads do not wait.
+- A write refused with `backlog_full` committed nothing: it waits for `synced()` and runs again. A reset raises the `UrsulaResetError`, from a write or a read, also through the async classes' aiosqlite connections, which are on `db`'s binding.
+- `UrsulaStore` runs its own `BEGIN` and `COMMIT`, so it takes a connection without implicit transactions: `sqlite_ursula.open(url, isolation_level=None)`. Open that one beside `db`, on the same binding, or use it for the saver too.
+- `aclose()`, or `async with`, closes an async class's aiosqlite connection. Keep `db` open while the graph runs.
+- `sqlite-vec`, which `langgraph-checkpoint-sqlite` requires, has no wheel for musl, so the extra does not install on Alpine. Use a Debian base with a uv-managed CPython, as [`recipes/Dockerfile.uv`](https://github.com/tonbo-io/ursula/blob/main/clients/sqlite-ursula-python/recipes/Dockerfile.uv) does.
+
 ## Errors
 
 Four classes with `kind` and `action` (`retry`, `reopen`, `stop`, `fix`), whose cause (`__cause__`) is the SQLite error they replace. Branch on `action`. The extension says which failure is which (`ursula_classify`).

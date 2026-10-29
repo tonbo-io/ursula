@@ -10,7 +10,8 @@ Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace
 event pump, `gate`, the Pi Durable adapter in the `/pi` entry, Tonbo's open by name in the `/tonbo`
 entry, Pi storage on a Tonbo database by name in the `/tonbo/pi` entry, the e2e suites and the
 benchmark), and `clients/sqlite-ursula-python` (Python, the `sqlite-ursula` package for the stdlib
-`sqlite3` module: see [Python](#python)). The server
+`sqlite3` module, with LangGraph's SQLite checkpointers and stores in `sqlite_ursula.langgraph`:
+see [Python](#python) and [LangGraph](#langgraph)). The server
 contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
 docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
@@ -2475,6 +2476,47 @@ Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_async.py`, `tes
 `tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py` and `tests/test_host.py`,
 against the model server and against one real `ursula` node ([Verification](#verification)).
 
+### LangGraph
+
+`sqlite_ursula.langgraph`, installed with the `langgraph` extra, subclasses LangGraph's SQLite
+checkpointers and stores and changes only their writes. It is the only module of the package that
+imports LangGraph.
+
+- **Connections.** `UrsulaSaver(db)` is `SqliteSaver` on `db`. `UrsulaStore(db)` is `SqliteStore`
+  on `db`, which must open no transactions of its own (`isolation_level=None`, or `autocommit=True`)
+  since `SqliteStore` runs its own `BEGIN` and `COMMIT`, and anything else is `invalid_argument`.
+  `await AsyncUrsulaSaver.open(db)` and `await AsyncUrsulaStore.open(db)` are `AsyncSqliteSaver`
+  and `AsyncSqliteStore` on an aiosqlite connection to `db.path`, the store's without implicit
+  transactions. aiosqlite connects on a thread of its own, through a factory that makes the
+  connection of `db`'s class and binds it as `db` is, read-only when `db` is. So the statements of
+  every adapter raise what their errors classify as and learn of a reset, as `db`'s do, and the
+  adapters add no classification of their own. `aclose()` or `async with` closes the aiosqlite
+  connection, and the store's also stops its TTL sweeper. The classes take only connections
+  `open()` made, and `from_conn_string` raises `invalid_argument` naming the call to use.
+- **Writes.** Every write returns once `synced()` or `asynced()` returned after it: a saver's
+  `put`, `put_writes` and `delete_thread` and their async forms, a store batch with a put or a
+  delete, and a TTL sweep. LangGraph waits for a run's background checkpoint writes before `invoke`
+  returns, so the return is gated in every durability mode, and `durability="sync"` also gates what
+  a node does after the step before it. Reads do not wait. A write refused with `backlog_full`
+  committed nothing: it waits for `synced()` and runs again, and the extension admits any commit
+  while nothing is pending. A store batch is listed before its first run, so it runs again whole. A
+  reset raises the `UrsulaResetError` from the write or the read that met it.
+- **Releases.** The extra pins `langgraph-checkpoint-sqlite>=3.0.3,<3.2`. 3.0.3 is the first
+  release whose `AsyncSqliteSaver` runs on aiosqlite 0.22. CI runs `tests/test_langgraph.py` on the
+  oldest supported release, with langgraph 1.0.1 and langgraph-checkpoint 3.0.0, and on the newest,
+  the `langgraph-oldest` and `langgraph-newest` groups of `pyproject.toml`, which
+  `scripts/langgraph_releases.py` checks against the extra's range. sqlite-vec, which
+  langgraph-checkpoint-sqlite requires, publishes no musl wheel and no sdist, so the extra installs
+  on glibc Linux and macOS but not on Alpine.
+
+Tests: `tests/test_langgraph.py` "invoke returns once the checkpoints of the run are in the
+stream", "ainvoke returns once the checkpoints of the run are in the stream", "a write refused with
+backlog_full runs again once synced", "an async write refused with backlog_full runs again once
+synced", "a reset raises from the run and from reads", "the async connections are on the binding",
+"the store returns from a put once it is in the stream", "the async store returns from a put once
+it is in the stream" and "the adapters take connections open made", against the model server and
+against one real `ursula` node.
+
 ## Status
 
 `db.status()` and `ursula_status(path)` return one snake_case JSON:
@@ -2610,7 +2652,9 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
   0.13.6) against the model server ([Forks](#forks)).
 - `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
-  3.14 and 3.14t, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, the wheel
+  3.14 and 3.14t, the LangGraph adapters on the oldest supported LangGraph on 3.11 and on the
+  newest on 3.14 ([LangGraph](#langgraph)), ruff, the wheel's own library found without
+  `SQLITE_URSULA_VFS`, the wheel
   hosted by a uv-managed CPython on `debian:trixie-slim` as `recipes/Dockerfile.uv` installs it,
   and on `python:3.13-slim`, whose SQLite is older than the extension supports,
   `python -m sqlite_ursula` failing with `host_unsupported`.
@@ -2619,7 +2663,8 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
   `python:3.13-alpine`, and the Python suites run there.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
-  in-memory cold store. The tests that script faults skip there.
+  in-memory cold store, with the newest supported LangGraph. The tests that script faults skip
+  there.
 - `sqlite-ursula-python-wheels.yml`, on pull requests that change the Python package or the
   workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
   builds it for npm (it loads on glibc 2.28 or newer, musl linked dynamically, macOS 11.0), packed

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 from typing import TypeVar
@@ -65,6 +66,12 @@ def autocommit_false() -> UrsulaError:
 
 
 ResetCallback = Callable[[UrsulaResetError], object]
+
+
+def database_of(path: str, read_only: bool) -> str:
+    """``sqlite3.connect``'s ``database`` for the bound file ``path``: a ``mode=ro`` URI, which
+    takes ``uri=True``, for a read-only connection."""
+    return f"file:{urllib.parse.quote(path)}?mode=ro" if read_only else path
 
 
 class UrsulaCursor(sqlite3.Cursor):
@@ -126,6 +133,7 @@ class UrsulaConnection(sqlite3.Connection):
         self.name = ""
         self.path = str(database)
         self._bound = False
+        self._read_only = False
         self._generation = _control.generation()
         self._closed = False
         self._listeners: list[ResetCallback] = []
@@ -135,12 +143,13 @@ class UrsulaConnection(sqlite3.Connection):
         #: An UrsulaError after which no transaction was open, until a statement succeeds.
         self._rolled_back: UrsulaError | None = None
 
-    def _bind(self, name: str, path: str) -> None:
+    def _bind(self, name: str, path: str, read_only: bool) -> None:
         """``open()``: the connection is on the binding of stream ``name``, whose file is
-        ``path``."""
+        ``path``, read-only when ``read_only``."""
         self.name = name
         self.path = path
         self._bound = True
+        self._read_only = read_only
         _events.track(self)
 
     if _AUTOCOMMIT is not None:
@@ -324,3 +333,30 @@ class UrsulaConnection(sqlite3.Connection):
             raise classified from error
         self._rolled_back = None
         return result
+
+
+def bound(db: object, caller: str) -> UrsulaConnection:
+    """``db``, which ``caller`` (a gate, an adapter) takes: ``invalid_argument`` unless ``open()``
+    made it, and ``forked`` in a child forked after the parent made it."""
+    if not isinstance(db, UrsulaConnection) or not db._bound:
+        raise invalid(f"{caller} takes connections open() made, not {db!r}")
+    db._check_fork()
+    return db
+
+
+def on_binding(db: UrsulaConnection) -> tuple[str, dict[str, Any]]:
+    """``sqlite3.connect``'s ``database`` and keywords for another connection on the binding of
+    ``db``, for a library that connects by itself, as aiosqlite does on a thread of its own.
+
+    The connection is of ``db``'s class and bound as ``db`` is, so its statements raise what their
+    errors classify as and it learns of a reset, and it is read-only when ``db`` is. Like any
+    connection on ``db.path``, it keeps the binding while it is open."""
+    cls = type(db)
+    name, path, read_only = db.name, db.path, db._read_only
+
+    def factory(*args: Any, **kwargs: Any) -> UrsulaConnection:
+        conn = cls(*args, **kwargs)
+        conn._bind(name, path, read_only)
+        return conn
+
+    return database_of(path, read_only), {"factory": factory, "uri": read_only}

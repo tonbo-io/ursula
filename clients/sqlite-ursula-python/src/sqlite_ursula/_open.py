@@ -22,7 +22,6 @@ import os
 import sqlite3
 import threading
 import time
-import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +32,7 @@ from ._args import invalid
 from ._args import seconds
 from ._connection import UrsulaConnection
 from ._connection import autocommit_false
+from ._connection import database_of
 from .errors import UrsulaError
 from .errors import UrsulaSetupError
 from .errors import UrsulaUnavailableError
@@ -358,10 +358,13 @@ def _connect(plan: _Plan, binding: dict[str, Any]) -> UrsulaConnection:
     path = str(binding["path"])
     kwargs = dict(plan.connect_kwargs)
     kwargs.setdefault("check_same_thread", False)
-    database = f"file:{urllib.parse.quote(path)}?mode=ro" if plan.read_only else path
     try:
         conn = sqlite3.connect(
-            database, timeout=plan.busy, factory=plan.factory, uri=plan.read_only, **kwargs
+            database_of(path, plan.read_only),
+            timeout=plan.busy,
+            factory=plan.factory,
+            uri=plan.read_only,
+            **kwargs,
         )
     except (sqlite3.Error, TypeError, ValueError) as error:
         raise UrsulaSetupError(
@@ -371,7 +374,7 @@ def _connect(plan: _Plan, binding: dict[str, Any]) -> UrsulaConnection:
             "fix",
             cause=error,
         ) from error
-    conn._bind(str(binding["name"]), path)
+    conn._bind(str(binding["name"]), path, plan.read_only)
     return conn
 
 

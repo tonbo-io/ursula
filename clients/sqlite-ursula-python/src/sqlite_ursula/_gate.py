@@ -33,6 +33,7 @@ from . import _events
 from ._args import invalid
 from ._args import limit
 from ._connection import UrsulaConnection
+from ._connection import bound
 from .errors import UrsulaError
 from .errors import UrsulaResetError
 from .errors import UrsulaWriteRefusedError
@@ -41,13 +42,7 @@ from .errors import UrsulaWriteRefusedError
 def _databases(dbs: tuple[object, ...]) -> tuple[UrsulaConnection, ...]:
     if not dbs:
         raise invalid("gate needs at least one database")
-    checked: list[UrsulaConnection] = []
-    for db in dbs:
-        if not isinstance(db, UrsulaConnection) or not db._bound:
-            raise invalid(f"gate takes connections open() made, not {db!r}")
-        db._check_fork()
-        checked.append(db)
-    return tuple(checked)
+    return tuple(bound(db, "gate") for db in dbs)
 
 
 def _passing(error: Exception, dbs: tuple[UrsulaConnection, ...]) -> BaseException | None:
