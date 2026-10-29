@@ -77,6 +77,8 @@ impl Transport for HttpTransport {
             refresh: attempt.refresh_token,
             fresh: attempt.fresh_connection,
         };
+        let token = auth::token(resend.refresh);
+        let token = token.as_deref();
         let limits = Timeouts::new(
             u64::try_from(request.body.len()).unwrap_or(u64::MAX),
             request.answer_bytes,
@@ -87,19 +89,34 @@ impl Transport for HttpTransport {
         // included, and never chunks it.
         let sent = match request.method {
             Method::Head => limits
-                .apply(with_headers(prepared(agent.head(&url), resend), request))
+                .apply(with_headers(
+                    prepared(agent.head(&url), resend, token),
+                    request,
+                ))
                 .call(),
             Method::Get => limits
-                .apply(with_headers(prepared(agent.get(&url), resend), request))
+                .apply(with_headers(
+                    prepared(agent.get(&url), resend, token),
+                    request,
+                ))
                 .call(),
             Method::Put => limits
-                .apply(with_headers(prepared(agent.put(&url), resend), request))
+                .apply(with_headers(
+                    prepared(agent.put(&url), resend, token),
+                    request,
+                ))
                 .send(&request.body[..]),
             Method::Post => limits
-                .apply(with_headers(prepared(agent.post(&url), resend), request))
+                .apply(with_headers(
+                    prepared(agent.post(&url), resend, token),
+                    request,
+                ))
                 .send(&request.body[..]),
             Method::Delete => limits
-                .apply(with_headers(prepared(agent.delete(&url), resend), request))
+                .apply(with_headers(
+                    prepared(agent.delete(&url), resend, token),
+                    request,
+                ))
                 .call(),
         };
         let mut response = match sent {
@@ -110,6 +127,11 @@ impl Transport for HttpTransport {
         // alone and reads no more: the connection, its body unread, is dropped rather than pooled.
         // A `206` body is read whole.
         let status = response.status().as_u16();
+        if status == 401
+            && let Some(token) = token
+        {
+            auth::refused(token);
+        }
         let read = match request.whole_answer_cut().filter(|_| status == 200) {
             Some(n) => {
                 let mut head = Vec::new();
@@ -360,7 +382,7 @@ fn tls() -> TlsConfig {
 /// `append`, `put_idempotent`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Resend {
-    /// The attempt's token was refused: the next one reads the token again (`authorized`).
+    /// The attempt's token was refused: the next one reads the token again (`auth::token`).
     pub(crate) refresh: bool,
     /// The attempt got no answer: the next one takes a new connection (`RETRY_IDLE_AGE`).
     pub(crate) fresh: bool,
@@ -374,10 +396,14 @@ pub(crate) struct Resend {
 /// first: each would cost its whole timeout.
 const RETRY_IDLE_AGE: Duration = Duration::from_secs(1);
 
-/// `req` for an attempt: with the token (`authorized`), on a new connection after an attempt that
+/// `req` for an attempt: with `token` (`authorized`), on a new connection after an attempt that
 /// got no answer (`Resend`).
-pub(crate) fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq::RequestBuilder<B> {
-    let req = authorized(req, resend.refresh);
+pub(crate) fn prepared<B>(
+    req: ureq::RequestBuilder<B>,
+    resend: Resend,
+    token: Option<&str>,
+) -> ureq::RequestBuilder<B> {
+    let req = authorized(req, token);
     if resend.fresh {
         req.config().max_idle_age(RETRY_IDLE_AGE).build()
     } else {
@@ -388,13 +414,13 @@ pub(crate) fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq:
 /// A token went out in clear (`authorized`), and the log said so.
 static IN_CLEAR_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// `req` with the bearer token, when there is one; `refresh` reads the token file again. A token
-/// sent over plain HTTP to another host crosses the network in clear: logged once per process.
+/// `req` with the bearer token, when there is one. A token sent over plain HTTP to another host
+/// crosses the network in clear: logged once per process.
 pub(crate) fn authorized<B>(
     req: ureq::RequestBuilder<B>,
-    refresh: bool,
+    token: Option<&str>,
 ) -> ureq::RequestBuilder<B> {
-    let Some(token) = auth::token(refresh) else {
+    let Some(token) = token else {
         return req;
     };
     if let Some(uri) = req.uri_ref().filter(|uri| in_clear(uri))

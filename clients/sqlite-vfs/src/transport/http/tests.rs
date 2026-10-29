@@ -349,6 +349,42 @@ fn a_connection_closed_after_the_body_is_lost() {
     server.join().unwrap();
 }
 
+// A `401` to the API key's token brings the key's refresh forward: the token no longer counts as
+// valid, so a host that uses the key again gets the next one, which requests carry from then on.
+// The only test that gives the process a key (requests of other tests running meanwhile carry its
+// token), and it forgets the key at the end. The canned answers give only the token answer's
+// wire format.
+#[test]
+fn a_401_to_the_keys_token_refreshes_it() {
+    let token = |token: &str| {
+        let body = format!(r#"{{"access_token": "{token}", "expires_in": 3600}}"#);
+        format!(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (endpoint, exchanges) = serve(vec![token("t1"), token("t2")]);
+    let wait = Duration::from_secs(30);
+    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait).unwrap();
+
+    let (url, refusing) = serve(vec![answer("401 Unauthorized")]);
+    let exchange = HttpTransport::new(url).send(&create(), Attempt::default());
+    assert!(
+        matches!(&exchange, Exchange::Answered(a) if a.status == 401),
+        "{exchange:?}"
+    );
+    let sent = refusing.join().unwrap();
+    assert_eq!(request_header(&sent[0], "authorization"), Some("Bearer t1"));
+
+    crate::auth::use_key("k-test", &endpoint, Some("streams"), wait).unwrap();
+    assert_eq!(crate::auth::token(false).as_deref(), Some("t2"));
+    crate::auth::forget_key();
+    let sent = exchanges.join().unwrap();
+    for head in &sent {
+        assert_eq!(request_header(head, "authorization"), Some("Bearer k-test"));
+    }
+}
+
 #[test]
 fn a_redirect_is_never_followed() {
     let (elsewhere, _refusing) = refusing();

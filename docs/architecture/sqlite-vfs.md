@@ -623,17 +623,52 @@ Tests:
 - No redirect is followed, so the stream URL names a gateway or a single node.
 - The DNS cache serves a host's addresses for 30 s after a lookup, and after a failed lookup keeps
   the last addresses for up to 10 minutes.
-- One bearer token per process: the last open's `token` (a string, or the latest a provider handed
-  out, see [Tokens](#tokens)), `ursula_set_token`, or the file `URSULA_VFS_TOKEN_FILE` names,
-  re-read when it changes and after a `401`. A token change sends every request a `401` blocked
+- One bearer token per process, from the first of three sources: the last open's `token` (a
+  string, or the latest a provider handed out, see [Tokens](#tokens)) or `ursula_set_token`, else
+  the file `URSULA_VFS_TOKEN_FILE` names, re-read when it changes and after a `401`, else the
+  token an API key was last exchanged for. A token change sends every request a `401` blocked
   again at once, with no wait for the 30 s retry: the replicators', the opens' and the rebuilds'
   alike, through the retry policy they share (`Core::token_changed`), and a snapshot attempt a
   `401` failed. Other waits keep their timers and jitter. A `401` to an attempt sent before the
   change sends the request again under the new token instead of blocking it. A token set changes
   at once. A token in the file changes when a read finds it: any request's, or the driver thread's
   check of the file every second while requests carry the file's token (no token set) and an open
-  or a writer may send requests. A private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent
-  over `http://` to a host that is not a loopback address logs `token_in_clear` once.
+  or a writer may send requests. A key's token changes when its exchange hands out a new one. A
+  private CA bundle goes in `URSULA_VFS_CA_FILE`. A token sent over `http://` to a host that is not
+  a loopback address logs `token_in_clear` once.
+- An API key is exchanged at its token endpoint (`auth/exchange.rs`): a `POST` with the key as the
+  bearer token and `{"audience": ...}` as the body, answered with `access_token` and
+  `expires_in` in seconds. Other members of the answer are skipped, nested ones included. It goes
+  out on the agent of appends and reads, so it trusts the same roots, takes the same proxy and
+  follows no redirect. The endpoint is `https://`, or `http://` to a loopback host. A refresher
+  thread exchanges the key by its schedule (`auth/key.rs`), only while an open, a bound database
+  or an import may send requests carrying its token, or while a host waits for its token. An open
+  counts from when it is asked for.
+  - A token is refreshed after 70 to 80% of its lifetime, and at least 1 s after it arrived. A
+    token that lives shorter counts as a failed exchange.
+  - A failed exchange is retried after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, and a
+    `429` no sooner than its `Retry-After` (up to a minute). The last token serves meanwhile,
+    expired or not. A host waiting for a token does not cut the backoff short.
+  - A key refused (`401`, `403`), a status the exchange cannot use (a redirect, another `4xx`) or
+    a panic inside the exchange is retried only every 15 to 30 s. A host waiting for a token fails
+    at once, and a host's next use of the key tries again at once. A refused key hands no host
+    its token, even an unexpired one, until an exchange gives it a new one. Other failures leave
+    the last token serving.
+  - The first failure of a run logs `token_exchange_failed`, and so does the first failure in it
+    that is one of those (`permanent=true`). The token that ends the run logs
+    `token_exchange_recovered`.
+  - A `401` to the key's token brings its refresh forward to at once, at least 1 s after the token
+    arrived, with one exchange out at a time, and a host waiting for a token waits for the next
+    one. Tokens refused one after another back off as failed exchanges do. A token that lasts
+    until its refresh ends that run. A `401` while an exchange is out or a retry is scheduled
+    leaves the schedule alone, but no host is handed that token again.
+  - The process holds one key. Another one is refused while a host waits for the key's token or
+    was handed one less than 60 s ago (it asks for its open meanwhile), and while an open, a bound
+    database or an import may send requests that can carry its token, since they would all carry
+    the other key's tokens from then on. A key that never got a token, or was refused since its
+    last token arrived, gives way. The key in its place carries the last token of the key it
+    replaced until its own first one, so requests already out never go without a token.
+  - Neither the key nor a token is logged or returned.
 
 Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `every_body_carries_content_length`, `time_limits_scale_with_the_body_and_the_answer`,
@@ -644,7 +679,27 @@ Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
 `a_failed_lookup_past_the_stale_limit_fails_as_never_sent`. Tokens: `auth.rs`
 `tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`,
 `the_read_that_finds_a_new_token_signals_the_change`,
-`a_lent_token_goes_back_unless_another_was_set_since`, `replicator/tests/machine.rs`
+`a_lent_token_goes_back_unless_another_was_set_since`,
+`another_key_is_refused_while_requests_may_go_out`,
+`the_log_reports_a_runs_start_its_turn_to_permanent_and_its_end`,
+`a_key_is_exchanged_only_while_active`, `key_errors_have_kinds`, `transport/http/tests.rs`
+`a_401_to_the_keys_token_refreshes_it`, `auth/key.rs`
+`a_refresh_is_due_at_70_to_80_percent_of_the_lifetime`,
+`failures_back_off_from_1_s_to_30_s_jittered_down_to_half`,
+`exchanges_go_out_one_at_a_time_while_active_and_refresh_on_schedule`,
+`a_failed_exchange_keeps_the_last_token_and_backs_off`,
+`a_429_is_retried_no_sooner_than_its_retry_after`,
+`a_token_shorter_lived_than_a_refresh_is_a_failure`,
+`a_401_refreshes_at_once_but_not_within_1_s_of_arrival`,
+`tokens_refused_in_a_row_back_off_until_one_serves_its_time`,
+`an_inactive_source_refreshes_once_active_again`,
+`a_refused_key_retries_slowly_until_a_host_uses_it_again`, `only_a_refusal_stops_a_key_serving`,
+`a_401_always_marks_the_token`,
+`a_key_in_place_of_another_carries_its_token_until_its_own`,
+`an_exchange_left_out_is_due_again_once_the_refresher_restarts`, `auth/exchange.rs`
+`a_token_answer_gives_the_token_and_its_lifetime`, `failures_are_classified_by_status`,
+`a_key_goes_only_to_a_confidential_endpoint_and_never_prints`, `json.rs`
+`nested_members_are_skipped_but_checked`, `replicator/tests/machine.rs`
 `a_token_change_resends_a_request_blocked_unauthorized_at_once`,
 `a_token_changed_while_the_refused_attempt_was_out_goes_at_once`,
 `a_token_change_leaves_a_resend_in_backoff_to_its_timer`, `driver/tests.rs`
@@ -1976,28 +2031,39 @@ since neither e2e server checks tokens.
   "snapshot": { "offset": 1048576, "age_ms": 1000, "failures": 0, "error": null, "log_bytes": 123, "due_bytes": 8388608 },
   "refused": null,                  // the last write refused with nothing committed: { kind, action, class, message }
   "salvage": [],                    // { dir, reason, time, incarnation, stream_incarnation, acknowledged_position, unacknowledged, plain }
-  "reset": null                     // { kind, action, class, message }
+  "reset": null,                    // { kind, action, class, message }
+  "token": { "source": "key",       // set | file | key | none
+             "key": { "state": "fresh", "expires_in_ms": 600000, "refresh_in_ms": 380000, "failures": 0, "error": null } }
 }
 ```
 
 - `replication.condition` names the retrying or blocked condition of [Answers](#answers):
   `retrying`, `request_too_large`, `unauthorized`, `payment_required`, `forbidden`, `redirected`,
   `wrong_cluster`, `no_server_identity`, `protocol_mismatch`, `rejected`.
+- `token` is the process's: `source` names where the token requests carry comes from
+  ([Transport](#transport)), and `key` is `null` until the process holds an API key. Then it
+  shows the key's schedule: `state` (`pending` before its first token, `exchanging`, `fresh`,
+  `expired` once its token expired or was refused `401` and no exchange is out, for instance
+  because nothing sends requests or requests carry a set token or the token file's, `failing`
+  while a retry is scheduled), the time until its token expires and until its next exchange
+  (`null` while one is out), the failed exchanges in a row and the last failure's
+  `{kind, action, message}`. It never shows the key or a token.
 - `ursula_stats(path)` drains per-commit measurements (bytes, pages, time in the log and the VFS),
   at most 8,192 of each kind between drains, and reports what it dropped.
 - Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.
   Events include `open`, `provisional`, `live`, `rekey`, `salvaged`, `reset`, `recut`, `log_cut`,
-  `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`,
-  `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`, `setting_adjusted`,
-  `host_dir_unreadable` (the host directory's path cannot be read, so it counts as absent),
-  `write_hold_expired` (a write transaction waited 60 s at the host's hold and went on),
-  `write_hold_failed` (the hold file could not be opened or tried, so writes do not wait) and
-  `panic`.
+  `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`, `retention_failed`,
+  `dns_stale`, `token_in_clear`, `token_file_unreadable`, `token_exchange_failed`,
+  `token_exchange_recovered`, `token_refresher_failed`, `setting_adjusted`, `host_dir_unreadable`
+  (the host directory's path cannot be read, so it counts as absent), `write_hold_expired` (a write
+  transaction waited 60 s at the host's hold and went on), `write_hold_failed` (the hold file could
+  not be opened or tried, so writes do not wait) and `panic`.
 - Alert on a growing `commits.pending_bytes`, any `replication.condition` that stays, refused
   writes, any reset, and a `snapshot.log_bytes` that stays above a few times `due_bytes`.
 
 Tests: `status.rs` `a_handed_out_binding_reports_live_or_provisional`, `synced_names_its_target`,
-`events_render_as_one_object`, `stats_report_what_was_dropped`, `stats.rs`
+`the_token_names_its_source_and_the_keys_schedule`, `events_render_as_one_object`,
+`stats_report_what_was_dropped`, `stats.rs`
 `a_database_nobody_drains_keeps_a_bounded_number_of_each_kind`, `log.rs`
 `values_are_quoted_only_when_needed`.
 

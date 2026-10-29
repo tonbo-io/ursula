@@ -1,6 +1,7 @@
 //! The JSON the SQL functions return: `ursula_status` (design: Status), `ursula_stats`,
 //! `ursula_events` and the results of `ursula_open` and `ursula_synced`.
 
+use crate::auth::TokenStatus;
 use crate::db::Binding;
 use crate::db::Opened;
 use crate::db::by_id;
@@ -196,7 +197,33 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
         ("refused", refused),
         ("salvage", json::array(&salvage)),
         ("reset", reset_json),
+        ("token", token_json(&crate::auth::status())),
     ]))
+}
+
+/// The process's token in `status().token`: its source and, while the process holds an API key,
+/// the key's schedule (design: Status). Never the key or a token.
+fn token_json(t: &TokenStatus) -> String {
+    let key = t.key.as_ref().map_or_else(null, |k| {
+        let ms = |v: Option<u64>| v.map_or_else(null, |v| v.to_string());
+        object(&[
+            ("state", json_str(k.state.as_str())),
+            ("expires_in_ms", ms(k.expires_in_ms)),
+            ("refresh_in_ms", ms(k.refresh_in_ms)),
+            ("failures", k.failures.to_string()),
+            (
+                "error",
+                k.error.as_ref().map_or_else(null, |e| {
+                    object(&[
+                        ("kind", json_str(e.kind().as_str())),
+                        ("action", json_str(e.kind().action().as_str())),
+                        ("message", json_str(&e.to_string())),
+                    ])
+                }),
+            ),
+        ])
+    });
+    object(&[("source", json_str(t.source.as_str())), ("key", key)])
 }
 
 /// A salvage in `status().salvage`: its directory and its manifest's fields.
@@ -419,6 +446,11 @@ mod tests {
     use super::state;
     use super::stats_json;
     use super::synced_json;
+    use super::token_json;
+    use crate::auth::ExchangeError;
+    use crate::auth::KeyView;
+    use crate::auth::Source;
+    use crate::auth::TokenStatus;
     use crate::driver::BindingId;
     use crate::driver::DriverEvent;
     use crate::driver::Life;
@@ -513,6 +545,34 @@ mod tests {
                 r#""message":"synced() failed: not_bound: fix the cause, then open() the database again."},"#,
                 r#"{"event":"opened","request":6,"ok":false,"error":{"kind":"stream_state","action":"fix","class":"setup","message":"stream_state: NotSqlite"}},"#,
                 r#"{"event":"gap","dropped":2}]}"#
+            )
+        );
+    }
+
+    // The token's status names its source and, with a key, the key's schedule and last failure.
+    #[test]
+    fn the_token_names_its_source_and_the_keys_schedule() {
+        let none = TokenStatus {
+            source: Source::File,
+            key: None,
+        };
+        assert_eq!(token_json(&none), r#"{"source":"file","key":null}"#);
+        let failing = TokenStatus {
+            source: Source::Key,
+            key: Some(KeyView {
+                state: crate::auth::KeyState::Failing,
+                expires_in_ms: Some(0),
+                refresh_in_ms: Some(2_000),
+                failures: 2,
+                error: Some(ExchangeError::Refused { status: 401 }),
+            }),
+        };
+        assert_eq!(
+            token_json(&failing),
+            concat!(
+                r#"{"source":"key","key":{"state":"failing","expires_in_ms":0,"refresh_in_ms":2000,"#,
+                r#""failures":2,"error":{"kind":"unauthorized","action":"fix","#,
+                r#""message":"the token endpoint refused the API key (401)"}}}"#
             )
         );
     }
