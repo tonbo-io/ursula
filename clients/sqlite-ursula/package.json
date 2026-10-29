@@ -1,7 +1,7 @@
 {
   "name": "@tonbo/sqlite-ursula",
   "version": "0.11.2",
-  "description": "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension: commits are local and replicate in the background, with Pi Durable's official SqliteStorage on top in @tonbo/sqlite-ursula/pi, Tonbo databases opened by name in @tonbo/sqlite-ursula/tonbo, and Pi storage on one by name in @tonbo/sqlite-ursula/tonbo/pi",
+  "description": "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension: commits are local and replicate in the background, with Pi Durable's official SqliteStorage on top in @tonbo/sqlite-ursula/pi",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

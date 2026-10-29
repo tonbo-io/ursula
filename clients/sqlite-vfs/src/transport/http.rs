@@ -127,11 +127,6 @@ impl Transport for HttpTransport {
         // alone and reads no more: the connection, its body unread, is dropped rather than pooled.
         // A `206` body is read whole.
         let status = response.status().as_u16();
-        if status == 401
-            && let Some(token) = token
-        {
-            auth::refused(token);
-        }
         let read = match request.whole_answer_cut().filter(|_| status == 200) {
             Some(n) => {
                 let mut head = Vec::new();

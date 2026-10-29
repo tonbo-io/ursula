@@ -187,26 +187,19 @@ Install Pi Durable next to the package:
 npm install @tonbo/sqlite-ursula @earendil-works/pi-durable
 ```
 
-Persist a Pi harness in a Tonbo database with Pi's own idiom, only the storage swapped:
+Persist a Pi harness in an Ursula stream with Pi's own idiom, only the storage swapped. `@tonbo/sqlite-ursula/pi` opens the storage by URL:
 
 ```ts
 import { Harness } from "@earendil-works/pi-durable";
-import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/tonbo/pi";
+import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 
-const harness = await Harness.open(await openUrsulaPiStorage("harness-1"), { models, registry }, context);
+const storage = await openUrsulaPiStorage("https://ursula.example.com/pi/harness-1", { closeTimeoutMs: 10_000 });
+const harness = await Harness.open(storage, { models, registry }, context);
 // ...
 await harness.close(context); // closes the storage too
 ```
 
-`@tonbo/sqlite-ursula/tonbo/pi` opens the database by name with a Tonbo API key, as [Tonbo databases](#tonbo-databases) describes, and keeps the Streams token fresh. `openUrsulaPiStorage(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the options of the `/pi` entry's `openUrsulaPiStorage` below and fails with the same errors as the `/tonbo` entry's `open`. Without `dir` it uses the default cache root. On Pi 1.0 to 1.3, `harness.close(context)` closes the storage the harness was opened with, so the storage needs no close of its own.
-
-For a stream of your own Ursula, `@tonbo/sqlite-ursula/pi` opens the storage by URL:
-
-```ts
-import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
-
-const storage = await openUrsulaPiStorage("https://ursula.example.com/pi/harness-1", { closeTimeoutMs: 10_000 });
-```
+Without `dir` it uses the default cache root. On Pi 1.0 to 1.3, `harness.close(context)` closes the storage the harness was opened with, so the storage needs no close of its own.
 
 `openUrsulaPiStorage` opens the stream with `open` and runs Pi's own node driver on it. Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it.
 
@@ -216,39 +209,9 @@ const storage = await openUrsulaPiStorage("https://ursula.example.com/pi/harness
 
 `@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.4.0`, and npm refuses the install with `ERESOLVE` outside it.
 
-## Tonbo databases
+## Tonbo databases by name
 
-`@tonbo/sqlite-ursula/tonbo` opens a database of a Tonbo account by name, with a Tonbo API key, and keeps the stream's tokens fresh:
-
-```ts
-import { open } from "@tonbo/sqlite-ursula/tonbo";
-
-const db = await open("notes"); // or the database's https:// URL, which skips the lookup
-```
-
-`open(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the options of the root entry's `open` and returns the same `UrsulaDatabase`. Its signal (30 s by default) also bounds the lookup.
-
-- **The key.** `apiKey`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`. The login file must be a regular file with no group or other permission bit (mode `0600`). A symlink, a non-regular file or a file open to others is refused with `credentials_refused` and never read, and no other source is tried. An expired login, or one of another version, fails with `invalid_api_key`.
-- **The lookup.** `GET https://api.tonbo.dev/v1/databases/{name}` with the key as the bearer token returns the database's stream URL. A key the API answers with `exchange_required` is exchanged at the token endpoint with no audience first, and that token is kept until it expires. A database still being created is waited for. A `429` is retried after its `Retry-After`, and a `5xx` or a network failure after a backoff.
-- **Streams tokens.** Requests to the stream carry tokens the extension exchanges for the key at `POST https://tonbo.dev/api/iam/token` with the audience `https://streams.tonbo.dev`, and refreshes in the background beside replication, so a busy event loop never delays a refresh. The open waits for the first one, so a key the token endpoint refuses fails the open with `invalid_api_key`. The tokens go only to a stream URL that is `https://`, or `http://` to a loopback host, and any other fails with `invalid_url`. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves them instead, and then opening a URL needs no key. The extension reads the file only while no open of the process has set a token.
-- **One key per process.** The process holds one key for Streams tokens. Once the first key held a token, an open by name without `token` and with a second key fails with `UrsulaSetupError` `invalid_argument` while any database of the process may send requests, and for 60 s after an open was handed the first key's token. A second key with a `token`, or with `URSULA_VFS_TOKEN_FILE`, only looks the name up and is never refused. An open with a string `token` or a provider (see [TLS and tokens](#tls-and-tokens)) replaces the key's tokens, and the next open by name without `token` gives them back. One token serves every database of the process.
-- **Origins.** `apiOrigin` or `TONBO_API_ORIGIN` names another Management API, and `authOrigin` or `TONBO_AUTH_ORIGIN` another token endpoint origin. Each must be `https://`, or `http://` to a loopback host. The key goes to these two origins only, redirects are never followed, and a Streams token never goes to the Management API. An answer outside the APIs' contracts, such as a `404` from a wrong origin, fails with `invalid_argument` and names the option and variable to check. No key or token is logged.
-- **TLS and proxies.** The lookup and the token exchanges go out from the extension, like replication: they trust the certificate authorities bundled with it, or only those in `URSULA_VFS_CA_FILE`, and take the environment's proxy. `NODE_EXTRA_CA_CERTS` does not apply to them.
-
-Errors are `TonboError`, an `UrsulaError` with action `fix`, whose `fix` field names the variable to set or the command to run, and whose `requestId` is the API's:
-
-| kind | when | fix |
-| --- | --- | --- |
-| `missing_credentials` | no key from any source | `Set TONBO_API_KEY, or run: tonbo login` |
-| `credentials_refused` | the login file is a symlink, not a regular file, or open to others | `Run: chmod 600 <path>`, or replace the file |
-| `invalid_api_key` | the key was refused (`401`), cannot read the database (`403`), or the login expired | a valid `apiKey` or `TONBO_API_KEY`, or `Run: tonbo login`, and for a `403`, `Use an API key that can read database "<name>"` |
-| `database_not_found` | no database of that name in the key's account (`404`), or it is being deleted | `Run: tonbo database create <name>` |
-
-When the signal fires while the Tonbo API does not answer, or the database is still being created, `open` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`). Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
-
-### Other openers
-
-`resolveDatabase` does the lookup without the open. It takes `apiKey`, `apiOrigin`, `authOrigin`, `token` and `signal`, and returns `{ url, token }`: the stream URL, and `token` as you passed it, or `undefined` when the key's tokens serve. It returns once the extension holds the key's first Streams token, which the extension keeps fresh, so you run no token refresher of your own. Pass both to another opener. It fails with the same errors as `open`, a key the token endpoint refuses a Streams token included. For Pi Durable, `@tonbo/sqlite-ursula/tonbo/pi` does both in one call (see [Pi Durable](#pi-durable)).
+Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, and pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can be a provider (see [TLS and tokens](#tls-and-tokens)).
 
 ## Other hosts
 

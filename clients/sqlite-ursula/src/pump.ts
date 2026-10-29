@@ -1,9 +1,8 @@
 // The pump (design: Pump): this thread's view of the extension's events. Calls into the extension
-// on this thread never wait (timeout 0): `ursula_open`, `tonbo_resolve` and `ursula_synced` either
+// on this thread never wait (timeout 0): `ursula_open` and `ursula_synced` either
 // answer at once or hand back a request or a ticket, which an event later resolves. One worker per
 // JavaScript thread (pump-worker.ts) waits for those events and posts them here, where they
-// complete `open()` and the `/tonbo` entry's resolve, resolve or reject `synced()` and fire the
-// `reset` listeners.
+// complete `open()`, resolve or reject `synced()` and fire the `reset` listeners.
 //
 // `synced()` tickets resolve through their binding's watermark (`synced {path, through}`): every
 // ticket of the path up to `through` resolved. The extension keeps only the latest watermark of a
@@ -33,7 +32,7 @@ export interface ResetTarget {
 
 /** One event of `ursula_events` (clients/sqlite-vfs/src/status.rs `events_json`). */
 export type PumpEvent =
-	| { event: "opened" | "resolved"; request: number; ok: boolean }
+	| { event: "opened"; request: number; ok: boolean }
 	| { event: "synced"; path: string | null; through: number }
 	| ({ event: "sync_failed"; ticket: number } & Described)
 	| ({ event: "reset"; path: string | null } & Described)
@@ -185,8 +184,8 @@ export function waitTicket(path: string, ticket: number, signal: AbortSignal | u
 class Pump {
 	readonly #worker: Worker;
 	/**
-	 * Pending opens and resolves by request: each waiter is woken once by the request's `opened` or
-	 * `resolved` event, a gap, or the pump's end.
+	 * Pending opens by request: each waiter is woken once by the request's `opened` event, a gap, or
+	 * the pump's end.
 	 */
 	readonly #requests = new Map<number, Set<() => void>>();
 	#failed = false;
@@ -231,10 +230,9 @@ class Pump {
 	}
 
 	/**
-	 * Waits until `request` of `ursula_open` or `tonbo_resolve` may have ended: its `opened` or
-	 * `resolved` event, a gap in the events, or the pump's end, after which the caller calls again
-	 * with the same arguments. Rejects with `signal.reason` when `signal` fires: the caller then
-	 * cancels the request.
+	 * Waits until `request` of `ursula_open` may have ended: its `opened` event, a gap in the events,
+	 * or the pump's end, after which the caller calls again with the same arguments. Rejects with
+	 * `signal.reason` when `signal` fires: the caller then cancels the request.
 	 */
 	completed(request: number, signal: AbortSignal): Promise<void> {
 		return new Promise((resolve, reject) => {
@@ -269,7 +267,6 @@ class Pump {
 		for (const event of events) {
 			switch (event.event) {
 				case "opened":
-				case "resolved":
 					this.#wake(event.request);
 					break;
 				case "synced":
@@ -333,8 +330,7 @@ class Pump {
 	/**
 	 * Events fell out of the queue before the worker read them. Every pending ticket is asked for
 	 * again under a new ticket, which no watermark of the batch covers, so a ticket whose failure
-	 * the gap dropped never passes for resolved. Opens and resolves ask again, and resets are read
-	 * from status.
+	 * the gap dropped never passes for resolved. Opens ask again, and resets are read from status.
 	 */
 	#gap(): void {
 		for (const request of [...this.#requests.keys()]) this.#wake(request);

@@ -75,12 +75,7 @@ fn kinds() -> Vec<ErrorKind> {
         | ErrorKind::Cancelled
         | ErrorKind::NotBound
         | ErrorKind::Forked
-        | ErrorKind::Internal
-        | ErrorKind::InvalidName
-        | ErrorKind::MissingCredentials
-        | ErrorKind::CredentialsRefused
-        | ErrorKind::InvalidApiKey
-        | ErrorKind::DatabaseNotFound => true,
+        | ErrorKind::Internal => true,
     };
     let mut all: Vec<ErrorKind> = [
         ErrorKind::BacklogFull,
@@ -108,11 +103,6 @@ fn kinds() -> Vec<ErrorKind> {
         ErrorKind::NotBound,
         ErrorKind::Forked,
         ErrorKind::Internal,
-        ErrorKind::InvalidName,
-        ErrorKind::MissingCredentials,
-        ErrorKind::CredentialsRefused,
-        ErrorKind::InvalidApiKey,
-        ErrorKind::DatabaseNotFound,
     ]
     .to_vec();
     all.extend(RESETS.map(ErrorKind::Reset));
@@ -207,11 +197,6 @@ fn every_kind_has_the_later_of_its_token_whatever_produced_it() {
         ("cancelled", Later::No),
         ("not_bound", Later::No),
         ("forked", Later::No),
-        ("invalid_name", Later::No),
-        ("missing_credentials", Later::No),
-        ("credentials_refused", Later::No),
-        ("invalid_api_key", Later::No),
-        ("database_not_found", Later::No),
     ];
     for (token, later) in table {
         assert_eq!(seen.get(token), Some(&later), "{token}");

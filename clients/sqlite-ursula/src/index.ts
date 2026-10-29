@@ -19,15 +19,12 @@
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
 // - token.ts: the bearer token, a string or the latest from a provider, refreshed ahead of expiry
-//   and after a 401, until a Tonbo API key's tokens take over.
+//   and after a 401.
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-// - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key, or
-//   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes,
-//   through the extension's `tonbo_resolve`.
-// - tonbo-pi.ts: the `/tonbo/pi` entry, which opens Pi storage on a Tonbo database by name: the
-//   `/tonbo` entry's resolve, then the `/pi` entry's open.
+// - tonbo.ts and tonbo-pi.ts: the `/tonbo` and `/tonbo/pi` entries, which opened Tonbo databases
+//   by name until 0.11.3 and now only throw an error that says where that moved. They go in 0.12.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";

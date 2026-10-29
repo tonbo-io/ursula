@@ -13,10 +13,6 @@
 // extension takes an equal token as no change, so a refused request would never go out again. A
 // retry is due by the expiry of `previous` at the latest, when a provider's cache turns over.
 //
-// A Tonbo API key's tokens, which the extension exchanges and refreshes itself (the `/tonbo` entry),
-// take over the same way: the extension clears the token set, and `useKeyTokens` stops the provider
-// and withdraws a token it set since.
-//
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
 // which the caller awaits. It stops once no binding the thread opened is bound, whatever token its
@@ -127,7 +123,7 @@ class Source {
 	#current: Fresh | undefined;
 	/**
 	 * The token the provider last handed out, also once a 401 dropped it, which its next call gets as
-	 * `previous`. A stop forgets it, unless the server refused it and no string or key replaced it.
+	 * `previous`. A stop forgets it, unless the server refused it and no string replaced it.
 	 */
 	#held: Fresh | undefined;
 	/**
@@ -234,7 +230,7 @@ class Source {
 
 	/**
 	 * No provider from now on: the call in flight is abandoned, and the opens waiting go on with the
-	 * process's token, which `why` set. `replaced`: a string or a key's tokens replaced the provider's.
+	 * process's token, which `why` set. `replaced`: a string replaced the provider's token.
 	 * Otherwise a token the server refused is still the process's, so the next call gets it as `previous`.
 	 */
 	stop(why: string, replaced: boolean): void {
@@ -473,15 +469,4 @@ export function useStringToken(token: string): void {
 	// Stopped already, it still forgets a token the server refused.
 	source.stop("an open with a string token replaced it", true);
 	apply(token);
-}
-
-/**
- * The `/tonbo` entry's resolve made a Tonbo API key the process's source of Streams tokens, which the
- * extension exchanges and refreshes, and cleared the token set: requests carry the key's tokens from
- * now on, so this thread's provider stops, and a token it set since the resolve is withdrawn.
- */
-export function useKeyTokens(): void {
-	const serving = source.provider !== undefined;
-	source.stop("an open with a Tonbo API key replaced it", true);
-	if (serving) call("SELECT ursula_set_token('', '')");
 }

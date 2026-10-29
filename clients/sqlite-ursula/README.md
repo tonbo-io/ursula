@@ -122,7 +122,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (retry after `synced()`), `unsupported` (fix), `too_large` (fix: the commit's pages take more than `URSULA_VFS_MAX_COMMIT_BYTES`, 128 MiB by default, so split the transaction or raise the limit, at most 1 GiB) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` when its signal fired first, also while it waited for a token provider (`unavailable`, action `retry`) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_argument`, `invalid_name` (an empty name passed to `/tonbo`), `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `no_server_identity`, `protocol_mismatch`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 An `UrsulaSetupError` says `fix`, except `in_use` and `claim_races`, which say `retry`, and `internal`, which says `reopen`. An open whose last condition was `wrong_cluster`, `no_server_identity` or `protocol_mismatch` when its signal fired throws an `UrsulaSetupError` of that kind, not an `UrsulaUnavailableError`. A bound database that meets one of them reports it as `status().replication.condition`, with no reset, and goes on once the route or the server is fixed.
 
@@ -132,67 +132,31 @@ After a reset, pending `synced()` calls reject first, then the `reset` listeners
 
 ## Pi Durable
 
-Persist a Pi harness in a Tonbo database with Pi's own idiom, only the storage swapped:
+Persist a Pi harness in an Ursula stream with Pi's own idiom, only the storage swapped. `@tonbo/sqlite-ursula/pi` runs Pi Durable's official node `SqliteStorage` on the stream at a URL:
 
 ```ts
 import { Harness } from "@earendil-works/pi-durable";
-import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/tonbo/pi";
+import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 
-const harness = await Harness.open(await openUrsulaPiStorage("harness-1"), { models, registry }, context);
+const storage = await openUrsulaPiStorage("https://streams.example.com/acme/agent", { closeTimeoutMs: 10_000 });
+const harness = await Harness.open(storage, { models, registry }, context);
 // ...
 await harness.close(context); // closes the storage too
 ```
 
-`@tonbo/sqlite-ursula/tonbo/pi` opens the database by name with a Tonbo API key, as `@tonbo/sqlite-ursula/tonbo` does ([Tonbo](#tonbo)), and runs Pi Durable's official node `SqliteStorage` on it. `openUrsulaPiStorage(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the options of the `/pi` entry's `openUrsulaPiStorage`, fails with the same errors as the `/tonbo` entry's `open` (it exports `TonboError` and the error classes), and keeps the Streams token fresh. Without `dir` it uses the default cache root. `harness.close(context)` closes the storage the harness was opened with, on Pi 1.0 to 1.3, so the storage needs no close of its own.
+`harness.close(context)` closes the storage the harness was opened with, on Pi 1.0 to 1.3, so the storage needs no close of its own. Without `dir` it uses the default cache root.
 
-For a stream of your own Ursula, `@tonbo/sqlite-ursula/pi` opens the storage by URL:
-
-```ts
-import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
-
-const storage = await openUrsulaPiStorage("https://streams.example.com/acme/agent", { closeTimeoutMs: 10_000 });
-```
-
-Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0, and the `/pi` and `/tonbo/pi` entries are the only ones that import it.
+Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0, and the `/pi` entry is the only one that imports it.
 
 `openUrsulaPiStorage(url, options)` passes `dir`, `token`, `signal`, `maxPendingBytes` and `recreate` to `open`, and takes no other option of `open`. `walAutoCheckpointPages` (SQLite's WAL auto-checkpoint threshold) and `busyTimeoutMs` (how long a statement waits for a lock) go to Pi's node driver, which opens its own connection on the database and applies Pi's defaults to the ones you leave out. `closeTimeoutMs` is 10 s by default.
 
-## Tonbo
+## Tonbo databases by name
 
-`@tonbo/sqlite-ursula/tonbo` opens a database of a Tonbo account by name, with a Tonbo API key:
-
-```ts
-import { open } from "@tonbo/sqlite-ursula/tonbo";
-
-const db = await open("notes"); // or the database's https:// URL, which skips the lookup
-```
-
-- `open(nameOrUrl, { apiKey, apiOrigin, authOrigin, ...options })` takes the root entry's options and returns the same `UrsulaDatabase`, so `synced()`, `status()`, `gate()`, `dir` and the 30 s default signal work as there. The signal also bounds the lookup.
-- The key comes from `apiKey`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`. The login file must be a regular file that no group or other permission bit is set on (mode `0600`). A symlink, a non-regular file or a file open to others is refused (`credentials_refused`) and never read, and no other source is tried. A login that expired, or one this package does not read, fails with `invalid_api_key`: run `tonbo login`. A login file the package cannot read (a permission error, for one) fails with `UrsulaSetupError` `local_setup`. An `apiKey` option that is not a non-empty string of printable ASCII without spaces fails with `UrsulaSetupError` `invalid_argument`, and such a `TONBO_API_KEY` with `invalid_api_key`.
-- A name is looked up with `GET https://api.tonbo.dev/v1/databases/{name}`, with the key as the bearer token. When the API answers `401` with `exchange_required` (an Agent key), the key is exchanged at the token endpoint with no audience, the lookup is sent again once with that token, and the token is kept until it expires. A database still being created is waited for.
-- Streams requests carry tokens the extension exchanges for the key at `POST https://tonbo.dev/api/iam/token` with the audience `https://streams.tonbo.dev`, and refreshes in the background beside replication, so a busy event loop never delays a refresh. The open waits for the first one, so a key the token endpoint refuses fails the open with `invalid_api_key`. The tokens go only to a stream URL that is `https://`, or `http://` to a loopback host, and any other fails with `invalid_url`. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead: then opening a URL needs no key. The extension reads the file only while no open of the process has set a token.
-- The process holds one key for Streams tokens. Once the first key held a token, an open by name without `token` and with a second key fails with `UrsulaSetupError` `invalid_argument` while any database of the process may send requests, and for 60 s after an open was handed the first key's token. A second key with a `token`, or with `URSULA_VFS_TOKEN_FILE`, only looks the name up and is never refused. An open with a string `token` or a [token provider](#tokens) replaces the key's tokens, and the next open by name without `token` gives them back. One token serves every database of the process ([Tokens](#tokens)).
-- `apiOrigin` (or `TONBO_API_ORIGIN`) and `authOrigin` (or `TONBO_AUTH_ORIGIN`) name other origins for the Management API and the token endpoint. Each must be `https://`, or `http://` to a loopback host, since its requests carry the key. The key goes to these two origins only, redirects are never followed, and a Streams token never goes to the Management API. An answer outside the APIs' contracts fails with `UrsulaSetupError` `invalid_argument` and names the option and variable to check: a status neither API documents (a redirect included, or a `404` from the token endpoint at a wrong origin), and an `active` database without a `url`.
-- The lookup and the token exchanges go out from the extension, like replication: they trust the certificate authorities bundled with it, or only those in the PEM bundle `URSULA_VFS_CA_FILE` names, and take the environment's proxy. `NODE_EXTRA_CA_CERTS` does not apply to them.
-- `apiKey`, `apiOrigin` and `authOrigin` must be strings when given: anything else, `null` included, fails with `UrsulaSetupError` `invalid_argument`.
-- No key or token is logged, and no error message carries one.
-
-Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`, `fix` (the variable to set or the command to run, which ends the message) and `requestId` (the API's, when it answered):
-
-| kind | when | fix |
-| --- | --- | --- |
-| `missing_credentials` | no `apiKey`, no `TONBO_API_KEY` and no login file | `Set TONBO_API_KEY, or run: tonbo login` |
-| `credentials_refused` | the login file is a symlink, not a regular file, or open to group or others | `Run: chmod 600 <path>`, or replace the file |
-| `invalid_api_key` | the API refused the key (`401`), the key cannot read the database (`403`), or the login expired or is not one this package reads | pass a valid `apiKey`, set `TONBO_API_KEY` to a valid key, or `Run: tonbo login`, after the key's source, and for a `403`, `Use an API key that can read database "<name>"` |
-| `database_not_found` | the key's account has no database of that name (`404`), or it is being deleted | `Run: tonbo database create <name>` |
-
-A `429` is looked up again after its `Retry-After`, and a `408`, a `5xx`, a network failure or a `200` whose body holds no database after a backoff, until the signal fires. Then `open()` rejects with `UrsulaUnavailableError` (`rate_limited`, `unavailable` or `unreachable`, action `retry`), and with `unavailable` when the database was still being created. The token endpoint's `408`, `429`, `5xx`, network failures and a `200` that holds no token are retried too: during the lookup as above, and for a Streams token after a backoff from 1 s up to 30 s. A token endpoint that refuses the key a Streams token fails the open with `invalid_api_key`. Every open by name looks the name up, so while the Management API does not answer, open the database by its URL.
-
-`resolveDatabase(nameOrUrl, { apiKey, apiOrigin, authOrigin, token, signal })` resolves a database without opening it, for another opener. It finds the key and looks the name up as `open` does, and returns `{ url, token }`: the stream URL, and `token` as you passed it, or `undefined` when the key's tokens serve. It returns once the extension holds the key's first Streams token, which the extension keeps fresh for the open you pass them to, so you run no refresher of your own. It fails with the same errors as `open`, a key the token endpoint refuses a Streams token included. Concurrent calls with the same arguments on one JavaScript thread share one resolve. For Pi Durable's storage, `@tonbo/sqlite-ursula/tonbo/pi` does both in one call ([Pi Durable](#pi-durable)).
+Opening a Tonbo database by name, with a Tonbo API key, was removed in 0.11.3: it moved to the Tonbo SDK. Until 0.12, the `@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi` entries stay, and their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with an error that says so. They send nothing. To open a Tonbo database with this package, resolve its stream URL and a Streams token with Tonbo's own tooling, then pass both to `open(url, { token })`, or to the `/pi` entry's `openUrsulaPiStorage(url, { token })`. The token can also be a [token provider](#tokens).
 
 ## SQL functions
 
-Other hosts call the extension's SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats`, `ursula_set_token`, `ursula_import(url, file, options_json, timeout_ms)`, whose `timeout_ms` must be positive, `tonbo_resolve(name_or_url, options_json, timeout_ms)`, which resolves a Tonbo database by name as the `/tonbo` entry does and returns a failure as `{done: true, error: {kind, action, class, message, fix, request_id}}`, and `ursula_classify(message, errcode, path)`, which says what a failure is from SQLite's message and result code as `{kind, action, class, message, fix, request_id}`: its `kind`, `action` and `class` (`write_refused`, `reset`, `unavailable` or `setup`, the error this package throws), the `message` a host shows for it, and `fix` and `request_id`, which are `null` for every failure of the extension. It returns `null` for SQLite's own errors. `path` is the database a statement ran on, whose state names the statement's I/O error, which says nothing itself. Pass `NULL` for a SQL function's error. A host reopens through `ursula_open` after closing: once a database retired, a plain `new DatabaseSync(path)` of its path is refused until `ursula_open` binds it again. `ursula_stats(path)` drains the per-commit measurements the extension keeps (bytes, pages, time in the log and the VFS), at most 8,192 of each kind between drains, and reports what it dropped. From this package, call it with `db.boundPath` on a connection `loadUrsulaVfs()` returns.
+Other hosts call the extension's SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats`, `ursula_set_token`, `ursula_import(url, file, options_json, timeout_ms)`, whose `timeout_ms` must be positive, and `ursula_classify(message, errcode, path)`, which says what a failure is from SQLite's message and result code as `{kind, action, class, message, fix, request_id}`: its `kind`, `action` and `class` (`write_refused`, `reset`, `unavailable` or `setup`, the error this package throws), the `message` a host shows for it, and `fix` and `request_id`, which are `null` for every failure of the extension. It returns `null` for SQLite's own errors. `path` is the database a statement ran on, whose state names the statement's I/O error, which says nothing itself. Pass `NULL` for a SQL function's error. A host reopens through `ursula_open` after closing: once a database retired, a plain `new DatabaseSync(path)` of its path is refused until `ursula_open` binds it again. `ursula_stats(path)` drains the per-commit measurements the extension keeps (bytes, pages, time in the log and the VFS), at most 8,192 of each kind between drains, and reports what it dropped. From this package, call it with `db.boundPath` on a connection `loadUrsulaVfs()` returns.
 
 A cache's files are not SQLite files outside the extension. The db file holds a marker in place of SQLite's header magic, and its WAL is `db-uwal`. The `sqlite3` shell, node:sqlite without the extension and a connection opened before the extension loaded fail with `SQLITE_NOTADB` (`file is not a database`) and change nothing. To read a database with plain SQLite, export it from a connection `open()` returned, with `VACUUM INTO`.
 
