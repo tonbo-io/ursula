@@ -225,3 +225,22 @@ describe("open()", () => {
 		db.close();
 	});
 });
+
+// Removed in 0.11.3, and gone in 0.12: the `/tonbo` entries only say where opening a Tonbo database
+// by name moved, and send nothing.
+describe("the /tonbo entries", () => {
+	it("reject every call with where opening a Tonbo database by name moved", async () => {
+		const tonbo = await import("../src/tonbo.ts");
+		const tonboPi = await import("../src/tonbo-pi.ts");
+		const calls: [entry: string, call: () => Promise<never>][] = [
+			["@tonbo/sqlite-ursula/tonbo", () => tonbo.open("db")],
+			["@tonbo/sqlite-ursula/tonbo", () => tonbo.resolveDatabase("db")],
+			["@tonbo/sqlite-ursula/tonbo/pi", () => tonboPi.openUrsulaPiStorage("db")],
+		];
+		for (const [entry, call] of calls) {
+			const error = await rejection(call());
+			expect(error).not.toBeInstanceOf(UrsulaError);
+			expect((error as Error).message).toMatch(new RegExp(`^${entry} was removed in 0\\.11\\.3: .* the Tonbo SDK\\. `));
+		}
+	});
+});

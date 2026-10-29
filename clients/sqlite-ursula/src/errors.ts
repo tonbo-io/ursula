@@ -42,11 +42,10 @@ export type ResetKind = "fenced" | "stale" | "rewound" | "deleted" | "local_dama
  * reports them as `status().replication.condition`.
  */
 export type UnavailableKind = "unreachable" | "unavailable" | "rate_limited" | "unauthorized" | "payment_required" | "forbidden" | "cancelled";
-/** The kinds of an {@link UrsulaSetupError}. `invalid_name` is the `/tonbo` entry's, for an empty database name. */
+/** The kinds of an {@link UrsulaSetupError}. */
 export type SetupKind =
 	| "invalid_argument"
 	| "invalid_url"
-	| "invalid_name"
 	| "not_found"
 	| "in_use"
 	| "bound_elsewhere"
@@ -60,13 +59,7 @@ export type SetupKind =
 	| "not_bound"
 	| "internal";
 
-/**
- * The kinds of the `/tonbo` entry's `TonboError` (tonbo.ts): a Tonbo API key that is missing, refused
- * or unusable, a login file the package refuses to read, or a database the account does not have.
- */
-export type TonboKind = "missing_credentials" | "credentials_refused" | "invalid_api_key" | "database_not_found";
-
-export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind | TonboKind;
+export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind;
 
 /**
  * A failure as the extension names it, in `ursula_classify`'s result, in events and in status:

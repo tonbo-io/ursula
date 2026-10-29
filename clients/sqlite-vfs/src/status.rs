@@ -1,7 +1,7 @@
 //! The JSON the SQL functions return: `ursula_status` (design: Status), `ursula_stats`,
-//! `ursula_events` and the results of `ursula_open`, `ursula_synced` and `tonbo_resolve`.
+//! `ursula_events` and the results of `ursula_open` and `ursula_synced`.
 
-use crate::auth::TokenStatus;
+use crate::auth::Source;
 use crate::db::Binding;
 use crate::db::Opened;
 use crate::db::by_id;
@@ -24,8 +24,6 @@ use crate::open::OpenError;
 use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
-use crate::tonbo::Resolution;
-use crate::tonbo::TonboError;
 
 /// An object of `before`, a failure's kind with what to do about it and the error a host throws
 /// for it as it surfaced at `surface` (design: Errors), then `after`.
@@ -179,33 +177,13 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
         ("refused", refused),
         ("salvage", json::array(&salvage)),
         ("reset", reset_json),
-        ("token", token_json(&crate::auth::status())),
+        ("token", token_json(crate::auth::source())),
     ]))
 }
 
-/// The process's token in `status().token`: its source and, while the process holds an API key,
-/// the key's schedule (design: Status). Never the key or a token.
-fn token_json(t: &TokenStatus) -> String {
-    let key = t.key.as_ref().map_or_else(null, |k| {
-        let ms = |v: Option<u64>| v.map_or_else(null, |v| v.to_string());
-        object(&[
-            ("state", json_str(k.state.as_str())),
-            ("expires_in_ms", ms(k.expires_in_ms)),
-            ("refresh_in_ms", ms(k.refresh_in_ms)),
-            ("failures", k.failures.to_string()),
-            (
-                "error",
-                k.error.as_ref().map_or_else(null, |e| {
-                    object(&[
-                        ("kind", json_str(e.kind().as_str())),
-                        ("action", json_str(e.kind().action().as_str())),
-                        ("message", json_str(&e.to_string())),
-                    ])
-                }),
-            ),
-        ])
-    });
-    object(&[("source", json_str(t.source.as_str())), ("key", key)])
+/// The process's token in `status().token`: its source (design: Status). Never a token.
+fn token_json(source: Source) -> String {
+    object(&[("source", json_str(source.as_str()))])
 }
 
 /// A salvage in `status().salvage`: its directory and its manifest's fields.
@@ -297,34 +275,6 @@ pub(crate) fn opened_json(opened: &Opened) -> String {
             object(&[("done", "false".into()), ("request", open.0.to_string())])
         }
     }
-}
-
-/// `tonbo_resolve`'s result: `{done: true, url, name, key_tokens}`, `name` `null` for a URL,
-/// `{done: true, error}` for a failure, `error` as [`tonbo_error_json`] writes it, or `{done:
-/// false, request}` while the resolve goes on.
-pub(crate) fn resolution_json(outcome: Result<&Resolution, &TonboError>) -> String {
-    match outcome {
-        Ok(Resolution::Done(resolved)) => object(&[
-            ("done", "true".into()),
-            ("url", json_str(&resolved.url)),
-            ("name", resolved.name.as_deref().map_or_else(null, json_str)),
-            ("key_tokens", resolved.key_tokens.to_string()),
-        ]),
-        Ok(Resolution::Pending(request)) => {
-            object(&[("done", "false".into()), ("request", request.to_string())])
-        }
-        Err(e) => object(&[("done", "true".into()), ("error", tonbo_error_json(e))]),
-    }
-}
-
-/// A resolve's failure, as `ursula_cancel` of a resolve reports it and as the `error` of
-/// `tonbo_resolve`'s `{done: true, error}`: `{kind, action, class, message, fix, request_id}`.
-pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
-    with_kind(&[], e.kind(), Surface::Open, &[
-        ("message", json_str(&e.report().to_string())),
-        ("fix", e.fix().as_deref().map_or_else(null, json_str)),
-        ("request_id", e.request_id().map_or_else(null, json_str)),
-    ])
 }
 
 /// `ursula_import`'s result.
@@ -439,11 +389,6 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
             DriverEvent::Gap { dropped } => {
                 object(&[("event", json_str("gap")), ("dropped", dropped.to_string())])
             }
-            DriverEvent::Resolved { request, ok } => object(&[
-                ("event", json_str("resolved")),
-                ("request", request.to_string()),
-                ("ok", ok.to_string()),
-            ]),
         })
         .collect();
     object(&[
@@ -462,10 +407,7 @@ mod tests {
     use super::stats_json;
     use super::synced_json;
     use super::token_json;
-    use crate::auth::ExchangeError;
-    use crate::auth::KeyView;
     use crate::auth::Source;
-    use crate::auth::TokenStatus;
     use crate::driver::BindingId;
     use crate::driver::DriverEvent;
     use crate::driver::Life;
@@ -564,35 +506,11 @@ mod tests {
         );
     }
 
-    // The token's status names its source and, with a key, the key's schedule and last failure.
+    // The token's status names its source alone.
     #[test]
-    fn the_token_names_its_source_and_the_keys_schedule() {
-        let none = TokenStatus {
-            source: Source::File,
-            key: None,
-        };
-        assert_eq!(token_json(&none), r#"{"source":"file","key":null}"#);
-        let failing = TokenStatus {
-            source: Source::Key,
-            key: Some(KeyView {
-                state: crate::auth::KeyState::Failing,
-                expires_in_ms: Some(0),
-                refresh_in_ms: Some(2_000),
-                failures: 2,
-                error: Some(ExchangeError::Refused {
-                    status: 401,
-                    problem: Box::default(),
-                }),
-            }),
-        };
-        assert_eq!(
-            token_json(&failing),
-            concat!(
-                r#"{"source":"key","key":{"state":"failing","expires_in_ms":0,"refresh_in_ms":2000,"#,
-                r#""failures":2,"error":{"kind":"unauthorized","action":"fix","#,
-                r#""message":"the token endpoint refused the API key (401)"}}}"#
-            )
-        );
+    fn the_token_names_its_source() {
+        assert_eq!(token_json(Source::File), r#"{"source":"file"}"#);
+        assert_eq!(token_json(Source::None), r#"{"source":"none"}"#);
     }
 
     // A binding handed out and not connected yet is live, or provisional before its claim; one

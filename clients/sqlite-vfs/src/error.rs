@@ -88,17 +88,6 @@ pub(crate) enum ErrorKind {
     /// The process is a child forked after its parent started the extension (design: Forks).
     Forked,
     Internal,
-    /// `tonbo_resolve` (design: Tonbo): an empty database name.
-    InvalidName,
-    /// No API key: no `api_key`, no `TONBO_API_KEY` and no `tonbo login`.
-    MissingCredentials,
-    /// The `tonbo login` file is a symlink, not a regular file, or open to group or others.
-    CredentialsRefused,
-    /// The Tonbo API refused the key, the key cannot read the database, or the login expired or
-    /// is not one the extension reads.
-    InvalidApiKey,
-    /// The account has no database of that name, or it is being deleted.
-    DatabaseNotFound,
 }
 
 /// [`ErrorKind::as_str`] and its inverse [`ErrorKind::parse`] from one list of the kinds that are no
@@ -153,11 +142,6 @@ kind_tokens! {
     NotBound => "not_bound",
     Forked => "forked",
     Internal => "internal",
-    InvalidName => "invalid_name",
-    MissingCredentials => "missing_credentials",
-    CredentialsRefused => "credentials_refused",
-    InvalidApiKey => "invalid_api_key",
-    DatabaseNotFound => "database_not_found",
 }
 
 impl ErrorKind {
@@ -189,12 +173,7 @@ impl ErrorKind {
             | ErrorKind::Forbidden
             | ErrorKind::NotBound
             | ErrorKind::BoundElsewhere
-            | ErrorKind::Forked
-            | ErrorKind::InvalidName
-            | ErrorKind::MissingCredentials
-            | ErrorKind::CredentialsRefused
-            | ErrorKind::InvalidApiKey
-            | ErrorKind::DatabaseNotFound => Action::Fix,
+            | ErrorKind::Forked => Action::Fix,
         }
     }
 }
@@ -283,12 +262,7 @@ impl ErrorKind {
             | ErrorKind::WrongCluster
             | ErrorKind::ClaimRaces
             | ErrorKind::NotBound
-            | ErrorKind::Forked
-            | ErrorKind::InvalidName
-            | ErrorKind::MissingCredentials
-            | ErrorKind::CredentialsRefused
-            | ErrorKind::InvalidApiKey
-            | ErrorKind::DatabaseNotFound => ErrorClass::Setup,
+            | ErrorKind::Forked => ErrorClass::Setup,
         }
     }
 }
@@ -572,7 +546,7 @@ pub(crate) enum Error {
     Reset(ResetKind),
     #[error("{path} is not a database ursula_open bound in this process")]
     NotBound { path: String },
-    #[error("the request {request} is not an open or a resolve in progress")]
+    #[error("the request {request} is not an open in progress")]
     NoRequest { request: u64 },
     #[error("{name}: {why}")]
     InvalidArgument { name: &'static str, why: String },

@@ -1,9 +1,8 @@
 // The pump (design: Pump): this thread's view of the extension's events. Calls into the extension
-// on this thread never wait (timeout 0): `ursula_open`, `tonbo_resolve` and `ursula_synced` either
-// answer at once or hand back a request or a ticket, which an event later resolves. One worker per
-// JavaScript thread (pump-worker.ts) waits for those events and posts them here, where they
-// complete `open()` and the `/tonbo` entry's resolve, resolve or reject `synced()` and fire the
-// `reset` listeners.
+// on this thread never wait (timeout 0): `ursula_open` and `ursula_synced` either answer at once or
+// hand back a request or a ticket, which an event later resolves. One worker per JavaScript thread
+// (pump-worker.ts) waits for those events and posts them here, where they complete `open()`,
+// resolve or reject `synced()` and fire the `reset` listeners.
 //
 // `synced()` tickets resolve through their binding's watermark (`synced {path, through}`): every
 // ticket of the path up to `through` resolved. The extension keeps only the latest watermark of a
@@ -33,7 +32,7 @@ export interface ResetTarget {
 
 /** One event of `ursula_events` (clients/sqlite-vfs/src/status.rs `events_json`). */
 export type PumpEvent =
-	| { event: "opened" | "resolved"; request: number; ok: boolean }
+	| { event: "opened"; request: number; ok: boolean }
 	| { event: "synced"; path: string | null; through: number }
 	| ({ event: "sync_failed"; ticket: number } & Described)
 	| ({ event: "reset"; path: string | null } & Described)
@@ -184,11 +183,8 @@ export function waitTicket(path: string, ticket: number, signal: AbortSignal | u
 
 class Pump {
 	readonly #worker: Worker;
-	/**
-	 * Pending opens and resolves by request: each waiter is woken once by the request's `opened` or
-	 * `resolved` event, a gap, or the pump's end.
-	 */
-	readonly #requests = new Map<number, Set<() => void>>();
+	/** Pending opens by request: each waiter is woken once by the open's `opened` event, a gap, or the pump's end. */
+	readonly #opens = new Map<number, Set<() => void>>();
 	#failed = false;
 
 	constructor(onExit: () => void) {
@@ -231,17 +227,16 @@ class Pump {
 	}
 
 	/**
-	 * Waits until `request` of `ursula_open` or `tonbo_resolve` may have ended: its `opened` or
-	 * `resolved` event, a gap in the events, or the pump's end, after which the caller calls again
-	 * with the same arguments. Rejects with `signal.reason` when `signal` fires: the caller then
-	 * cancels the request.
+	 * Waits until open `request` may have resolved: its `opened` event, a gap in the events, or the
+	 * pump's end, after which the caller asks `ursula_open` again. Rejects with `signal.reason` when
+	 * `signal` fires: the caller then cancels the request.
 	 */
-	completed(request: number, signal: AbortSignal): Promise<void> {
+	opened(request: number, signal: AbortSignal): Promise<void> {
 		return new Promise((resolve, reject) => {
-			let set = this.#requests.get(request);
+			let set = this.#opens.get(request);
 			if (set === undefined) {
 				set = new Set();
-				this.#requests.set(request, set);
+				this.#opens.set(request, set);
 			}
 			const waiters = set;
 			const done = (): void => {
@@ -254,7 +249,7 @@ class Pump {
 			};
 			const abort = (): void => {
 				waiters.delete(wake);
-				if (waiters.size === 0 && this.#requests.get(request) === waiters) this.#requests.delete(request);
+				if (waiters.size === 0 && this.#opens.get(request) === waiters) this.#opens.delete(request);
 				done();
 				reject(signal.reason);
 			};
@@ -269,8 +264,7 @@ class Pump {
 		for (const event of events) {
 			switch (event.event) {
 				case "opened":
-				case "resolved":
-					this.#wake(event.request);
+					this.#wakeOpen(event.request);
 					break;
 				case "synced":
 					for (const [id, t] of [...tickets]) {
@@ -299,9 +293,9 @@ class Pump {
 		}
 	}
 
-	#wake(request: number): void {
-		const waiters = this.#requests.get(request);
-		this.#requests.delete(request);
+	#wakeOpen(request: number): void {
+		const waiters = this.#opens.get(request);
+		this.#opens.delete(request);
 		for (const wake of waiters ?? []) wake();
 	}
 
@@ -333,11 +327,10 @@ class Pump {
 	/**
 	 * Events fell out of the queue before the worker read them. Every pending ticket is asked for
 	 * again under a new ticket, which no watermark of the batch covers, so a ticket whose failure
-	 * the gap dropped never passes for resolved. Opens and resolves ask again, and resets are read
-	 * from status.
+	 * the gap dropped never passes for resolved. Opens ask again, and resets are read from status.
 	 */
 	#gap(): void {
-		for (const request of [...this.#requests.keys()]) this.#wake(request);
+		for (const request of [...this.#opens.keys()]) this.#wakeOpen(request);
 		reissue();
 		for (const target of live()) {
 			const error = target.currentReset();
@@ -346,16 +339,16 @@ class Pump {
 	}
 
 	/**
-	 * The worker is gone: pending opens and resolves ask again, and pending tickets move to a new
-	 * pump, which also starts while a watcher wants the events. After {@link MAX_FAILURES} failures
-	 * in a row the tickets fail instead, and so does every later call.
+	 * The worker is gone: pending opens ask again, and pending tickets move to a new pump, which also
+	 * starts while a watcher wants the events. After {@link MAX_FAILURES} failures in a row the
+	 * tickets fail instead, and so does every later call.
 	 */
 	#fail(onExit: () => void): void {
 		if (this.#failed) return;
 		this.#failed = true;
 		failures += 1;
 		onExit();
-		for (const request of [...this.#requests.keys()]) this.#wake(request);
+		for (const request of [...this.#opens.keys()]) this.#wakeOpen(request);
 		void this.#worker.terminate();
 		setImmediate(() => {
 			if (exiting || (tickets.size === 0 && ![...watchers.values()].some((wanted) => wanted()))) return;

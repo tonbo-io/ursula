@@ -336,8 +336,8 @@ impl Undrained {
 }
 
 /// `later` of an [`ErrorKind`]. A drain cannot meet the kinds of SQL, of commits, of the registry,
-/// of takeovers, of `synced()`, of a forked child or of `tonbo_resolve`, and they map to `no`, so
-/// the function is total.
+/// of takeovers, of `synced()` or of a forked child, and they map to `no`, so the function is
+/// total.
 fn later_of(kind: ErrorKind) -> Later {
     match kind {
         ErrorKind::InUse
@@ -373,12 +373,7 @@ fn later_of(kind: ErrorKind) -> Later {
         | ErrorKind::ClaimRaces
         | ErrorKind::Cancelled
         | ErrorKind::NotBound
-        | ErrorKind::Forked
-        | ErrorKind::InvalidName
-        | ErrorKind::MissingCredentials
-        | ErrorKind::CredentialsRefused
-        | ErrorKind::InvalidApiKey
-        | ErrorKind::DatabaseNotFound => Later::No,
+        | ErrorKind::Forked => Later::No,
     }
 }
 

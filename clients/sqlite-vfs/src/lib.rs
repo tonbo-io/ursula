@@ -48,13 +48,6 @@
 //! * `SELECT ursula_classify(message, errcode, path)` says what a failure a host met is: `{kind,
 //!   action, class, message, fix, request_id}` for a SQL function's error, or for a statement's
 //!   I/O error on the database at `path`, and `null` for SQLite's own errors.
-//! * `SELECT tonbo_resolve(name_or_url, options_json, timeout_ms)` resolves the name of a Tonbo
-//!   database into its stream URL with the account's API key, and fetches the key's first Streams
-//!   token before it returns `{done, url, name, key_tokens}` (`tonbo`). A failure is its outcome
-//!   too, `{done: true, error: {kind, action, class, message, fix, request_id}}`. With
-//!   `timeout_ms` 0 it returns `{done: false, request}` at once, a `resolved` event ends it, and a
-//!   call with the same arguments then takes its outcome. Only the SQL functions call into Tonbo,
-//!   and the JSON rendering shows what it returns: the open, the registry and the driver never do.
 //!
 //! A write refused at admission (`backlog_full`), one the extension does not capture
 //! (`unsupported`) or a commit above the commit limit (`too_large`) fails its transaction alone with
@@ -68,8 +61,6 @@
 //!
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`, `URSULA_VFS_MAX_COMMIT_BYTES`.
-//! `tonbo_resolve` reads `TONBO_API_KEY`, `TONBO_API_ORIGIN`, `TONBO_AUTH_ORIGIN`, and
-//! `XDG_CONFIG_HOME` or `HOME` for the `tonbo login` file, at each call.
 //! Test hooks: `URSULA_VFS_ABORT_AT=<step>[:<n>]` (`config::Step`), `URSULA_VFS_PANIC_IN=<entry>`,
 //! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`,
 //! `URSULA_VFS_SNAPSHOT_HOLD=<dir>`, `URSULA_VFS_HOST_DIR=<absolute dir>` (the host directory when
@@ -110,8 +101,7 @@
 //! - [`codec`]: the formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies, the
 //!   page-1 marker) and the digests the server checks.
 //! - `applier`: applies commits to a db file in batches of final page images, page 1 marked.
-//! - `auth`: the bearer token every request carries: the token set, the token file, or an API
-//!   key's exchanges, which a refresher thread keeps fresh.
+//! - `auth`: the bearer token every request carries: the token set, or the token file.
 //! - `capture`: the WAL's layout, the shape of a write transaction's WAL writes, and its final page
 //!   images at the commit point.
 //! - `config`: settings and test hooks from the environment.
@@ -139,8 +129,7 @@
 //!   that snapshots or moves the process.
 //! - [`inspection`]: a host's read of every recorded root and every open root lock: the
 //!   unacknowledged bytes on disk, and whether the read is complete.
-//! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests,
-//!   token answers, whose nested members it skips, and one level down for the Management API).
+//! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
 //!   frames from the stream.
@@ -161,8 +150,6 @@
 //!   retention one snapshot behind.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: the JSON the SQL functions return.
-//! - `tonbo`: `tonbo_resolve`, a Tonbo database's stream URL by name, the key from the option,
-//!   the environment or the `tonbo login` file, and the key's first Streams token.
 //! - `transport`: one attempt of a request, over HTTP or to the model in process.
 //! - `vfs`: the VFS file methods (the page-1 marker, the `db-uwal` WAL), its `xAccess` and
 //!   `xDelete`, and the commit path.
@@ -203,7 +190,6 @@ mod salvage;
 mod snapshotter;
 mod stats;
 mod status;
-mod tonbo;
 mod transport;
 mod vfs;
 mod wire;

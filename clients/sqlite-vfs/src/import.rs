@@ -313,11 +313,8 @@ pub(crate) fn import(
     // The token stays the process's only once the import succeeded, and a failed import puts the
     // previous one back unless the application set another meanwhile (`ursula_set_token`).
     let lent = options.token.as_deref().map(crate::auth::lend_token);
-    // An API key's token, when requests carry one, is kept fresh while the import runs.
-    let importing = crate::auth::importing();
     let transport = crate::transport::http::HttpTransport::new(url);
     let imported = run(&transport, &staged, deadline, timeout_ms);
-    drop(importing);
     if let (Err(_failed), Some(lent)) = (&imported, lent) {
         crate::auth::take_back(lent);
     }

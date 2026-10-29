@@ -1,7 +1,7 @@
 //! The fork guard (design: Forks).
 //!
-//! The extension starts a process with the first `ursula_open`, `ursula_events`, `ursula_import` or
-//! `tonbo_resolve` ([`db::start_process`]), before it makes anything that lives on in the process:
+//! The extension starts a process with the first `ursula_open`, `ursula_events` or `ursula_import`
+//! ([`db::start_process`]), before it makes anything that lives on in the process:
 //! the driver and its threads, HTTP agents with their pooled connections, the resolver's cache, a
 //! token. A child forked after that has all of it in its memory but none of the threads that serve
 //! it, and a lock one of them held at the fork stays held in the child forever. So in such a child

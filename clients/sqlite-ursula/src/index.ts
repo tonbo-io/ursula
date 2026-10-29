@@ -19,19 +19,16 @@
 // - pump.ts and pump-worker.ts: one worker per JavaScript thread that waits for the extension's
 //   events, so no call on the thread itself waits on the network.
 // - token.ts: the bearer token, a string or the latest from a provider, refreshed ahead of expiry
-//   and after a 401, until a Tonbo API key's tokens take over.
+//   and after a 401.
 // - abort.ts: waiting under an AbortSignal.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-// - tonbo.ts: the `/tonbo` entry, which opens a Tonbo database by name with a Tonbo API key, or
-//   resolves it into the stream URL and token another opener, such as the `/pi` entry's, takes,
-//   through the extension's `tonbo_resolve`.
-// - tonbo-pi.ts: the `/tonbo/pi` entry, which opens Pi storage on a Tonbo database by name: the
-//   `/tonbo` entry's resolve, then the `/pi` entry's open.
+// - tonbo.ts and tonbo-pi.ts: the `/tonbo` and `/tonbo/pi` entries, which opened Tonbo databases
+//   by name until 0.11.3 and now only throw an error that says where that moved. They go in 0.12.
 import type { DatabaseSyncOptions } from "node:sqlite";
 import { call } from "./control.ts";
 import { type Binding, UrsulaDatabase } from "./database.ts";
-import { DEFAULT_OPEN_MS, raced, reasonOf } from "./abort.ts";
+import { raced, reasonOf } from "./abort.ts";
 import { type Described, errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "./errors.ts";
 import { pump } from "./pump.ts";
 import { bound, openWithProvider, type TokenProvider, useStringToken } from "./token.ts";
@@ -101,6 +98,8 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 /** `ursula_open`'s answer. */
 type Opened = ({ done: true } & Binding) | { done: false; request: number };
 
+/** How long an open may take without a signal. */
+const DEFAULT_OPEN_MS = 30_000;
 /** The extension's own deadline for an open: far past any signal, which governs the open. */
 const EXTENSION_OPEN_MS = 24 * 60 * 60 * 1000;
 /** node:sqlite's busy `timeout` unless the caller passes one: the connections of a binding share its files. */
@@ -238,7 +237,7 @@ async function bind(stream: string, dir: string | undefined, json: string, until
 		}
 		if (opened.done) return opened;
 		try {
-			await events.completed(opened.request, until);
+			await events.opened(opened.request, until);
 		} catch {
 			throw giveUp(stream, opened.request, until);
 		}
