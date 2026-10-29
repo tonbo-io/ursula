@@ -1900,10 +1900,10 @@ carries none of its own. Only `extension.rs` calls into the `tonbo` module, and 
   calls it owes, and gives it up only as the last. `ursula_cancel(request)` gives it up for the host
   that cancels: it goes on while a blocking call waits for it, and otherwise ends. The cancel
   reports what the resolve came to: `null` for an answer, the error it ended with, or `cancelled`
-  with the last condition, as `{kind, action, message, fix, request_id}`. A call that gives up names
-  what the resolve waited for then, the lookup or the Streams token, with the last condition met
-  while waiting for it. A call that finds the resolve it waited for given up starts another and
-  names its request.
+  with the last condition, as `{kind, action, class, message, fix, request_id}`. A call that gives
+  up names what the resolve waited for then, the lookup or the Streams token, with the last
+  condition met while waiting for it. A call that finds the resolve it waited for given up starts
+  another and names its request.
 - An outcome goes only to calls made before it arrived, and leaves with the last of them, with two
   exceptions. A call made while blocking calls are still to take it takes it with them, and a call
   that returned at once is then owed it no more. A call that returned at once and neither came back

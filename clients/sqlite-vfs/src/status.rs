@@ -334,13 +334,10 @@ pub(crate) fn resolution_json(resolution: &Resolution) -> String {
     }
 }
 
-/// What `ursula_cancel` of a resolve reports it ended with: `{kind, action, message, fix,
+/// What `ursula_cancel` of a resolve reports it ended with: `{kind, action, class, message, fix,
 /// request_id}`.
 pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
-    let kind = e.kind();
-    object(&[
-        ("kind", json_str(kind.as_str())),
-        ("action", json_str(kind.action().as_str())),
+    with_kind(&[], e.kind(), Surface::Open, &[
         ("message", json_str(&e.report().to_string())),
         ("fix", e.fix().as_deref().map_or_else(null, json_str)),
         ("request_id", e.request_id().map_or_else(null, json_str)),

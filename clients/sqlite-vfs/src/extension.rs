@@ -533,7 +533,7 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 9] = [
+    let fns: [(&CStr, c_int, SqlFn); 10] = [
         (c"ursula_open", 4, c_ursula_open),
         (c"ursula_synced", 2, c_synced),
         (c"ursula_events", 2, c_events),
