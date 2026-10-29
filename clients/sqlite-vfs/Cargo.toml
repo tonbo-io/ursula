@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-ursula-vfs"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2024"
 publish = false
 description = "A SQLite VFS (loadable extension) that logs every commit locally and replicates the log to an Ursula stream in the background"

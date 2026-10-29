@@ -3,6 +3,34 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.11.3
+
+0.11.3 is a patch of 0.11 and interoperates with 0.11.0, 0.11.1 and 0.11.2: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, the gateway and `ursulactl` change only their version. 0.11.0, 0.11.1, 0.11.2 and 0.11.3 nodes run in one cluster, and extensions of all four work with any of these servers and open, read and import the same streams. The extension's local formats are unchanged. By deliberate decision, 0.11.3 breaks the 0.11 line in one place: it removes opening a Tonbo database by name and Tonbo API key tokens from the extension and from `@tonbo/sqlite-ursula`, platform features that never belonged in Ursula. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Upgrade the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.3 or replacing the extension library, once your code no longer uses what 0.11.3 removes. Rolling back to 0.11.2, 0.11.1 or 0.11.0 is safe.
+
+### Removed
+
+These removals break code that uses them inside the 0.11 line, by deliberate decision: opening a database by name and exchanging an API key for tokens are Tonbo platform features and never belonged in Ursula. Formats, the protocol and the server are unchanged, and so is the generic surface: open by URL, a token string or provider, `URSULA_VFS_TOKEN_FILE`, `ursula_set_token`, `ursula_classify`, events, status and the host tools.
+
+- **`@tonbo/sqlite-ursula/tonbo` and `@tonbo/sqlite-ursula/tonbo/pi`.** Both entries are gone, and importing them fails with `ERR_PACKAGE_PATH_NOT_EXPORTED`. `resolveDatabase`, `useKeyTokens`, `TonboError` and the types `TonboKind`, `TonboOpenOptions`, `TonboResolveOptions`, `ResolvedDatabase` and `TonboPiStorageOptions` go with them. Open a database by its stream URL with a token instead: `open(url, { token })`, or `openUrsulaPiStorage(url, { token })` from `@tonbo/sqlite-ursula/pi`. The token can be a provider, see [TLS and tokens](/docs/examples/sqlite-vfs#tls-and-tokens).
+- **`tonbo_resolve` and API key tokens in the extension.** The SQL function `tonbo_resolve` is gone. The extension no longer reads `TONBO_API_KEY`, `TONBO_API_ORIGIN`, `TONBO_AUTH_ORIGIN` or the `tonbo login` credentials file, and no longer exchanges an API key for tokens. A request's token is the one the host set (`ursula_set_token`, `open`'s `token`) or the content of `URSULA_VFS_TOKEN_FILE`. `ursula_events` no longer emits `resolved`, and the log events `token_exchange_failed`, `token_exchange_recovered` and `token_refresher_failed` are gone.
+- **Error kinds and status.** The kinds `invalid_name`, `missing_credentials`, `credentials_refused`, `invalid_api_key` and `database_not_found` are gone. The `token` member of `ursula_status` and `status()` is `{source}`, one of `set`, `file` or `none`, without `key`.
+
+### `@tonbo/sqlite-ursula`
+
+- **The token provider gets `previous`.** `open()`'s token provider is called as `provider({ signal, previous })`. `previous` is the token the provider last handed out, when the package will not take it again: the current one at a scheduled refresh, or the one the server refused after a `401`. An answer equal to `previous` counts as a failed call, retried with backoff and by the expiry of `previous` at the latest, so a provider that caches its token until it expires is asked again as its cache turns over. String tokens and providers that hand out a new token at each refresh behave as before. A token that never changes belongs in a string `token` or in `URSULA_VFS_TOKEN_FILE`.
+- **A provider error whose `action` is `fix` is permanent.** Whatever its class, it fails a waiting open at once: an `UrsulaError` as it is, any other error as the `cause` of an `UrsulaUnavailableError` `unauthorized` (action `fix`). Other errors are retried with backoff as before.
+- **A refused token comes back once its reporters retired.** A token an `unauthorized` condition dropped is taken again once none of the databases that reported the refusal is still bound and blocked. Before, a caching provider could never hand it back once the database that reported it closed.
+- **The backoff restarts at the expiry of `previous`.** The retry stays capped at that expiry, and from then on the backoff counts only the failures after it, so a cache that still hands its token back at the expiry is asked again within 1 s.
+
+### Python
+
+- **Token providers for `open` and `aopen`.** `open(url, token=provider)` and `aopen(url, token=provider)` take a token provider besides a string: a synchronous callable `provider(*, previous, timeout)` that returns `BearerToken(token, expires_at)`, exported from `sqlite_ursula`, with `expires_at` in seconds since the epoch or a timezone-aware `datetime`. It runs on a daemon thread of the package, never on the event loop, and follows the same rules as the npm package's provider: an answer equal to `previous` counts as a failed call, an error whose `action` is `fix` fails for good, a refused token comes back once its reporters retired, and the backoff restarts at the expiry of `previous`. String tokens, `set_token` and `import_sqlite` are unchanged. See the [README](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula-python#token-providers).
+- **LangGraph checkpointers and stores.** `sqlite_ursula.langgraph`, installed with the `langgraph` extra, holds `UrsulaSaver`, `UrsulaStore`, `AsyncUrsulaSaver` and `AsyncUrsulaStore`, LangGraph's SQLite checkpointers and stores on a replicated database. Each opens a connection of its own on the database's binding, and every write returns once the stream holds it, so `invoke` returns once the run's checkpoints are in the stream. The extra takes `langgraph-checkpoint-sqlite` from 3.0.3 up to 3.2 and does not install on Alpine. See the [README](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula-python#langgraph).
+
+### Known issues
+
+The known issues of [0.11.0](#0110) are unchanged.
+
 ## 0.11.2
 
 0.11.2 is a patch of 0.11 and interoperates with 0.11.0 and 0.11.1: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, the gateway and `ursulactl` change only their version. 0.11.0, 0.11.1 and 0.11.2 nodes run in one cluster, and extensions of all three work with any of these servers and open, read and import the same streams. The extension's local formats are unchanged, its SQL functions keep their arguments, and its new functions, error kinds and fields are additions. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Upgrade the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.2 or replacing the extension library. Rolling back to 0.11.1 or 0.11.0 is safe.
