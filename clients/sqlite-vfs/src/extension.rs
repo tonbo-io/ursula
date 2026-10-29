@@ -285,11 +285,42 @@ unsafe fn fn_cancel(
     argv: *mut *mut ffi::sqlite3_value,
 ) {
     // SAFETY: SQLite calls the function with its arguments.
-    let outcome = unsafe { arg_count(argc, argv, 0, "request") }
-        .and_then(|request| db::cancel(OpenId(request)))
-        .map(|ended| ended.map_or_else(|| "null".to_owned(), |e| status::error_json(&e)));
+    let outcome = unsafe { arg_count(argc, argv, 0, "request") }.and_then(|request| {
+        // A resolve's request (`tonbo_resolve`), else an open's: their ids never collide.
+        match crate::tonbo::cancel(request) {
+            Some(ended) => {
+                Ok(ended.map_or_else(|| "null".to_owned(), |e| status::tonbo_error_json(&e)))
+            }
+            None => db::cancel(OpenId(request))
+                .map(|ended| ended.map_or_else(|| "null".to_owned(), |e| status::error_json(&e))),
+        }
+    });
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "ursula_cancel", outcome.as_ref().map(Clone::clone)) };
+}
+
+/// `tonbo_resolve(name_or_url, options_json, timeout_ms)` (design: Tonbo): `{done, url, name}`
+/// once the stream URL of the Tonbo database `name_or_url` names is known and, when the API key's
+/// tokens serve the Streams requests, the first of them is held. `{done: false, request}` while it
+/// goes on: a `resolved` event of `ursula_events` ends it, and a call with the same arguments then
+/// takes its outcome. `timeout_ms` 0 returns at once.
+unsafe fn fn_tonbo_resolve(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let name_or_url = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let options = unsafe { arg(argc, argv, 1) };
+    // SAFETY: as above.
+    let outcome = unsafe { arg_count(argc, argv, 2, "timeout_ms") }.and_then(|timeout| {
+        crate::tonbo::resolve(&name_or_url, &options, timeout)
+            .map(|resolution| status::resolution_json(&resolution))
+            .map_err(Error::Tonbo)
+    });
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "tonbo_resolve", outcome.as_ref().map(Clone::clone)) };
 }
 
 unsafe fn fn_status(
@@ -413,6 +444,7 @@ sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
 sql_entry!(c_import => fn_import, "ursula_import", db::start_process);
 sql_entry!(c_classify => fn_classify, "ursula_classify");
+sql_entry!(c_tonbo_resolve => fn_tonbo_resolve, "tonbo_resolve", db::start_process);
 
 /// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
 /// over "unix" as the default (once per process) and the SQL functions on `db`, direct-only: a
@@ -501,7 +533,7 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 9] = [
+    let fns: [(&CStr, c_int, SqlFn); 10] = [
         (c"ursula_open", 4, c_ursula_open),
         (c"ursula_synced", 2, c_synced),
         (c"ursula_events", 2, c_events),
@@ -511,6 +543,7 @@ unsafe fn init(
         (c"ursula_set_token", 2, c_set_token),
         (c"ursula_import", 4, c_import),
         (c"ursula_classify", 3, c_classify),
+        (c"tonbo_resolve", 3, c_tonbo_resolve),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the

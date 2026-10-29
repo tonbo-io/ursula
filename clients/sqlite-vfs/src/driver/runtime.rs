@@ -510,6 +510,21 @@ impl Driver {
         self.command(Command::Snapshotted { binding, log_bytes })
     }
 
+    /// An id for a request the driver does not run (a host's `tonbo_resolve`), from the ids of
+    /// opens and tickets, so that no id `ursula_cancel` or an event names stands for two requests.
+    pub(crate) fn request_id(&self) -> u64 {
+        self.id()
+    }
+
+    /// Request `request` of [`Driver::request_id`] resolved: a `resolved` event says so.
+    pub(crate) fn resolved(&self, request: u64, ok: bool) {
+        self.shared
+            .lock()
+            .events
+            .push(DriverEvent::Resolved { request, ok });
+        self.shared.changed.notify_all();
+    }
+
     /// The transport of the stream at `url`: the snapshot thread's publishes go out on it.
     pub(crate) fn transport(&self, url: &str) -> Arc<dyn Transport> {
         (self.transports)(url)

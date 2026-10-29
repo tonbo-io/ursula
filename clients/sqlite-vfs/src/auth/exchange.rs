@@ -2,7 +2,8 @@
 //! its bearer token and `{"audience": ...}` (or `{}` without an audience) as its body, answered
 //! with `{"access_token": ..., "expires_in": <seconds>}` and any other members, which are skipped.
 //! It goes out on the agent of appends and reads (`transport::http::agent`), so it trusts the same
-//! roots (`URSULA_VFS_CA_FILE`), takes the same proxy and follows no redirect.
+//! roots (`URSULA_VFS_CA_FILE`), takes the same proxy and follows no redirect. A refusal's problem
+//! details (`code`, `detail`, `request_id`, or `X-Request-Id`) travel with its error ([`Problem`]).
 //!
 //! Neither the key nor a token is ever printed: [`Secret`] and [`Exchanged`] print redacted, and
 //! no error carries either.
@@ -100,6 +101,47 @@ impl fmt::Debug for Exchanged {
     }
 }
 
+/// An answer's problem details (`application/problem+json`), as far as a reader reads them: what
+/// a host reports beside the status, the request id for support.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Problem {
+    pub(crate) code: Option<String>,
+    pub(crate) detail: Option<String>,
+    pub(crate) request_id: Option<String>,
+}
+
+impl Problem {
+    /// The problem details of `body`, the request id from `x_request_id` (the `X-Request-Id`
+    /// header) when the body names none. A body that is not a JSON object gives none: the status
+    /// says it all. Empty members count as missing.
+    pub(crate) fn read(body: &[u8], x_request_id: Option<&str>) -> Self {
+        let mut problem = Problem::default();
+        let members = std::str::from_utf8(body)
+            .ok()
+            .and_then(|text| parse_members(text).ok())
+            .unwrap_or_default();
+        for (member, value) in members {
+            let Value::Text(text) = value else { continue };
+            if text.is_empty() {
+                continue;
+            }
+            match member.as_str() {
+                "code" => problem.code = Some(text),
+                "detail" => problem.detail = Some(text),
+                "request_id" => problem.request_id = Some(text),
+                _ => {}
+            }
+        }
+        if problem.request_id.is_none() {
+            problem.request_id = x_request_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+        }
+        problem
+    }
+}
+
 /// Why an exchange gave no token. None carries the key or a token.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ExchangeError {
@@ -109,8 +151,9 @@ pub(crate) enum ExchangeError {
     #[error("the token endpoint did not answer: {reason}")]
     Unreachable { reason: String },
     /// `401` or `403`: the key was refused.
+    /// The problem is boxed: an error that carries it stays small.
     #[error("the token endpoint refused the API key ({status})")]
-    Refused { status: u16 },
+    Refused { status: u16, problem: Box<Problem> },
     /// `429`, with the wait its `Retry-After` asked for in whole seconds.
     #[error("the token endpoint answered 429")]
     RateLimited { retry_after_ms: Option<u64> },
@@ -119,7 +162,7 @@ pub(crate) enum ExchangeError {
     Unavailable { status: u16 },
     /// A status the exchange cannot use: a redirect (never followed) or another `4xx`.
     #[error("the token endpoint answered {status}, which the exchange cannot use")]
-    Unexpected { status: u16 },
+    Unexpected { status: u16, problem: Box<Problem> },
     /// A `2xx` without a usable `access_token` and a positive `expires_in`.
     #[error("the token endpoint answered without a usable token")]
     NoToken,
@@ -138,7 +181,7 @@ impl ExchangeError {
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
             ExchangeError::Unreachable { .. } => ErrorKind::Unreachable,
-            ExchangeError::Refused { status: 403 } => ErrorKind::Forbidden,
+            ExchangeError::Refused { status: 403, .. } => ErrorKind::Forbidden,
             ExchangeError::Refused { .. } => ErrorKind::Unauthorized,
             ExchangeError::RateLimited { .. } => ErrorKind::RateLimited,
             ExchangeError::Unavailable { .. }
@@ -169,28 +212,38 @@ impl ExchangeError {
     }
 }
 
-/// Exchanges `key` once, blocking.
-pub(crate) fn exchange(key: &Key) -> Result<Exchanged, ExchangeError> {
+/// Exchanges `key` once, blocking, within `timeout` when one is given and otherwise within the
+/// agent's own.
+pub(crate) fn exchange(key: &Key, timeout: Option<Duration>) -> Result<Exchanged, ExchangeError> {
     let body = match &key.audience {
         Some(audience) => crate::json::object(&[("audience", crate::json::str(audience))]),
         None => "{}".to_owned(),
     };
-    let sent = agent()
+    let mut request = agent()
         .post(&key.endpoint)
         .header("authorization", format!("Bearer {}", key.secret.0))
         .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .send(body.as_bytes());
-    let mut response = sent.map_err(|e| ExchangeError::Unreachable {
-        reason: e.to_string(),
-    })?;
+        .header("accept", "application/json");
+    if let Some(timeout) = timeout {
+        request = request.config().timeout_global(Some(timeout)).build();
+    }
+    let mut response = request
+        .send(body.as_bytes())
+        .map_err(|e| ExchangeError::Unreachable {
+            reason: e.to_string(),
+        })?;
     let status = response.status().as_u16();
-    let retry_after_ms = response
-        .headers()
-        .get(RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let retry_after_ms = header(RETRY_AFTER)
         .and_then(|seconds| seconds.trim().parse::<u64>().ok())
         .map(|seconds| seconds.saturating_mul(1000));
+    let request_id = header("x-request-id");
     let body = response
         .body_mut()
         .with_config()
@@ -199,22 +252,30 @@ pub(crate) fn exchange(key: &Key) -> Result<Exchanged, ExchangeError> {
         .map_err(|e| ExchangeError::Unreachable {
             reason: format!("the answer's body broke off: {e}"),
         })?;
-    answer(status, retry_after_ms, &body)
+    answer(status, retry_after_ms, request_id.as_deref(), &body)
 }
 
 /// What the endpoint's answer `status` with `body` gives, where `retry_after_ms` is its
-/// `Retry-After`.
+/// `Retry-After` and `request_id` its `X-Request-Id`.
 pub(crate) fn answer(
     status: u16,
     retry_after_ms: Option<u64>,
+    request_id: Option<&str>,
     body: &[u8],
 ) -> Result<Exchanged, ExchangeError> {
+    let problem = || Box::new(Problem::read(body, request_id));
     match status {
         200..=299 => token_of(body).ok_or(ExchangeError::NoToken),
-        401 | 403 => Err(ExchangeError::Refused { status }),
+        401 | 403 => Err(ExchangeError::Refused {
+            status,
+            problem: problem(),
+        }),
         429 => Err(ExchangeError::RateLimited { retry_after_ms }),
         408 | 500..=599 => Err(ExchangeError::Unavailable { status }),
-        _ => Err(ExchangeError::Unexpected { status }),
+        _ => Err(ExchangeError::Unexpected {
+            status,
+            problem: problem(),
+        }),
     }
 }
 
@@ -252,6 +313,7 @@ mod tests {
     use super::Exchanged;
     use super::Key;
     use super::KeyRefusal;
+    use super::Problem;
     use super::answer;
     use crate::error::ErrorKind;
 
@@ -268,6 +330,7 @@ mod tests {
             answer(
                 200,
                 None,
+                None,
                 br#"{"access_token": "t.1-x", "token_type": "Bearer", "expires_in": 900}"#
             ),
             ok("t.1-x", 900_000)
@@ -277,6 +340,7 @@ mod tests {
             answer(
                 200,
                 None,
+                None,
                 br#"{"scope": ["a", {"b": [1, {}]}], "access_token": "t1",
                      "authorization_details": {"type": "x", "n": null}, "expires_in": 60}"#
             ),
@@ -284,12 +348,18 @@ mod tests {
         );
         // Any positive number of seconds, rounded down to whole milliseconds.
         assert_eq!(
-            answer(200, None, br#"{"access_token": "t1", "expires_in": 1.5}"#),
+            answer(
+                200,
+                None,
+                None,
+                br#"{"access_token": "t1", "expires_in": 1.5}"#
+            ),
             ok("t1", 1_500)
         );
         assert_eq!(
             answer(
                 200,
+                None,
                 None,
                 br#"{"access_token": "t1", "expires_in": 0.0004}"#
             ),
@@ -308,7 +378,7 @@ mod tests {
             b"not json",
             b"",
         ] {
-            assert_eq!(answer(200, None, body), Err(ExchangeError::NoToken));
+            assert_eq!(answer(200, None, None, body), Err(ExchangeError::NoToken));
         }
     }
 
@@ -317,9 +387,15 @@ mod tests {
     #[test]
     fn failures_are_classified_by_status() {
         let ok = br#"{"access_token": "t1", "expires_in": 900}"#;
-        let refused = |status| ExchangeError::Refused { status };
+        let refused = |status| ExchangeError::Refused {
+            status,
+            problem: Box::default(),
+        };
         let unavailable = |status| ExchangeError::Unavailable { status };
-        let unexpected = |status| ExchangeError::Unexpected { status };
+        let unexpected = |status| ExchangeError::Unexpected {
+            status,
+            problem: Box::default(),
+        };
         let cases = [
             (401, refused(401), ErrorKind::Unauthorized),
             (403, refused(403), ErrorKind::Forbidden),
@@ -337,7 +413,7 @@ mod tests {
         ];
         for (status, error, kind) in cases {
             assert_eq!(
-                answer(status, Some(3_000), ok),
+                answer(status, Some(3_000), None, ok),
                 Err(error.clone()),
                 "{status}"
             );
@@ -349,6 +425,42 @@ mod tests {
         assert!(!ExchangeError::NoToken.permanent());
         assert_eq!(ExchangeError::Panicked.kind(), ErrorKind::Internal);
         assert!(ExchangeError::Panicked.permanent());
+    }
+
+    // A refusal and a status the exchange cannot use carry the answer's problem details, the
+    // request id from `X-Request-Id` when the body names none.
+    #[test]
+    fn a_refusal_carries_its_problem_details() {
+        let body = br#"{"type": "about:blank", "status": 401, "code": "unauthenticated", "detail": "revoked", "request_id": "req-1"}"#;
+        let problem = Problem {
+            code: Some("unauthenticated".to_owned()),
+            detail: Some("revoked".to_owned()),
+            request_id: Some("req-1".to_owned()),
+        };
+        assert_eq!(
+            answer(401, None, Some("req-header"), body),
+            Err(ExchangeError::Refused {
+                status: 401,
+                problem: Box::new(problem.clone()),
+            })
+        );
+        assert_eq!(
+            answer(
+                404,
+                None,
+                Some("req-header"),
+                br#"{"code": "", "detail": "no route"}"#
+            ),
+            Err(ExchangeError::Unexpected {
+                status: 404,
+                problem: Box::new(Problem {
+                    code: None,
+                    detail: Some("no route".to_owned()),
+                    request_id: Some("req-header".to_owned()),
+                }),
+            })
+        );
+        assert_eq!(Problem::read(b"<html>", Some(" ")), Problem::default());
     }
 
     // The key goes only to an https:// endpoint, or an http:// one on a loopback host, and is

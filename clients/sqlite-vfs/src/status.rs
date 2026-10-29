@@ -1,5 +1,5 @@
 //! The JSON the SQL functions return: `ursula_status` (design: Status), `ursula_stats`,
-//! `ursula_events` and the results of `ursula_open` and `ursula_synced`.
+//! `ursula_events` and the results of `ursula_open`, `ursula_synced` and `tonbo_resolve`.
 
 use crate::auth::TokenStatus;
 use crate::db::Binding;
@@ -26,6 +26,8 @@ use crate::replicator::Condition;
 use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
+use crate::tonbo::Resolution;
+use crate::tonbo::TonboError;
 
 /// An object of `before`, a failure's kind with what to do about it and the error a host throws
 /// for it as it surfaced at `surface` (design: Errors), then `after`.
@@ -317,6 +319,31 @@ pub(crate) fn opened_json(opened: &Opened) -> String {
     }
 }
 
+/// `tonbo_resolve`'s result: `{done, url, name}`, `name` `null` for a URL, or `{done: false,
+/// request}` while the resolve goes on.
+pub(crate) fn resolution_json(resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Done(resolved) => object(&[
+            ("done", "true".into()),
+            ("url", json_str(&resolved.url)),
+            ("name", resolved.name.as_deref().map_or_else(null, json_str)),
+        ]),
+        Resolution::Pending(request) => {
+            object(&[("done", "false".into()), ("request", request.to_string())])
+        }
+    }
+}
+
+/// What `ursula_cancel` of a resolve reports it ended with: `{kind, action, class, message, fix,
+/// request_id}`.
+pub(crate) fn tonbo_error_json(e: &TonboError) -> String {
+    with_kind(&[], e.kind(), Surface::Open, &[
+        ("message", json_str(&e.report().to_string())),
+        ("fix", e.fix().as_deref().map_or_else(null, json_str)),
+        ("request_id", e.request_id().map_or_else(null, json_str)),
+    ])
+}
+
 /// `ursula_import`'s result.
 pub(crate) fn imported_json(imported: &crate::import::Imported) -> String {
     object(&[
@@ -429,6 +456,11 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
             DriverEvent::Gap { dropped } => {
                 object(&[("event", json_str("gap")), ("dropped", dropped.to_string())])
             }
+            DriverEvent::Resolved { request, ok } => object(&[
+                ("event", json_str("resolved")),
+                ("request", request.to_string()),
+                ("ok", ok.to_string()),
+            ]),
         })
         .collect();
     object(&[
@@ -564,7 +596,10 @@ mod tests {
                 expires_in_ms: Some(0),
                 refresh_in_ms: Some(2_000),
                 failures: 2,
-                error: Some(ExchangeError::Refused { status: 401 }),
+                error: Some(ExchangeError::Refused {
+                    status: 401,
+                    problem: Box::default(),
+                }),
             }),
         };
         assert_eq!(

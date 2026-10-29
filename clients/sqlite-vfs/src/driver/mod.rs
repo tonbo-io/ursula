@@ -846,6 +846,10 @@ pub(crate) enum DriverEvent {
     Retired { binding: BindingId },
     /// `dropped` events fell out of the bounded queue before this reader saw them.
     Gap { dropped: u64 },
+    /// A request the driver does not run resolved (`ok` when it succeeded): a host's
+    /// `tonbo_resolve` with `timeout_ms` 0, whose id came from [`runtime::Driver::request_id`].
+    /// The host calls again to take its outcome.
+    Resolved { request: u64, ok: bool },
 }
 
 /// The bounded queue of events, read by cursor: each event has a sequence number, and a reader

@@ -21,10 +21,11 @@
 //!
 //! Module map:
 //!
-//! - `exchange`: one exchange of a key at its token endpoint, and what the answer gives.
+//! - `exchange`: one exchange of a key at its token endpoint, and what the answer gives, which
+//!   the Tonbo lookup's Management API token uses too (`tonbo`).
 //! - `key`: a key's schedule: when it exchanges, and what a token, a failure or a `401` changes.
 
-mod exchange;
+pub(crate) mod exchange;
 mod key;
 
 use std::fs;
@@ -99,7 +100,7 @@ pub(crate) fn set_token(token: Option<&str>) {
 /// The token requests carry changed: the requests a `401` blocked go again at once. The key's
 /// source may have started or stopped serving: its refresher looks again.
 fn changed() {
-    wake_refresher();
+    wake();
     crate::driver::runtime::token_changed();
 }
 
@@ -291,9 +292,10 @@ fn jitter() -> Jitter {
     Jitter::new(draw.checked_rem(1_001).unwrap_or_default())
 }
 
-/// Wakes the refresher to look at its schedule again. The lock taken first means it is either
-/// waiting already, or has not yet looked at what changed.
-fn wake_refresher() {
+/// Wakes the refresher to look at its schedule again, and the hosts waiting in [`use_key`] to look
+/// at whether they were cancelled. The lock taken first means each is either waiting already, or
+/// has not yet looked at what changed.
+pub(crate) fn wake() {
     drop(lock(&KEY));
     KEY_CHANGED.notify_all();
 }
@@ -303,7 +305,7 @@ fn wake_refresher() {
 /// runs or a host waits for its token).
 pub(crate) fn requests_may_go_out(requesting: bool) {
     if REQUESTING.swap(requesting, Ordering::AcqRel) != requesting && requesting {
-        wake_refresher();
+        wake();
     }
 }
 
@@ -332,7 +334,7 @@ pub(crate) struct Importing(());
 /// it runs, as while a database may send requests.
 pub(crate) fn importing() -> Importing {
     IMPORTS.fetch_add(1, Ordering::AcqRel);
-    wake_refresher();
+    wake();
     Importing(())
 }
 
@@ -380,6 +382,12 @@ pub(crate) enum KeyError {
         timeout_ms: u64,
         last: Option<ExchangeError>,
     },
+    /// The host gave up waiting ([`use_key`]'s `cancelled`).
+    #[error(
+        "cancelled before a token{}",
+        .last.as_ref().map(|e| format!(": {e}")).unwrap_or_default()
+    )]
+    Cancelled { last: Option<ExchangeError> },
     #[error("the token refresher thread could not be started")]
     NoRefresher(#[source] std::io::Error),
     /// The refresher stopped on a panic while the host waited. The next use starts another.
@@ -389,13 +397,6 @@ pub(crate) enum KeyError {
 
 impl KeyError {
     /// The kind a host reports.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Tonbo resolution reports it, in the change that adds it"
-        )
-    )]
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
             KeyError::Invalid(_) | KeyError::AnotherKey => ErrorKind::InvalidArgument,
@@ -403,6 +404,9 @@ impl KeyError {
             KeyError::TimedOut { last, .. } => last
                 .as_ref()
                 .map_or(ErrorKind::Unavailable, ExchangeError::kind),
+            KeyError::Cancelled { last } => last
+                .as_ref()
+                .map_or(ErrorKind::Cancelled, ExchangeError::kind),
             KeyError::NoRefresher(_) | KeyError::RefresherStopped => ErrorKind::Internal,
         }
     }
@@ -447,19 +451,15 @@ fn admit(held: Option<(&Key, Use)>, next: &Key) -> Admit {
 /// one held fails while a host waits for the held key's token or was handed it less than
 /// [`HANDED_OUT_HOLD_MS`] ago, or while an open, a bound database or an import may send requests
 /// carrying its token. The host asks for its open within [`HANDED_OUT_HOLD_MS`], so that the open
-/// carries this key's tokens.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Tonbo resolution installs the key, in the change that adds it"
-    )
-)]
+/// carries this key's tokens. The wait ends early once `cancelled` holds, asked again after each
+/// [`wake`] and each change of the key, with the key's last failure: the host gives up its claim
+/// on the key at once.
 pub(crate) fn use_key(
     secret: &str,
     endpoint: &str,
     audience: Option<&str>,
     timeout: Duration,
+    cancelled: &dyn Fn(Option<&ExchangeError>) -> bool,
 ) -> Result<(), KeyError> {
     let key = Key::new(secret, endpoint, audience)?;
     start_refresher()?;
@@ -502,6 +502,11 @@ pub(crate) fn use_key(
         }
         if !REFRESHER_UP.load(Ordering::Acquire) {
             break Err(KeyError::RefresherStopped);
+        }
+        if cancelled(last) {
+            break Err(KeyError::Cancelled {
+                last: last.cloned(),
+            });
         }
         if now >= deadline {
             break Err(KeyError::TimedOut {
@@ -560,7 +565,7 @@ fn start_refresher() -> Result<(), KeyError> {
 fn run_refresher() {
     crate::guard::contain("token_refresher", || (), refresh);
     REFRESHER_UP.store(false, Ordering::Release);
-    wake_refresher();
+    wake();
 }
 
 /// The refresher's loop: exchanges the key whenever its schedule says so while it is active,
@@ -590,7 +595,7 @@ fn refresh() {
         let outcome = crate::guard::contain(
             "token_exchange",
             || Err(ExchangeError::Panicked),
-            || exchange::exchange(&key),
+            || exchange::exchange(&key, None),
         );
         let jitter = jitter();
         held = lock(&KEY);
@@ -757,7 +762,7 @@ fn stat(path: &str) -> (Option<SystemTime>, Option<u64>) {
 
 /// A token as `Authorization: Bearer` carries it: trimmed, non-empty, printable ASCII without
 /// spaces.
-fn usable(token: &str) -> Option<String> {
+pub(crate) fn usable(token: &str) -> Option<String> {
     let token = token.trim();
     (!token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())).then(|| token.to_owned())
 }
@@ -825,7 +830,10 @@ mod tests {
         assert!(served.exchanged(Ok(t1), 0, jitter));
         let mut refused = served.clone();
         assert!(refused.start(70_000, true));
-        let refusal = Err(ExchangeError::Refused { status: 401 });
+        let refusal = Err(ExchangeError::Refused {
+            status: 401,
+            problem: Box::default(),
+        });
         assert!(!refused.exchanged(refusal, 70_000, jitter));
         let mut failing = served.clone();
         assert!(failing.start(70_000, true));
@@ -885,7 +893,12 @@ mod tests {
             error,
         };
         let down = || Some(ExchangeError::Unavailable { status: 503 });
-        let refused = || Some(ExchangeError::Refused { status: 401 });
+        let refused = || {
+            Some(ExchangeError::Refused {
+                status: 401,
+                problem: Box::default(),
+            })
+        };
         assert_eq!(
             report(&view(0, None), view(1, down())),
             Some(Report::Failed(ExchangeError::Unavailable { status: 503 }))
@@ -893,7 +906,10 @@ mod tests {
         assert_eq!(report(&view(1, down()), view(2, down())), None);
         assert_eq!(
             report(&view(2, down()), view(3, refused())),
-            Some(Report::Failed(ExchangeError::Refused { status: 401 }))
+            Some(Report::Failed(ExchangeError::Refused {
+                status: 401,
+                problem: Box::default(),
+            }))
         );
         assert_eq!(report(&view(3, refused()), view(4, refused())), None);
         assert_eq!(report(&view(4, refused()), view(5, down())), None);
@@ -923,7 +939,10 @@ mod tests {
             ErrorKind::InvalidArgument
         );
         assert_eq!(KeyError::AnotherKey.kind(), ErrorKind::InvalidArgument);
-        let refused = ExchangeError::Refused { status: 403 };
+        let refused = ExchangeError::Refused {
+            status: 403,
+            problem: Box::default(),
+        };
         assert_eq!(
             KeyError::Exchange(refused.clone()).kind(),
             ErrorKind::Forbidden
