@@ -85,6 +85,8 @@ pub(crate) enum ErrorKind {
     Cancelled,
     /// The path names no database bound in this process.
     NotBound,
+    /// The process is a child forked after its parent started the extension (design: Forks).
+    Forked,
     Internal,
 }
 
@@ -138,6 +140,7 @@ kind_tokens! {
     Forbidden => "forbidden",
     Cancelled => "cancelled",
     NotBound => "not_bound",
+    Forked => "forked",
     Internal => "internal",
 }
 
@@ -169,7 +172,8 @@ impl ErrorKind {
             | ErrorKind::PaymentRequired
             | ErrorKind::Forbidden
             | ErrorKind::NotBound
-            | ErrorKind::BoundElsewhere => Action::Fix,
+            | ErrorKind::BoundElsewhere
+            | ErrorKind::Forked => Action::Fix,
         }
     }
 }
@@ -257,7 +261,8 @@ impl ErrorKind {
             | ErrorKind::ProtocolMismatch
             | ErrorKind::WrongCluster
             | ErrorKind::ClaimRaces
-            | ErrorKind::NotBound => ErrorClass::Setup,
+            | ErrorKind::NotBound
+            | ErrorKind::Forked => ErrorClass::Setup,
         }
     }
 }
@@ -554,6 +559,9 @@ pub(crate) enum Error {
     Salvage(#[from] SalvageError),
     #[error(transparent)]
     Import(#[from] ImportError),
+    /// Every SQL function's failure in a child forked after its parent started the extension.
+    #[error("the process forked after the extension started: open databases after the fork")]
+    Forked,
 }
 
 impl Error {
@@ -567,6 +575,7 @@ impl Error {
             Error::DriverGone(_) | Error::Panicked { .. } => ErrorKind::Internal,
             Error::Salvage(_) => ErrorKind::LocalSetup,
             Error::Import(e) => e.kind(),
+            Error::Forked => ErrorKind::Forked,
         }
     }
 }
@@ -626,6 +635,7 @@ mod tests {
             ErrorKind::StreamState,
             ErrorKind::Internal,
             ErrorKind::NotBound,
+            ErrorKind::Forked,
         ];
         for kind in resets.into_iter().map(ErrorKind::Reset).chain(others) {
             let read = ErrorKind::parse(kind.as_str()).unwrap();

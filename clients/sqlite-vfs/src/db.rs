@@ -40,6 +40,8 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -283,6 +285,9 @@ struct Registry {
     /// Opens that resolved and whose binding one caller is registering ([`register`]): another
     /// open of one waits on [`registered`] until it is registered.
     registering: HashSet<OpenKey>,
+    /// The process started the extension ([`start_process`]): a child forked from here on is
+    /// `forked` ([`crate::fork`]).
+    started: bool,
 }
 
 impl Registry {
@@ -338,6 +343,48 @@ fn registry() -> MutexGuard<'static, Registry> {
     registry_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Marks the process started (design: Forks): a child forked from here on is `forked`. The SQL
+/// functions that make what lives on in the process (`ursula_open`, `ursula_events` and
+/// `ursula_import`: the driver and its threads, HTTP agents and their pooled connections, the
+/// resolver's cache, a token) call it before anything else. It marks under the registry, which
+/// every fork takes first, so a fork falls before the mark, and the child has none of what follows
+/// it, or after it, and the child is `forked`.
+pub(crate) fn start_process() {
+    registry().started = true;
+    STARTED.store(true, Ordering::Release);
+}
+
+/// [`start_process`] ran, read without the registry: [`expect_started`] runs where the registry may
+/// already be held, as `driver()` is first reached under it.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// A safety net for the start rule (design: Forks): `what` (the driver, an HTTP agent, a thread)
+/// lives on in the process, so the SQL function that makes it marks the process started first. If
+/// one did not, a child forked later would reuse it instead of failing `forked`: the first such
+/// make logs `fork_guard_unstarted` once.
+pub(crate) fn expect_started(what: &'static str) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !STARTED.load(Ordering::Acquire) && !SAID.swap(true, Ordering::AcqRel) {
+        log::emit(Level::Warn, "fork_guard_unstarted", &[("what", &what)]);
+    }
+}
+
+/// The registry, held across a fork by the thread that forks ([`crate::fork`]).
+pub(crate) struct Held(MutexGuard<'static, Registry>);
+
+impl Held {
+    /// Whether the process had started the extension ([`start_process`]).
+    pub(crate) fn started(&self) -> bool {
+        self.0.started
+    }
+}
+
+/// Before a fork, on the thread that forks: takes the registry, so no other thread holds it at
+/// the fork and the child gets it whole.
+pub(crate) fn hold_for_fork() -> Held {
+    Held(registry())
 }
 
 /// Signalled when a registration ends.
@@ -860,6 +907,12 @@ pub(crate) fn registered_for_tests(b: &Arc<Binding>) -> impl Drop {
     }
     registry().paths.insert(b.path.clone(), Arc::clone(b));
     Registered(b.path.clone())
+}
+
+/// The registry, locked by this thread until the guard drops: another thread's fork waits for it.
+#[cfg(test)]
+pub(crate) fn registry_locked_for_tests() -> impl Drop {
+    registry()
 }
 
 #[cfg(test)]

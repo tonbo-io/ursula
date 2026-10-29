@@ -485,6 +485,7 @@ impl Watchdog {
         let snapper = Arc::new(Snapper::default());
         let expired = Arc::new(AtomicBool::new(false));
         let (s, e) = (Arc::clone(&snapper), Arc::clone(&expired));
+        crate::db::expect_started("import_watchdog");
         let thread = std::thread::Builder::new()
             .name("ursula-vfs-import".to_owned())
             .spawn(move || {

@@ -218,9 +218,11 @@ pub(crate) struct Driver {
 /// The process driver.
 static DRIVER: OnceLock<Driver> = OnceLock::new();
 
-/// The process driver, over HTTP, started on first use.
+/// The process driver, over HTTP, started on first use: by `ursula_open` or `ursula_events`, each
+/// after it marked the process started (`db::start_process`, design: Forks).
 pub(crate) fn driver() -> &'static Driver {
     DRIVER.get_or_init(|| {
+        crate::db::expect_started("driver");
         let transports: Transports =
             Arc::new(|url: &str| Arc::new(HttpTransport::new(url)) as Arc<dyn Transport>);
         Driver::start(transports, seed())
