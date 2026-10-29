@@ -2358,6 +2358,15 @@ What CI runs (`.github/workflows/integration.yml`):
   `python:3.13-alpine`, and the Python suites run there.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
   in-memory cold store. The tests that script faults skip there.
+- `sqlite-ursula-python-wheels.yml`, on pull requests that change the Python package or the
+  workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
+  builds it for npm (glibc 2.28 at most, musl linked dynamically, macOS 11.0), packed into one
+  `py3-none` wheel per platform and the `py3-none-any` wheel without a library
+  (`scripts/pack.py`), `auditwheel show` finding each Linux wheel within its tag, `twine check`,
+  and the wheels installed from their directory alone (`scripts/smoke.sh`): uv-managed CPython
+  3.11, 3.14 and 3.14t on Debian 11 x64 and arm64 and on macOS, Homebrew's Python on macOS and
+  `python:3.13-alpine` host the library their wheel carries, and `python:3.13-slim` and the
+  `py3-none-any` wheel fail with `host_unsupported`.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
   with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.

@@ -1,0 +1,249 @@
+name: sqlite-ursula-python Wheels
+
+# Builds the wheels of clients/sqlite-ursula-python, checks them and installs them on each platform,
+# as pypi-publish.yml publishes them. Uploads nothing to an index. Runs on pull requests that touch
+# the package or these workflows, and pypi-publish.yml calls it.
+#
+# build (the extension, sqlite-vfs-build.yml) -> pack -> smoke. pack makes one py3-none wheel per
+# platform with its library under sqlite_ursula/_lib/ (manylinux_2_28_x86_64,
+# manylinux_2_28_aarch64, musllinux_1_2_x86_64, macosx_11_0_arm64) and the py3-none-any wheel
+# without one, then runs auditwheel show on the Linux wheels and twine check on all of them
+# (scripts/pack.py). The wheels are the artifact `python-wheels`. smoke installs them, picking the
+# one that fits, from that directory alone (scripts/smoke.sh): uv-managed CPython 3.11, 3.14 and
+# 3.14t on Debian 11 (glibc 2.31) x64 and arm64 and on macOS, Homebrew's Python on macOS and
+# python:3.13-alpine (Alpine 3.23, musl) host the extension. python:3.13-slim, whose SQLite is older
+# than the extension's floor, and the py3-none-any wheel, which carries no library, fail with
+# host_unsupported and the fix for that reason.
+
+on:
+  pull_request:
+    paths:
+      - clients/sqlite-ursula-python/**
+      - .github/workflows/sqlite-vfs-build.yml
+      - .github/workflows/sqlite-ursula-python-wheels.yml
+      - .github/workflows/pypi-publish.yml
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build
+        required: true
+        type: string
+      version:
+        description: The version the wheels carry, the package's own or a .devN pre-release
+        required: true
+        type: string
+    outputs:
+      version:
+        description: The version the wheels carry
+        value: ${{ jobs.pack.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build
+    uses: ./.github/workflows/sqlite-vfs-build.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
+  pack:
+    name: Pack and check
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: Download the extensions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: extension-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/extension
+
+      # The package's own version on a pull request.
+      - name: Resolve the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version=${VERSION:-$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py)}
+          test -n "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      # pack fails unless every wheel holds exactly the files it should, and check unless auditwheel
+      # finds each Linux wheel within its tag and twine finds every wheel's metadata valid.
+      - name: Pack and check the wheels
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/python-wheels"
+          pack=clients/sqlite-ursula-python/scripts/pack.py
+          uv run --no-project --python 3.14 "$pack" pack "$RUNNER_TEMP/extension" "$out" "$VERSION"
+          uv run --no-project --python 3.14 "$pack" check "$out"
+          {
+            echo "sqlite-ursula $VERSION"
+            echo
+            echo '| Wheel | Bytes |'
+            echo '| --- | ---: |'
+            for wheel in "$out"/*.whl; do
+              echo "| $(basename "$wheel") | $(wc -c <"$wheel") |"
+              echo "== $(basename "$wheel")" >&2
+              unzip -l "$wheel" >&2
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the wheels
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: python-wheels
+          path: ${{ runner.temp }}/python-wheels
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Smoke ${{ matrix.name }}
+    needs: pack
+    # Linux entries are RunsOn labels that take the run id, and fork PRs run on GitHub-hosted
+    # runners. `macos-15` has no placeholder.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || format(matrix.runner, github.run_id) }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu (Debian 11, uv CPython 3.11, 3.14, 3.14t)
+            runner: runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64
+            hosted: ubuntu-24.04
+            image: public.ecr.aws/docker/library/debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd
+            installer: uv
+            pythons: 3.11 3.14 3.14t
+            wheel: best
+            expect: ok
+          - name: linux-arm64-gnu (Debian 11, uv CPython 3.11, 3.14, 3.14t)
+            runner: runs-on={0}/cpu=4/ram=16/family=m8g+m7g/image=ubuntu24-full-arm64
+            hosted: ubuntu-24.04-arm
+            image: public.ecr.aws/docker/library/debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd
+            installer: uv
+            pythons: 3.11 3.14 3.14t
+            wheel: best
+            expect: ok
+          - name: linux-x64-musl (python:3.13-alpine, Alpine 3.23)
+            runner: runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64
+            hosted: ubuntu-24.04
+            image: public.ecr.aws/docker/library/python:3.13-alpine3.23@sha256:b30bef26263dd158b3c8a5cca642fcd2f9c83cb6942138db50208cdb9be78bfe
+            installer: pip
+            pythons: python
+            wheel: best
+            expect: ok
+          - name: darwin-arm64 (uv CPython 3.11, 3.14, 3.14t)
+            runner: macos-15
+            hosted: macos-15
+            installer: uv
+            pythons: 3.11 3.14 3.14t
+            wheel: best
+            expect: ok
+          - name: darwin-arm64 (Homebrew python@3.13)
+            runner: macos-15
+            hosted: macos-15
+            brew: python@3.13
+            installer: pip
+            wheel: best
+            expect: ok
+          - name: python:3.13-slim (host_unsupported)
+            runner: runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64
+            hosted: ubuntu-24.04
+            image: public.ecr.aws/docker/library/python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+            installer: pip
+            pythons: python
+            wheel: best
+            expect: host_unsupported
+            fix: use a Python whose sqlite3 module loads extensions
+          - name: py3-none-any (Debian 11, uv CPython 3.14, host_unsupported)
+            runner: runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64
+            hosted: ubuntu-24.04
+            image: public.ecr.aws/docker/library/debian:bullseye-slim@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd
+            installer: uv
+            pythons: "3.14"
+            wheel: any
+            expect: host_unsupported
+            fix: set SQLITE_URSULA_VFS to a library built from clients/sqlite-vfs
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+          sparse-checkout: clients/sqlite-ursula-python/scripts
+
+      - name: Download the wheels
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: python-wheels
+          path: ${{ runner.temp }}/python-wheels
+
+      - name: Install uv
+        if: matrix.installer == 'uv'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: Install ${{ matrix.brew }}
+        if: matrix.brew
+        env:
+          FORMULA: ${{ matrix.brew }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install "$FORMULA"
+          python="$(brew --prefix "$FORMULA")/bin/python${FORMULA#python@}"
+          "$python" -c 'import sqlite3, sys; print(sys.version, "SQLite", sqlite3.sqlite_version)'
+          echo "BREW_PYTHON=$python" >>"$GITHUB_ENV"
+
+      - name: Install the wheel and smoke it
+        env:
+          IMAGE: ${{ matrix.image }}
+          INSTALLER: ${{ matrix.installer }}
+          PYTHONS: ${{ matrix.pythons }}
+          WHEEL: ${{ matrix.wheel }}
+          EXPECT: ${{ matrix.expect }}
+          FIX: ${{ matrix.fix }}
+          VERSION: ${{ needs.pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=("$EXPECT")
+          if [ -n "$FIX" ]; then args+=("$FIX"); fi
+          pythons=${PYTHONS:-${BREW_PYTHON:-}}
+          test -n "$pythons"
+          scripts="$PWD/clients/sqlite-ursula-python/scripts"
+          if [ -n "$IMAGE" ]; then
+            mounts=(-v "$RUNNER_TEMP/python-wheels:/wheels:ro" -v "$scripts:/scripts:ro")
+            if [ "$INSTALLER" = uv ]; then mounts+=(-v "$(command -v uv):/usr/local/bin/uv:ro"); fi
+            docker run --rm "${mounts[@]}" -e UV_PYTHON_PREFERENCE "$IMAGE" \
+              sh /scripts/smoke.sh /wheels "$VERSION" "$INSTALLER" "$pythons" "$WHEEL" "${args[@]}"
+          else
+            sh "$scripts/smoke.sh" "$RUNNER_TEMP/python-wheels" "$VERSION" "$INSTALLER" "$pythons" "$WHEEL" "${args[@]}"
+          fi

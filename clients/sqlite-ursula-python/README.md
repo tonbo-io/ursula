@@ -88,4 +88,4 @@ Open databases after a fork, never before: the extension's replication does not 
 
 ## The extension
 
-The package loads the extension its wheel carries, or the one `SQLITE_URSULA_VFS` names, built from [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs). The design is [`docs/architecture/sqlite-vfs.md`](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md).
+The package loads the extension its wheel carries, or the one `SQLITE_URSULA_VFS` names, built from [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs). Wheels carry it for Linux x64 and arm64 with glibc 2.28 or newer, Linux x64 with musl, and macOS 11 or newer on arm64. Elsewhere the installer picks the wheel without a library, and `open()` raises `host_unsupported` unless `SQLITE_URSULA_VFS` names one. The design is [`docs/architecture/sqlite-vfs.md`](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md).

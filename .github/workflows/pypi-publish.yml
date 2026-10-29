@@ -1,0 +1,135 @@
+name: PyPI Publish
+
+# Publishes clients/sqlite-ursula-python to PyPI as `sqlite-ursula`: one py3-none wheel per platform
+# with the SQLite extension (clients/sqlite-vfs) prebuilt under sqlite_ursula/_lib/, and the
+# py3-none-any wheel without one, so the package installs anywhere. No sdist.
+#
+# source -> wheels (sqlite-ursula-python-wheels.yml: build, pack and check, smoke on each platform)
+# -> publish. With dry_run, the default, the run stops before publish, and the wheels are the run's
+# `python-wheels` artifact. The version is the package's own, which scripts/check-release-versions.sh
+# keeps equal to Cargo's and package.json's, or with `dev` the pre-release `.devN` of the next patch.
+#
+# publish uses trusted publishing: PyPI's publisher for `sqlite-ursula` trusts this workflow
+# (pypi-publish.yml) in the `pypi` environment, and pypa/gh-action-pypi-publish trades the job's
+# GitHub OIDC token (id-token: write) for a short-lived upload token, and attaches PEP 740
+# attestations. No secret is involved. PyPI accepts no reusable workflow as a trusted publisher, so
+# only the build is shared with npm-publish.yml.
+
+run-name: pypi ${{ inputs.dry_run == false && 'publish' || 'dry run' }} of ${{ inputs.ref }}${{ inputs.dev != '' && format(' (dev{0})', inputs.dev) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        required: true
+        default: main
+        type: string
+      dev:
+        description: "N for the pre-release <next patch>.devN (0.11.2.dev0 from 0.11.1). Empty for the package's own version"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: Build, check and smoke-test the wheels, but do not publish them
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Resolve ${{ inputs.ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: The package's version is the release's
+        run: ./scripts/check-release-versions.sh
+
+      # Every later job builds this commit, even if the ref moves meanwhile. Only an explicit
+      # dry_run=false publishes.
+      - name: Resolve the commit and the version
+        id: resolve
+        env:
+          DEV: ${{ inputs.dev }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py)
+          if [ -n "$DEV" ]; then
+            if ! [[ "$DEV" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::dev is a number, not $DEV"
+              exit 1
+            fi
+            IFS=. read -r major minor patch <<<"$version"
+            version="$major.$minor.$((patch + 1)).dev$DEV"
+          fi
+          if [ "$DRY_RUN" = false ]; then dry_run=false; else dry_run=true; fi
+          # The attestations name the commit the run was dispatched on as the wheels' source.
+          if [ "$dry_run" = false ] && [ "$sha" != "$RUN_SHA" ]; then
+            echo "::error::ref is $sha, but the run is on $RUN_SHA. Dispatch the workflow on the ref you publish (gh workflow run pypi-publish.yml --ref <ref> -f ref=<ref>), so the attestations name the commit the wheels are built from."
+            exit 1
+          fi
+          printf 'sha=%s\nversion=%s\ndry_run=%s\n' "$sha" "$version" "$dry_run" >>"$GITHUB_OUTPUT"
+          echo "sqlite-ursula $version from $sha (dry run: $dry_run)" >>"$GITHUB_STEP_SUMMARY"
+
+  wheels:
+    name: Wheels
+    needs: source
+    uses: ./.github/workflows/sqlite-ursula-python-wheels.yml
+    with:
+      ref: ${{ needs.source.outputs.sha }}
+      version: ${{ needs.source.outputs.version }}
+
+  publish:
+    name: Publish
+    needs: [source, wheels]
+    if: needs.source.outputs.dry_run == 'false'
+    # GitHub-hosted, as PyPI's trusted publishing and attestations expect.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sqlite-ursula/${{ needs.source.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the wheels
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: python-wheels
+          path: dist
+
+      # Before publishing, so a failed publish still leaves the exact wheels to retry with.
+      - name: Upload the wheels
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: python-packages
+          path: dist
+          if-no-files-found: error
+          retention-days: 30
+
+      # A wheel already on PyPI is skipped, so a failed run can be run again.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
+          skip-existing: true
