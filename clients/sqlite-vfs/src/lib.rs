@@ -78,7 +78,8 @@
 //! An owner `ursula_open` records its cache directory in the host directory, when there is one,
 //! before it claims anything, and fails `local_setup` when it cannot (`hostdir`, design: Hosts).
 //! A host reads every root of the recorded directories, and checks every open root lock, with
-//! [`inspection::inspect`], which the `ursula-vfs-host` binary runs. While a host holds the host
+//! [`inspection::inspect`], which the `ursula-vfs-host` binary runs, and removes the records of
+//! directories that no longer exist with [`prune::prune`]. While a host holds the host
 //! directory's `hold` file ([`hold::take`], `ursula-vfs-host hold`), a write transaction of an
 //! owner binding waits before it takes the WAL write lock, for at most 60 s, so the logs drain.
 //! The wait itself returns no `SQLITE_BUSY` and calls no busy handler; afterwards the request
@@ -149,6 +150,8 @@
 //! - `open`: opening a stream (design: Open) up to its takeover, or a reader's bind, run by the
 //!   driver.
 //! - `options`: `ursula_open`'s `options_json`.
+//! - [`prune`]: a host's removal of the records of cache directories that no longer exist, and of
+//!   the temp files of writers that no longer run, after a complete inspection pass of its own.
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle.
 //! - `replicator`: the replicator state machine of one bound database.
 //! - `replog`: the commit log, `USL1` segments in a generation's `log/`.
@@ -192,6 +195,7 @@ pub mod model;
 mod net;
 mod open;
 mod options;
+pub mod prune;
 mod publication;
 mod replicator;
 mod replog;

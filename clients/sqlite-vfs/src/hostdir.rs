@@ -53,6 +53,7 @@ use crate::config::Step as AbortStep;
 use crate::config::abort_at;
 use crate::ids::URANDOM;
 use crate::ids::random16;
+use crate::inspection;
 use crate::json;
 use crate::json::SyntaxError;
 use crate::json::Value;
@@ -258,6 +259,24 @@ pub(crate) fn entry(name: &str) -> Entry {
         return Entry::Host;
     }
     Entry::Unrecognized
+}
+
+/// The writer's PID that the temp file's name `name` (`.tmp-<pid>-<16 hex>`) carries, as its own
+/// PID namespace numbers it. `None` for another name, or a number that is not a PID `kill` can
+/// probe ([`inspection::process_id`]): 0, or one above `pid_t`'s maximum.
+pub(crate) fn tmp_pid(name: &str) -> Option<u32> {
+    if entry(name) != Entry::Tmp {
+        return None;
+    }
+    let (pid, _suffix) = name.strip_prefix(TMP)?.split_once('-')?;
+    let pid: u32 = pid.parse().ok()?;
+    inspection::process_id(pid).map(|_probed| pid)
+}
+
+/// Removes the file `name` from the open host directory `dir`, through its descriptor and never
+/// through a link (`unlinkat`): a host's prune of a record or a temp file.
+pub(crate) fn unlink(dir: &File, name: &str) -> std::io::Result<()> {
+    at::unlink(dir, name)
 }
 
 /// The real path `real` of a cache directory as text.

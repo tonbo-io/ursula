@@ -1327,12 +1327,12 @@ own, and loads, commits, `synced()` and status never consult the host directory.
   (logged once, `host_dir_unreadable`). `URSULA_VFS_HOST_DIR` is a test hook, read only when that
   path is absent, and not a setting: an application can scrub its environment, never the
   compiled-in path.
-- A host may delete the record of a directory that no longer exists, while nothing that may load
-  the extension runs: an open that locks a root in a directory at that path again records it
-  before it can log.
+- A host may delete the record of a directory that no longer exists and is gone for good at that
+  path, while nothing that may load the extension runs: an open that locks a root in a directory
+  at that path again records it before it can log. `ursula-vfs-host prune` does this (below).
 - A `.tmp-<pid>-*` carries the writer's PID as its own PID namespace numbers it. A host may delete
-  one only when it shares that namespace and no process with that PID runs. A PID from another
-  namespace says nothing about the processes the host sees.
+  one only when it shares that namespace and no process with that PID runs (`prune --tmp`). A PID
+  from another namespace says nothing about the processes the host sees.
 - A mode-1777 directory is no boundary between the processes that share it. Any of them can link a
   record under a name another's directory hashes to, failing that one's opens, or record a
   directory that is not its own. Processes that must not affect each other need host directories
@@ -1347,10 +1347,11 @@ until the root is opened where it now is.
 
 `ursula-vfs-host` is a binary of the extension's crate that never loads SQLite. `inspect`
 (`inspection::inspect`) is the host's read of the disk, and never writes a file or takes a lock.
-`drain` is a process of the extension that locks roots and writes their logs and claims
-([Draining](#draining)), so a host that tells its helpers apart by executable must tell a drain
-apart by its first argument. A host runs `inspect` as root, so that it can read every root and every
-process's descriptors. One pass reads:
+`hold` locks the host directory's `hold` file, and `prune` removes records, and with `--tmp` temp
+files, from the host directory. `drain` is a process of the extension that locks roots and writes
+their logs and claims ([Draining](#draining)), so a host that tells its helpers apart by executable
+must tell a drain apart by its first argument. A host runs `inspect` as root, so that it can read
+every root and every process's descriptors. One pass reads:
 
 1. The host directory: the one `--dir` names, or the compiled-in path. The inspector never reads
    `URSULA_VFS_HOST_DIR`, so a test hook left in the host's environment cannot point it at another
@@ -1506,6 +1507,73 @@ extension does not see it either until the root is opened where it now is. A cop
 from before the host directory records nothing, so its roots are read only while it runs (the lock
 check) or in a directory the host scans.
 
+`ursula-vfs-host prune [--dir D] [--scan S]... [--budget-ms MS] [--tmp]` (`prune::prune`) removes
+the records of cache directories that no longer exist. It runs one pass of the inspection with
+`--dir`, `--scan` and `--budget-ms` as `inspect` takes them, and reads only its arguments, never
+the environment. Its lock check covers every process, so a host runs it as root, and it takes no
+`--pid`, which is a usage error: a check of some processes could miss a live root in an absent
+directory. A host passes the `--scan`s of its proof, so that the pass covers the same roots.
+
+- When the pass is not complete, it removes nothing.
+- When the pass is complete, it removes, in name order, the record of each recorded directory the
+  pass found absent (in `dirs[]`, `from` is `record`, `present` false and `error` null: nothing at
+  the path, or something that is not a directory). With `--tmp` it also removes each
+  `.tmp-<pid>-<16 hex>` whose PID no process has in the prune's PID namespace (`kill(pid, 0)`
+  answers `ESRCH`). A name whose number is not a PID `kill` can probe (0, or above `pid_t`'s
+  maximum) stays.
+- Before the removals it opens the host directory again (`O_DIRECTORY` and `O_NOFOLLOW`) and
+  refuses it unless it is the directory the pass checked (the same device and inode). Each
+  record's removal checks that the directory is still absent by the pass's test, reads the record
+  again through the descriptor, which must still be a record of that directory, and unlinks it
+  through the descriptor. A removal that fails is skipped and the others go on, since each checks
+  for itself. After the last one the host directory is fsynced once.
+- Nothing else ever goes: not a present directory's record, not a name the inspection does not
+  recognize (it would hide a later line's entries from a later host), not `hold` or a `host`
+  name, not a temp file of a live PID, nothing after an incomplete pass and nothing through a
+  link.
+
+A removed record comes back before its directory can hold a commit made after the prune, since
+every owner open that locks a root in a directory records it before it can log. No live process
+holds a root in an absent directory, or the lock check of every process would have found its lock
+unread and the pass would be incomplete. That covers a root deleted, moved or hidden under a live
+process. What the prune cannot check is the host's:
+
+- Nothing that may load the extension runs from the pass to the last removal. A process that runs
+  in between can recreate the directory, find the record, and log commits after the record is
+  gone. A host prunes after the freeze, the sync and a complete proof, before the thaw, or after a
+  stop emptied the workload, and never while the workload runs.
+- Every filesystem the workload wrote to is mounted at the path it was written through, as for the
+  proof. A cache directory on a filesystem that is not mounted looks absent.
+- A directory absent at a complete proof is gone for good at that path: never moved back,
+  remounted or restored there. Without its record no later inspection reads such a directory
+  unless a `--scan` names it, so the commits it brings back would be missed. A directory that can
+  come back keeps its record, and a host that cannot promise this does not prune.
+- `--tmp` only when every process that may load the extension shares the prune's PID namespace.
+  Removing the temp file of a live writer in another namespace fails that writer's open with
+  `local_setup` before it claims anything (its link of the temp file fails, or once linked its
+  unlink of the temp file), so nothing reaches the stream. The flag stays explicit anyway: readers
+  ignore temp files, which appear only after a crash mid-publish.
+
+The host directory is mode 1777, so only root or a record's own writer can remove a record, which
+is one more reason a host runs `prune` as root.
+
+```json
+{"v":1,"dir":"/var/lib/sqlite-ursula/host","pruned":true,"incomplete":null,
+ "removed":[{"name":"dir-5e0c…","dir":"/home/app/.cache/sqlite-ursula/0.8"}],
+ "tmp_removed":[],"error":null}
+```
+
+- `pruned` is true when the pass was complete and every removal it tried succeeded, the fsync
+  included, and also when there was nothing to remove.
+- `incomplete` is the pass's reason, as `inspect` reports it, with its precedence.
+- `removed` and `tmp_removed` list only the removals that completed.
+- `error` is the first failure (a removal, the fsync, or a host directory that is no longer the one
+  the pass read), else the pass's own message, else null. A host acts on `pruned` and
+  `incomplete`, never on the message.
+- `prune` exits 0 when it printed a result, 2 on a usage error and 1 when it could not write.
+  Within `v` 1 the keys and their order are fixed: any change is a new `v`, and a host may refuse
+  any other shape.
+
 Tests: `hostdir/tests.rs` `the_default_wins_whenever_lstat_finds_it`,
 `without_the_default_the_hook_decides`, `a_record_names_the_real_path_under_its_hash`,
 `a_real_path_that_is_not_utf8_fails`, `an_open_records_its_cache_directory_once`,
@@ -1528,15 +1596,16 @@ crash at each step of the record). The inspection: `inspection/tests.rs`
 `a_root_that_cannot_be_looked_at_is_unreadable`, `the_check_of_every_process_needs_root`,
 `replog/tests.rs` `a_fold_past_its_deadline_stops_the_read` and the read's equivalence proptest,
 `test/host.e2e.ts` H6 to H8 and H13 to H15, and CI's `sqlite-vfs-host-musl`, which runs the static
-binary as root against the compiled-in directory, its `hold` included. H6: after a crash at each
-step of the commit path and of a checkpoint (both checkpoint modes), of a re-key while bound and at
-open, of a publish that salvages, of a fresh open's first publish, of a trim and of an open's cut of
-a torn tail, the bytes read equal the `commits.pending_bytes` of a reopen with the stream refused,
-the salvaged commits are the same before and after the reopen, and the root drains to clean. The
-others: unreadable and unrecognized states, an inspection that changes no byte or name, an orphan
-drained by a reopen, an unread lock under a cache directory moved or deleted and under a root
-renamed out of its grammar, and a 0.11.0 copy's root read in a scanned directory. The hold:
-`vfs/tests.rs` `a_write_transaction_waits_while_the_host_holds_the_hold`,
+binary as root against the compiled-in directory, its `hold` and its `prune` included, and its
+`prune` as another user, which removes nothing. H6: after a crash at each step of the commit path
+and of a checkpoint (both checkpoint modes), of a re-key while bound and at open, of a publish that
+salvages, of a fresh open's first publish, of a trim and of an open's cut of a torn tail, the bytes
+read equal the `commits.pending_bytes` of a reopen with the stream refused, the salvaged commits are
+the same before and after the reopen, and the root drains to clean. The others: unreadable and
+unrecognized states, an inspection that changes no byte or name, an orphan drained by a reopen, an
+unread lock under a cache directory moved or deleted and under a root renamed out of its grammar,
+and a 0.11.0 copy's root read in a scanned directory. The hold: `vfs/tests.rs`
+`a_write_transaction_waits_while_the_host_holds_the_hold`,
 `the_valve_lets_a_write_go_on_and_latches_until_the_hold_is_free`,
 `only_a_write_transaction_of_the_host_waits_at_the_hold`,
 `a_thread_holding_a_bound_write_lock_does_not_wait_for_another`,
@@ -1547,7 +1616,15 @@ resumes after the release), H10 (the host's sequence with SIGSTOP as the freeze 
 fresh build of the stream holds every commit the writer made, and a transaction that held the write
 lock before the hold takes a second round), H11 (with the stream blackholed the bytes stay in the
 proof, and drain once it answers), and the `sqlite-vfs-perf` run with a `hold` file present, which
-checks that the extension opened it.
+checks that the extension opened it. The prune: `prune/tests.rs`
+`a_removal_unlinks_the_record_of_an_absent_directory`,
+`a_removal_refuses_a_host_directory_that_moved`, `a_removal_refuses_a_record_that_changed`,
+`a_temp_files_name_carries_its_writers_pid`, and `test/host.e2e.ts` H23, run as root: the record of
+a deleted cache directory goes and a present directory's stays, a temp file goes only with `--tmp`
+and only when its PID is not alive, `--pid` is a usage error, an unrecognized name or a root held
+under a renamed directory (an unread lock) removes nothing, an owner open in a recreated directory
+records it again before its first commit, and a directory moved away, pruned and moved back holding
+an orphan is read only when a `--scan` names it, the second host condition's negative control.
 
 #### Draining
 
@@ -2474,7 +2551,7 @@ runs every e2e suite against one real node with an in-memory cold store and agai
 | stream frames | `USQ2` ([Frames](#frames)), and the reserved import activation `ursula-import-v1` ([Import](#import)) |
 | snapshot bodies | `USS3` ([Snapshots](#snapshots)), digest BLAKE3 of the length-prefixed content type and the body |
 | local state | generation directories ([Layout](#layout)), `USL1` log segments ([Log](#log)), the page-1 marker ([Marker](#marker)), `db-uwal`, `manifest.json` |
-| host directory | `dir-<key>` records, and the JSON of `ursula-vfs-host inspect` ([Hosts](#hosts)) |
+| host directory | `dir-<key>` records, the JSON of `ursula-vfs-host inspect`, and the JSON of `ursula-vfs-host prune`, whose keys and their order are fixed within its `v` ([Hosts](#hosts)) |
 | producer | `Producer-Id: sqlite-ursula-vfs/2`, `Producer-Digest`, receipt contiguity |
 | content type | `application/vnd.ursula.sqlite-vfs.v2` |
 

@@ -1,13 +1,14 @@
 //! `ursula-vfs-host`: a host's tool for the roots on its disk (design: Hosts), for a host that
 //! snapshots or moves the process, or the VM it runs in. It never loads SQLite. `inspect` writes
-//! no file and takes no lock, `hold` locks the host directory's `hold` file, and `drain` is a
-//! process of the extension: it locks roots, writes their logs and claims, so a host that tells
-//! its helpers apart by executable must tell a drain apart by its first argument.
+//! no file and takes no lock, `hold` locks the host directory's `hold` file, `prune` removes
+//! records, and with `--tmp` temp files, from the host directory, and `drain` is a process of the
+//! extension: it locks roots, writes their logs and claims, so a host that tells its helpers apart
+//! by executable must tell a drain apart by its first argument.
 //!
 //! `ursula-vfs-host inspect [--dir D] [--scan S]... [--pid P]... [--until-clean MS] [--budget-ms MS]`
 //! reads every root of the directories the host directory records and of each `--scan S`, checks
 //! that every root lock a live process holds belongs to a root it read, and prints the result as
-//! one line of JSON ([`Inspection::to_json`]).
+//! one line of JSON ([`Inspection::to_json`](sqlite_ursula_vfs::inspection::Inspection::to_json)).
 //!
 //! - `--dir D`: the host directory, the compiled-in `/var/lib/sqlite-ursula/host` by default.
 //! - `--scan S`: a directory to read besides the recorded ones, such as a default cache root.
@@ -22,11 +23,22 @@
 //! meanwhile write transactions of the extension wait before they start ([`hold::take`]). It never
 //! creates the file, which the host creates with the directory.
 //!
+//! `ursula-vfs-host prune [--dir D] [--scan S]... [--budget-ms MS] [--tmp]` runs one inspection
+//! pass with `--dir`, `--scan` and `--budget-ms` as `inspect` takes them, its lock check over every
+//! process, and only when that pass is complete removes the record of each recorded directory it
+//! found absent, and with `--tmp` each temp file whose writer's PID no process has
+//! ([`prune::prune`]). It prints the result as one line of JSON
+//! ([`Pruned::to_json`](sqlite_ursula_vfs::prune::Pruned::to_json)). It takes no `--pid`: a lock
+//! check of some processes could miss a live root in an absent directory. A host runs it as root,
+//! only while nothing that may load the extension runs, and only for directories that are gone for
+//! good at their paths.
+//!
 //! `ursula-vfs-host drain --origin URL --budget-ms MS [--scan S]... [--concurrency N]` reads every
 //! root of the host directory the extension records into and of each `--scan S` as an inspection
 //! does, drains each one its effective user owns that holds commits the stream has not
-//! acknowledged, and prints one line of JSON within MS + 250 ms ([`Drained::to_json`]). It reads
-//! the extension's settings from its environment, `URSULA_VFS_TOKEN_FILE` included.
+//! acknowledged, and prints one line of JSON within MS + 250 ms
+//! ([`Drained::to_json`](sqlite_ursula_vfs::drain::Drained::to_json)). It reads the extension's
+//! settings from its environment, `URSULA_VFS_TOKEN_FILE` included.
 //!
 //! - `--origin URL`: where the deployment answers: `http://` or `https://`, a host and an optional
 //!   port. A root's stream URL is the origin followed by its stream path.
@@ -47,23 +59,25 @@ use std::time::Duration;
 use sqlite_ursula_vfs::drain::Concurrency;
 use sqlite_ursula_vfs::drain::ConcurrencyError;
 use sqlite_ursula_vfs::drain::Drain;
-use sqlite_ursula_vfs::drain::Drained;
 use sqlite_ursula_vfs::drain::Origin;
 use sqlite_ursula_vfs::drain::OriginError;
 use sqlite_ursula_vfs::drain::drain;
 use sqlite_ursula_vfs::hold;
 use sqlite_ursula_vfs::inspection::Inspect;
-use sqlite_ursula_vfs::inspection::Inspection;
 use sqlite_ursula_vfs::inspection::inspect;
+use sqlite_ursula_vfs::prune;
+use sqlite_ursula_vfs::prune::Prune;
 
 const USAGE: &str = "usage: ursula-vfs-host inspect [--dir D] [--scan S]... [--pid P]... \
                      [--until-clean MS] [--budget-ms MS]\n       ursula-vfs-host hold [--dir D]\n       \
+                     ursula-vfs-host prune [--dir D] [--scan S]... [--budget-ms MS] [--tmp]\n       \
                      ursula-vfs-host drain --origin URL --budget-ms MS [--scan S]... [--concurrency N]";
 
 /// What the command line asks for.
 enum Command {
     Inspect(Inspect),
     Hold { dir: Option<PathBuf> },
+    Prune(Prune),
     Drain(Drain),
 }
 
@@ -80,6 +94,9 @@ enum Usage {
     Missing(&'static str),
     #[error("{flag} takes a whole number, not {value:?}")]
     Number { flag: &'static str, value: String },
+    /// A prune's lock check must read every process.
+    #[error("prune takes no --pid: it checks the root locks of every process")]
+    PrunePid,
     #[error("--budget-ms takes a whole number from 1, not 0")]
     NoBudget,
     #[error("--concurrency: {0}")]
@@ -110,6 +127,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Command, Usage> {
     match args.next() {
         Some(command) if command == "inspect" => parse_inspect(args).map(Command::Inspect),
         Some(command) if command == "hold" => parse_hold(args),
+        Some(command) if command == "prune" => parse_prune(args).map(Command::Prune),
         Some(command) if command == "drain" => parse_drain(args).map(Command::Drain),
         Some(other) => Err(Usage::Command(other.to_string_lossy().into_owned())),
         None => Err(Usage::NoCommand),
@@ -152,6 +170,25 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<Inspect, Us
     Ok(request)
 }
 
+fn parse_prune(mut args: impl Iterator<Item = OsString>) -> Result<Prune, Usage> {
+    let mut request = Prune::default();
+    while let Some(flag) = args.next() {
+        let mut value = |name: &'static str| args.next().ok_or(Usage::Missing(name));
+        match flag.to_str().unwrap_or_default() {
+            "--dir" => request.dir = Some(PathBuf::from(value("--dir")?)),
+            "--scan" => request.scans.push(PathBuf::from(value("--scan")?)),
+            "--budget-ms" => {
+                let ms = number("--budget-ms", value("--budget-ms")?)?;
+                request.budget = Some(Duration::from_millis(ms));
+            }
+            "--tmp" => request.tmp = true,
+            "--pid" => return Err(Usage::PrunePid),
+            _ => return Err(Usage::Option(flag.to_string_lossy().into_owned())),
+        }
+    }
+    Ok(request)
+}
+
 fn parse_drain(mut args: impl Iterator<Item = OsString>) -> Result<Drain, Usage> {
     let (mut origin, mut budget, mut scans) = (None, None, Vec::new());
     let mut concurrency = Concurrency::default();
@@ -185,16 +222,18 @@ fn parse_drain(mut args: impl Iterator<Item = OsString>) -> Result<Drain, Usage>
     })
 }
 
-fn print_drained(drained: &Drained) -> std::io::Result<()> {
+/// Prints `json` and a LF on stdout.
+fn print(json: &str) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{}", drained.to_json())?;
+    writeln!(stdout, "{json}")?;
     stdout.flush()
 }
 
-fn print(inspection: &Inspection) -> std::io::Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{}", inspection.to_json())?;
-    stdout.flush()
+fn printed(json: &str) -> ExitCode {
+    match print(json) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_closed) => ExitCode::FAILURE,
+    }
 }
 
 /// Why `hold` failed.
@@ -240,14 +279,9 @@ fn main() -> ExitCode {
         }
     };
     match command {
-        Command::Inspect(request) => match print(&inspect(&request)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_closed) => ExitCode::FAILURE,
-        },
-        Command::Drain(request) => match print_drained(&drain(&request)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_closed) => ExitCode::FAILURE,
-        },
+        Command::Inspect(request) => printed(&inspect(&request).to_json()),
+        Command::Prune(request) => printed(&prune::prune(&request).to_json()),
+        Command::Drain(request) => printed(&drain(&request).to_json()),
         Command::Hold { dir } => match hold_until_stdin_closes(dir) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
