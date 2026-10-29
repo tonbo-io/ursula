@@ -11,7 +11,9 @@
 // the waiting opens go on under the string. Each call is handed the token it last handed out as
 // `previous` (the refused one after a 401), and an answer equal to it counts as a failed call: the
 // extension takes an equal token as no change, so a refused request would never go out again. A
-// retry is due by the expiry of `previous` at the latest, when a provider's cache turns over.
+// retry is due by the expiry of `previous` at the latest, when a provider's cache turns over, and
+// the backoff starts again from there. A token a 401 condition dropped is taken back once none of
+// the bindings that reported the condition is still bound and blocked.
 //
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
@@ -37,12 +39,15 @@ export interface BearerToken {
  *
  * `previous` is the token the provider last handed out, exactly as it handed it out, when the
  * package will not take it again: the current one at a scheduled refresh, or the one the server
- * refused after a 401. It is `undefined` before the first call and after the provider stopped, but
- * a token the server refused stays `previous` until a string token replaces it. When `previous` is
- * set, hand out a different token, and refill a cache that holds it: the package compares tokens
+ * refused after a 401. It is `undefined` before the first call and after the provider stopped,
+ * except that a token the server refused stays `previous` across a stop, until the provider hands
+ * out another one or an open with a string token stops the provider. When `previous` is set,
+ * hand out a different token, and refill a cache that holds it: the package compares tokens
  * without surrounding whitespace, and an equal one counts as a failed call, retried with backoff
- * and by the expiry of `previous` at the latest. A token that never changes belongs in a string
- * `token` or in `URSULA_VFS_TOKEN_FILE`.
+ * and by the expiry of `previous` at the latest, from where the backoff starts again. A token
+ * that only replication was refused under is taken back once each database whose replication
+ * reported the refusal is closed or no longer blocked. A token that never changes belongs in a
+ * string `token` or in `URSULA_VFS_TOKEN_FILE`.
  *
  * To fail for good, throw an error whose `action` is `"fix"`, an {@link UrsulaError} such as
  * `new UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized")` or any other
@@ -123,18 +128,21 @@ class Source {
 	#current: Fresh | undefined;
 	/**
 	 * The token the provider last handed out, also once a 401 dropped it, which its next call gets as
-	 * `previous`. A stop forgets it, unless the server refused it and no string replaced it.
+	 * `previous`. A stop forgets it, unless the server refused it and no string replaced it:
+	 * a token only a condition dropped whose reporters are clear is not refused.
 	 */
 	#held: Fresh | undefined;
 	/**
 	 * The token a condition `unauthorized` of `paths` dropped. The event may predate the token, since
 	 * the extension clears a condition only once the blocked request went out again under a new one:
-	 * once none of `paths` is blocked any more, the provider's answer of that token is taken.
+	 * once none of `paths` is still bound and blocked, the provider's answer of that token is taken.
 	 */
 	#dropped: { readonly token: string; readonly paths: readonly string[] } | undefined;
 	#timer: NodeJS.Timeout | undefined;
 	/** Failed calls in a row. */
 	#failures = 0;
+	/** Of {@link #failures}, those the backoff no longer counts: the ones before the expiry of `previous`. */
+	#forgiven = 0;
 	/** The last call's failure, one for good included, until a call succeeds. */
 	#lastFailure: { readonly error: unknown } | undefined;
 	/** It failed for good: no call until the next open. */
@@ -231,7 +239,8 @@ class Source {
 	/**
 	 * No provider from now on: the call in flight is abandoned, and the opens waiting go on with the
 	 * process's token, which `why` set. `replaced`: a string replaced the provider's token.
-	 * Otherwise a token the server refused is still the process's, so the next call gets it as `previous`.
+	 * Otherwise a token the server refused is still the process's, so the next call gets it as
+	 * `previous`, unless only a condition dropped it and its reporters are clear.
 	 */
 	stop(why: string, replaced: boolean): void {
 		this.#attempt?.abort(new UrsulaUnavailableError(`cancelled: the token provider stopped: ${why}`, "cancelled"));
@@ -239,10 +248,12 @@ class Source {
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
 		this.#provider = undefined;
-		if (replaced || this.#current !== undefined) this.#held = undefined;
+		const held = this.#held;
+		if (replaced || this.#current !== undefined || (held !== undefined && this.#restored(held.token))) this.#held = undefined;
 		this.#current = undefined;
 		this.#dropped = undefined;
 		this.#failures = 0;
+		this.#forgiven = 0;
 		this.#lastFailure = undefined;
 		this.#failed = false;
 		for (const waiter of [...this.#waiters]) waiter({ token: undefined });
@@ -260,7 +271,8 @@ class Source {
 
 	/**
 	 * Whether the provider's answer `token`, equal to `previous`, is taken: only when a condition that
-	 * may predate it dropped it, and none of the paths that reported the condition is blocked any more.
+	 * may predate it dropped it, and none of the paths that reported the condition is still bound and
+	 * blocked.
 	 */
 	#restored(token: string): boolean {
 		const dropped = this.#dropped;
@@ -317,12 +329,16 @@ class Source {
 		this.#held = fresh;
 		this.#dropped = undefined;
 		this.#failures = 0;
+		this.#forgiven = 0;
 		this.#lastFailure = undefined;
 		for (const waiter of [...this.#waiters]) waiter({ token: fresh.token });
 		this.#schedule(fresh.refreshAt - Date.now());
 	}
 
-	/** A failed call: retried with backoff, and by `by` at the latest, unless it failed for good. */
+	/**
+	 * A failed call: retried with backoff, and by `by` at the latest, unless it failed for good. A retry
+	 * due at `by`, the expiry of `previous`, restarts the backoff: the failures before it no longer count.
+	 */
 	#failedWith(error: unknown, by: number | undefined): void {
 		this.#attempt = undefined;
 		this.#lastFailure = { error };
@@ -332,8 +348,10 @@ class Source {
 			return;
 		}
 		this.#failures += 1;
-		const backoff = retryAfter(this.#failures);
-		this.#schedule(by === undefined ? backoff : Math.min(backoff, by - Date.now()));
+		const backoff = retryAfter(this.#failures - this.#forgiven);
+		const left = by === undefined ? Number.POSITIVE_INFINITY : by - Date.now();
+		if (left < backoff) this.#forgiven = this.#failures;
+		this.#schedule(Math.min(backoff, left));
 	}
 
 	/** The next call after `ms`. Its timer keeps the process alive only while an open waits. */
@@ -388,9 +406,9 @@ function blockedNow(path: string): boolean | undefined {
 	}
 }
 
-/** Whether each of `paths`, one at least, is still bound and no longer blocked `unauthorized`. */
+/** Whether none of `paths`, one at least, is still bound and blocked `unauthorized`: a path that retired is clear. */
 function cleared(paths: readonly string[]): boolean {
-	return paths.length > 0 && paths.every((path) => blockedNow(path) === false);
+	return paths.length > 0 && paths.every((path) => blockedNow(path) !== true);
 }
 
 /** The extension's events: a 401 asks for a token at once, and a retired binding may stop the provider. */
