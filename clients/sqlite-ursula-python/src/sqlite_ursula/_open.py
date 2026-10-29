@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -180,41 +179,13 @@ def opened(stream: str, checked: Plan, deadline: float | None = None) -> UrsulaC
     ``time.monotonic()`` instant) ends it instead of ``checked.timeout`` from now, for an open whose
     time began earlier (``tonbo``'s, which resolved the stream first)."""
     _apply(checked)
-    bind = _Bind(stream, checked, deadline)
-    while True:
-        waiter = threading.Event()
-        try:
-            binding = bind.ask(waiter)
-            if binding is not None:
-                return _connect(checked, binding)
-            left = bind.left()
-            woke = left > 0 and waiter.wait(left)
-        except BaseException as error:
-            if bind.again(error):
-                continue
-            raise
-        if not woke:
-            raise bind.timed_out()
+    return _connect(checked, _events.wait_for(_Bind(stream, checked, deadline)))
 
 
 async def aopened(stream: str, checked: Plan, deadline: float | None = None) -> UrsulaConnection:
     """:func:`opened` for a coroutine: it waits on the event loop."""
     _apply(checked)
-    bind = _Bind(stream, checked, deadline)
-    while True:
-        waiter = _events.LoopEvent()
-        try:
-            binding = bind.ask(waiter)
-            if binding is not None:
-                return _connect(checked, binding)
-            left = bind.left()
-            woke = left > 0 and await waiter.wait(left)
-        except BaseException as error:
-            if bind.again(error):
-                continue
-            raise
-        if not woke:
-            raise bind.timed_out()
+    return _connect(checked, await _events.await_for(_Bind(stream, checked, deadline)))
 
 
 @dataclass(frozen=True)
@@ -243,8 +214,8 @@ def plan(
     busy_timeout: object,
     connect_kwargs: dict[str, Any],
 ) -> Plan:
-    """Checks an open's arguments but the stream, before anything starts."""
-    chosen = _token(token)
+    """Checks an open's arguments but the stream, before anything starts. The token is checked
+    last, so no local but ``token`` holds it while a check raises."""
     settings: dict[str, object] = {"timeout_ms": EXTENSION_OPEN_MS}
     if max_pending_bytes is not None:
         if (
@@ -272,7 +243,7 @@ def plan(
     if not (isinstance(factory, type) and issubclass(factory, UrsulaConnection)):
         raise invalid(f"factory must be a subclass of UrsulaConnection, not {factory!r}")
     root = None if dir is None else os.fspath(dir)
-    return Plan(chosen, root, json.dumps(settings), limit, ro, busy, factory, connect_kwargs)
+    return Plan(_token(token), root, json.dumps(settings), limit, ro, busy, factory, connect_kwargs)
 
 
 def _apply(checked: Plan) -> None:
@@ -285,9 +256,9 @@ def _apply(checked: Plan) -> None:
 
 
 class _Bind:
-    """One open's bind of its stream: ``ursula_open`` with timeout 0, asked again each time its
-    waiter wakes, until it is done. ``open`` waits on a ``threading.Event`` and ``aopen`` on a
-    :class:`_events.LoopEvent`, through the same steps.
+    """One open's bind of its stream, an :class:`_events.Step`: ``ursula_open`` with timeout 0,
+    asked again each time its waiter wakes, until it is done. ``open`` waits on a
+    ``threading.Event`` and ``aopen`` on a :class:`_events.LoopEvent`, through the same steps.
 
     Any exception once a reply named the request cancels it, in a later pass too (one a gap or a
     lost events thread woke), so no bind goes on to claim the stream after the open gave up. A
@@ -345,16 +316,22 @@ class _Bind:
             _give_up(self._stream, self._known, self._plan.timeout)
         return False
 
-    def timed_out(self) -> UrsulaError:
-        """The timeout passed: the request is cancelled, and the error is the last condition it
-        met, or ``cancelled``."""
+    def timed_out(self) -> dict[str, Any]:
+        """The timeout passed: the request is cancelled, and raises the last condition it met, or
+        ``cancelled``."""
         assert self._known is not None
         self._forget()
-        return _give_up(self._stream, self._known, self._plan.timeout)
+        raise _give_up(self._stream, self._known, self._plan.timeout)
 
     def _forget(self) -> None:
         if self._ev is not None and self._waiter is not None and self._known is not None:
             self._ev.forget_request(self._known, self._waiter)
+
+
+def met_nothing(ended: dict[str, Any] | None) -> bool:
+    """Whether a request ``ursula_cancel`` gave up met no condition: it ended before the cancel
+    (``null``, or an error once its outcome was taken), or the cancel reports ``cancelled``."""
+    return ended is None or ended.get("kind") == "cancelled"
 
 
 def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:
@@ -366,7 +343,7 @@ def _give_up(stream: str, request: int, timeout: float) -> UrsulaError:
     except UrsulaError:
         # It resolved meanwhile and its result was taken.
         ended = None
-    if ended is None or ended.get("kind") == "cancelled":
+    if met_nothing(ended):
         return UrsulaUnavailableError(
             f"cancelled: the open of {stream} gave up after {timeout:g} s before it met any "
             "condition",

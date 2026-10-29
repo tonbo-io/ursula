@@ -114,8 +114,8 @@ db = tonbo.open("notes")  # or the database's https:// URL, which skips the look
 db = await tonbo.aopen("notes")
 ```
 
-- `open(name_or_url, *, api_key, api_origin, auth_origin, token, **options)` takes the root `open()`'s arguments and returns the same `UrsulaConnection`. `timeout` (30 s by default) bounds the whole open, the lookup included. `aopen()` is the same for asyncio, and cancelling it cancels the lookup.
-- The key comes from `api_key`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`, which must be a regular file with mode `0600`.
+- `open(name_or_url, *, api_key, api_origin, auth_origin, token, **options)` takes the root `open()`'s arguments and returns the same `UrsulaConnection`. `timeout` (30 s by default) bounds the whole open, the lookup included. `aopen()` is the same for asyncio, and cancelling it cancels the lookup when no other call shares it.
+- The key comes from `api_key`, else `TONBO_API_KEY`, else the login `tonbo login` saves in `${XDG_CONFIG_HOME:-~/.config}/tonbo/credentials.json`, which must be a regular file, not a symlink, with no group or other permission bits (such as `0600`).
 - Streams requests carry tokens the extension exchanges for the key and refreshes in the background, beside replication. The open waits for the first one. An explicit `token`, or `URSULA_VFS_TOKEN_FILE`, serves Streams requests instead: then opening a URL needs no key. The process holds one key for Streams tokens.
 - `api_origin` (or `TONBO_API_ORIGIN`) and `auth_origin` (or `TONBO_AUTH_ORIGIN`) name other origins for the Management API and the token endpoint. Each must be `https://`, or `http://` to a loopback host.
 - `resolve_database(name_or_url, *, api_key, api_origin, auth_origin, token, timeout)` and `aresolve_database()` resolve a database without opening it, for another opener: `ResolvedDatabase(url, name, token)`. Concurrent calls with the same arguments, from any thread or task, share one lookup.
@@ -130,7 +130,7 @@ Its errors are `TonboError`, an `UrsulaError` whose action is `fix`, with `kind`
 | `invalid_api_key` | the API refused the key, the key cannot read the database, or the login expired | a valid key for the key's source, or `Run: tonbo login` |
 | `database_not_found` | the account has no database of that name, or it is being deleted | `Run: tonbo database create <name>` |
 
-Past its timeout while the Tonbo API did not answer, or while the database was still being created, `open()` raises `UrsulaUnavailableError` (`unreachable`, `unavailable` or `rate_limited`, action `retry`). An origin it cannot use, an answer outside the APIs' contracts or a second key for Streams tokens raise `UrsulaSetupError` `invalid_argument`.
+Past its timeout while the Tonbo API did not answer, or while the database was still being created, `open()` raises `UrsulaUnavailableError` (`unreachable`, `unavailable` or `rate_limited`, action `retry`). A call that gives up while other calls share its lookup leaves the lookup to them and raises `cancelled`, and the last one cancels it. An origin it cannot use, an answer outside the APIs' contracts or a second key for Streams tokens raise `UrsulaSetupError` `invalid_argument`. A stream URL it cannot take, or one that would get the key's Streams tokens over plain `http://` to another host, raises `invalid_url`, an empty name `invalid_name`, and a login file it cannot read `local_setup`.
 
 ## Errors
 

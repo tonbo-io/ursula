@@ -2478,16 +2478,18 @@ classes, whose class, kind and action come from `ursula_classify`.
   lock, and its `resolved` event wakes the waiter on the events thread, as `opened` does for an
   open. The process's concurrent calls with the same arguments, from any thread or task, share one
   resolve, since the extension owes a host one outcome for its calls that return at once: the
-  first call back takes it for all, and the last call that gives up cancels it. The four Tonbo
-  kinds raise `TonboError` with `fix` and `request_id`, and the others the class `ursula_classify`
-  names.
+  first call back takes it for all. A call that gives up leaves it to the others and raises
+  `cancelled`, and the last one cancels it and raises the last condition it met. The bind and the
+  resolve run through one wait loop of the events module. The four Tonbo kinds raise `TonboError`
+  with `fix` and `request_id`, and the others the class their `class` field names, as
+  `ursula_open`'s do.
 
 Tests: `tests/test_open.py`, `tests/test_synced.py`, `tests/test_async.py`, `tests/test_gate.py`,
 `tests/test_errors.py`, `tests/test_fork.py`, `tests/test_import.py`, `tests/test_host.py` and
 `tests/test_tonbo.py`, against the model server and against one real `ursula` node
 ([Verification](#verification)). `tests/test_tonbo.py` runs the TypeScript suite's stand-in for
-the Tonbo APIs (`test/tonbo-api.ts`) in a Node process of its own (`tests/tonbo-api-process.mts`),
-and skips without Node.
+the Tonbo APIs (`test/tonbo-api.ts`) in a Node process of its own (`tests/tonbo-api-process.mts`)
+on `E2E_NODE`, and skips when it is unset.
 
 ## Status
 
@@ -2624,14 +2626,15 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-fork`: `e2e/fork.py` in `clients/sqlite-vfs` on a uv-managed CPython 3.13.18 (uv
   0.13.6) against the model server ([Forks](#forks)).
 - `sqlite-ursula-python`: the Python suites against the model server on uv-managed CPython 3.11,
-  3.14 and 3.14t, with Node 22 for the Tonbo stand-in, ruff, the wheel's own library found without `SQLITE_URSULA_VFS`, the wheel
-  hosted by a uv-managed CPython on `debian:trixie-slim` as `recipes/Dockerfile.uv` installs it,
+  3.14 and 3.14t, with Node 22 for the Tonbo stand-in, ruff, the wheel's own library found
+  without `SQLITE_URSULA_VFS`, the wheel hosted by a uv-managed CPython on `debian:trixie-slim` as
+  `recipes/Dockerfile.uv` installs it,
   and on `python:3.13-slim`, whose SQLite is older than the extension supports,
   `python -m sqlite_ursula` failing with `host_unsupported`.
 - `sqlite-ursula-python-windows`: on Windows, which has no VFS, `import sqlite_ursula` works, and
   `python -m sqlite_ursula` and `open()` fail with `host_unsupported`, whose fix is WSL.
 - `sqlite-ursula-python-alpine`: the extension and the model server built for musl in
-  `python:3.13-alpine`, and the Python suites run there, the Tonbo tests skipping without Node.
+  `python:3.13-alpine`, and the Python suites run there, the Tonbo tests on Alpine's `nodejs`.
 - `sqlite-ursula-python-ursula`: the Python suites against one release `ursula` node with an
   in-memory cold store, with Node 22 for the Tonbo stand-in. The tests that script faults skip
   there.

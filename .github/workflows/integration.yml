@@ -648,8 +648,12 @@ jobs:
               "$HOME/.cargo/bin/cargo" +"$TOOLCHAIN" build --locked --release --features model --bin ursula-vfs-model
               python -c "import sqlite3; print(\"SQLite\", sqlite3.sqlite_version)"
               pip install --no-cache-dir --root-user-action=ignore pytest==9.1.1
+              # tests/test_tonbo.py runs the TypeScript suite's stand-in for the Tonbo APIs on it
+              # (Node 22.18 or newer: Alpine 3.23 has Node 24).
+              apk add --no-cache nodejs
+              node --version
               cd /src/clients/sqlite-ursula-python
-              E2E_SERVER=model URSULA_VFS_MODEL=/src/clients/sqlite-vfs/target/release/ursula-vfs-model \
+              E2E_NODE="$(command -v node)" E2E_SERVER=model URSULA_VFS_MODEL=/src/clients/sqlite-vfs/target/release/ursula-vfs-model \
                 SQLITE_URSULA_VFS=/src/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so python -m pytest -v
             '
 

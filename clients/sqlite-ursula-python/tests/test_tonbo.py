@@ -1,19 +1,20 @@
 """``sqlite_ursula.tonbo`` against the e2e server: a name resolves through the extension's
-``tonbo_resolve`` and opens through the root module's open, sync and async, the key comes from the
-option, then ``TONBO_API_KEY``, then the ``tonbo login`` file, the origins pass through, the
-extension's failures become ``TonboError`` with their fix and request id, a timeout reports the
-last condition and cancels the resolve, and the process's concurrent resolves with the same
-arguments, from threads and tasks, share one.
+``tonbo_resolve`` and opens through the root module's open, sync and async, the options reach the
+APIs, the extension's failures become ``TonboError`` with their fix and request id, a timeout
+reports the last condition and cancels the resolve, and the process's concurrent resolves with the
+same arguments, from threads and tasks, share one, which a call that gives up leaves to the others
+and the last cancels.
 
 The Node suite's stand-in for the Tonbo APIs (clients/sqlite-ursula/test/tonbo-api.ts) serves the
 lookups and the token exchanges, in a process of its own (tests/tonbo-api-process.mts), and its
-databases are streams of the e2e server. It runs on Node 22.18 or newer, ``E2E_NODE`` or the
-``node`` on the path: without one the tests skip. The lookup rules themselves (backoff, retries,
-redirects, the login file's checks) are the extension's, and run in the Node suite.
+databases are streams of the e2e server. It runs on ``E2E_NODE``, a Node 22.18 or newer: without
+it the tests skip. The extension's own rules (the key's sources, the login file's checks, the
+origins it refuses, backoff, retries, redirects) run in its unit tests and the Node suite, so these
+assert kinds and fields, not its wording.
 
-The process holds one API key for Streams tokens, so the tests that fetch them share ``KEY``,
-after the one whose key gets none, and the others give the Streams requests a token of their own.
-The tests depend on their order, which is the file's: never shuffle it.
+The process holds one API key for Streams tokens, so the tests of this process that fetch them
+share ``KEY``, and the others give the Streams requests a token of their own. The test of a key
+that gets no Streams token runs in a child process.
 """
 
 from __future__ import annotations
@@ -21,10 +22,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import pickle
-import re
-import shutil
 import subprocess
+import sys
+import textwrap
 import threading
 import time
 from collections.abc import Iterator
@@ -34,10 +34,10 @@ from typing import Any
 
 import pytest
 from conftest import HERE
+from conftest import env
 from conftest import new_stream
 
 from sqlite_ursula import UrsulaConnection
-from sqlite_ursula import UrsulaError
 from sqlite_ursula import UrsulaSetupError
 from sqlite_ursula import UrsulaUnavailableError
 from sqlite_ursula import tonbo
@@ -47,14 +47,6 @@ from sqlite_ursula.tonbo import TonboError
 #: The one API key whose Streams tokens the tests of this process fetch.
 KEY = "tbo_process"
 STREAMS_AUDIENCE = "https://streams.tonbo.dev"
-VECTORS = HERE.parent.parent / "sqlite-vfs" / "src" / "tonbo" / "vectors"
-#: The usable logins of the Tonbo CLI's credentials contract, version 1, as the extension's unit
-#: tests read them.
-USABLE_LOGINS = [
-    json.loads(line)
-    for line in (VECTORS / "credentials-v1-usable.jsonl").read_text().splitlines()
-    if line.strip()
-]
 
 
 class TonboApi:
@@ -87,9 +79,12 @@ class TonboApi:
 
 @pytest.fixture(scope="module")
 def tonbo_api() -> Iterator[TonboApi]:
-    node = os.environ.get("E2E_NODE") or shutil.which("node")
-    if not node:
+    node = os.environ.get("E2E_NODE")
+    if node is None:
         pytest.skip("the Tonbo API stand-in runs on Node 22.18 or newer: set E2E_NODE")
+    # A CI leg that sets it and lost its Node fails here rather than skips.
+    if not node:
+        raise RuntimeError("E2E_NODE is set but empty")
     proc = subprocess.Popen(
         [node, "--no-warnings", str(HERE / "tonbo-api-process.mts")],
         stdin=subprocess.PIPE,
@@ -135,16 +130,6 @@ def database(api: TonboApi, server, label: str, state: str = "active", **extra: 
     return Database(name, s.url, s.path)
 
 
-def login(content: dict[str, Any], mode: int = 0o600) -> Path:
-    """Writes the login file ``tonbo login`` saves, with ``mode``."""
-    folder = Path(os.environ["XDG_CONFIG_HOME"]) / "tonbo"
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = folder / "credentials.json"
-    path.write_text(json.dumps(content))
-    path.chmod(mode)
-    return path
-
-
 def stays_cancelled(api: TonboApi, name: str) -> None:
     """The resolve of ``name`` was cancelled: no lookup of it goes out any more, past the longest
     backoff of a database being created (2 s)."""
@@ -155,42 +140,63 @@ def stays_cancelled(api: TonboApi, name: str) -> None:
     assert tonbo._inflight == {}
 
 
-# First: the process holds one API key, and a key that never got a Streams token gives way to the
-# next.
 def test_a_key_refused_a_streams_token_fails_invalid_api_key_with_its_fix_and_request_id(
     tonbo_api, server, fresh
 ):
     d = database(tonbo_api, server, "nostreams")
-    with pytest.raises(TonboError) as refused:
-        tonbo.open(d.name, dir=fresh(), api_key="tbo_nostreams")
-    error = refused.value
-    assert isinstance(error, UrsulaError)
-    assert not isinstance(error, UrsulaSetupError)
-    assert (error.kind, error.action, error.fix) == (
-        "invalid_api_key",
-        "fix",
-        "Pass a valid API key",
-    )
-    assert error.request_id is not None
-    assert re.fullmatch(r"req-\d+", error.request_id)
-    assert re.fullmatch(
-        r"invalid_api_key: the Tonbo token endpoint refused the API key from the API key option "
-        r"\(unauthenticated\) \(request req-\d+\)\. Pass a valid API key",
-        str(error),
-    )
-    assert len(tonbo_api.of("management")) == 1
-    assert [s["audience"] for s in tonbo_api.of("token")] == [STREAMS_AUDIENCE]
-    # It crosses processes with its fields.
-    copied = pickle.loads(pickle.dumps(error))
-    assert type(copied) is TonboError
-    assert (copied.kind, copied.fix, copied.request_id) == (error.kind, error.fix, error.request_id)
+    # In a process of its own, which holds no key yet.
+    script = textwrap.dedent(
+        """
+        import json, pickle, sys
+        from sqlite_ursula import UrsulaError, UrsulaSetupError, tonbo
 
-    tonbo_api.reset()
-    with pytest.raises(TonboError) as resolved:
-        tonbo.resolve_database(d.name, api_key="tbo_nostreams")
-    assert resolved.value.kind == "invalid_api_key"
-    assert [s["authorization"] for s in tonbo_api.of("token")] == ["Bearer tbo_nostreams"]
-    assert tonbo._inflight == {}
+        name, root = sys.argv[1], sys.argv[2]
+        out = []
+        for call in (
+            lambda: tonbo.open(name, dir=root, api_key="tbo_nostreams"),
+            lambda: tonbo.resolve_database(name, api_key="tbo_nostreams"),
+        ):
+            try:
+                call()
+                out.append(None)
+            except UrsulaError as e:
+                copied = pickle.loads(pickle.dumps(e))
+                out.append({
+                    "type": type(e).__name__,
+                    "setup": isinstance(e, UrsulaSetupError),
+                    "fields": [e.kind, e.action, e.fix, e.request_id],
+                    "message": str(e),
+                    "copied": [type(copied).__name__, copied.kind, copied.fix, copied.request_id],
+                })
+        out.append(len(tonbo._inflight))
+        print(json.dumps(out))
+        """
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script, d.name, fresh()],
+        env=env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == 0, run.stderr
+    *failures, inflight = json.loads(run.stdout)
+    assert inflight == 0
+    assert len(failures) == 2
+    for failure in failures:
+        assert failure is not None
+        assert (failure["type"], failure["setup"]) == ("TonboError", False)
+        kind, action, fix, request_id = failure["fields"]
+        assert (kind, action) == ("invalid_api_key", "fix")
+        assert fix and request_id
+        assert failure["message"].endswith(fix)
+        assert f"(request {request_id})" in failure["message"]
+        # It crosses processes with its fields.
+        assert failure["copied"] == ["TonboError", kind, fix, request_id]
+    assert len(tonbo_api.of("management")) == 2
+    assert [(s["authorization"], s["audience"]) for s in tonbo_api.of("token")] == [
+        ("Bearer tbo_nostreams", STREAMS_AUDIENCE)
+    ] * 2
 
 
 def test_opens_by_name_with_the_key_whose_streams_tokens_the_extension_holds(
@@ -208,16 +214,18 @@ def test_opens_by_name_with_the_key_whose_streams_tokens_the_extension_holds(
     assert [(s["name"], s["authorization"]) for s in tonbo_api.of("management")] == [
         (d.name, f"Bearer {KEY}")
     ]
-    # The first test of the key: its first Streams token.
-    assert [(s["authorization"], s["audience"]) for s in tonbo_api.of("token")] == [
-        (f"Bearer {KEY}", STREAMS_AUDIENCE)
-    ]
+    # The key's first Streams token, unless an earlier test of the process fetched it.
+    exchanged = tonbo_api.of("token")
+    assert [(s["authorization"], s["audience"]) for s in exchanged] in (
+        [],
+        [(f"Bearer {KEY}", STREAMS_AUDIENCE)],
+    )
     # A later open looks the name up again and reuses the Streams token.
     again = tonbo.open(d.name, dir=root, api_key=KEY)
     assert again.path == db.path
     assert again.execute("SELECT x FROM t").fetchall() == [(1,)]
     assert len(tonbo_api.of("management")) == 2
-    assert len(tonbo_api.of("token")) == 1
+    assert tonbo_api.of("token") == exchanged
     # Resolving alone hands out the URL and the name, and no token: the key's serve.
     assert tonbo.resolve_database(d.name, api_key=KEY) == ResolvedDatabase(d.url, d.name, None)
     again.close()
@@ -275,28 +283,20 @@ def test_a_timeout_reports_the_last_condition_and_cancels_the_resolve(tonbo_api,
 
 
 # Keys other than KEY look the name up only: the Streams requests carry a token of their own.
-def test_takes_the_key_from_the_option_then_tonbo_api_key_then_the_login_file(
-    tonbo_api, server, fresh, monkeypatch
+def test_the_api_key_option_reaches_the_api_and_a_token_of_its_own_serves_the_streams(
+    tonbo_api, server, fresh
 ):
-    d = database(tonbo_api, server, "sources")
-    token = "explicit-sources"
-    login(USABLE_LOGINS[1])
-    monkeypatch.setenv("TONBO_API_KEY", "tbo_env")
+    d = database(tonbo_api, server, "option")
+    token = "explicit-option"
     resolved = tonbo.resolve_database(d.name, api_key="tbo_option", token=token)
     assert resolved == ResolvedDatabase(d.url, d.name, token)
     assert token not in repr(resolved)
-    tonbo.resolve_database(d.name, token=token)
-    monkeypatch.delenv("TONBO_API_KEY")
-    db = tonbo.open(d.name, dir=fresh(), token=token)
+    db = tonbo.open(d.name, dir=fresh(), api_key="tbo_option", token=token)
     db.execute("CREATE TABLE t(x)")
     db.commit()
     db.synced(timeout=30)
     db.close()
-    assert [s["authorization"] for s in tonbo_api.of("management")] == [
-        "Bearer tbo_option",
-        "Bearer tbo_env",
-        "Bearer tbo_secret",
-    ]
+    assert [s["authorization"] for s in tonbo_api.of("management")] == ["Bearer tbo_option"] * 2
     assert tonbo_api.of("token") == []
 
 
@@ -306,13 +306,10 @@ def test_fails_with_the_extensions_kind_fix_and_request_id(tonbo_api, server, fr
         # A URL needs the key only for Streams tokens.
         with pytest.raises(TonboError) as missing:
             tonbo.open(target, dir=fresh())
-        assert (missing.value.kind, missing.value.action, missing.value.fix) == (
-            "missing_credentials",
-            "fix",
-            "Set TONBO_API_KEY, or run: tonbo login",
-        )
-        assert missing.value.request_id is None
+        assert (missing.value.kind, missing.value.action) == ("missing_credentials", "fix")
+        assert missing.value.fix
         assert str(missing.value).endswith(missing.value.fix)
+        assert missing.value.request_id is None
     db = tonbo.open(d.url, dir=fresh(), token="explicit-url")
     db.execute("CREATE TABLE t(x)")
     db.commit()
@@ -322,21 +319,18 @@ def test_fails_with_the_extensions_kind_fix_and_request_id(tonbo_api, server, fr
 
     with pytest.raises(TonboError) as not_found:
         tonbo.resolve_database("py-nope", api_key="tbo_answers")
-    assert (not_found.value.kind, not_found.value.fix) == (
-        "database_not_found",
-        "Run: tonbo database create py-nope",
-    )
-    assert not_found.value.request_id is not None
-    assert re.fullmatch(r"req-\d+", not_found.value.request_id)
+    assert (not_found.value.kind, not_found.value.action) == ("database_not_found", "fix")
+    assert not_found.value.fix
+    assert str(not_found.value).endswith(not_found.value.fix)
+    assert not_found.value.request_id
     assert f"(request {not_found.value.request_id})" in str(not_found.value)
 
     forbidden = database(tonbo_api, server, "forbidden", forbidden=True)
     with pytest.raises(TonboError) as refused:
         tonbo.open(forbidden.name, dir=fresh(), api_key="tbo_answers")
-    assert (refused.value.kind, refused.value.fix) == (
-        "invalid_api_key",
-        f'Use an API key that can read database "{forbidden.name}"',
-    )
+    assert (refused.value.kind, refused.value.action) == ("invalid_api_key", "fix")
+    assert refused.value.fix
+    assert refused.value.request_id
     assert "tbo_" not in str(refused.value)
 
     with pytest.raises(UrsulaSetupError) as empty:
@@ -359,11 +353,6 @@ def test_passes_the_origins_through_and_refuses_arguments_it_cannot_send(
         api_origin=tonbo_api.origin,
         auth_origin=tonbo_api.origin,
     ).close()
-    assert len(tonbo_api.of("management")) == 1
-    with pytest.raises(UrsulaSetupError) as plain:
-        tonbo.resolve_database(d.name, api_key=KEY, api_origin="http://api.example.com")
-    assert (plain.value.kind, plain.value.action) == ("invalid_argument", "fix")
-    assert "TONBO_API_ORIGIN" in str(plain.value)
     assert len(tonbo_api.of("management")) == 1
 
     tonbo_api.reset()
@@ -423,3 +412,73 @@ def test_shares_one_resolve_among_the_threads_and_tasks_with_the_same_arguments(
     # One resolve: its lookups while the database was created, and the one that found it active.
     assert tonbo_api.lookups(d.name) == 3
     assert tonbo._inflight == {}
+
+
+def test_a_call_that_gives_up_leaves_the_shared_resolve_to_the_others(tonbo_api, server):
+    # Lookups after 0 s, 0.25 s, 0.75 s, 1.75 s and 3.75 s, the last of which finds it active.
+    d = database(tonbo_api, server, "leave", "creating", activeAfter=4)
+    arguments: dict[str, Any] = {"api_key": "tbo_leave", "token": "explicit-leave"}
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, object] = {}
+
+    def resolver(label: str, timeout: float) -> None:
+        barrier.wait()
+        try:
+            outcomes[label] = tonbo.resolve_database(d.name, timeout=timeout, **arguments)
+        except BaseException as e:
+            outcomes[label] = e
+
+    threads = [
+        threading.Thread(target=resolver, args=("short", 1)),
+        threading.Thread(target=resolver, args=("long", 8)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    short = outcomes["short"]
+    assert isinstance(short, UrsulaUnavailableError)
+    assert (short.kind, short.action) == ("cancelled", "retry")
+    assert outcomes["long"] == ResolvedDatabase(d.url, d.name, "explicit-leave")
+    assert tonbo_api.lookups(d.name) == 5
+    assert tonbo._inflight == {}
+    # A call after the outcome was taken resolves anew.
+    assert tonbo.resolve_database(d.name, **arguments) == outcomes["long"]
+    assert tonbo_api.lookups(d.name) == 6
+
+
+def test_the_last_call_that_gives_up_cancels_the_shared_resolve(tonbo_api, server):
+    stuck = database(tonbo_api, server, "abandon", "creating")
+    arguments: dict[str, Any] = {"api_key": "tbo_abandon", "token": "explicit-abandon"}
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, object] = {}
+
+    def resolver() -> None:
+        barrier.wait()
+        try:
+            outcomes["first"] = tonbo.resolve_database(stuck.name, timeout=1, **arguments)
+        except BaseException as e:
+            outcomes["first"] = e
+
+    def task() -> None:
+        async def main() -> ResolvedDatabase:
+            barrier.wait()
+            return await tonbo.aresolve_database(stuck.name, timeout=2, **arguments)
+
+        try:
+            outcomes["last"] = asyncio.run(main())
+        except BaseException as e:
+            outcomes["last"] = e
+
+    threads = [threading.Thread(target=resolver), threading.Thread(target=task)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    first, last = outcomes["first"], outcomes["last"]
+    assert isinstance(first, UrsulaUnavailableError)
+    assert (first.kind, first.action) == ("cancelled", "retry")
+    # The last reports the last condition the resolve met: the database is being created.
+    assert isinstance(last, UrsulaUnavailableError)
+    assert (last.kind, last.action) == ("unavailable", "retry")
+    stays_cancelled(tonbo_api, stuck.name)

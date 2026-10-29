@@ -44,6 +44,8 @@ import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Protocol
+from typing import TypeVar
 
 from . import _args
 from . import _control
@@ -101,6 +103,67 @@ class LoopEvent:
 
 
 Waiter = threading.Event | LoopEvent
+
+T = TypeVar("T")
+
+
+class Step(Protocol[T]):
+    """A call that waits for a request of the extension (an open's bind, a resolve) in passes,
+    which :func:`wait_for` and :func:`await_for` drive."""
+
+    def ask(self, waiter: Waiter) -> T | None:
+        """One pass: the result when the request is done, else ``None`` with ``waiter`` registered
+        for its event."""
+        ...
+
+    def left(self) -> float:
+        """The seconds left before the call's deadline."""
+        ...
+
+    def again(self, error: BaseException) -> bool:
+        """A pass or the wait raised ``error``: whether to ask anew. Otherwise the call gives the
+        request up, and ``error`` is raised."""
+        ...
+
+    def timed_out(self) -> T:
+        """The deadline passed: the result after all, or the error the call gives up with."""
+        ...
+
+
+def wait_for(step: Step[T]) -> T:
+    """Drives ``step`` on a ``threading.Event``, which the events thread wakes."""
+    while True:
+        waiter = threading.Event()
+        try:
+            done = step.ask(waiter)
+            if done is not None:
+                return done
+            left = step.left()
+            woke = left > 0 and waiter.wait(left)
+        except BaseException as error:
+            if step.again(error):
+                continue
+            raise
+        if not woke:
+            return step.timed_out()
+
+
+async def await_for(step: Step[T]) -> T:
+    """:func:`wait_for` for a coroutine: it waits on the event loop."""
+    while True:
+        waiter = LoopEvent()
+        try:
+            done = step.ask(waiter)
+            if done is not None:
+                return done
+            left = step.left()
+            woke = left > 0 and await waiter.wait(left)
+        except BaseException as error:
+            if step.again(error):
+                continue
+            raise
+        if not woke:
+            return step.timed_out()
 
 
 class Wait:

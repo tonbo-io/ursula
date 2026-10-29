@@ -22,9 +22,12 @@ opens the stream as the root module's ``open`` does.
   over ``TONBO_API_ORIGIN`` and ``TONBO_AUTH_ORIGIN``.
 - An explicit ``token`` serves the Streams requests instead of the key's tokens, and so does
   ``URSULA_VFS_TOKEN_FILE``, which the extension reads.
-- ``timeout`` bounds the whole open, the lookup included. On the timeout, or on Ctrl-C, a
-  cancellation or any other exception, the last call waiting for a resolve cancels it
-  (``ursula_cancel``), so no lookup goes on after every caller gave up.
+- ``timeout`` bounds the whole open, the lookup included. At the timeout one last pass takes an
+  outcome that arrived. Otherwise, as on Ctrl-C, a cancellation or any other exception, the call
+  leaves the resolve to the other calls that share it and reports ``cancelled``, and the last one
+  cancels it (``ursula_cancel``) and reports the last condition it met. A Ctrl-C that lands inside
+  the first ``tonbo_resolve`` call of a resolve, before its reply is read, can miss the cancel:
+  that resolve then runs to the extension's own deadline.
 
 Nothing here logs, no error message carries a key or a token, and the options a resolve sends,
 which may hold a key, never show in a ``repr``.
@@ -35,7 +38,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -152,18 +154,35 @@ class _Options:
 def _options(
     name_or_url: object, api_key: object, api_origin: object, auth_origin: object, token: object
 ) -> tuple[str, _Options]:
-    """Checks a resolve's arguments, before any request."""
+    """Checks a resolve's arguments, before any request. No local but ``api_key`` and ``token``
+    holds a key or a token while a check raises, so that error reporters that scrub those names
+    find no other."""
     if not isinstance(name_or_url, str):
         raise invalid(f"name_or_url must be a string, not {type(name_or_url).__name__}")
-    given = {"api_key": api_key, "api_origin": api_origin, "auth_origin": auth_origin}
-    for option, value in given.items():
+    wrong = [
         # Never the value itself: it may be a key.
-        if value is not None and not isinstance(value, str):
-            raise invalid(f"{option} must be a string, not {type(value).__name__}")
-    chosen = _open._token(token)
+        f"{option} must be a string, not {type(value).__name__}"
+        for option, value in (
+            ("api_key", api_key),
+            ("api_origin", api_origin),
+            ("auth_origin", auth_origin),
+        )
+        if value is not None and not isinstance(value, str)
+    ]
+    if wrong:
+        raise invalid(wrong[0])
+    _open._token(token)
     # Options left out take the extension's defaults.
-    settings: dict[str, object] = {k: v for k, v in given.items() if v is not None}
-    settings["own_token"] = chosen is not None
+    settings: dict[str, object] = {
+        option: value
+        for option, value in (
+            ("api_key", api_key),
+            ("api_origin", api_origin),
+            ("auth_origin", auth_origin),
+        )
+        if value is not None
+    }
+    settings["own_token"] = token is not None
     settings["timeout_ms"] = EXTENSION_RESOLVE_MS
     return name_or_url, _Options(name_or_url, json.dumps(settings))
 
@@ -186,15 +205,13 @@ _inflight: dict[bytes, _Shared] = {}
 
 
 class _Resolve:
-    """One call's resolve: ``tonbo_resolve`` with timeout 0, asked again each time its waiter
-    wakes, until a call of the shared resolve took its outcome. The sync calls wait on a
-    ``threading.Event`` and the async ones on a :class:`_events.LoopEvent`, through the same
-    steps.
+    """One call's resolve, an :class:`_events.Step`: ``tonbo_resolve`` with timeout 0, asked again
+    each time its waiter wakes, until a call of the shared resolve took its outcome.
 
     The extension owes a host one outcome for its calls that returned at once, so the calls of the
     process share one :class:`_Shared` by their arguments: the first back takes the outcome for
-    all. A call that gives up, at its timeout or at an exception, leaves the resolve to the others,
-    and the last one cancels it."""
+    all. A call that gives up, at its timeout or at an exception, leaves the resolve to the others
+    and reports ``cancelled``, and the last one cancels it."""
 
     def __init__(self, target: str, options: _Options, timeout: float, deadline: float) -> None:
         self._target = target
@@ -204,6 +221,8 @@ class _Resolve:
         self._ev: _events.Events | None = None
         self._waiter: _events.Waiter | None = None
         self._request: int | None = None
+        #: The call took the outcome or left the resolve.
+        self._done = False
         with _control.lock():
             shared = _inflight.get(options.digest)
             if shared is None:
@@ -214,59 +233,93 @@ class _Resolve:
     def ask(self, waiter: _events.Waiter) -> dict[str, Any] | None:
         """One pass: the answer when the resolve is done, else ``None`` with ``waiter`` registered
         for the request's ``resolved`` event. Raises the resolve's failure."""
-        shared = self._shared
         with _control.lock():
             self._forget()
-            if shared.outcome is None:
+            if self._shared.outcome is None:
                 # The thread first, so its cursor precedes the request, and the waiter registered
                 # in the step that got the request, before any event about it applies.
                 ev = _events.events()
-                answer = _control.call(
-                    "SELECT tonbo_resolve(?, ?, 0)", self._target, self._options.text
-                )
-                if not answer["done"]:
-                    shared.request = self._request = int(answer["request"])
-                    ev.wait_request(self._request, waiter)
+                request = self._poll()
+                if request is not None:
+                    self._request = request
+                    ev.wait_request(request, waiter)
                     self._ev, self._waiter = ev, waiter
                     return None
-                shared.outcome = _error(answer["error"]) if "error" in answer else answer
-                if _inflight.get(self._options.digest) is shared:
-                    del _inflight[self._options.digest]
-            outcome = shared.outcome
-            shared.calls -= 1
-        if isinstance(outcome, UrsulaError):
-            raise again(outcome)
-        return outcome
+            return self._take()
 
     def left(self) -> float:
         return self._deadline - time.monotonic()
 
-    def give_up(self) -> UrsulaError:
-        """The call gives up: at its timeout, or at an exception, which the caller raises. The last
-        call waiting for the resolve cancels it, and the error is what it came to, the last
-        condition it met, or ``cancelled``. A call that took the outcome or raised it gives up
-        nothing."""
-        shared = self._shared
+    def again(self, error: BaseException) -> bool:
+        """A pass raised ``error``, which the caller raises: a call that did not take the outcome
+        leaves the resolve, and the last one cancels it."""
         with _control.lock():
             self._forget()
-            if shared.outcome is not None:
-                return self._cancelled()
-            shared.calls -= 1
-            if shared.calls > 0:
-                return self._cancelled()
-            if _inflight.get(self._options.digest) is shared:
-                del _inflight[self._options.digest]
-            if shared.request is None:
-                return self._cancelled()
-            # Under the lock, so no call joins the resolve between the two. The cancel of a resolve
-            # never waits.
+            if not self._done:
+                self._leave()
+        return False
+
+    def timed_out(self) -> dict[str, Any]:
+        """The timeout passed: one last pass takes an outcome that arrived, else the call leaves
+        the resolve and raises ``cancelled`` or, as the last, what the cancel reports."""
+        with _control.lock():
+            self._forget()
             try:
-                ended = _control.call("SELECT ursula_cancel(?)", shared.request)
-            except UrsulaError:
-                # It ended and its outcome was taken meanwhile.
-                ended = None
-        if ended is None or ended.get("kind") == "cancelled":
-            return self._cancelled()
+                pending = self._shared.outcome is None and self._poll() is not None
+            except BaseException:
+                self._leave()
+                raise
+            if not pending:
+                return self._take()
+            error = self._leave()
+        raise error
+
+    def _poll(self) -> int | None:
+        """``tonbo_resolve`` once, under the lock: its request while the resolve goes on, else
+        ``None`` with the outcome in for every call that shares it."""
+        shared = self._shared
+        answer = _control.call("SELECT tonbo_resolve(?, ?, 0)", self._target, self._options.text)
+        if not answer["done"]:
+            shared.request = int(answer["request"])
+            return shared.request
+        shared.outcome = _error(answer["error"]) if "error" in answer else answer
+        if _inflight.get(self._options.digest) is shared:
+            del _inflight[self._options.digest]
+        return None
+
+    def _take(self) -> dict[str, Any]:
+        """Takes the outcome, under the lock: the answer, or raises the failure."""
+        outcome = self._shared.outcome
+        assert outcome is not None
+        self._done = True
+        self._shared.calls -= 1
+        if isinstance(outcome, UrsulaError):
+            raise again(outcome)
+        return outcome
+
+    def _leave(self) -> UrsulaError:
+        """The call leaves the resolve, under the lock. It goes on for the other calls that share
+        it, and the error is ``cancelled``. The last call cancels it, and the error is the last
+        condition it met, or ``cancelled`` when it met none or ended as it was cancelled. The
+        cancel of a resolve never waits."""
+        shared = self._shared
+        self._done = True
+        shared.calls -= 1
+        if shared.outcome is not None:
+            return self._cancelled("")
+        if shared.calls > 0:
+            return self._cancelled(", and it goes on for the other calls that share it")
+        if _inflight.get(self._options.digest) is shared:
+            del _inflight[self._options.digest]
+        if shared.request is None:
+            return self._cancelled(" before it met any condition")
+        try:
+            ended = _control.call("SELECT ursula_cancel(?)", shared.request)
+        except UrsulaError:
+            # It ended and its outcome was taken meanwhile.
+            ended = None
+        if _open.met_nothing(ended):
+            return self._cancelled(" before it met any condition")
         return _error(ended)
 
     def _forget(self) -> None:
@@ -274,9 +327,9 @@ class _Resolve:
             self._ev.forget_request(self._request, self._waiter)
         self._ev = self._waiter = None
 
-    def _cancelled(self) -> UrsulaUnavailableError:
+    def _cancelled(self, why: str) -> UrsulaUnavailableError:
         return UrsulaUnavailableError(
-            f'cancelled: the resolve of "{self._target}" gave up after {self._timeout:g} s',
+            f'cancelled: the resolve of "{self._target}" gave up after {self._timeout:g} s{why}',
             "cancelled",
             "retry",
         )
@@ -284,8 +337,9 @@ class _Resolve:
 
 def _error(report: dict[str, Any]) -> UrsulaError:
     """The package's error for what a resolve failed with, as ``tonbo_resolve`` and
-    ``ursula_cancel`` report it: a :class:`TonboError` for its kinds, the root module's class
-    otherwise. The message is the extension's, ``<kind>: <what>[ (request <id>)][. <fix>]``."""
+    ``ursula_cancel`` report it: a :class:`TonboError` for its kinds, the class the report's
+    ``class`` field names otherwise. The message is the extension's,
+    ``<kind>: <what>[ (request <id>)][. <fix>]``."""
     kind = str(report["kind"])
     message = str(report["message"])
     if kind not in TONBO_KINDS:
@@ -298,40 +352,6 @@ def _error(report: dict[str, Any]) -> UrsulaError:
         fix=fix if isinstance(fix, str) else None,
         request_id=request_id if isinstance(request_id, str) else None,
     )
-
-
-def _resolved(resolve: _Resolve) -> dict[str, Any]:
-    """Waits for ``resolve`` on a ``threading.Event``."""
-    while True:
-        waiter = threading.Event()
-        try:
-            answer = resolve.ask(waiter)
-            if answer is not None:
-                return answer
-            left = resolve.left()
-            woke = left > 0 and waiter.wait(left)
-        except BaseException:
-            resolve.give_up()
-            raise
-        if not woke:
-            raise resolve.give_up()
-
-
-async def _aresolved(resolve: _Resolve) -> dict[str, Any]:
-    """Waits for ``resolve`` on the event loop."""
-    while True:
-        waiter = _events.LoopEvent()
-        try:
-            answer = resolve.ask(waiter)
-            if answer is not None:
-                return answer
-            left = resolve.left()
-            woke = left > 0 and await waiter.wait(left)
-        except BaseException:
-            resolve.give_up()
-            raise
-        if not woke:
-            raise resolve.give_up()
 
 
 def _resolve(
@@ -376,7 +396,7 @@ def resolve_database(
     resolve = _resolve(
         name_or_url, api_key, api_origin, auth_origin, token, limit, time.monotonic() + limit
     )
-    answer = _resolved(resolve)
+    answer = _events.wait_for(resolve)
     return _handed_out(answer, token)
 
 
@@ -396,7 +416,7 @@ async def aresolve_database(
     resolve = _resolve(
         name_or_url, api_key, api_origin, auth_origin, token, limit, time.monotonic() + limit
     )
-    answer = await _aresolved(resolve)
+    answer = await _events.await_for(resolve)
     return _handed_out(answer, token)
 
 
@@ -447,7 +467,8 @@ def open(  # noqa: A001 - the module's entry point, as Node's `open`
 
     Raises :class:`TonboError` for a key or database to fix, :class:`UrsulaUnavailableError` when
     the timeout passed while the Tonbo API did not answer (``unreachable``, ``unavailable`` or
-    ``rate_limited``, action ``retry``), :class:`UrsulaSetupError` ``invalid_argument`` for an
+    ``rate_limited``, action ``retry``, or ``cancelled`` for a call that left the resolve to other
+    calls that share it), :class:`UrsulaSetupError` ``invalid_argument`` for an
     argument it cannot use, an answer of the Tonbo API it cannot read or a second key,
     ``invalid_url`` for a stream URL the open cannot take or that would get the key's Streams
     tokens over plain http to another host, and the root module's errors from the open of the
@@ -466,7 +487,7 @@ def open(  # noqa: A001 - the module's entry point, as Node's `open`
     )
     deadline = time.monotonic() + checked.timeout
     _control.start()
-    answer = _resolved(_Resolve(target, options, checked.timeout, deadline))
+    answer = _events.wait_for(_Resolve(target, options, checked.timeout, deadline))
     return _open.opened(str(answer["url"]), checked, deadline)
 
 
@@ -504,13 +525,5 @@ async def aopen(
     )
     deadline = time.monotonic() + checked.timeout
     _control.start()
-    answer = await _aresolved(_Resolve(target, options, checked.timeout, deadline))
+    answer = await _events.await_for(_Resolve(target, options, checked.timeout, deadline))
     return await _open.aopened(str(answer["url"]), checked, deadline)
-
-
-def _after_fork_in_child() -> None:
-    _inflight.clear()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_after_fork_in_child)
