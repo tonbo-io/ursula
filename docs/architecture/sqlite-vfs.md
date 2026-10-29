@@ -2357,9 +2357,9 @@ provider, and the provider owns how a token is made. These rules hold for any pa
 
 - Each call is handed `previous`, the token the package holds at the call: the one the server
   refused after a `401`, the current one at a scheduled refresh, none before the first call or
-  after the package stopped calling it. The extension takes an equal token as no change and would not send a
-  refused request again, so an answer equal to `previous` counts as a failed call and is retried
-  with backoff. A provider that caches its tokens therefore never hands back a refused one.
+  after the package stopped calling it. The extension takes an equal token as no change and would
+  not send a refused request again, so an answer equal to `previous` counts as a failed call and is
+  retried with backoff. A provider that caches its tokens therefore never hands back a refused one.
 - A provider error whose `action` is `fix` fails for good, whatever its class: the waiting opens
   reject, and the provider is called again only for the next open. An `UrsulaError` is the
   rejection itself. Any other error, such as one of a library that cannot extend a class of this
