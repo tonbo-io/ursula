@@ -8,7 +8,10 @@
 // while it was binding (the extension reports conditions of bound databases only). Which function
 // minted the token held does not matter, since the process carries one token: an open with another
 // function only names the function the next call runs. An open with a string stops the provider:
-// the waiting opens go on under the string.
+// the waiting opens go on under the string. Each call is handed the token it last handed out as
+// `previous` (the refused one after a 401), and an answer equal to it counts as a failed call: the
+// extension takes an equal token as no change, so a refused request would never go out again. A
+// retry is due by the expiry of `previous` at the latest, when a provider's cache turns over.
 //
 // A Tonbo API key's tokens, which the extension exchanges and refreshes itself (the `/tonbo` entry),
 // take over the same way: the extension clears the token set, and `useKeyTokens` stops the provider
@@ -36,16 +39,28 @@ export interface BearerToken {
  * longer waits for the answer: after 30 s, or once an open with a string token stopped the provider
  * or no database uses it.
  *
- * To fail for good, throw an {@link UrsulaError} whose action is `fix`, such as
- * `new UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized")`: the package
- * stops calling the provider until the next `open()` with a provider. It retries every other error
- * with backoff.
+ * `previous` is the token the provider last handed out, exactly as it handed it out, when the
+ * package will not take it again: the current one at a scheduled refresh, or the one the server
+ * refused after a 401. It is `undefined` before the first call and after the provider stopped, but
+ * a token the server refused stays `previous` until a string token replaces it. When `previous` is
+ * set, hand out a different token, and refill a cache that holds it: the package compares tokens
+ * without surrounding whitespace, and an equal one counts as a failed call, retried with backoff
+ * and by the expiry of `previous` at the latest. A token that never changes belongs in a string
+ * `token` or in `URSULA_VFS_TOKEN_FILE`.
+ *
+ * To fail for good, throw an error whose `action` is `"fix"`, an {@link UrsulaError} such as
+ * `new UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized")` or any other
+ * object with that property: the package stops calling the provider until the next `open()` with a
+ * provider. It retries every other error with backoff.
  */
-export type TokenProvider = (options: { readonly signal: AbortSignal }) => Promise<BearerToken>;
+export type TokenProvider = (options: { readonly signal: AbortSignal; readonly previous?: string | undefined }) => Promise<BearerToken>;
 
 /** A token as the package holds it: when it expires and when to ask for the next one, in epoch ms. */
 interface Fresh {
+	/** The token as requests carry it: what the provider handed out, without surrounding whitespace. */
 	readonly token: string;
+	/** What the provider handed out, which a later call gets back as `previous`. */
+	readonly handed: string;
 	readonly expiresAt: number;
 	readonly refreshAt: number;
 }
@@ -68,13 +83,14 @@ const USABLE = /^[\x21-\x7e]+$/;
 const refreshAfter = (lifetime: number): number => Math.max(MIN_REFRESH_MS, lifetime * (0.7 + 0.1 * Math.random()));
 const retryAfter = (failures: number): number => Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(failures - 1, 16)) * (0.5 + 0.5 * Math.random());
 
-/** A failure the package does not retry: the provider's own UrsulaError that says `fix`, or an answer it cannot use. */
-const permanent = (error: unknown): error is UrsulaError => error instanceof UrsulaError && error.action === "fix";
+/** A failure the package does not retry: an error of the provider whose `action` is `fix`, an UrsulaError or not, or an answer it cannot use. */
+const permanent = (error: unknown): boolean => typeof error === "object" && error !== null && (error as { action?: unknown }).action === "fix";
 
 /** What the provider returned, checked: an answer the package cannot use fails for good, a token that expired or expires within {@link MIN_REFRESH_MS} is retried. */
 function checked(got: unknown, now: number): Fresh {
 	const answer = got as { token?: unknown; expiresAt?: unknown } | null | undefined;
-	const token = typeof answer?.token === "string" ? answer.token.trim() : "";
+	const handed = typeof answer?.token === "string" ? answer.token : "";
+	const token = handed.trim();
 	if (!USABLE.test(token)) {
 		throw new UrsulaSetupError("invalid_argument: the token provider returned no usable token: a non-empty string of printable ASCII without spaces", "invalid_argument");
 	}
@@ -91,7 +107,7 @@ function checked(got: unknown, now: number): Fresh {
 	}
 	const lifetime = expiresAt - now;
 	if (lifetime < MIN_REFRESH_MS) throw new Error(`the token provider returned a token that expires in ${lifetime} ms, under the ${MIN_REFRESH_MS} ms the package needs to refresh it in time`);
-	return { token, expiresAt, refreshAt: now + refreshAfter(lifetime) };
+	return { token, handed, expiresAt, refreshAt: now + refreshAfter(lifetime) };
 }
 
 /** Requests carry `token` from now on. */
@@ -100,7 +116,7 @@ const apply = (token: string): void => {
 };
 
 /** What an open waiting for a token learns: the token (none when a string token replaced the provider), or a failure for good. */
-type Outcome = { token: string | undefined } | { error: UrsulaError };
+type Outcome = { token: string | undefined } | { error: unknown };
 
 /** This thread's provider and its schedule. At most one call of it runs at a time: concurrent refreshes share it. */
 class Source {
@@ -109,6 +125,17 @@ class Source {
 	/** The call in flight: aborting it discards its answer. */
 	#attempt: AbortController | undefined;
 	#current: Fresh | undefined;
+	/**
+	 * The token the provider last handed out, also once a 401 dropped it, which its next call gets as
+	 * `previous`. A stop forgets it, unless the server refused it and no string or key replaced it.
+	 */
+	#held: Fresh | undefined;
+	/**
+	 * The token a condition `unauthorized` of `paths` dropped. The event may predate the token, since
+	 * the extension clears a condition only once the blocked request went out again under a new one:
+	 * once none of `paths` is blocked any more, the provider's answer of that token is taken.
+	 */
+	#dropped: { readonly token: string; readonly paths: readonly string[] } | undefined;
 	#timer: NodeJS.Timeout | undefined;
 	/** Failed calls in a row. */
 	#failures = 0;
@@ -142,9 +169,10 @@ class Source {
 	 * The token for an open of `stream`, applied. A token held serves at once while it is valid, so a
 	 * connection on a bound binding needs no network, and a refresh that is due runs in the
 	 * background. An expired one serves only while the provider fails, since otherwise its next token
-	 * is on the way. Else the open waits for the provider: it rejects with the provider's error when
-	 * that fails for good, and with an {@link UrsulaUnavailableError} `unavailable` when `signal`
-	 * fires first.
+	 * is on the way. Else the open waits for the provider: when that fails for good it rejects with
+	 * the provider's error if that is an {@link UrsulaError}, else with an
+	 * {@link UrsulaUnavailableError} `unauthorized`, action `fix`, whose cause it is, and with an
+	 * {@link UrsulaUnavailableError} `unavailable` when `signal` fires first.
 	 */
 	token(stream: string, signal: AbortSignal): Promise<string | undefined> {
 		const failing = this.#failed || this.#failures > 0;
@@ -165,7 +193,7 @@ class Source {
 			const waiter = (outcome: Outcome): void => {
 				done();
 				if ("token" in outcome) resolve(outcome.token);
-				else reject(outcome.error);
+				else reject(failedForGood(stream, outcome.error));
 			};
 			const abort = (): void => {
 				done();
@@ -184,26 +212,40 @@ class Source {
 		});
 	}
 
-	/**
-	 * A request was refused with 401 under `token` (the token held when absent): it is dropped, and a
-	 * call starts unless one is in flight or a retry is scheduled. A token newer than `token` stays.
-	 */
-	refused(token?: string): void {
+	/** A bind under `token` was refused with 401: the token is dropped unless a newer one is held, and a call starts unless one is in flight or a retry is scheduled. */
+	refused(token: string): void {
 		if (this.#provider === undefined || this.#failed) return;
 		const current = this.#current;
-		if (current !== undefined && token !== undefined && current.token !== token) return;
+		if (current !== undefined && current.token !== token) return;
+		if (this.#dropped?.token === token) this.#dropped = undefined;
 		this.#current = undefined;
-		if (this.#attempt === undefined && !this.#backingOff) this.#call();
+		this.#ask();
 	}
 
-	/** No provider from now on: the call in flight is abandoned, and the opens waiting go on with the process's token, which `why` set. */
-	stop(why: string): void {
+	/** The replication of `paths` blocked `unauthorized`: the token held is dropped, and a call starts unless one is in flight or a retry is scheduled. */
+	blocked(paths: readonly string[]): void {
+		if (this.#provider === undefined || this.#failed) return;
+		const current = this.#current;
+		if (current !== undefined) this.#dropped = { token: current.token, paths };
+		else if (this.#dropped !== undefined) this.#dropped = { token: this.#dropped.token, paths: [...new Set([...this.#dropped.paths, ...paths])] };
+		this.#current = undefined;
+		this.#ask();
+	}
+
+	/**
+	 * No provider from now on: the call in flight is abandoned, and the opens waiting go on with the
+	 * process's token, which `why` set. `replaced`: a string or a key's tokens replaced the provider's.
+	 * Otherwise a token the server refused is still the process's, so the next call gets it as `previous`.
+	 */
+	stop(why: string, replaced: boolean): void {
 		this.#attempt?.abort(new UrsulaUnavailableError(`cancelled: the token provider stopped: ${why}`, "cancelled"));
 		this.#attempt = undefined;
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
 		this.#provider = undefined;
+		if (replaced || this.#current !== undefined) this.#held = undefined;
 		this.#current = undefined;
+		this.#dropped = undefined;
 		this.#failures = 0;
 		this.#lastFailure = undefined;
 		this.#failed = false;
@@ -213,6 +255,20 @@ class Source {
 	/** A retry after a failed call is scheduled. */
 	get #backingOff(): boolean {
 		return this.#failures > 0 && this.#timer !== undefined;
+	}
+
+	/** A call at once, unless one is in flight or a retry is scheduled. */
+	#ask(): void {
+		if (this.#attempt === undefined && !this.#backingOff) this.#call();
+	}
+
+	/**
+	 * Whether the provider's answer `token`, equal to `previous`, is taken: only when a condition that
+	 * may predate it dropped it, and none of the paths that reported the condition is blocked any more.
+	 */
+	#restored(token: string): boolean {
+		const dropped = this.#dropped;
+		return dropped !== undefined && dropped.token === token && cleared(dropped.paths);
 	}
 
 	#gaveUp(stream: string, signal: AbortSignal): UrsulaUnavailableError {
@@ -229,16 +285,23 @@ class Source {
 		const attempt = new AbortController();
 		this.#attempt = attempt;
 		const signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(PROVIDER_MS)]);
+		const previous = this.#held;
+		// A retry is due by the expiry of `previous` at the latest, when a cache that hands it back turns over.
+		const by = previous !== undefined && previous.expiresAt > Date.now() ? previous.expiresAt : undefined;
 		raced(
 			// A call abandoned before it started never reaches the provider.
 			Promise.resolve().then(() => {
 				signal.throwIfAborted();
-				return provider({ signal });
+				return provider({ signal, previous: previous?.handed });
 			}),
 			signal,
 		)
 			.then((got) => {
 				const fresh = checked(got, Date.now());
+				// The extension takes an equal token as no change, so it would not send a refused request again.
+				if (fresh.token === previous?.token && !(this.#attempt === attempt && this.#restored(fresh.token))) {
+					throw new Error("the token provider returned the token it was handed as previous, which the package holds already or the server refused");
+				}
 				if (this.#attempt === attempt) apply(fresh.token);
 				return fresh;
 			})
@@ -247,7 +310,7 @@ class Source {
 					if (this.#attempt === attempt) this.#succeeded(fresh);
 				},
 				(error: unknown) => {
-					if (this.#attempt === attempt) this.#failedWith(error);
+					if (this.#attempt === attempt) this.#failedWith(error, by);
 				},
 			);
 	}
@@ -255,13 +318,16 @@ class Source {
 	#succeeded(fresh: Fresh): void {
 		this.#attempt = undefined;
 		this.#current = fresh;
+		this.#held = fresh;
+		this.#dropped = undefined;
 		this.#failures = 0;
 		this.#lastFailure = undefined;
 		for (const waiter of [...this.#waiters]) waiter({ token: fresh.token });
 		this.#schedule(fresh.refreshAt - Date.now());
 	}
 
-	#failedWith(error: unknown): void {
+	/** A failed call: retried with backoff, and by `by` at the latest, unless it failed for good. */
+	#failedWith(error: unknown, by: number | undefined): void {
 		this.#attempt = undefined;
 		this.#lastFailure = { error };
 		if (permanent(error)) {
@@ -270,7 +336,8 @@ class Source {
 			return;
 		}
 		this.#failures += 1;
-		this.#schedule(retryAfter(this.#failures));
+		const backoff = retryAfter(this.#failures);
+		this.#schedule(by === undefined ? backoff : Math.min(backoff, by - Date.now()));
 	}
 
 	/** The next call after `ms`. Its timer keeps the process alive only while an open waits. */
@@ -283,11 +350,17 @@ class Source {
 	#due(): void {
 		this.#timer = undefined;
 		if (this.#waiters.size === 0 && !inUse()) {
-			this.stop("no binding uses it");
+			this.stop("no binding uses it", false);
 			return;
 		}
 		this.#call();
 	}
+}
+
+/** The error an open of `stream` rejects with when the provider failed for good with `error`: an UrsulaError as it is, any other error as the cause of one that says `fix`. */
+function failedForGood(stream: string, error: unknown): unknown {
+	if (error instanceof UrsulaError) return error;
+	return new UrsulaUnavailableError(`unauthorized: the token provider failed for good (${reasonOf(error)}): the open of ${stream} has no token`, "unauthorized", error, "fix");
 }
 
 /** This thread's token source. */
@@ -309,32 +382,40 @@ function inUse(): boolean {
 	return paths.size > 0 || opening > 0;
 }
 
+/** Whether the binding of `path` is blocked `unauthorized` now, or `undefined` once it retired. */
+function blockedNow(path: string): boolean | undefined {
+	try {
+		const status = call<{ state: string; replication: { condition: string | null } }>("SELECT ursula_status(?)", path);
+		return status.state === "retired" ? undefined : status.replication.condition === "unauthorized";
+	} catch {
+		return undefined;
+	}
+}
+
+/** Whether each of `paths`, one at least, is still bound and no longer blocked `unauthorized`. */
+function cleared(paths: readonly string[]): boolean {
+	return paths.length > 0 && paths.every((path) => blockedNow(path) === false);
+}
+
 /** The extension's events: a 401 asks for a token at once, and a retired binding may stop the provider. */
 function onEvent(event: PumpEvent): void {
 	switch (event.event) {
 		case "condition":
-			if (event.condition === "unauthorized") source.refused();
+			if (event.condition === "unauthorized") source.blocked(event.path === null ? [] : [event.path]);
 			break;
 		case "retired": {
 			// Pruned with or without a provider, so the paths of string opens never pile up.
 			const used = inUse();
-			if (!used && source.provider !== undefined && !source.waited) source.stop("no binding uses it");
+			if (!used && source.provider !== undefined && !source.waited) source.stop("no binding uses it", false);
 			break;
 		}
-		case "gap":
+		case "gap": {
 			// The events it dropped may have held a 401: status still shows it.
 			if (source.provider === undefined) break;
-			for (const path of paths) {
-				try {
-					if (call<{ replication: { condition: string | null } }>("SELECT ursula_status(?)", path).replication.condition === "unauthorized") {
-						source.refused();
-						break;
-					}
-				} catch {
-					// Retired meanwhile.
-				}
-			}
+			const blocked = [...paths].filter((path) => blockedNow(path) === true);
+			if (blocked.length > 0) source.blocked(blocked);
 			break;
+		}
 		default:
 			break;
 	}
@@ -389,7 +470,8 @@ function refusedWith(error: unknown, token: string | undefined): unknown {
 
 /** An open with a string token: requests carry `token` from now on, and this thread's provider stops. */
 export function useStringToken(token: string): void {
-	if (source.provider !== undefined) source.stop("an open with a string token replaced it");
+	// Stopped already, it still forgets a token the server refused.
+	source.stop("an open with a string token replaced it", true);
 	apply(token);
 }
 
@@ -399,7 +481,7 @@ export function useStringToken(token: string): void {
  * now on, so this thread's provider stops, and a token it set since the resolve is withdrawn.
  */
 export function useKeyTokens(): void {
-	if (source.provider === undefined) return;
-	source.stop("an open with a Tonbo API key replaced it");
-	call("SELECT ursula_set_token('', '')");
+	const serving = source.provider !== undefined;
+	source.stop("an open with a Tonbo API key replaced it", true);
+	if (serving) call("SELECT ursula_set_token('', '')");
 }

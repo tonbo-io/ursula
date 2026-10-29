@@ -1,34 +1,44 @@
 // `open()`'s token provider against the e2e server (test/stack.ts): the package calls it before
 // the open's first request, again ahead of each token's expiry and at once after a 401, shares one
 // call between concurrent opens, whatever functions they passed, stops once no binding of the thread
-// is bound or an open with a string replaced it, and never keeps the process alive. Its failures are typed. The 401s are scripted faults (the
-// model's, or test/gate.mjs's in front of Ursula), since neither server checks tokens. In front of
+// is bound or an open with a string replaced it, and never keeps the process alive. Each call is
+// handed the token it last handed out as `previous`, and an answer equal to it is retried, by that
+// token's expiry at the latest. Its failures are typed. The 401s are scripted faults (the model's,
+// or test/gate.mjs's in front of Ursula), since neither server checks tokens, or a gate of a test's
+// own that refuses every token but one, as an authorizer refuses an expired token. In front of
 // Ursula the gate records each request's `Authorization` header (`sentTokens`), so there the suite
 // also checks which token each request carried. The token is one per process, so each test closes
 // its databases and waits until the provider stopped (`closeAll`): the next test starts with none held.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { type BearerToken, loadUrsulaVfs, open, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
-import { ext, fault, freshDir, rejection, retired, sentTokens, stream } from "./kit.ts";
+import { type BearerToken, loadUrsulaVfs, open, type TokenProvider, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
+import { ext, fault, freshDir, gate, rejection, retired, sentTokens, stream, ursulaUrl } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
- * A provider of tokens `<label>-<n>` that last `lifetimeMs`, and when each of its calls started.
- * `before` runs first in each call, with the call's number from 1: it may wait, or throw to fail the call.
+ * A provider of tokens `<label>-<n>` that last `lifetimeMs`, when each of its calls started, and the
+ * `previous` each was handed. `before` runs first in each call, with the call's number from 1: it
+ * may wait, or throw to fail the call.
  */
-function provider(label: string, lifetimeMs: number, before: (n: number) => void | Promise<void> = () => {}): { fn: () => Promise<BearerToken>; calls: number[] } {
+function provider(
+	label: string,
+	lifetimeMs: number,
+	before: (n: number) => void | Promise<void> = () => {},
+): { fn: TokenProvider; calls: number[]; previous: (string | undefined)[] } {
 	const calls: number[] = [];
-	const fn = async (): Promise<BearerToken> => {
+	const previous: (string | undefined)[] = [];
+	const fn: TokenProvider = async (options) => {
 		calls.push(Date.now());
+		previous.push(options.previous);
 		const n = calls.length;
 		await before(n);
 		return { token: `${label}-${n}`, expiresAt: Date.now() + lifetimeMs };
 	};
-	return { fn, calls };
+	return { fn, calls, previous };
 }
 
 /** The number `n` of the token `<label>-<n>` an `Authorization` header carries, or NaN. */
@@ -78,6 +88,8 @@ describe("a token provider", () => {
 		expect(error).toMatchObject({ kind: "unauthorized", action: "fix" });
 		// The refused open dropped the token and asked for the next one, which the next open uses.
 		await until("a call after the refused open", () => p.calls.length === 2);
+		// The first call held no token, and the call after the 401 is handed the refused one.
+		expect(p.previous).toEqual([undefined, "bind-1"]);
 		const next = stream("token-bind-401-next");
 		const db = await open(next.url, { dir: freshDir(), token: p.fn });
 		expect(p.calls).toHaveLength(2);
@@ -104,6 +116,8 @@ describe("a token provider", () => {
 		await until("the second refresh", () => p.calls.length >= 3, 5_000);
 		const [first, second] = p.calls as [number, number];
 		expect(second - first).toBeGreaterThanOrEqual(2_000);
+		// No token before the first call, then each scheduled refresh is handed the current token.
+		expect(p.previous.slice(0, 3)).toEqual([undefined, "refresh-1", "refresh-2"]);
 		db.exec("INSERT INTO t VALUES (2)");
 		await db.synced();
 		const sent = await sentTokens(s.path);
@@ -209,6 +223,8 @@ describe("a token provider", () => {
 		// The blocked append goes out again within 30 s, under the new token.
 		await db.synced();
 		expect(p.calls).toHaveLength(2);
+		// The call after the 401 is handed the refused token.
+		expect(p.previous).toEqual([undefined, "refused-1"]);
 		const sent = await sentTokens(s.path);
 		if (sent !== undefined) {
 			const posts = sent.filter((r) => r.method === "POST").map((r) => r.authorization);
@@ -217,6 +233,75 @@ describe("a token provider", () => {
 			expect(posts.slice(-3, -1)).toEqual(["Bearer refused-1", "Bearer refused-1"]);
 		}
 		await closeAll(db);
+	});
+
+	it("is retried when it hands back the refused token after a 401, and its next new token unblocks replication", async () => {
+		const s = stream("token-401-cached");
+		const previous: (string | undefined)[] = [];
+		// A cache that hands its token out again, refused or not, until its second refill.
+		const cached: TokenProvider = async (options) => {
+			previous.push(options.previous);
+			return { token: previous.length <= 2 ? "cached-1" : "cached-2", expiresAt: Date.now() + 3_600_000 };
+		};
+		const db = await open(s.url, { dir: freshDir(), token: cached });
+		db.exec("CREATE TABLE t(x)");
+		await db.synced();
+		await fault("status 401", 2, "POST");
+		db.exec("INSERT INTO t VALUES (1)");
+		// The second call hands back the refused token: a failed call, retried after 0.5 to 1 s.
+		await until("a retry after the refused token came back", () => previous.length === 3);
+		await db.synced();
+		expect(previous).toEqual([undefined, "cached-1", "cached-1"]);
+		const sent = await sentTokens(s.path);
+		if (sent !== undefined) {
+			const posts = sent.filter((r) => r.method === "POST").map((r) => r.authorization);
+			// The refused token never went out again: the blocked append's resend carried the new one.
+			expect(posts.at(-1)).toBe("Bearer cached-2");
+			expect(posts.slice(-3, -1)).toEqual(["Bearer cached-1", "Bearer cached-1"]);
+		}
+		await closeAll(db);
+	});
+
+	it("is asked again as the token it hands back until expiry expires, and replication goes on under the next one", async () => {
+		// A gate of the test's own refuses every token but the one it requires, as an authorizer
+		// refuses an expired token.
+		const g = await gate(ursulaUrl());
+		const requireToken = async (token: string): Promise<void> => {
+			const r = await fetch(`${g.control}/auth`, { method: "PUT", body: JSON.stringify({ token }) });
+			expect(r.status, await r.text()).toBe(204);
+		};
+		try {
+			// A cache that hands its token out until it expires, whatever `previous` says.
+			const cache: { held?: BearerToken & { expiresAt: number } } = {};
+			const minted: number[] = [];
+			const cached: TokenProvider = async () => {
+				if (cache.held === undefined || cache.held.expiresAt <= Date.now()) {
+					minted.push(Date.now());
+					cache.held = { token: `expiring-${minted.length}`, expiresAt: Date.now() + 6_000 };
+				}
+				return cache.held;
+			};
+			await requireToken("expiring-1");
+			const s = stream("token-expiring");
+			const db = await open(`${g.url}${s.path}`, { dir: freshDir(), token: cached });
+			db.exec("CREATE TABLE t(x)");
+			await db.synced();
+			const expiry = cache.held?.expiresAt ?? 0;
+			// The refresh due 4.2 to 4.8 s in gets the same token back, and so does each retry until
+			// it expires: the retry is due by then at the latest, when the cache turns over.
+			await until("the next token", () => minted.length === 2, 15_000);
+			expect((minted[1] as number) - expiry).toBeLessThan(500);
+			await requireToken("expiring-2");
+			// A commit after the expiry goes out under the next token, never blocked `unauthorized`.
+			const wrote = Date.now();
+			db.exec("INSERT INTO t VALUES (1)");
+			await db.synced();
+			expect(Date.now() - wrote).toBeLessThan(2_000);
+			expect(db.status().replication.condition).toBeNull();
+			await closeAll(db);
+		} finally {
+			await g.stop();
+		}
 	});
 
 	it("fails the open with its own error when it fails for good, and is retried after any other failure", async () => {
@@ -234,6 +319,24 @@ describe("a token provider", () => {
 		const db = await open(stream("token-flaky").url, { dir: freshDir(), token: flaky.fn });
 		expect(flaky.calls).toHaveLength(3);
 		await closeAll(db);
+	});
+
+	it("fails the open at once with `unauthorized`, `fix`, when it throws another error that says `fix`, as that error's cause", async () => {
+		// Any object whose action is `fix`, as an error of a library that cannot extend UrsulaError.
+		const revoked = { action: "fix", message: "the key was revoked" };
+		const p = provider("revoked", 60_000, () => {
+			throw revoked;
+		});
+		const started = Date.now();
+		const error = await rejection(open(stream("token-revoked").url, { dir: freshDir(), token: p.fn, signal: AbortSignal.timeout(10_000) }));
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(error).toBeInstanceOf(UrsulaUnavailableError);
+		expect(error).toMatchObject({ kind: "unauthorized", action: "fix" });
+		expect((error as UrsulaUnavailableError).cause).toBe(revoked);
+		expect((error as UrsulaUnavailableError).message).toContain("the key was revoked");
+		// Failed for good: no retry until the next open.
+		await sleep(2_000);
+		expect(p.calls).toHaveLength(1);
 	});
 
 	it("fails the open at its signal with `unavailable`, `retry`, when it handed out no token", async () => {

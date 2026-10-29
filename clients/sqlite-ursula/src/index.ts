@@ -148,7 +148,9 @@ const byAbort = new WeakSet<object>();
  * Errors say what to do through `action`: {@link UrsulaSetupError} (`fix`, or `retry` for `in_use` and
  * `claim_races`), and {@link UrsulaUnavailableError} when the signal fired first: the last condition
  * the open met, or `cancelled` when it met none. With a token provider, the open also rejects with
- * the provider's own {@link UrsulaError} when it fails for good, with an `UrsulaSetupError`
+ * the provider's own {@link UrsulaError} when it fails for good (with an `UrsulaUnavailableError`
+ * `unauthorized`, action `fix`, whose cause is the provider's error, when that error says `fix`
+ * but is no `UrsulaError`), with an `UrsulaSetupError`
  * `invalid_argument` when it hands out a token that cannot be sent, and with an
  * `UrsulaUnavailableError` `unavailable` whose cause is the provider's last error when it handed out
  * no token before the signal fired. A bind refused with 401 after a failed call of the provider
