@@ -1751,7 +1751,7 @@ Tests: `drain/tests.rs` `every_kind_has_the_later_of_its_token_whatever_produced
 `a_drain_refuses_or_declines_with_nothing_sent_but_its_head`,
 `a_drain_of_an_unreachable_stream_continues_once_it_answers`,
 `a_drain_of_a_stream_deleted_and_created_again_resets_rewound_with_nothing_sent`, the drain's rows
-in [Open](#open), `test/host.e2e.ts` H16 to H22 and H24 against the model server and a real server,
+in [Open](#open), `test/host.e2e.ts` H16 to H22, H24 and H25 against the model server and a real server,
 and CI's `sqlite-vfs-host-musl`, which runs the static binary's drain on both architectures, and
 whose x64 binary runs H16 and H20. H16: an orphan drains with one CLAIM frame, at its log's latest
 epoch + 1, no connection and no snapshot, and the application resumes above it. H17: another cache
@@ -1762,8 +1762,9 @@ renamed root are refused before any claim. H19: the token file. H20: the deadlin
 blackholed or refused, a SIGKILL during the continuation, and a panic in a root's drain or in the
 pass. H21: a drain under the hold, and the inspection beside it. H22: two orphans of one stream in
 two cache roots, in either order, and orphans of two streams under `--concurrency` 1 and 2. H24: a
-root the per-root read refuses is `unreadable`, with nothing claimed, and drains once readable. The
-musl job also checks that each usage error exits 2 with nothing on stdout.
+root the per-root read refuses is `unreadable`, with nothing claimed, and drains once readable. H25:
+a drain as root of an orphan another user owns leaves it `not_owner`, with nothing claimed. The musl
+job also checks that each usage error exits 2 with nothing on stdout.
 
 ### Forks
 
