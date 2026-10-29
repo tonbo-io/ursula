@@ -1035,7 +1035,7 @@ fn drain_root(shared: &Shared, job: &Job, deadline: Option<Instant>) -> Outcome 
         None => return budget(Note::Unresolved),
         Some(Err(e)) => Opened::Refused {
             why: refusal(&e),
-            error: Arc::new(e),
+            error: e,
         },
         Some(Ok(bound)) => match hand_back(driver, &bound, deadline) {
             Waited::Released => Opened::Released {
