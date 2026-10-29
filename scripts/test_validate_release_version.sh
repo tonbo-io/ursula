@@ -16,6 +16,20 @@ for version in '' v0.5.1 0.5 0.5.0-alpha 0.5.0-patch 0.5.0-patch0 0.5.0-patch01;
   fi
 done
 
+python_version="${repo_root}/scripts/python-version.sh"
+
+test "$("$python_version" 0.11.1)" = 0.11.1
+test "$("$python_version" 10.20.30)" = 10.20.30
+test "$("$python_version" 0.5.0-patch1)" = 0.5.0.post1
+test "$("$python_version" 0.5.0-patch12)" = 0.5.0.post12
+
+for version in '' v0.11.1 0.11 0.11.1.post1 0.11.1.dev0 0.5.0-patch0; do
+  if "$python_version" "$version" >/dev/null 2>&1; then
+    echo "python-version.sh unexpectedly accepted: ${version:-<empty>}" >&2
+    exit 1
+  fi
+done
+
 branch_of="${repo_root}/scripts/release-source-branch.sh"
 
 test "$("$branch_of" 0.7.5 refs/heads/main)" = main

@@ -56,11 +56,13 @@ if [ "${npm_version}" != "${workspace}" ]; then
   status=1
 fi
 
-# The Python client carries the release version too (its pyproject.toml reads it
-# from the package's __init__.py).
+# The Python client carries the release version too, in its PEP 440 form
+# (python-version.sh), and its pyproject.toml reads it from the package's
+# __init__.py.
+py_expected=$(./scripts/python-version.sh "${workspace}")
 py_version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py)
-if [ "${py_version}" != "${workspace}" ]; then
-  echo "clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py __version__ is ${py_version}, workspace is ${workspace}" >&2
+if [ "${py_version}" != "${py_expected}" ]; then
+  echo "clients/sqlite-ursula-python/src/sqlite_ursula/__init__.py __version__ is ${py_version}, not ${py_expected} for workspace ${workspace}" >&2
   status=1
 fi
 

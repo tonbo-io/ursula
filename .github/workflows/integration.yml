@@ -217,7 +217,7 @@ jobs:
           set -euo pipefail
           toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           test -n "$toolchain"
-          # The musl target links statically by default. As in npm-publish.yml, libsqlite3-sys must
+          # The musl target links statically by default. As in sqlite-vfs-build.yml, libsqlite3-sys must
           # not probe a system libsqlite3.
           docker run --rm -v "$PWD:/src" -w /src/clients/sqlite-vfs \
             -e SQLITE3_LIB_DIR=/nonexistent -e CARGO_TERM_COLOR -e TOOLCHAIN="$toolchain" \
@@ -610,7 +610,7 @@ jobs:
 
   # The Python suites on python:3.13-alpine (Alpine 3.23, SQLite 3.53), the image the Docker recipe
   # switches to: the extension and the model server are built there for musl, the extension
-  # linked dynamically as npm-publish.yml builds it, since a musl Python cannot load a static one.
+  # linked dynamically as sqlite-vfs-build.yml builds it, since a musl Python cannot load a static one.
   sqlite-ursula-python-alpine:
     name: sqlite-ursula-python (model server, python:3.13-alpine)
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
@@ -631,7 +631,7 @@ jobs:
           set -euo pipefail
           toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           test -n "$toolchain"
-          # As in npm-publish.yml, libsqlite3-sys must not probe a system libsqlite3.
+          # As in sqlite-vfs-build.yml, libsqlite3-sys must not probe a system libsqlite3.
           docker run --rm -v "$PWD:/src" -w /src/clients/sqlite-vfs \
             -e SQLITE3_LIB_DIR=/nonexistent -e CARGO_TERM_COLOR -e TOOLCHAIN="$toolchain" \
             -e RUSTFLAGS="-C target-feature=-crt-static" \
