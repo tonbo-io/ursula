@@ -188,7 +188,9 @@ def check(out: Path) -> None:
         if report["external_libs"] or report["unsupported_isa"]:
             raise SystemExit(f"{wheel.name}: needs libraries outside its policy, or ISA extensions")
     for wheel in wheels:
-        grafted = sorted(n for n in names(wheel) if n.startswith("sqlite_ursula.libs/"))
+        grafted = sorted(
+            n for n in names(wheel) if n.startswith("sqlite_ursula.libs/") and not n.endswith("/")
+        )
         if "-musllinux_" in wheel.name:
             ok = len(grafted) == 1 and re.fullmatch(GRAFTED, grafted[0]) is not None
         else:
