@@ -2,12 +2,13 @@
 Python under test outside the checkout, where the wheel is installed:
 
     python smoke.py <version> ok
-    python smoke.py <version> <kind> <fix>
+    python smoke.py <version> <kind> <fix> <why>
 
 With ``SQLITE_URSULA_VFS`` unset, the package loads the library its wheel carries. ``ok``: this
 Python hosts it, ``python -m sqlite_ursula`` says so, and a plain database works through its VFS,
 which the extension made SQLite's default. Otherwise ``python -m sqlite_ursula`` and ``open()`` fail
-with ``<kind>``, and the fix starts with ``<fix>``. No server is needed.
+with ``<kind>``, the reason contains ``<why>``, and the fix starts with ``<fix>``. No server is
+needed.
 """
 
 from __future__ import annotations
@@ -46,14 +47,17 @@ if expect == "ok":
     assert db.execute("SELECT x FROM t").fetchone() == (42,)
     db.close()
 else:
-    (fix,) = rest
+    fix, why = rest
     assert doctor.returncode == 1
     assert f"result: {expect}:" in doctor.stdout
+    (reason,) = [line for line in doctor.stdout.splitlines() if line.startswith("why: ")]
+    assert why in reason, reason
     assert f"\nfix: {fix}" in doctor.stdout
     try:
         sqlite_ursula.open("http://127.0.0.1:9/smoke/db", timeout=5)
     except sqlite_ursula.UrsulaSetupError as error:
         assert (error.kind, error.action) == (expect, "fix"), (error.kind, error.action)
+        assert why in str(error), str(error)
         assert error.fix is not None and error.fix.startswith(fix), error.fix
     else:
         raise AssertionError("open() did not fail")

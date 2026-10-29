@@ -7,13 +7,14 @@ name: sqlite-ursula-python Wheels
 # build (the extension, sqlite-vfs-build.yml) -> pack -> smoke. pack makes one py3-none wheel per
 # platform with its library under sqlite_ursula/_lib/ (manylinux_2_28_x86_64,
 # manylinux_2_28_aarch64, musllinux_1_2_x86_64, macosx_11_0_arm64) and the py3-none-any wheel
-# without one (scripts/pack.py), grafts libgcc_s into the musl wheel with auditwheel repair, then
-# runs auditwheel show on the Linux wheels and twine check on all of them. The wheels are the artifact `python-wheels`. smoke installs them, picking the
-# one that fits, from that directory alone (scripts/smoke.sh): uv-managed CPython 3.11, 3.14 and
-# 3.14t on Debian 11 (glibc 2.31) x64 and arm64 and on macOS, Homebrew's Python on macOS and
+# without one (scripts/pack.py). It grafts libgcc_s into the musl wheel with auditwheel repair, and
+# that wheel carries libgcc_s's license. It then runs auditwheel show on the Linux wheels and twine
+# check on all of them. The wheels are the artifact `python-wheels`. smoke installs them, picking
+# the one that fits, from that directory alone (scripts/smoke.sh): uv-managed CPython 3.11, 3.14
+# and 3.14t on Debian 11 (glibc 2.31) x64 and arm64 and on macOS, Homebrew's Python on macOS and
 # python:3.13-alpine (Alpine 3.23, musl) host the extension. python:3.13-slim, whose SQLite is older
 # than the extension's floor, and the py3-none-any wheel, which carries no library, fail with
-# host_unsupported and the fix for that reason.
+# host_unsupported, that reason and its fix.
 
 on:
   pull_request:
@@ -32,10 +33,6 @@ on:
         description: The version the wheels carry, the package's own or a .devN pre-release
         required: true
         type: string
-    outputs:
-      version:
-        description: The version the wheels carry
-        value: ${{ jobs.pack.outputs.version }}
 
 permissions:
   contents: read
@@ -187,6 +184,7 @@ jobs:
             wheel: best
             expect: host_unsupported
             fix: use a Python whose sqlite3 module loads extensions
+            why: sqlite-ursula-vfs needs SQLite
           - name: py3-none-any (Debian 11, uv CPython 3.14, host_unsupported)
             runner: runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64
             hosted: ubuntu-24.04
@@ -196,6 +194,7 @@ jobs:
             wheel: any
             expect: host_unsupported
             fix: set SQLITE_URSULA_VFS to a library built from clients/sqlite-vfs
+            why: carries no extension for this platform
     env:
       UV_PYTHON_PREFERENCE: only-managed
     steps:
@@ -239,11 +238,12 @@ jobs:
           WHEEL: ${{ matrix.wheel }}
           EXPECT: ${{ matrix.expect }}
           FIX: ${{ matrix.fix }}
+          WHY: ${{ matrix.why }}
           VERSION: ${{ needs.pack.outputs.version }}
         run: |
           set -euo pipefail
           args=("$EXPECT")
-          if [ -n "$FIX" ]; then args+=("$FIX"); fi
+          if [ -n "$FIX" ]; then args+=("$FIX" "$WHY"); fi
           pythons=${PYTHONS:-${BREW_PYTHON:-}}
           test -n "$pythons"
           scripts="$PWD/clients/sqlite-ursula-python/scripts"

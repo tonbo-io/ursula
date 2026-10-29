@@ -5,7 +5,8 @@
 
 ``pack`` builds, with hatchling through ``uv build``, one wheel per entry of ``PLATFORMS``, carrying
 ``<extensions>/<platform>/<file>`` (the artifacts of sqlite-vfs-build.yml) under
-``sqlite_ursula/_lib/``, and retags it ``py3-none-<tag>`` with ``wheel tags``: the library links no
+``sqlite_ursula/_lib/``, retags it ``py3-none-<tag>`` with ``wheel tags``, and marks it
+``Root-Is-Purelib: false``, as a wheel with a native library is (PEP 427): the library links no
 libpython, so one wheel per platform serves every CPython 3.11 or newer, free-threaded builds
 included. A ``py3-none-any`` wheel without a library lets the package install anywhere, and there
 ``open()`` raises ``host_unsupported`` unless ``SQLITE_URSULA_VFS`` names a library. ``<version>``
@@ -13,17 +14,24 @@ is the package's own version, or a ``.devN`` pre-release, which the wheels carry
 ``__version__``. Every wheel must hold exactly the files it should.
 
 The workflow then grafts libgcc_s into the musl wheel with ``auditwheel repair``: the library links
-it for unwinding, musllinux allows none from the host, and ``python:3.13-alpine`` has none.
+it for unwinding, musllinux allows none from the host, and ``python:3.13-alpine`` has none. So
+``pack`` gives that wheel libgcc_s's license too (``licenses/libgcc_s.txt``, GPL-3.0-or-later WITH
+GCC-exception-3.1) and widens its ``License-Expression`` to cover it.
 
 ``check`` runs ``auditwheel show`` on each Linux wheel, which must find the library consistent with
 the wheel's tag and needing no library outside the tag's policy, checks that only the musl wheel
-carries a grafted library, libgcc_s, and runs ``twine check --strict`` on every wheel.
+carries a grafted library, libgcc_s, and its license, that only the ``any`` wheel is purelib, and
+runs ``twine check --strict`` on every wheel.
 
 It needs uv on ``PATH`` and only the standard library.
 """
 
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
+import io
 import json
 import re
 import shutil
@@ -47,6 +55,10 @@ PLATFORMS = [
 
 #: The one library auditwheel grafts, into the musl wheel.
 GRAFTED = r"sqlite_ursula\.libs/libgcc_s-[0-9a-f]+\.so\.1"
+#: The license of that library, which the musl wheel carries beside the package's own.
+GCC_LICENSE = "licenses/libgcc_s.txt"
+LICENSE = "Apache-2.0"
+GCC_EXPRESSION = f"{LICENSE} AND GPL-3.0-or-later WITH GCC-exception-3.1"
 
 AUDITWHEEL = "auditwheel==6.8.2"
 TWINE = "twine==7.0.0"
@@ -73,7 +85,8 @@ def check_version(version: str) -> None:
     if version == own:
         return
     dev = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)\.dev(0|[1-9]\d*)", version)
-    base = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", own)
+    # A release X.Y.Z-patchN is X.Y.Z.postN here (scripts/python-version.sh).
+    base = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.post[1-9]\d*)?", own)
     if dev is None or base is None:
         raise SystemExit(f"version {version} is neither {own} nor X.Y.Z.devN")
     if tuple(map(int, dev.groups()[:3])) <= tuple(map(int, base.groups())):
@@ -83,7 +96,8 @@ def check_version(version: str) -> None:
 def project(version: str) -> Path:
     """A copy of the project to build, with ``version`` as ``__version__``."""
     copy = Path(tempfile.mkdtemp(prefix="sqlite-ursula-project-"))
-    for name in ("pyproject.toml", "README.md", "LICENSE", ".gitignore"):
+    for name in ("pyproject.toml", "README.md", "LICENSE", ".gitignore", GCC_LICENSE):
+        (copy / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, copy / name)
     shutil.copytree(
         ROOT / "src", copy / "src", ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_lib")
@@ -101,9 +115,64 @@ def build(source: Path, out: Path) -> Path:
         return Path(shutil.move(wheel, out / wheel.name))
 
 
+def with_gcc_license(pyproject: str) -> str:
+    """``pyproject`` declaring libgcc_s's license beside the package's own."""
+    for old, new in [
+        (f'license = "{LICENSE}"', f'license = "{GCC_EXPRESSION}"'),
+        ('license-files = ["LICENSE"]', f'license-files = ["LICENSE", "{GCC_LICENSE}"]'),
+    ]:
+        if pyproject.count(old) != 1:
+            raise SystemExit(f"pyproject.toml has no single {old}")
+        pyproject = pyproject.replace(old, new)
+    return pyproject
+
+
 def names(wheel: Path) -> set[str]:
     with zipfile.ZipFile(wheel) as z:
         return set(z.namelist())
+
+
+def dist_info(wheel: Path) -> str:
+    (info,) = [n for n in names(wheel) if n.endswith(".dist-info/WHEEL")]
+    return info.removesuffix("/WHEEL")
+
+
+def read(wheel: Path, member: str) -> str:
+    with zipfile.ZipFile(wheel) as z:
+        return z.read(f"{dist_info(wheel)}/{member}").decode()
+
+
+def platlib(wheel: Path) -> None:
+    """Rewrites ``wheel``'s WHEEL to ``Root-Is-Purelib: false``, and its line in RECORD."""
+    with zipfile.ZipFile(wheel) as z:
+        infos = z.infolist()
+        data = {i.filename: z.read(i) for i in infos}
+    info = f"{dist_info(wheel)}/WHEEL"
+    record = f"{dist_info(wheel)}/RECORD"
+    text, count = re.subn(
+        r"^Root-Is-Purelib: (true|false)$",
+        "Root-Is-Purelib: false",
+        data[info].decode(),
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise SystemExit(f"{wheel.name}: WHEEL has {count} Root-Is-Purelib lines, not one")
+    data[info] = text.encode()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data[info]).digest()).rstrip(b"=").decode()
+    old = data[record].decode()
+    rows = list(csv.reader(io.StringIO(old)))
+    if [row[0] for row in rows].count(info) != 1:
+        raise SystemExit(f"{wheel.name}: RECORD does not list {info} once")
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\r\n" if "\r\n" in old else "\n")
+    for row in rows:
+        writer.writerow([info, f"sha256={digest}", str(len(data[info]))] if row[0] == info else row)
+    data[record] = out.getvalue().encode()
+    rewritten = wheel.with_name(wheel.name + ".tmp")
+    with zipfile.ZipFile(rewritten, "w") as z:
+        for i in infos:
+            z.writestr(i, data[i.filename])
+    rewritten.replace(wheel)
 
 
 def wheel_tag(wheel: Path) -> list[str]:
@@ -126,6 +195,8 @@ def pack(extensions: Path, out: Path, version: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     source = project(version)
     lib = source / "src" / "sqlite_ursula" / "_lib"
+    pyproject = source / "pyproject.toml"
+    plain = pyproject.read_text()
 
     fallback = build(source, out)
     if not fallback.name.endswith("-py3-none-any.whl"):
@@ -138,6 +209,8 @@ def pack(extensions: Path, out: Path, version: str) -> None:
     built = [fallback]
 
     for platform, file, tag in PLATFORMS:
+        grafts = tag.startswith("musllinux_")
+        pyproject.write_text(with_gcc_license(plain) if grafts else plain)
         shutil.rmtree(lib, ignore_errors=True)
         lib.mkdir()
         shutil.copy2(extensions / platform / file, lib / file)
@@ -145,15 +218,19 @@ def pack(extensions: Path, out: Path, version: str) -> None:
             pure = build(source, Path(tmp))
             run("uvx", "--from", WHEEL, "wheel", "tags", "--remove", "--platform-tag", tag, pure)
             (wheel,) = Path(tmp).glob("*.whl")
+            platlib(wheel)
             wheel = Path(shutil.move(wheel, out / wheel.name))
         if not wheel.name.endswith(f"-py3-none-{tag}.whl") or wheel_tag(wheel) != [
             f"py3-none-{tag}"
         ]:
             raise SystemExit(f"{wheel.name} is tagged {wheel_tag(wheel)}, not py3-none-{tag}")
+        expected = {f"sqlite_ursula/_lib/{file}"}
+        if grafts:
+            expected.add(f"{dist_info(wheel)}/licenses/{GCC_LICENSE}")
         extra = names(wheel) - base
         missing = base - names(wheel)
-        # RECORD and WHEEL differ in content, not in name.
-        if extra != {f"sqlite_ursula/_lib/{file}"} or missing:
+        # RECORD, WHEEL and METADATA differ in content, not in name.
+        if extra != expected or missing:
             raise SystemExit(f"{wheel.name}: adds {sorted(extra)}, lacks {sorted(missing)}")
         built.append(wheel)
     shutil.rmtree(source)
@@ -191,12 +268,26 @@ def check(out: Path) -> None:
         grafted = sorted(
             n for n in names(wheel) if n.startswith("sqlite_ursula.libs/") and not n.endswith("/")
         )
-        if "-musllinux_" in wheel.name:
+        musl = "-musllinux_" in wheel.name
+        if musl:
             ok = len(grafted) == 1 and re.fullmatch(GRAFTED, grafted[0]) is not None
         else:
             ok = not grafted
         if not ok:
             raise SystemExit(f"{wheel.name} carries the grafted libraries {grafted}")
+        metadata = read(wheel, "METADATA")
+        expression = re.findall(r"^License-Expression: (.*)$", metadata, re.MULTILINE)
+        files = re.findall(r"^License-File: (.*)$", metadata, re.MULTILINE)
+        licensed = f"{dist_info(wheel)}/licenses/{GCC_LICENSE}" in names(wheel)
+        want = ([GCC_EXPRESSION], ["LICENSE", GCC_LICENSE]) if musl else ([LICENSE], ["LICENSE"])
+        if (expression, files) != want or licensed != musl:
+            raise SystemExit(
+                f"{wheel.name}: License-Expression {expression}, License-File {files}, "
+                f"libgcc_s's license {'present' if licensed else 'absent'}"
+            )
+        purelib = re.findall(r"^Root-Is-Purelib: (.*)$", read(wheel, "WHEEL"), re.MULTILINE)
+        if purelib != ["true" if wheel.name.endswith("-any.whl") else "false"]:
+            raise SystemExit(f"{wheel.name}: Root-Is-Purelib {purelib}")
     run("uvx", TWINE, "check", "--strict", *wheels)
 
 

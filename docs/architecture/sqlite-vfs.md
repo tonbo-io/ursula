@@ -2360,15 +2360,22 @@ What CI runs (`.github/workflows/integration.yml`):
   in-memory cold store. The tests that script faults skip there.
 - `sqlite-ursula-python-wheels.yml`, on pull requests that change the Python package or the
   workflows that build it, and from `pypi-publish.yml`: the extension built as `sqlite-vfs-build.yml`
-  builds it for npm (glibc 2.28 at most, musl linked dynamically, macOS 11.0), packed into one
-  `py3-none` wheel per platform and the `py3-none-any` wheel without a library
-  (`scripts/pack.py`), `auditwheel repair` grafting libgcc_s, which musllinux does not allow from
-  the host, into the musl wheel, `auditwheel show` finding each Linux wheel within its tag,
-  `twine check`,
-  and the wheels installed from their directory alone (`scripts/smoke.sh`): uv-managed CPython
+  builds it for npm (it loads on glibc 2.28 or newer, musl linked dynamically, macOS 11.0), packed
+  into one `py3-none` wheel per platform, marked not purelib, and the `py3-none-any` wheel without
+  a library (`scripts/pack.py`). `auditwheel repair` grafts libgcc_s, which musllinux does not
+  allow from the host, into the musl wheel, which also carries libgcc_s's license
+  (GPL-3.0-or-later WITH GCC-exception-3.1) in its `License-Expression` and license files.
+  `auditwheel show` finds each Linux wheel within its tag, `twine check` passes every wheel, and
+  the wheels are installed from their directory alone (`scripts/smoke.sh`): uv-managed CPython
   3.11, 3.14 and 3.14t on Debian 11 x64 and arm64 and on macOS, Homebrew's Python on macOS and
-  `python:3.13-alpine` host the library their wheel carries, and `python:3.13-slim` and the
-  `py3-none-any` wheel fail with `host_unsupported`.
+  `python:3.13-alpine` host the library their wheel carries. `python:3.13-slim` fails with
+  `host_unsupported` because its SQLite is older than the extension's floor, and the
+  `py3-none-any` wheel because it carries no library.
+- `pypi-publish.yml`, by hand only: these wheels, published to PyPI through trusted publishing
+  from the `pypi` environment. A release's version publishes only from its tag `v<release>`,
+  which must name the commit built, and `-patchN` releases carry `.postN`
+  (`scripts/python-version.sh`). A `.devN` pre-release of the next patch publishes from any ref.
+  A version PyPI already has fails the run before the build.
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), run twice, the second time
   with the host's `hold` file present and not taken (`BENCH_HOLD=1`). Each run fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
