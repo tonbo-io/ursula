@@ -1,8 +1,8 @@
 """``open()``'s and ``aopen()``'s token provider against the e2e server: the package calls it on
 its own thread before the open's first request, again ahead of each token's expiry and at once
-after a 401, shares one call between concurrent opens, passes the token it holds as ``previous``
-and counts that token handed out again as a failed call, stops once no binding is bound or a string
-token replaced it, and takes one provider per process. Its failures are typed: an error whose
+after a 401, shares one call between concurrent opens, whatever providers they name, passes the
+token it holds as ``previous`` and counts that token handed out again as a failed call, and stops
+once no binding is bound or a string token replaced it. Its failures are typed: an error whose
 action is ``fix`` is permanent until the next open, any other is retried with backoff, and a call
 that does not return is abandoned.
 
@@ -203,28 +203,113 @@ def test_is_called_once_for_concurrent_opens_and_a_later_open_reuses_its_token(s
         db.close()
 
 
-def test_takes_one_provider_per_process_and_a_string_token_stops_it(server, fresh):
+def test_hands_the_bindings_it_served_to_the_provider_of_a_later_open_which_shares_the_token_held(
+    server, fresh
+):
+    root = fresh()
+    first = Provider("first", 2.0)
+    second = Provider("second", 2.0)
+    s = new_stream(server, "token-first")
+    a = sqlite_ursula.open(s.url, dir=root, token=first, isolation_level=None)
+    b = sqlite_ursula.open(new_stream(server, "token-second").url, dir=root, token=second)
+    # The token held served the second open: no call of the second provider yet.
+    assert second.calls == []
+    b.close()
+    until("the second binding retired", lambda: b.status()["state"] == "retired")
+    # `a` still needs a fresh token: the second provider keeps refreshing, the first never runs
+    # again.
+    until("a refresh for the first binding", lambda: len(second.calls) >= 3, 8.0)
+    assert len(first.calls) == 1
+    a.execute("CREATE TABLE t(x)")
+    a.synced(timeout=30)
+    sent = server.sent(s.path)
+    if sent is not None:
+        assert nth("second", posts(sent)[-1]) >= 3
+    a.close()
+
+
+def test_stops_once_a_string_token_replaced_it(server, fresh):
     root = fresh()
     # Its refresh is due 4.2 to 4.8 s after the first call.
     p = Provider("one", 6.0)
-    other = Provider("other", 3600.0)
     a = sqlite_ursula.open(new_stream(server, "token-one").url, dir=root, token=p)
-    with pytest.raises(UrsulaSetupError) as refused:
-        sqlite_ursula.open(new_stream(server, "token-other").url, dir=root, token=other)
-    assert (refused.value.kind, refused.value.action) == ("invalid_argument", "fix")
-    assert other.calls == []
-    # The same provider again: the token it handed out serves.
-    b = sqlite_ursula.open(new_stream(server, "token-one-again").url, dir=root, token=p)
     assert len(p.calls) == 1
-    # A string token stops the provider: no refresh past the token's due time.
-    c = sqlite_ursula.open(new_stream(server, "token-string").url, dir=root, token="a-string")
+    # A string token stops the provider: no refresh past the token's due time, and the requests
+    # carry the string.
+    s = new_stream(server, "token-string")
+    c = sqlite_ursula.open(s.url, dir=root, token="a-string", isolation_level=None)
+    c.execute("CREATE TABLE t(x)")
+    c.synced(timeout=30)
     time.sleep(5.0)
     assert len(p.calls) == 1
-    # With no provider left, another one may serve.
-    d = sqlite_ursula.open(new_stream(server, "token-other-after").url, dir=root, token=other)
-    assert len(other.calls) == 1
-    for db in (a, b, c, d):
+    sent = server.sent(s.path)
+    if sent is not None:
+        assert {r["authorization"] for r in sent} == {"Bearer a-string"}
+    for db in (a, c):
         db.close()
+
+
+def test_serves_the_token_it_holds_at_once_expired_too_while_its_refresh_fails(stream, fresh):
+    root = fresh()
+
+    def down(n: int, previous: str | None) -> None:
+        if n > 1:
+            raise RuntimeError("the exchange is down")
+
+    p = Provider("held", 1.5, down)
+    db = sqlite_ursula.open(stream.url, dir=root, token=p)
+    until("a failed refresh", lambda: len(p.calls) >= 2, 5.0)
+    # Past the token's expiry: a connection on the bound binding still needs no network.
+    time.sleep(1.0)
+    started = time.monotonic()
+    again = sqlite_ursula.open(stream.url, dir=root, token=p, timeout=5)
+    assert time.monotonic() - started < 1.0
+    again.close()
+    db.close()
+
+
+def test_waits_for_the_refresh_in_flight_rather_than_serve_an_expired_token_while_healthy(
+    server, fresh
+):
+    root = fresh()
+
+    def slow(n: int, previous: str | None) -> None:
+        # Every refresh takes 2 s, longer than what is left of the 1.5 s token when it starts.
+        if n > 1:
+            time.sleep(2.0)
+
+    p = Provider("slow", 1.5, slow)
+    a = sqlite_ursula.open(new_stream(server, "token-slow-a").url, dir=root, token=p)
+    until("the refresh in flight", lambda: len(p.calls) >= 2, 5.0)
+    time.sleep(0.6)
+    # The token held expired and the refresh has not answered: the open waits for it.
+    b = new_stream(server, "token-slow-b")
+    db = sqlite_ursula.open(b.url, dir=root, token=p, timeout=5)
+    assert time.monotonic() >= p.calls[1] + 2.0
+    sent = server.sent(b.path)
+    if sent is not None:
+        assert len(sent) > 0
+        assert sent[0]["authorization"] == "Bearer slow-2"
+    db.close()
+    a.close()
+
+
+def test_keeps_refreshing_while_a_binding_opened_with_a_string_token_is_bound(server, fresh):
+    root = fresh()
+    p = Provider("any", 2.0)
+    s = new_stream(server, "token-string-bound")
+    a = sqlite_ursula.open(s.url, dir=root, token="a-string-token", isolation_level=None)
+    b = sqlite_ursula.open(new_stream(server, "token-provider-bound").url, dir=root, token=p)
+    b.close()
+    until("the provider's binding retired", lambda: b.status()["state"] == "retired")
+    # The provider's tokens are the process's, so `a` carries them now: it keeps them fresh.
+    until("a refresh for the binding opened with a string", lambda: len(p.calls) >= 3, 8.0)
+    a.execute("CREATE TABLE t(x)")
+    a.synced(timeout=30)
+    sent = server.sent(s.path)
+    if sent is not None:
+        assert nth("any", posts(sent)[-1]) >= 3
+    a.close()
 
 
 def test_fails_the_open_with_its_own_error_when_it_fails_for_good(stream, fresh):
@@ -435,6 +520,8 @@ def test_is_asked_again_at_the_expiry_of_a_token_its_cache_hands_back(server, fr
     # its expiry on and takes the next one, armed before the call hands it out. It still takes the
     # first, which a request in flight may carry.
     minted: list[BearerToken] = []
+    #: When each token was minted, in ``time.time()`` seconds.
+    minted_at: list[float] = []
     asked: list[str | None] = []
     evicted = threading.Event()
 
@@ -449,6 +536,7 @@ def test_is_asked_again_at_the_expiry_of_a_token_its_cache_hands_back(server, fr
             server.require(
                 {"expiring-1": None, "expiring-2": float(token.expires_at), "expiring-3": None}
             )
+        minted_at.append(time.time())
         minted.append(token)
         return token
 
@@ -465,15 +553,14 @@ def test_is_asked_again_at_the_expiry_of_a_token_its_cache_hands_back(server, fr
         db.synced(timeout=30)
         assert [m.token for m in minted] == ["expiring-1", "expiring-2"]
         expiry = float(minted[1].expires_at)
-        before = len(server.sent(s.path) or [])
-        # Still before the expiry, so every request from here on goes out across it.
-        assert time.time() < expiry
-        # A commit 100 ms past the expiry goes out under the next token, which the retry due at the
-        # expiry took.
-        time.sleep(max(0.0, expiry + 0.1 - time.time()))
+        # The cache mints the next token only from the expiry on: the retry due at the expiry
+        # takes it, rather than one after the backoff alone, 0.3 s or more past it.
+        until("the call at the expiry", lambda: len(minted) == 3)
+        assert [m.token for m in minted] == ["expiring-1", "expiring-2", "expiring-3"]
+        assert expiry <= minted_at[2] < expiry + 0.3
+        # Replication goes on under the next token.
         db.execute("INSERT INTO t VALUES (2)")
         db.synced(timeout=30)
-        assert [m.token for m in minted] == ["expiring-1", "expiring-2", "expiring-3"]
         assert db.status()["replication"]["condition"] is None
         # The call after the 401 is handed the refused token, and each call after it the 1.2 s
         # one, which the cache hands back until it expires.
@@ -481,9 +568,7 @@ def test_is_asked_again_at_the_expiry_of_a_token_its_cache_hands_back(server, fr
         assert set(asked[2:]) == {"expiring-2"}
         sent = server.sent(s.path)
         if sent is not None:
-            after = posts(sent[before:])
-            assert len(after) > 0
-            assert all(a == "Bearer expiring-3" for a in after)
+            assert posts(sent)[-1] == "Bearer expiring-3"
         db.close()
     finally:
         if server.gate is not None:
@@ -806,13 +891,13 @@ def test_aopen_fails_with_the_providers_permanent_error(stream, fresh):
     assert len(p.calls) == 1
 
 
-def test_stops_once_no_binding_uses_it_and_then_another_provider_may_serve(stream, fresh):
+def test_stops_once_no_binding_uses_it_and_the_next_open_calls_it_again(stream, fresh):
     # In a process of its own, where no other binding is bound.
     script = textwrap.dedent(
         """
         import json, sys, time
         import sqlite_ursula
-        from sqlite_ursula import BearerToken, UrsulaSetupError
+        from sqlite_ursula import BearerToken
 
         url, root = sys.argv[1], sys.argv[2]
         calls = []
@@ -821,17 +906,9 @@ def test_stops_once_no_binding_uses_it_and_then_another_provider_may_serve(strea
             calls.append(time.monotonic())
             return BearerToken(f"p-{len(calls)}", time.time() + 2)
 
-        def q(*, previous, timeout):
-            return BearerToken("q-1", time.time() + 3600)
-
         db = sqlite_ursula.open(url, dir=root, token=p, isolation_level=None)
         db.execute("CREATE TABLE t(x)")
         db.synced(timeout=30)
-        try:
-            sqlite_ursula.open(url + "-q", dir=root, token=q)
-            while_bound = "returned"
-        except UrsulaSetupError as e:
-            while_bound = [e.kind, e.action]
         deadline = time.monotonic() + 20
         while len(calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -843,10 +920,11 @@ def test_stops_once_no_binding_uses_it_and_then_another_provider_may_serve(strea
         stopped = len(calls)
         time.sleep(3)
         after = len(calls)
-        other = sqlite_ursula.open(url + "-q", dir=root, token=q)
+        # The source stopped and forgot its token: the next open calls the provider again.
+        other = sqlite_ursula.open(url + "-next", dir=root, token=p)
         other.close()
-        print(json.dumps({"while_bound": while_bound, "refreshed": refreshed,
-                          "stopped": stopped, "after": after}), flush=True)
+        print(json.dumps({"refreshed": refreshed, "stopped": stopped, "after": after,
+                          "reopened": len(calls)}), flush=True)
         """
     )
     out = subprocess.run(
@@ -858,6 +936,6 @@ def test_stops_once_no_binding_uses_it_and_then_another_provider_may_serve(strea
     )
     assert out.returncode == 0, out.stderr
     result = json.loads(out.stdout)
-    assert result["while_bound"] == ["invalid_argument", "fix"]
     assert result["refreshed"] >= 2
     assert result["after"] == result["stopped"]
+    assert result["reopened"] == result["after"] + 1

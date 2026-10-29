@@ -816,9 +816,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The Python suites against one release `ursula` node with an in-memory cold store, with the
-  # newest LangGraph the `langgraph` extra supports. The tests that script faults, which only the
-  # model takes, skip.
+  # The Python suites against one release `ursula` node with an in-memory cold store, behind
+  # clients/sqlite-ursula/test/gate.mjs, with the newest LangGraph the `langgraph` extra supports.
+  # The token tests script their 401s on the gate and check the tokens it recorded. The tests that
+  # read the model's frames or were written for its faults skip.
   sqlite-ursula-python-ursula:
     name: sqlite-ursula-python (ursula, 1 node, CPython 3.14)
     needs: [build-ursula, sqlite-vfs]

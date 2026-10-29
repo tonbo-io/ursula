@@ -124,8 +124,9 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
     - ``token``: the bearer token requests carry, applied with :func:`set_token` before the open,
       or a token provider, ``provider(*, previous, timeout)`` returning a :class:`BearerToken`,
       which the package calls on a thread of its own before the open's first request, ahead of
-      each expiry and at once after a 401 (:class:`TokenProvider`). One provider per process:
-      another one while databases it serves are open is ``invalid_argument``.
+      each expiry and at once after a 401 (:class:`TokenProvider`). The token is one per process,
+      whichever provider minted it: an open with another provider names the one the next call
+      runs.
     - ``dir``: the cache root, created when missing. By default ``<user cache>/sqlite-ursula/0.8``.
     - ``read_only``: claims nothing, so it never fences the owner, and writes fail with
       ``SQLITE_READONLY``. In a process that owns the stream it is a read-only connection on the
@@ -167,11 +168,11 @@ def open(  # noqa: A001 - the package's entry point, as Node's `open`
         return _bound(plan, deadline)
     opening = _token.source.begin(plan.provider, threading.Event())
     try:
-        held = opening.wait(plan.stream, deadline, plan.timeout)
+        opening.wait(plan.stream, deadline, plan.timeout)
         try:
             return _bound(plan, deadline)
         except UrsulaError as error:
-            raise _token.source.refused_with(error, held)  # noqa: B904 - the open's own error
+            raise opening.refused_with(error)  # noqa: B904 - the open's own error
     finally:
         opening.end()
 
@@ -232,11 +233,11 @@ async def aopen(
         return await _abound(plan, deadline)
     opening = _token.source.begin(plan.provider, _events.LoopEvent())
     try:
-        held = await opening.await_(plan.stream, deadline, plan.timeout)
+        await opening.await_(plan.stream, deadline, plan.timeout)
         try:
             return await _abound(plan, deadline)
         except UrsulaError as error:
-            raise _token.source.refused_with(error, held)  # noqa: B904 - the open's own error
+            raise opening.refused_with(error)  # noqa: B904 - the open's own error
     finally:
         opening.end()
 

@@ -2085,8 +2085,8 @@ on its own, its database left open", `test/workers.e2e.ts`.
 returns `{ token, expiresAt }` (`token.ts`). In Python it is a synchronous callable
 `provider(*, previous, timeout)` that returns `BearerToken(token, expires_at)` (`_token.py`), for
 `open()` and `aopen()` alike. The extension knows only the process's token, which the package sets
-with `ursula_set_token` for both kinds, once per open. No token goes into `ursula_open`'s options, which
-a bind sends again on each of its retries and would put back a token older than one applied
+with `ursula_set_token` for both kinds, once per open. No token goes into `ursula_open`'s options,
+which a bind sends again on each of its retries and would put back a token older than one applied
 meanwhile. So the last open that names a token sets it.
 
 The extension carries the token and classifies refusals. The package decides when to call the
@@ -2169,13 +2169,12 @@ The TypeScript package's source of tokens:
   retires, the source stops if no path is bound and no open waits for it or is binding.
 - `importSqlite` takes a string only: it blocks its thread, so nothing could refresh it meanwhile.
 
-The Python package's source of tokens follows the same rules, with these differences:
+The Python package's source of tokens follows the same rules, and the TypeScript package's, with
+these differences:
 
-- One source per process, since a provider is a plain callable with no thread of its own. The
-  process takes one provider: another one while a path the process bound is bound, or an open with
-  a provider is under way, is `invalid_argument` (`fix`), and the same one shares the token held.
-  Once nothing uses the source, it stops, and any provider may serve the next open. An open with a
-  string, or `set_token()`, stops the source.
+- One source per process rather than one per JavaScript thread, since a provider is a plain
+  callable with no thread of its own. It follows every path the process bound. An open with a
+  string, or `set_token()`, stops it.
 - A daemon thread, `sqlite-ursula-token-source`, keeps the schedule, and each call of the provider
   runs on a daemon thread of its own, `sqlite-ursula-token`, never on an event loop: `aopen()`
   waits for its token on the loop. A call is handed `previous` (`None` when there is none) and
@@ -2229,22 +2228,26 @@ gate's), or come from a gate of the test's own that refuses each token from its 
 authorizer does.
 
 Python tests: `tests/test_token.py` "is called on its own thread before the open and again ahead of
-each expiry", "is called once for concurrent opens and a later open reuses its token", "takes one
-provider per process and a string token stops it", "fails the open with its own error when it fails
-for good", "retries any other failure with backoff", "fails the open at its timeout with unavailable
-retry when it handed out no token", "refuses an answer it cannot use with invalid_argument", "is
-called again at once when a request is refused with 401", "handing out the previous token again
-counts as a failed call", "is asked again at the expiry of a token its cache hands back", "starts
-its backoff again at the expiry of the token it hands back", "takes back a dropped token once the
-database that reported it closed", "takes back a dropped token once its database closed while
-another stays bound", "counts a binding it cannot find as retired and a condition with no path as
-clear", "takes the token a condition dropped again once its binding is unblocked", "an open refused
-with 401 drops its token and the next open uses the next", "abandons a call that does
-not return once the provider is replaced", "aopen runs the provider on the package thread and waits
-on the loop", "aopen fails with the provider's permanent error" and "stops once no binding uses it
-and then another provider may serve", against the model server and one real `ursula` node behind the
-same gate, with the same checks of `previous` and of the tokens requests carried, and
-`tests/test_fork.py` "a child forked while a provider serves is forked and the parent's goes on".
+each expiry", "is called once for concurrent opens and a later open reuses its token", "hands the
+bindings it served to the provider of a later open, which shares the token held", "stops once a
+string token replaced it", "serves the token it holds at once, expired too, while its refresh
+fails", "waits for the refresh in flight rather than serve an expired token while healthy", "keeps
+refreshing while a binding opened with a string token is bound", "fails the open with its own error
+when it fails for good", "retries any other failure with backoff", "fails the open at its timeout
+with unavailable retry when it handed out no token", "refuses an answer it cannot use with
+invalid_argument", "is called again at once when a request is refused with 401", "handing out the
+previous token again counts as a failed call", "is asked again at the expiry of a token its cache
+hands back", "starts its backoff again at the expiry of the token it hands back", "takes back a
+dropped token once the database that reported it closed", "takes back a dropped token once its
+database closed while another stays bound", "counts a binding it cannot find as retired and a
+condition with no path as clear", "takes the token a condition dropped again once its binding is
+unblocked", "an open refused with 401 drops its token and the next open uses the next", "abandons a
+call that does not return once the provider is replaced", "aopen runs the provider on the package
+thread and waits on the loop", "aopen fails with the provider's permanent error" and "stops once no
+binding uses it and the next open calls it again", against the model server and one real `ursula`
+node behind the same gate, with the same checks of `previous` and of the tokens requests carried,
+and `tests/test_fork.py` "a child forked while a provider serves is forked and the parent's goes
+on".
 
 ### Python
 

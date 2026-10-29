@@ -15,16 +15,18 @@ out again. A retry is due by the expiry of ``previous`` at the latest, when a pr
 over, and the failures before that expiry no longer count. A token a 401 condition dropped is taken
 back once none of the bindings that reported the condition is still bound and blocked.
 
-One provider per process, never run on an event loop: ``aopen`` waits for its token on the loop. A
-daemon thread, ``sqlite-ursula-token-source``, keeps the schedule, and each call of the provider
-runs on a daemon thread of its own, ``sqlite-ursula-token``, so a call that does not return within
-:data:`PROVIDER_S` is abandoned rather than holding up the next one. A different provider
-while a binding the process opened is bound, or an open with a provider is under way, is
-``invalid_argument``. Once none is, the source stops at its next due call or at a ``retired``
-event, and any provider may be named again. A child forked from the process starts with no
-provider and no thread.
+One source per process, and its provider never runs on an event loop: ``aopen`` waits for its
+token on the loop. An open with another provider only names the function the next call runs, and
+shares the token held and the call in flight. A daemon thread, ``sqlite-ursula-token-source``,
+keeps the schedule, and each call of the provider runs on a daemon thread of its own,
+``sqlite-ursula-token``, so a call that does not return within :data:`PROVIDER_S` is abandoned
+rather than holding up the next one. Once no binding the process opened is bound and no open with a
+provider is under way, the source stops at its next due call or at a ``retired`` event. A child
+forked from the process starts with no provider and no thread.
 
-Tokens are never logged.
+Tokens are never logged. No frame of the package's that a failure of the provider or of the source
+passes through keeps one in a plain local: they travel in a :class:`_Fresh`, whose ``repr`` leaves
+them out, so an error reporter that records frame locals records none.
 """
 
 from __future__ import annotations
@@ -219,9 +221,8 @@ def _checked(got: object) -> _Fresh:
         raise invalid(
             f"the token provider returned {type(got).__name__}, not a sqlite_ursula.BearerToken"
         )
-    handed = got.token if isinstance(got.token, str) else ""
-    token = handed.strip()
-    if USABLE.fullmatch(token) is None:
+    # The token is read inline, never into a local of this frame, which a failure passes through.
+    if not _usable(got.token):
         raise invalid(
             "the token provider returned no usable token: a non-empty string of printable ASCII "
             "without spaces"
@@ -233,7 +234,14 @@ def _checked(got: object) -> _Fresh:
             f"the token provider returned a token that expires in {lifetime:.3f} s, under the "
             f"{MIN_REFRESH_S:g} s the package needs to refresh it in time"
         )
-    return _Fresh(token, handed, expires_at, time.monotonic() + _refresh_after(lifetime))
+    return _Fresh(
+        got.token.strip(), got.token, expires_at, time.monotonic() + _refresh_after(lifetime)
+    )
+
+
+def _usable(token: object) -> bool:
+    """Whether ``token``, without surrounding whitespace, can go out as a bearer token."""
+    return isinstance(token, str) and USABLE.fullmatch(token.strip()) is not None
 
 
 class _Wanted:
@@ -255,24 +263,26 @@ class _Wanted:
 
 class Opening:
     """One open with a provider, from :meth:`Source.begin` to :meth:`end`: its token, at once or
-    once the provider answers."""
+    once the provider answers. The token stays an attribute, never a local of the open's frame,
+    which the open's error passes through."""
 
     def __init__(self, source: Source, token: str | None, wanted: _Wanted | None) -> None:
         self._source = source
         self.token = token
         self._wanted = wanted
 
-    def wait(self, stream: str, deadline: float, timeout: float) -> str | None:
-        """The token, waiting on the calling thread until ``deadline`` (``time.monotonic()``)."""
+    def wait(self, stream: str, deadline: float, timeout: float) -> None:
+        """Until the token is in :attr:`token`, waiting on the calling thread until ``deadline``
+        (``time.monotonic()``)."""
         wanted = self._wanted
         while wanted is not None and wanted.outcome is None:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise self._source.gave_up(wanted, stream, timeout)
             wanted.waiter.wait(left)
-        return self._outcome(stream)
+        self._outcome(stream)
 
-    async def await_(self, stream: str, deadline: float, timeout: float) -> str | None:
+    async def await_(self, stream: str, deadline: float, timeout: float) -> None:
         """:meth:`wait` on the event loop."""
         wanted = self._wanted
         while wanted is not None and wanted.outcome is None:
@@ -280,17 +290,20 @@ class Opening:
             if left <= 0:
                 raise self._source.gave_up(wanted, stream, timeout)
             await wanted.waiter.wait(left)
-        return self._outcome(stream)
+        self._outcome(stream)
 
-    def _outcome(self, stream: str) -> str | None:
+    def _outcome(self, stream: str) -> None:
         wanted = self._wanted
-        if wanted is not None:
-            assert wanted.outcome is not None
-            what, value = wanted.outcome
-            if what == "error":
-                raise failed_for_good(stream, value)
-            self.token = value
-        return self.token
+        if wanted is None:
+            return
+        assert wanted.outcome is not None
+        if wanted.outcome[0] == "error":
+            raise failed_for_good(stream, wanted.outcome[1])
+        self.token = wanted.outcome[1]
+
+    def refused_with(self, error: UrsulaError) -> UrsulaError:
+        """:meth:`Source.refused_with` for this open's token."""
+        return self._source.refused_with(error, self.token)
 
     def end(self) -> None:
         self._source.end(self._wanted)
@@ -346,44 +359,34 @@ class Source:
 
     def begin(self, provider: Callable[..., Any], waiter: Any) -> Opening:
         """An open with ``provider``: its token at once when one is held and usable, else an
-        :class:`Opening` that waits for it with ``waiter``. Raises ``invalid_argument`` when
-        another provider serves the process."""
-        with _control.lock():
-            used = self._in_use()
-            with self._cond:
-                if self._provider is not None and self._provider != provider:
-                    if used:
-                        raise invalid(
-                            "one token provider per process: another one serves the databases "
-                            "this process has open. Pass the same provider to every open, or "
-                            "close those databases first"
-                        )
-                    self._stop_locked(replaced=False)
-                if self._provider is None:
-                    self._provider = provider
-                self._start_locked()
-                self._opening += 1
-                # A new open asks a provider that failed for good again.
-                failing = self._failed or self._failures > 0
-                self._failed = False
-                current = self._current
-                if current is not None and (failing or current.expires_at > time.time()):
-                    if self._calling != self._epoch and self._due is None:
-                        self._kick_locked()
-                    # The process carries it already: the call that took it set it in the same
-                    # step, under the control lock, and every other writer of the process's token
-                    # stops the source.
-                    return Opening(self, current.token, None)
-                wanted = _Wanted(waiter)
-                self._wanted.append(wanted)
-                # A retry already scheduled runs on time, or at once when it would take back a
-                # token whose reporters cleared.
-                if self._calling != self._epoch:
-                    if not self._backing_off():
-                        self._kick_locked()
-                    else:
-                        self._reconsider_locked()
-                return Opening(self, None, wanted)
+        :class:`Opening` that waits for it with ``waiter``. The next call runs ``provider``: the
+        token held and the call in flight serve on, since the process carries one token, whichever
+        function minted it."""
+        with _control.lock(), self._cond:
+            self._provider = provider
+            self._start_locked()
+            self._opening += 1
+            # A new open asks a provider that failed for good again.
+            failing = self._failed or self._failures > 0
+            self._failed = False
+            current = self._current
+            if current is not None and (failing or current.expires_at > time.time()):
+                if self._calling != self._epoch and self._due is None:
+                    self._kick_locked()
+                # The process carries it already: the call that took it set it in the same
+                # step, under the control lock, and every other writer of the process's token
+                # stops the source.
+                return Opening(self, current.token, None)
+            wanted = _Wanted(waiter)
+            self._wanted.append(wanted)
+            # A retry already scheduled runs on time, or at once when it would take back a
+            # token whose reporters cleared.
+            if self._calling != self._epoch:
+                if not self._backing_off():
+                    self._kick_locked()
+                else:
+                    self._reconsider_locked()
+            return Opening(self, None, wanted)
 
     def end(self, wanted: _Wanted | None) -> None:
         with self._cond:
@@ -611,9 +614,24 @@ class Source:
                 waited = bool(self._wanted)
                 if kicked or waited:
                     self._calling = epoch
-            if not kicked and not waited and self._idle(epoch):
-                continue
-            self._call(epoch)
+            try:
+                if not kicked and not waited and self._idle(epoch):
+                    continue
+                self._call(epoch)
+            except Exception as error:
+                # A failure of the source's own, not of the provider, which ``_call`` keeps: it
+                # counts as a failed call, so the thread and the schedule go on and the next open
+                # still asks for a call.
+                self._broke(epoch, _frameless(error))
+
+    def _broke(self, epoch: int, error: Exception) -> None:
+        with self._cond:
+            if self._calling == epoch:
+                self._calling = None
+            if epoch != self._epoch or self._provider is None or self._failed:
+                return
+            held = self._held
+            self._failed_locked(error, None if held is None else held.expires_at)
 
     def _idle(self, epoch: int) -> bool:
         """A refresh or a retry is due: the source stops, and says so, if nothing uses it."""
@@ -642,8 +660,7 @@ class Source:
         fresh: _Fresh | None = None
         failure: BaseException | None = None
         try:
-            handed = None if previous is None else previous.handed
-            fresh = _checked(self._answer(provider, handed, epoch))
+            fresh = _checked(self._answer(provider, previous, epoch))
         except BaseException as error:
             failure = error
         # The token goes to the process and to the source in one step: an open that reads the
@@ -673,7 +690,8 @@ class Source:
                 try:
                     _control.call("SELECT ursula_set_token('', ?)", fresh.token)
                 except Exception as error:
-                    failure = error
+                    # Its frames hold the token as an argument of the call.
+                    failure = _frameless(error)
                 else:
                     self._succeeded_locked(fresh)
                     return
@@ -687,7 +705,7 @@ class Source:
         dropped = self._dropped
         return dropped is not None and dropped.token == token and _cleared(dropped.paths)
 
-    def _answer(self, provider: Callable[..., Any], previous: str | None, epoch: int) -> object:
+    def _answer(self, provider: Callable[..., Any], previous: _Fresh | None, epoch: int) -> object:
         """The provider's answer to one call, made on a thread of its own: a call that has not
         returned after :data:`PROVIDER_S`, or once the source stopped, is abandoned. A call the
         source stopped before it started never reaches the provider."""
@@ -757,14 +775,26 @@ def _standing(path: str) -> str:
     reason. With the control lock held."""
     try:
         status = _control.call("SELECT ursula_status(?)", path)
+        if status.get("state") == "retired":
+            return "retired"
+        replication = status.get("replication") or {}
+        return "blocked" if replication.get("condition") == "unauthorized" else "clear"
     except UrsulaError as error:
         return "retired" if error.kind == "not_bound" else "unknown"
     except Exception:
+        # A status the package cannot read, malformed included.
         return "unknown"
-    if status.get("state") == "retired":
-        return "retired"
-    replication = status.get("replication") or {}
-    return "blocked" if replication.get("condition") == "unauthorized" else "clear"
+
+
+def _frameless(error: BaseException) -> BaseException:
+    """``error`` with no traceback along its causes, so it keeps no frame's locals."""
+    seen: set[int] = set()
+    at: BaseException | None = error
+    while at is not None and id(at) not in seen:
+        seen.add(id(at))
+        at.__traceback__ = None
+        at = at.__cause__ or at.__context__
+    return error
 
 
 def _cleared(paths: tuple[str, ...]) -> bool:
@@ -780,7 +810,7 @@ class _Call:
     itself when it comes. Any exception the call raises is its failure, ``SystemExit`` included."""
 
     def __init__(
-        self, cond: threading.Condition, provider: Callable[..., Any], previous: str | None
+        self, cond: threading.Condition, provider: Callable[..., Any], previous: _Fresh | None
     ):
         self._cond = cond
         self._provider = provider
@@ -797,7 +827,12 @@ class _Call:
         got: object = None
         failure: BaseException | None = None
         try:
-            got = self._provider(previous=self._previous, timeout=PROVIDER_S)
+            # ``previous`` is read inline, never into a local of this frame, which the provider's
+            # failure passes through.
+            got = self._provider(
+                previous=None if self._previous is None else self._previous.handed,
+                timeout=PROVIDER_S,
+            )
         except BaseException as error:
             failure = error
         with self._cond:
