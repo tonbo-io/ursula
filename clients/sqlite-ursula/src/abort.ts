@@ -13,5 +13,9 @@ export function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 	});
 }
 
-/** A signal's reason, or any other failure, as a message. */
-export const reasonOf = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason));
+/** A signal's reason, or any other failure, as a message: its `message` when it has one. */
+export function reasonOf(reason: unknown): string {
+	if (reason instanceof Error) return reason.message;
+	const message = (reason as { message?: unknown } | null | undefined)?.message;
+	return typeof message === "string" ? message : String(reason);
+}

@@ -1855,7 +1855,7 @@ export interface BearerToken {
   token: string;
   expiresAt: Date | number; // epoch ms
 }
-export type TokenProvider = (options: { signal: AbortSignal }) => Promise<BearerToken>;
+export type TokenProvider = (options: { signal: AbortSignal; previous?: string }) => Promise<BearerToken>;
 
 export interface GateOptions {
   signal?: AbortSignal;     // bounds the wait for the outcome (Gates)
@@ -2352,6 +2352,22 @@ on its own, its database left open", `test/workers.e2e.ts`.
 a bind sends again on each of its retries and would put back a token older than one applied
 meanwhile. So the last open that names a token sets it.
 
+The extension carries the token and classifies refusals. The package decides when to call the
+provider, and the provider owns how a token is made. These rules hold for any package's provider:
+
+- Each call is handed `previous`, the token the package holds at the call: the one the server
+  refused after a `401`, the current one at a scheduled refresh, none before the first call or
+  after the package stopped calling it. The extension takes an equal token as no change and would not send a
+  refused request again, so an answer equal to `previous` counts as a failed call and is retried
+  with backoff. A provider that caches its tokens therefore never hands back a refused one.
+- A provider error whose `action` is `fix` fails for good, whatever its class: the waiting opens
+  reject, and the provider is called again only for the next open. An `UrsulaError` is the
+  rejection itself. Any other error, such as one of a library that cannot extend a class of this
+  package, is the `cause` of an `UrsulaUnavailableError` `unauthorized`, action `fix`. Every other
+  error is retried with backoff.
+
+The TypeScript package's source of tokens:
+
 - One source per JavaScript thread, since a function lives on the thread that made it. The
   process carries one token, so which function minted the token held does not matter: an open with
   another function only names the function the next call runs, and shares the token held and the
@@ -2371,12 +2387,12 @@ meanwhile. So the last open that names a token sets it.
 - A refresh is due after 70 to 80% of the token's lifetime, and at least 1 s after the token
   arrived. A token that expires within 1 s counts as a failed call, so backoff bounds how often a
   provider with a skewed clock is called. A failed call is retried after
-  `min(30 s, 1 s * 2^(n-1))`, jittered down to half. The provider's own `UrsulaError` with action
-  `fix`, a token that is not printable ASCII without spaces, or an `expiresAt` that is not a time
-  in milliseconds (one below 10^12 is in seconds) fails for good: the waiting opens reject with it,
-  and the source calls the provider again only for the next open. An open whose signal fires while
-  it waits rejects with `UrsulaUnavailableError` `unavailable`, action `retry`, whose `cause` is the
-  last failure, or the signal's reason when no call failed.
+  `min(30 s, 1 s * 2^(n-1))`, jittered down to half. Besides a provider error that says `fix`, a
+  token that is not printable ASCII without spaces, or an `expiresAt` that is not a time in
+  milliseconds (one below 10^12 is in seconds) fails for good with `UrsulaSetupError`
+  `invalid_argument`. An open whose signal fires while it waits rejects with
+  `UrsulaUnavailableError` `unavailable`, action `retry`, whose `cause` is the last failure, or the
+  signal's reason when no call failed.
 - The pump's `condition` event `unauthorized` (a request of a bound binding refused twice with
   `401`) drops the token held and calls the provider at once, unless a retry is scheduled. Setting
   the new token sends the blocked request again at once ([Transport](#transport)). After a `gap`,
@@ -2402,13 +2418,16 @@ uses it", "is called once for concurrent opens, and a later open with the same f
 token", "serves concurrent opens with different functions from one call, and runs the last one
 next", "serves the token it holds at once, expired too, while its refresh fails", "waits for the
 refresh in flight rather than serve an expired token while it is healthy", "is called again at once
-when a request is refused with 401", "fails the open with its own error when it fails for good, and
-is retried after any other failure", "fails the open at its signal with `unavailable`, `retry`,
-when it handed out no token", "fails the open with `invalid_argument` when it hands out a token that
-cannot be sent", "stops once an open with a string token replaced it, and the opens waiting for it
-go on under the string", "hands the bindings it served to the provider of a later open, which
-shares the token held", "keeps refreshing while a binding opened with a string token is bound",
-"never keeps the process alive: an idle process exits on its own". In front of Ursula,
+when a request is refused with 401", "is retried when it hands back the refused token after a 401,
+and its next new token unblocks replication", "fails the open with its own error when it fails for
+good, and is retried after any other failure", "fails the open at once with `unauthorized`, `fix`,
+when it throws another error that says `fix`, as that error's cause", "fails the open at its signal
+with `unavailable`, `retry`, when it handed out no token", "fails the open with `invalid_argument`
+when it hands out a token that cannot be sent", "stops once an open with a string token replaced
+it, and the opens waiting for it go on under the string", "hands the bindings it served to the
+provider of a later open, which shares the token held", "keeps refreshing while a binding opened
+with a string token is bound", "never keeps the process alive: an idle process exits on its own".
+The first, second and seventh also check the `previous` each call was handed. In front of Ursula,
 test/gate.mjs records each request's `Authorization` header, and the tests check which token each
 request of their streams carried. The `401`s are scripted faults (the model's, or the gate's),
 since neither e2e server checks tokens.
