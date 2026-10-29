@@ -2105,16 +2105,20 @@ package:
 - Each call is handed `previous`, the token the provider last handed out, exactly as it handed it
   out, when the package will not take it again: the current one at a scheduled refresh, or the one
   the server refused after a `401`. It is none before the first call and after the provider stopped,
-  but a refused one stays, since the extension still carries it, until a string token replaces it.
-  When `previous` is set, the provider hands out a different token, and refills a cache that holds
-  it. The extension takes an equal token as no change and would not send a refused request again, so
-  an answer equal to `previous`, compared without surrounding whitespace, counts as a failed call. A
-  token that never changes belongs in a string `token` or in `URSULA_VFS_TOKEN_FILE`, not in a
-  provider.
+  except that one a bind was refused under, or one a binding still bound and blocked was refused
+  under, stays across a stop, since the extension still carries it, until the provider hands out
+  another token or a string token replaces it. When `previous` is set, the
+  provider hands out a different token, and refills a cache that holds it. The extension takes an
+  equal token as no change and would not send a refused request again, so an answer equal to
+  `previous`, compared without surrounding whitespace, counts as a failed call. A token that never
+  changes belongs in a string `token` or in `URSULA_VFS_TOKEN_FILE`, not in a provider.
 - A failed call is retried after `min(30 s, 1 s * 2^(n-1))`, jittered down to half, and by the
   expiry of `previous` at the latest, so a provider that hands its token back until it expires is
-  asked again as its cache turns over. A token that expires within 1 s counts as a failed call, so
-  backoff bounds how often a provider with a skewed clock is called.
+  asked again as its cache turns over. Once `previous` has expired, `n` counts only the failures
+  from its expiry on, whichever retry they came from, so a cache that still hands the token back
+  at the call on its expiry is asked again within 1 s.
+  A token that expires within 1 s counts as a failed call, so backoff bounds how often a provider
+  with a skewed clock is called.
 - A provider error whose `action` is `fix` fails for good, whatever its class: the waiting opens
   reject, and the provider is called again only for the next open. An `UrsulaError` is the
   rejection itself. Any other error, such as one of a library that cannot extend a class of the
@@ -2129,10 +2133,17 @@ package:
   token sends the blocked request again at once ([Transport](#transport)). The extension clears the
   condition only once that request went out again, so a condition can arrive after the token that
   ends it was set. When the provider hands back a token such a condition dropped, it is taken
-  again once none of the bindings that reported the condition is still blocked. The driver reports
-  conditions of bound bindings only, so a bind refused with `401` reaches the package when the open
-  fails `unauthorized` at its signal: the refused token is dropped and a call starts, unless a newer
-  token is held already.
+  again once none of the bindings that reported the condition is still bound and blocked: a
+  binding that retired is no longer blocked, and neither is one whose condition carries no path,
+  since the process no longer has it. A binding whose status cannot be read for another reason may
+  still be blocked. When a reporter retires or its condition changes, or an open waits, while a
+  retry is scheduled after the provider handed such a token back, the retry runs at once. A stop
+  forgets such a token as it forgets one in use, so the next call is not handed it as `previous`,
+  unless one of them is still bound and blocked: then the token stays dropped across the stop, and
+  is taken once they are clear.
+  The driver reports conditions of bound bindings only, so a bind refused with `401` reaches the
+  package when the open fails `unauthorized` at its signal: the refused token is dropped and a call
+  starts, unless a newer token is held already. A token a bind refused stays refused.
 - The last failure is kept until a call succeeds. An open that fails `unauthorized` carries it as
   its `cause`, with action `retry` unless it failed for good, since a new call may then succeed.
   With no failure recorded the server refused a fresh token, and the action stays `fix`. Before
@@ -2163,20 +2174,24 @@ token", "serves concurrent opens with different functions from one call, and run
 next", "serves the token it holds at once, expired too, while its refresh fails", "waits for the
 refresh in flight rather than serve an expired token while it is healthy", "is called again at once
 when a request is refused with 401", "is retried when it hands back the refused token after a 401,
-and its next new token unblocks replication", "is asked again as the token it hands back until
-expiry expires, and replication goes on under the next one", "fails the open with its own error when
-it fails for good, and is retried after any other failure", "fails the open at once with `unauthorized`, `fix`,
-when it throws another error that says `fix`, as that error's cause", "fails the open at its signal
-with `unavailable`, `retry`, when it handed out no token", "fails the open with `invalid_argument`
-when it hands out a token that cannot be sent", "stops once an open with a string token replaced
-it, and the opens waiting for it go on under the string", "hands the bindings it served to the
-provider of a later open, which shares the token held", "keeps refreshing while a binding opened
-with a string token is bound", "never keeps the process alive: an idle process exits on its own".
-The first, second and seventh also check the `previous` each call was handed. In front of Ursula,
-test/gate.mjs records each request's `Authorization` header, and the tests check which token each
-request of their streams carried. Neither e2e server checks tokens, so the `401`s are scripted
-faults (the model's, or the gate's), or come from a gate of the test's own that refuses every token
-but the one it requires, as an authorizer refuses an expired token.
+and its next new token unblocks replication", "takes back a token a 401 condition dropped once the
+database that reported it closed", "takes back a token a 401 condition dropped once the database
+that reported it closed, while another stays bound", "is asked again at the expiry of a token its
+cache hands back, so replication goes on across the expiry with no 401", "starts its backoff again
+at the expiry of the token it hands back, so a cache that runs behind turns over within 1 s", "fails
+the open with its own error when it fails for good, and is retried after any other failure", "fails
+the open at once with `unauthorized`, `fix`, when it throws another error that says `fix`, as that
+error's cause", "fails the open at its signal with `unavailable`, `retry`, when it handed out no
+token", "fails the open with `invalid_argument` when it hands out a token that cannot be sent",
+"stops once an open with a string token replaced it, and the opens waiting for it go on under the
+string", "hands the bindings it served to the provider of a later open, which shares the token
+held", "keeps refreshing while a binding opened with a string token is bound", "never keeps the
+process alive: an idle process exits on its own". The first, the second and the seventh to the tenth
+also check the `previous` each call was handed. In front of Ursula, test/gate.mjs records each
+request's `Authorization` header, and the tests check which token each request of their streams
+carried. Neither e2e server checks tokens, so the `401`s are scripted faults (the model's, or the
+gate's), or come from a gate of the test's own that refuses each token from its expiry on, as an
+authorizer does.
 
 ### Python
 

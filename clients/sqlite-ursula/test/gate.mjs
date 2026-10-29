@@ -18,9 +18,9 @@
 // It records the method and the `Authorization` header of the last requests it received, so a
 // suite sees which token went out on each request of a stream (test/token.e2e.ts).
 //
-// For test/token-change.e2e.ts it also stands in for an authorizer: once told a token, it answers `401`
-// to every request that does not carry it as `Authorization: Bearer <token>`, and forwards nothing
-// of it.
+// For test/token-change.e2e.ts and test/token.e2e.ts it also stands in for an authorizer: once told
+// the tokens it accepts, it answers `401` to every request that does not carry one of them as
+// `Authorization: Bearer <token>` before that token expires, and forwards nothing of it.
 //
 // argv: the server's URL. Prints {"port": n, "control": n} once it listens: the proxy's port and a
 // control port of its own, which no mode affects. Control requests:
@@ -28,7 +28,9 @@
 //   PUT /target {"url": "<server URL>"} -> 204: later requests go to that server
 //   PUT /auth {"token": "<token>" | null} -> 204: later requests without that token get `401`
 //     (null: none required)
-//   GET /stats -> {"mode", "forwarded", "answered", "held", "refused", "unauthorized", "token"}
+//   PUT /auth {"tokens": [{"token": "<token>", "expiresAt": <ms since the epoch> | null}]} -> 204:
+//     later requests get `401` unless they carry one of the tokens before its expiry (null: never)
+//   GET /stats -> {"mode", "forwarded", "answered", "held", "refused", "unauthorized", "tokens"}
 //   GET /requests?path=<path> -> [{"method", "authorization"}]: the recorded requests to `path` and
 //     below it, oldest first, `authorization` null for a request without one
 //   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` or `status <code>` -> 204: the
@@ -38,7 +40,8 @@
 import { createServer, request } from "node:http";
 
 let target = new URL(process.argv[2]);
-const state = { mode: "forward", forwarded: 0, answered: 0, held: 0, refused: 0, unauthorized: 0, token: null };
+/** `tokens`: the tokens the authorizer accepts, `{ token, expiresAt }` with `expiresAt` null for no expiry, or null: no authorizer. */
+const state = { mode: "forward", forwarded: 0, answered: 0, held: 0, refused: 0, unauthorized: 0, tokens: null };
 const sockets = new Set();
 let port = 0;
 /** Scripted faults, in order: `{ method, delayMs, status, times }`, with one of `delayMs` and `status`. */
@@ -46,6 +49,13 @@ const faults = [];
 /** The last requests received, oldest first: `{ path, method, authorization }`. */
 const seen = [];
 const SEEN = 10_000;
+
+/** Whether the authorizer lets a request with the `Authorization` header `authorization` through. */
+function authorized(authorization) {
+	if (state.tokens === null) return true;
+	const now = Date.now();
+	return state.tokens.some(({ token, expiresAt }) => authorization === `Bearer ${token}` && (expiresAt === null || now < expiresAt));
+}
 
 /** The fault for a request with `method`: the first scripted fault that matches, used once. */
 function takeFault(method) {
@@ -66,7 +76,7 @@ const proxy = createServer((req, res) => {
 		req.resume();
 		return;
 	}
-	if (state.token !== null && req.headers.authorization !== `Bearer ${state.token}`) {
+	if (!authorized(req.headers.authorization)) {
 		state.unauthorized++;
 		// Answered once the body is read: an answer before it can close the connection under a
 		// writer still sending, which then sees no answer instead of the `401`.
@@ -171,17 +181,19 @@ const control = createServer((req, res) => {
 			return;
 		}
 		if (req.method === "PUT" && url.pathname === "/auth") {
-			let token;
+			let parsed;
 			try {
-				({ token } = JSON.parse(body));
+				parsed = JSON.parse(body);
 			} catch {
-				token = undefined;
+				parsed = undefined;
 			}
-			if (token !== null && typeof token !== "string") {
-				res.writeHead(400).end(`not a JSON body with a token or null: ${body}`);
+			const { token, tokens } = parsed ?? {};
+			const expiring = (t) => typeof t?.token === "string" && (t.expiresAt === null || Number.isFinite(t.expiresAt));
+			if (token !== undefined ? token !== null && typeof token !== "string" : !Array.isArray(tokens) || !tokens.every(expiring)) {
+				res.writeHead(400).end(`not a JSON body with a token or null, or with tokens and their expiries: ${body}`);
 				return;
 			}
-			state.token = token;
+			state.tokens = token !== undefined ? (token === null ? null : [{ token, expiresAt: null }]) : tokens.map((t) => ({ token: t.token, expiresAt: t.expiresAt }));
 			res.writeHead(204).end();
 			return;
 		}

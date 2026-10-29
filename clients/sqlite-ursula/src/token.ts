@@ -11,7 +11,9 @@
 // the waiting opens go on under the string. Each call is handed the token it last handed out as
 // `previous` (the refused one after a 401), and an answer equal to it counts as a failed call: the
 // extension takes an equal token as no change, so a refused request would never go out again. A
-// retry is due by the expiry of `previous` at the latest, when a provider's cache turns over.
+// retry is due by the expiry of `previous` at the latest, when a provider's cache turns over, and
+// the failures before that expiry no longer count. A token a 401 condition dropped is taken back
+// once none of the bindings that reported the condition is still bound and blocked.
 //
 // One source per JavaScript thread, since a function lives on the thread that made it. Its timers
 // are unref'd, so they never keep the process alive, except while an `open()` waits for a token,
@@ -37,12 +39,16 @@ export interface BearerToken {
  *
  * `previous` is the token the provider last handed out, exactly as it handed it out, when the
  * package will not take it again: the current one at a scheduled refresh, or the one the server
- * refused after a 401. It is `undefined` before the first call and after the provider stopped, but
- * a token the server refused stays `previous` until a string token replaces it. When `previous` is
- * set, hand out a different token, and refill a cache that holds it: the package compares tokens
- * without surrounding whitespace, and an equal one counts as a failed call, retried with backoff
- * and by the expiry of `previous` at the latest. A token that never changes belongs in a string
- * `token` or in `URSULA_VFS_TOKEN_FILE`.
+ * refused after a 401. It is `undefined` before the first call and after the provider stopped,
+ * except that a token an open's bind was refused under, or one a database still bound and blocked
+ * was refused under, stays `previous` across a stop, until the provider hands out another one or an
+ * open with a string token stops the provider. When `previous` is set, hand out a different token,
+ * and refill a cache that holds it: the package compares tokens without surrounding whitespace, and
+ * an equal one counts as a failed call, retried with backoff and by the expiry of `previous` at the
+ * latest, from where the backoff starts again. A token that only replication was refused under is
+ * taken back once each database whose replication reported the refusal is closed and retired (every
+ * commit acknowledged) or no longer blocked. A token that never changes belongs in a string `token`
+ * or in `URSULA_VFS_TOKEN_FILE`.
  *
  * To fail for good, throw an error whose `action` is `"fix"`, an {@link UrsulaError} such as
  * `new UrsulaUnavailableError("unauthorized: the key was revoked", "unauthorized")` or any other
@@ -123,18 +129,25 @@ class Source {
 	#current: Fresh | undefined;
 	/**
 	 * The token the provider last handed out, also once a 401 dropped it, which its next call gets as
-	 * `previous`. A stop forgets it, unless the server refused it and no string replaced it.
+	 * `previous`. A stop forgets it, unless the server refused it and no string replaced it:
+	 * a bind was refused under it, or a reporter of the condition that dropped it is still bound and
+	 * blocked.
 	 */
 	#held: Fresh | undefined;
 	/**
 	 * The token a condition `unauthorized` of `paths` dropped. The event may predate the token, since
 	 * the extension clears a condition only once the blocked request went out again under a new one:
-	 * once none of `paths` is blocked any more, the provider's answer of that token is taken.
+	 * once none of `paths` is still bound and blocked, the provider's answer of that token is taken.
+	 * A stop keeps it as long as it keeps {@link #held}.
 	 */
 	#dropped: { readonly token: string; readonly paths: readonly string[] } | undefined;
 	#timer: NodeJS.Timeout | undefined;
 	/** Failed calls in a row. */
 	#failures = 0;
+	/** Of {@link #failures}, those the backoff no longer counts once `previous` expired: the ones before its expiry. */
+	#forgiven: number | undefined;
+	/** The last call failed by handing back the token it was handed as `previous`. */
+	#handedBack = false;
 	/** The last call's failure, one for good included, until a call succeeds. */
 	#lastFailure: { readonly error: unknown } | undefined;
 	/** It failed for good: no call until the next open. */
@@ -201,10 +214,14 @@ class Source {
 			}
 			this.#waiters.add(waiter);
 			signal.addEventListener("abort", abort, { once: true });
-			// A retry already scheduled runs on time: the open keeps the process alive meanwhile.
+			// A retry already scheduled runs on time, or at once when it would take back a token whose
+			// reporters cleared: the open keeps the process alive meanwhile.
 			if (this.#attempt !== undefined) return;
-			if (this.#backingOff) this.#timer?.ref();
-			else this.#call();
+			if (!this.#backingOff) this.#call();
+			else {
+				this.#timer?.ref();
+				this.reconsider();
+			}
 		});
 	}
 
@@ -229,9 +246,22 @@ class Source {
 	}
 
 	/**
+	 * A binding retired, a condition other than `unauthorized` arrived, or an open waits: when the
+	 * provider handed back the token a condition dropped and its reporters are now clear, the retry
+	 * scheduled runs at once rather than after its backoff, so the opens waiting take that token back.
+	 */
+	reconsider(): void {
+		const dropped = this.#dropped;
+		if (this.#provider === undefined || this.#failed || !this.#handedBack || !this.#backingOff || dropped === undefined) return;
+		if (this.#held?.token === dropped.token && cleared(dropped.paths)) this.#call();
+	}
+
+	/**
 	 * No provider from now on: the call in flight is abandoned, and the opens waiting go on with the
 	 * process's token, which `why` set. `replaced`: a string replaced the provider's token.
-	 * Otherwise a token the server refused is still the process's, so the next call gets it as `previous`.
+	 * Otherwise a token the server refused is still the process's, so the next call gets it as
+	 * `previous`, unless only a condition dropped it and its reporters are clear. A token kept stays
+	 * dropped, so it is taken back once its reporters clear.
 	 */
 	stop(why: string, replaced: boolean): void {
 		this.#attempt?.abort(new UrsulaUnavailableError(`cancelled: the token provider stopped: ${why}`, "cancelled"));
@@ -239,10 +269,15 @@ class Source {
 		clearTimeout(this.#timer);
 		this.#timer = undefined;
 		this.#provider = undefined;
-		if (replaced || this.#current !== undefined) this.#held = undefined;
+		const held = this.#held;
+		if (replaced || this.#current !== undefined || (held !== undefined && this.#restored(held.token))) {
+			this.#held = undefined;
+			this.#dropped = undefined;
+		}
 		this.#current = undefined;
-		this.#dropped = undefined;
 		this.#failures = 0;
+		this.#forgiven = undefined;
+		this.#handedBack = false;
 		this.#lastFailure = undefined;
 		this.#failed = false;
 		for (const waiter of [...this.#waiters]) waiter({ token: undefined });
@@ -260,7 +295,8 @@ class Source {
 
 	/**
 	 * Whether the provider's answer `token`, equal to `previous`, is taken: only when a condition that
-	 * may predate it dropped it, and none of the paths that reported the condition is blocked any more.
+	 * may predate it dropped it, and none of the paths that reported the condition is still bound and
+	 * blocked.
 	 */
 	#restored(token: string): boolean {
 		const dropped = this.#dropped;
@@ -282,8 +318,6 @@ class Source {
 		this.#attempt = attempt;
 		const signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(PROVIDER_MS)]);
 		const previous = this.#held;
-		// A retry is due by the expiry of `previous` at the latest, when a cache that hands it back turns over.
-		const by = previous !== undefined && previous.expiresAt > Date.now() ? previous.expiresAt : undefined;
 		raced(
 			// A call abandoned before it started never reaches the provider.
 			Promise.resolve().then(() => {
@@ -295,9 +329,7 @@ class Source {
 			.then((got) => {
 				const fresh = checked(got, Date.now());
 				// The extension takes an equal token as no change, so it would not send a refused request again.
-				if (fresh.token === previous?.token && !(this.#attempt === attempt && this.#restored(fresh.token))) {
-					throw new Error("the token provider returned the token it was handed as previous, which the package holds already or the server refused");
-				}
+				if (fresh.token === previous?.token && !(this.#attempt === attempt && this.#restored(fresh.token))) throw new HandedBack();
 				if (this.#attempt === attempt) apply(fresh.token);
 				return fresh;
 			})
@@ -306,7 +338,7 @@ class Source {
 					if (this.#attempt === attempt) this.#succeeded(fresh);
 				},
 				(error: unknown) => {
-					if (this.#attempt === attempt) this.#failedWith(error, by);
+					if (this.#attempt === attempt) this.#failedWith(error, previous?.expiresAt);
 				},
 			);
 	}
@@ -317,23 +349,32 @@ class Source {
 		this.#held = fresh;
 		this.#dropped = undefined;
 		this.#failures = 0;
+		this.#forgiven = undefined;
+		this.#handedBack = false;
 		this.#lastFailure = undefined;
 		for (const waiter of [...this.#waiters]) waiter({ token: fresh.token });
 		this.#schedule(fresh.refreshAt - Date.now());
 	}
 
-	/** A failed call: retried with backoff, and by `by` at the latest, unless it failed for good. */
-	#failedWith(error: unknown, by: number | undefined): void {
+	/**
+	 * A failed call: retried with backoff, and by `expiry`, that of `previous`, at the latest, unless
+	 * it failed for good. From that expiry on, only the failures since it count, whichever retry they
+	 * came from: the first failure at or after it restarts the backoff.
+	 */
+	#failedWith(error: unknown, expiry: number | undefined): void {
 		this.#attempt = undefined;
 		this.#lastFailure = { error };
+		this.#handedBack = error instanceof HandedBack;
 		if (permanent(error)) {
 			this.#failed = true;
 			for (const waiter of [...this.#waiters]) waiter({ error });
 			return;
 		}
 		this.#failures += 1;
-		const backoff = retryAfter(this.#failures);
-		this.#schedule(by === undefined ? backoff : Math.min(backoff, by - Date.now()));
+		const now = Date.now();
+		if (expiry !== undefined && now >= expiry && this.#forgiven === undefined) this.#forgiven = this.#failures - 1;
+		const backoff = retryAfter(this.#failures - (this.#forgiven ?? 0));
+		this.#schedule(expiry !== undefined && now < expiry ? Math.min(backoff, expiry - now) : backoff);
 	}
 
 	/** The next call after `ms`. Its timer keeps the process alive only while an open waits. */
@@ -353,6 +394,13 @@ class Source {
 	}
 }
 
+/** A call that handed back the token it was handed as `previous`: a failed call, retried. */
+class HandedBack extends Error {
+	constructor() {
+		super("the token provider returned the token it was handed as previous, which the package holds already or the server refused");
+	}
+}
+
 /** The error an open of `stream` rejects with when the provider failed for good with `error`: an UrsulaError as it is, any other error as the cause of one that says `fix`. */
 function failedForGood(stream: string, error: unknown): unknown {
 	if (error instanceof UrsulaError) return error;
@@ -368,48 +416,57 @@ let opening = 0;
 
 /** Drops the paths that retired, then whether a path of the thread is bound or an open with a provider is binding. */
 function inUse(): boolean {
-	for (const path of [...paths]) {
-		try {
-			if (call<{ state: string }>("SELECT ursula_status(?)", path).state === "retired") paths.delete(path);
-		} catch {
-			paths.delete(path);
-		}
-	}
+	for (const path of [...paths]) if (standing(path) === "retired") paths.delete(path);
 	return paths.size > 0 || opening > 0;
 }
 
-/** Whether the binding of `path` is blocked `unauthorized` now, or `undefined` once it retired. */
-function blockedNow(path: string): boolean | undefined {
+/**
+ * The binding of `path` now: `blocked` `unauthorized`, `clear`, `retired` (also once the process no
+ * longer has it), or `unknown` when its status cannot be read for another reason.
+ */
+function standing(path: string): "blocked" | "clear" | "retired" | "unknown" {
 	try {
 		const status = call<{ state: string; replication: { condition: string | null } }>("SELECT ursula_status(?)", path);
-		return status.state === "retired" ? undefined : status.replication.condition === "unauthorized";
-	} catch {
-		return undefined;
+		if (status.state === "retired") return "retired";
+		return status.replication.condition === "unauthorized" ? "blocked" : "clear";
+	} catch (error) {
+		return error instanceof UrsulaError && error.kind === "not_bound" ? "retired" : "unknown";
 	}
 }
 
-/** Whether each of `paths`, one at least, is still bound and no longer blocked `unauthorized`. */
+/**
+ * Whether none of `paths` is still bound and blocked `unauthorized`: a path that retired is clear,
+ * and so is a condition with no path, which a binding the process no longer has reported. A path
+ * whose status cannot be read may still be blocked.
+ */
 function cleared(paths: readonly string[]): boolean {
-	return paths.length > 0 && paths.every((path) => blockedNow(path) === false);
+	return paths.every((path) => {
+		const now = standing(path);
+		return now === "clear" || now === "retired";
+	});
 }
 
 /** The extension's events: a 401 asks for a token at once, and a retired binding may stop the provider. */
 function onEvent(event: PumpEvent): void {
 	switch (event.event) {
 		case "condition":
+			// No path: the binding that reported it is gone, so it blocks nothing any more.
 			if (event.condition === "unauthorized") source.blocked(event.path === null ? [] : [event.path]);
+			else source.reconsider();
 			break;
 		case "retired": {
 			// Pruned with or without a provider, so the paths of string opens never pile up.
 			const used = inUse();
 			if (!used && source.provider !== undefined && !source.waited) source.stop("no binding uses it", false);
+			else source.reconsider();
 			break;
 		}
 		case "gap": {
-			// The events it dropped may have held a 401: status still shows it.
+			// The events it dropped may have held a 401, which status still shows, or a clear.
 			if (source.provider === undefined) break;
-			const blocked = [...paths].filter((path) => blockedNow(path) === true);
+			const blocked = [...paths].filter((path) => standing(path) === "blocked");
 			if (blocked.length > 0) source.blocked(blocked);
+			else source.reconsider();
 			break;
 		}
 		default:

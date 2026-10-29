@@ -5,7 +5,7 @@
 // handed the token it last handed out as `previous`, and an answer equal to it is retried, by that
 // token's expiry at the latest. Its failures are typed. The 401s are scripted faults (the model's,
 // or test/gate.mjs's in front of Ursula), since neither server checks tokens, or a gate of a test's
-// own that refuses every token but one, as an authorizer refuses an expired token. In front of
+// own that refuses each token from its expiry on, as an authorizer does. In front of
 // Ursula the gate records each request's `Authorization` header (`sentTokens`), so there the suite
 // also checks which token each request carried. The token is one per process, so each test closes
 // its databases and waits until the provider stopped (`closeAll`): the next test starts with none held.
@@ -46,6 +46,13 @@ const nth = (label: string, authorization: string | null | undefined): number =>
 	const prefix = `Bearer ${label}-`;
 	return authorization?.startsWith(prefix) === true ? Number(authorization.slice(prefix.length)) : Number.NaN;
 };
+
+/** The requests a gate of a test's own (`control`) received for the stream at `path`, oldest first. */
+async function requests(control: string, path: string): Promise<{ method: string; authorization: string | null }[]> {
+	const r = await fetch(`${control}/requests?path=${encodeURIComponent(path)}`);
+	expect(r.status).toBe(200);
+	return (await r.json()) as { method: string; authorization: string | null }[];
+}
 
 /** Waits until `done()` holds, for at most `ms`. */
 async function until(what: string, done: () => boolean, ms = 10_000): Promise<void> {
@@ -262,46 +269,159 @@ describe("a token provider", () => {
 		await closeAll(db);
 	});
 
-	it("is asked again as the token it hands back until expiry expires, and replication goes on under the next one", async () => {
-		// A gate of the test's own refuses every token but the one it requires, as an authorizer
-		// refuses an expired token.
-		const g = await gate(ursulaUrl());
-		const requireToken = async (token: string): Promise<void> => {
-			const r = await fetch(`${g.control}/auth`, { method: "PUT", body: JSON.stringify({ token }) });
-			expect(r.status, await r.text()).toBe(204);
+	it("takes back a token a 401 condition dropped once the database that reported it closed", async () => {
+		const previous: (string | undefined)[] = [];
+		// A cache that hands out one token for an hour, whatever `previous` says.
+		const kept = { token: "kept-1", expiresAt: Date.now() + 3_600_000 };
+		const cached: TokenProvider = async (options) => {
+			previous.push(options.previous);
+			return kept;
 		};
+		const db = await open(stream("token-kept").url, { dir: freshDir(), token: cached });
+		db.exec("CREATE TABLE t(x)");
+		await db.synced();
+		// The read of an idle owner's `synced()` and its resend are refused: replication blocks
+		// `unauthorized` with every commit acknowledged, so a close retires the binding at once.
+		await fault("status 401", 2, "GET");
+		db.synced().catch(() => undefined);
+		// The call after the 401 gets the refused token back: a failed call.
+		await until("a call after the 401", () => previous.length >= 2);
+		expect(previous.slice(0, 2)).toEqual([undefined, "kept-1"]);
+		expect(db.status().replication.condition).toBe("unauthorized");
+		// The database that reported the 401 retired, and the provider stopped with it: the token is
+		// not refused any more, so the next open takes it from the cache at once.
+		await closeAll(db);
+		const started = Date.now();
+		const next = await open(stream("token-kept-next").url, { dir: freshDir(), token: cached, signal: AbortSignal.timeout(5_000) });
+		// Well within the open's signal, which a token still refused would run into.
+		expect(Date.now() - started).toBeLessThan(3_000);
+		expect(previous.at(-1)).toBeUndefined();
+		await closeAll(next);
+	});
+
+	it("takes back a token a 401 condition dropped once the database that reported it closed, while another stays bound", async () => {
+		const dir = freshDir();
+		const calls: { previous: string | undefined; at: number }[] = [];
+		const kept = { token: "kept-2", expiresAt: Date.now() + 3_600_000 };
+		const cached: TokenProvider = async (options) => {
+			calls.push({ previous: options.previous, at: Date.now() });
+			return kept;
+		};
+		const a = await open(stream("token-kept-a").url, { dir, token: cached });
+		const b = await open(stream("token-kept-b").url, { dir, token: cached });
+		b.exec("CREATE TABLE t(x)");
+		await b.synced();
+		await fault("status 401", 2, "GET");
+		b.synced().catch(() => undefined);
+		// Each call after the 401 gets the refused token back: retried after 0.5 to 1 s, 1 to 2 s and
+		// 2 to 4 s, so the retry after the fourth is due 4 to 8 s later.
+		await until("four failed calls", () => calls.length >= 5, 15_000);
+		expect(calls.slice(1).every((call) => call.previous === "kept-2")).toBe(true);
+		expect(b.status().replication.condition).toBe("unauthorized");
+		const path = b.boundPath;
+		b.close();
+		await retired(path);
+		const retiredAt = Date.now();
+		// `a` keeps the provider running. The retirement runs the retry at once rather than after its
+		// backoff: it takes the token back, and an open waiting for it goes on under it.
+		const c = await open(stream("token-kept-c").url, { dir, token: cached, signal: AbortSignal.timeout(5_000) });
+		const taken = calls[5];
+		expect(taken?.previous).toBe("kept-2");
+		expect((taken?.at ?? Number.POSITIVE_INFINITY) - retiredAt).toBeLessThan(1_000);
+		a.exec("CREATE TABLE t(x)");
+		await a.synced();
+		expect(a.status().replication.condition).toBeNull();
+		await closeAll(a, c);
+	});
+
+	it("is asked again at the expiry of a token its cache hands back, so replication goes on across the expiry with no 401", async () => {
+		// A gate of the test's own stands in for an authorizer, which refuses a token from its expiry on.
+		const g = await gate(ursulaUrl());
 		try {
-			// A cache that hands its token out until it expires, whatever `previous` says.
-			const cache: { held?: BearerToken & { expiresAt: number } } = {};
-			const minted: number[] = [];
+			// A cache that hands its token out until it expires, whatever `previous` says, unless the
+			// test evicted it. The first token lasts an hour, so the setup takes any time it needs.
+			// The one a 401 makes the cache mint after the eviction lasts 1.2 s: its refresh is due 1 s
+			// after it arrived, gets it back, and the backoff alone would retry 0.5 to 1 s later, at
+			// least 0.3 s past the expiry. The gate refuses it from its expiry on and takes the next one,
+			// armed before the call hands it out. It still takes the first, which a request in flight
+			// may carry.
+			const minted: { token: string; expiresAt: number }[] = [];
+			let evicted = false;
 			const cached: TokenProvider = async () => {
-				if (cache.held === undefined || cache.held.expiresAt <= Date.now()) {
-					minted.push(Date.now());
-					cache.held = { token: `expiring-${minted.length}`, expiresAt: Date.now() + 6_000 };
+				const held = minted.at(-1);
+				if (held !== undefined && held.expiresAt > Date.now() && !evicted) return held;
+				evicted = false;
+				const next = { token: `expiring-${minted.length + 1}`, expiresAt: Date.now() + (minted.length === 1 ? 1_200 : 3_600_000) };
+				if (minted.length === 1) {
+					const r = await fetch(`${g.control}/auth`, {
+						method: "PUT",
+						body: JSON.stringify({ tokens: [{ token: "expiring-1", expiresAt: null }, { token: "expiring-2", expiresAt: next.expiresAt }, { token: "expiring-3", expiresAt: null }] }),
+					});
+					expect(r.status, await r.text()).toBe(204);
 				}
-				return cache.held;
+				minted.push(next);
+				return next;
 			};
-			await requireToken("expiring-1");
 			const s = stream("token-expiring");
 			const db = await open(`${g.url}${s.path}`, { dir: freshDir(), token: cached });
 			db.exec("CREATE TABLE t(x)");
 			await db.synced();
-			const expiry = cache.held?.expiresAt ?? 0;
-			// The refresh due 4.2 to 4.8 s in gets the same token back, and so does each retry until
-			// it expires: the retry is due by then at the latest, when the cache turns over.
-			await until("the next token", () => minted.length === 2, 15_000);
-			expect((minted[1] as number) - expiry).toBeLessThan(500);
-			await requireToken("expiring-2");
-			// A commit after the expiry goes out under the next token, never blocked `unauthorized`.
-			const wrote = Date.now();
+			// A commit refused twice blocks replication: the call it makes mints the 1.2 s token, and
+			// the blocked commit goes out again under it.
+			evicted = true;
+			const f = await fetch(`${g.control}/faults?times=2&method=POST`, { method: "POST", body: "status 401" });
+			expect(f.status, await f.text()).toBe(204);
 			db.exec("INSERT INTO t VALUES (1)");
 			await db.synced();
-			expect(Date.now() - wrote).toBeLessThan(2_000);
+			expect(minted.map((m) => m.token)).toEqual(["expiring-1", "expiring-2"]);
+			const expiry = (minted[1] as { expiresAt: number }).expiresAt;
+			const before = (await requests(g.control, s.path)).length;
+			// Still before the expiry, so every request from here on goes out across it.
+			expect(Date.now()).toBeLessThan(expiry);
+			// A commit 100 ms past the expiry goes out under the next token, which the retry due at
+			// the expiry took.
+			await sleep(expiry + 100 - Date.now());
+			db.exec("INSERT INTO t VALUES (2)");
+			await db.synced();
+			expect(minted.map((m) => m.token)).toEqual(["expiring-1", "expiring-2", "expiring-3"]);
 			expect(db.status().replication.condition).toBeNull();
+			const posts = (await requests(g.control, s.path)).slice(before).filter((q) => q.method === "POST");
+			expect(posts.length).toBeGreaterThan(0);
+			expect(posts.every((q) => q.authorization === "Bearer expiring-3")).toBe(true);
 			await closeAll(db);
 		} finally {
 			await g.stop();
 		}
+	});
+
+	it("starts its backoff again at the expiry of the token it hands back, so a cache that runs behind turns over within 1 s", async () => {
+		// A cache whose clock runs 300 ms behind the package's: it hands its token out until 300 ms
+		// past its expiry, whatever `previous` says.
+		const minted: { token: string; expiresAt: number; at: number }[] = [];
+		const cached: TokenProvider = async () => {
+			const held = minted.at(-1);
+			if (held !== undefined && held.expiresAt + 300 > Date.now()) return held;
+			const next = { token: `behind-${minted.length + 1}`, expiresAt: Date.now() + 5_000, at: Date.now() };
+			minted.push(next);
+			return next;
+		};
+		const db = await open(stream("token-behind").url, { dir: freshDir(), token: cached });
+		db.exec("CREATE TABLE t(x)");
+		await db.synced();
+		// Replication blocks `unauthorized`, and each call gets the refused token back: retried after
+		// 0.5 to 1 s, then after 1 to 2 s, and so on, and at the expiry, which gets it back once more.
+		await fault("status 401", 2, "POST");
+		db.exec("INSERT INTO t VALUES (1)");
+		await until("the next token", () => minted.length === 2, 15_000);
+		// The failures before the expiry no longer count: the call after it came 0.5 to 1 s later,
+		// not 2 s or more.
+		const first = minted[0] as { expiresAt: number };
+		const second = minted[1] as { at: number };
+		expect(second.at - first.expiresAt).toBeGreaterThanOrEqual(300);
+		expect(second.at - first.expiresAt).toBeLessThan(1_500);
+		await db.synced();
+		expect(db.status().replication.condition).toBeNull();
+		await closeAll(db);
 	});
 
 	it("fails the open with its own error when it fails for good, and is retried after any other failure", async () => {
