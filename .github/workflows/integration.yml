@@ -513,7 +513,7 @@ jobs:
           uvx ruff@0.17.1 check
           uvx ruff@0.17.1 format --check
 
-      - name: e2e (open, synced and the events thread, asyncio, gates, errors, forks, import, the host check)
+      - name: e2e (open, synced and the events thread, asyncio, gates, errors, forks, import, token providers, the host check)
         timeout-minutes: 10
         working-directory: clients/sqlite-ursula-python
         run: |
@@ -838,6 +838,12 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.6"
+
+      # Runs clients/sqlite-ursula/test/gate.mjs in front of the node (tests/conftest.py).
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
 
       - name: Download ursula
         uses: actions/download-artifact@v7

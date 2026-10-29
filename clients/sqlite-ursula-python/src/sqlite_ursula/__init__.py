@@ -29,6 +29,8 @@ Module map:
 - ``_connection``: :class:`UrsulaConnection`, the ``sqlite3.Connection`` subclass ``open``
   returns, and its cursor, whose statements classify their errors.
 - ``_open``: :func:`open`, :func:`aopen`, :func:`import_sqlite` and :func:`set_token`.
+- ``_token``: the token source, which calls the token provider an open names on a thread of its
+  own, and :class:`BearerToken`, what the provider returns.
 - ``_gate``: :func:`gate` and :func:`agate`, which hold a block's outcome until ``synced()``.
 - ``_args``: the checks of their arguments, and of ``synced()``'s, as ``invalid_argument``.
 - ``_doctor``: ``python -m sqlite_ursula``, which says whether this Python can host the extension.
@@ -48,6 +50,8 @@ from ._open import aopen
 from ._open import import_sqlite
 from ._open import open  # noqa: A004 - the package's entry point, as Node's `open`
 from ._open import set_token
+from ._token import BearerToken
+from ._token import TokenProvider
 from .errors import Action
 from .errors import UrsulaError
 from .errors import UrsulaResetError
@@ -59,7 +63,9 @@ __version__ = "0.11.2"
 
 __all__ = [
     "Action",
+    "BearerToken",
     "Imported",
+    "TokenProvider",
     "UrsulaConnection",
     "UrsulaCursor",
     "UrsulaError",

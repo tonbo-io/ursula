@@ -16,6 +16,11 @@ control lock:
   wakes every open, and reads resets from status.
 - ``opened {request}`` wakes the opens waiting for it, which call ``ursula_open`` again to
   collect the result.
+- ``condition {path, condition: "unauthorized"}`` tells the token source (``_token``) that the
+  replication of ``path`` was refused with 401: it drops the token held and calls its provider.
+  ``retired`` lets it stop once nothing uses it, and a gap has it read the bound paths' status for
+  a missed ``unauthorized``. Otherwise a ``retired``, another condition or a gap has it reconsider
+  a retry it scheduled after the provider handed back a token those reporters have cleared.
 
 A waiter is a ``threading.Event`` for ``synced()``, ``gate`` and ``open()``, and a
 :class:`LoopEvent` for ``asynced()``, ``agate`` and ``aopen()``, which the thread wakes through its
@@ -25,9 +30,9 @@ wakes: it ends once every ticket resolved, or at the first that failed, and drop
 
 The thread takes its cursor before any request or ticket is handed out, and requests and tickets
 are registered under the lock in the same step that asks for them, so no event about one applies
-before it is registered. A thread that fails is replaced while tickets wait or connections are
-open, and the new one starts with a gap, since events may have passed between the two. After three
-failures in a row, waits fail ``internal``.
+before it is registered. A thread that fails is replaced while tickets wait, connections are open
+or a token provider serves the process, and the new one starts with a gap, since events may have
+passed between the two. After three failures in a row, waits fail ``internal``.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from typing import Any
 
 from . import _args
 from . import _control
+from . import _token
 from .errors import UrsulaResetError
 from .errors import UrsulaSetupError
 from .errors import again
@@ -272,6 +278,15 @@ class Events:
                 self._reset(event.get("path"), event)
             elif kind == "gap":
                 self._gap()
+            elif kind == "condition":
+                if event.get("condition") == "unauthorized":
+                    path = event.get("path")
+                    # No path: the binding that reported it is gone, so it blocks nothing any more.
+                    _token.source.blocked([] if path is None else [str(path)])
+                else:
+                    _token.source.reconsider()
+            elif kind == "retired":
+                _token.source.retired()
 
     def _reset(self, path: str | None, named: dict[str, Any]) -> None:
         """A reset of ``path`` (``None``: a binding the process no longer has): its pending
@@ -306,12 +321,13 @@ class Events:
             if error is not None:
                 hit.append((target, error))
         _fire(hit)
+        _token.source.missed()
 
     def _fail(self) -> None:
-        """The thread is gone: pending opens ask again, and while tickets wait or connections are
-        open a new thread starts with a gap, since events may have passed between the two. After
-        :data:`MAX_FAILURES` failures in a row the tickets fail instead, and so does every later
-        call."""
+        """The thread is gone: pending opens ask again, and while tickets wait, connections are
+        open or a token provider serves the process a new thread starts with a gap, since events
+        may have passed between the two. After :data:`MAX_FAILURES` failures in a row the tickets
+        fail instead, and so does every later call."""
         global _current, _failures
         with _control.lock():
             if self._failed:
@@ -322,7 +338,7 @@ class Events:
                 _current = None
             for request in list(self._opens):
                 self._wake(request)
-            if not _tickets and not _live():
+            if not _tickets and not _live() and not _token.source.serving():
                 return
             try:
                 replacement = events()

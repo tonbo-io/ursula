@@ -4,8 +4,12 @@
   clients/sqlite-vfs with the ``model`` feature) from ``URSULA_VFS_MODEL``, the one the Node suite
   runs against. Its ``/__model/faults`` scripts the delays the waiting tests need.
 - ``E2E_SERVER=ursula``: one ``ursula server`` node from ``URSULA_BIN``, with its Raft WAL in a
-  temporary directory and an in-memory cold store. The tests that script faults or read the
-  model's frames skip there.
+  temporary directory and an in-memory cold store, behind clients/sqlite-ursula/test/gate.mjs (run
+  with ``node``), the transparent proxy the Node suite puts in front of Ursula. The gate scripts
+  ``delay <ms>`` and ``status <code>`` faults as the model does, records each request's
+  ``Authorization`` header (:meth:`Server.sent`), and stands in for an authorizer
+  (:meth:`Server.require`). The tests that read the model's frames or script its other faults
+  skip there.
 
 ``SQLITE_URSULA_VFS`` names the extension the package loads.
 """
@@ -15,12 +19,14 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -30,6 +36,7 @@ import pytest
 
 HERE = Path(__file__).parent
 SRC = HERE.parent / "src"
+GATE = HERE.parent.parent / "sqlite-ursula" / "test" / "gate.mjs"
 CLUSTER_ID = "sqlite-ursula-python-test"
 
 
@@ -52,13 +59,48 @@ def request(method: str, url: str, body: bytes | None = None, **headers: str) ->
 class Server:
     url: str
     on_model: bool
+    #: The control URL of the gate in front of Ursula, ``None`` on the model.
+    gate: str | None = None
+
+    @property
+    def faults(self) -> str:
+        """Where :meth:`fault` posts: the model's faults, or the gate's in front of Ursula."""
+        return f"{self.url}/__model/faults" if self.gate is None else f"{self.gate}/faults"
 
     def fault(self, line: str, times: int = 1, method: str | None = None) -> None:
-        """Scripts a fault for the next ``times`` requests of ``method`` (the model only)."""
-        assert self.on_model
+        """Scripts a fault for the next ``times`` requests of ``method``: on the model, or on the
+        gate in front of Ursula, which takes ``delay <ms>`` and ``status <code>`` only."""
         query = f"times={times}" + ("" if method is None else f"&method={method}")
-        status, body = request("POST", f"{self.url}/__model/faults?{query}", line.encode())
+        status, body = request("POST", f"{self.faults}?{query}", line.encode())
         assert status == 204, body
+
+    def require(self, tokens: dict[str, float | None] | None) -> None:
+        """Has the gate in front of Ursula answer ``401`` to every request that does not carry one
+        of ``tokens`` before its expiry (``time.time()`` seconds, ``None``: never), as an
+        authorizer refuses a token from its expiry on. ``None``: none required."""
+        assert self.gate is not None
+        auth = (
+            {"token": None}
+            if tokens is None
+            else {
+                "tokens": [
+                    {"token": token, "expiresAt": None if at is None else round(at * 1000)}
+                    for token, at in tokens.items()
+                ]
+            }
+        )
+        status, body = request("PUT", f"{self.gate}/auth", json.dumps(auth).encode())
+        assert status == 204, body
+
+    def sent(self, path: str) -> list[dict[str, str | None]] | None:
+        """The method and the ``Authorization`` header of each request the gate in front of Ursula
+        received for the stream at ``path``, oldest first: ``None`` on the model, which records
+        none."""
+        if self.gate is None:
+            return None
+        status, body = request("GET", f"{self.gate}/requests?path={urllib.parse.quote(path)}")
+        assert status == 200, body
+        return json.loads(body)
 
     def frames(self, path: str) -> dict[str, int]:
         """The ``USQ2`` frames the stream at ``path`` holds, by kind (the model only)."""
@@ -143,7 +185,7 @@ def _ursula() -> Iterator[Server]:
     url = f"http://127.0.0.1:{port}"
     try:
         _wait_writable(url, proc)
-        yield Server(url, on_model=False)
+        yield from _gate(url)
     finally:
         proc.terminate()
         try:
@@ -151,6 +193,32 @@ def _ursula() -> Iterator[Server]:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def _gate(target: str) -> Iterator[Server]:
+    """clients/sqlite-ursula/test/gate.mjs in front of ``target``. It exits when its stdin
+    closes."""
+    node = shutil.which("node")
+    if node is None:
+        raise RuntimeError("E2E_SERVER=ursula runs Ursula behind test/gate.mjs: install node")
+    proc = subprocess.Popen(
+        [node, "--no-warnings", str(GATE), target], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    )
+    assert proc.stdout is not None
+    line = proc.stdout.readline()
+    if not line:
+        raise RuntimeError(f"{GATE} exited before it printed its ports")
+    ports = json.loads(line)
+    try:
+        yield Server(
+            f"http://127.0.0.1:{ports['port']}",
+            on_model=False,
+            gate=f"http://127.0.0.1:{ports['control']}",
+        )
+    finally:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        proc.wait(timeout=10)
 
 
 def _wait_writable(url: str, proc: subprocess.Popen[bytes]) -> None:
@@ -195,9 +263,10 @@ def server() -> Iterator[Server]:
 
 @pytest.fixture
 def model(server: Server) -> Server:
-    """The server, for a test that scripts faults or reads frames: the model only."""
+    """The server, for a test that reads the model's frames or was written for its faults: the
+    model only."""
     if not server.on_model:
-        pytest.skip("scripts faults, which only the model server takes")
+        pytest.skip("runs on the model server only")
     return server
 
 
