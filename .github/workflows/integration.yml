@@ -246,6 +246,44 @@ jobs:
           status=0
           "$bin" inspect --budget-ms soon || status=$?
           test "$status" -eq 2
+          # The drain's CLI, its pass and its JSON run here: the scanned directory holds no root, so
+          # nothing is opened. Its open, driver and transport run in sqlite-vfs-host-musl-e2e.
+          mkdir -p "$RUNNER_TEMP/empty-scan"
+          out=$("$bin" drain --origin http://127.0.0.1:9 --budget-ms 500 --scan "$RUNNER_TEMP/empty-scan" < /dev/null)
+          echo "$out"
+          python3 -c '
+          import json, sys
+          r = json.loads(sys.argv[1])
+          assert list(r) == ["v", "origin", "uid", "dir", "roots", "error"], r
+          assert r["v"] == 1 and r["origin"] == "http://127.0.0.1:9" and r["roots"] == [], r
+          ' "$out"
+          # Each usage error exits 2 with nothing on stdout.
+          for args in \
+            "--origin http://127.0.0.1:9 --budget-ms 0" \
+            "--budget-ms 500" \
+            "--origin http://127.0.0.1:9" \
+            "--origin http://127.0.0.1:9 --budget-ms" \
+            "--origin ftp://127.0.0.1:9 --budget-ms 500" \
+            "--origin http://127.0.0.1:9/v1 --budget-ms 500" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --concurrency 0" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --concurrency 17" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --dir $RUNNER_TEMP" \
+            "--origin http://127.0.0.1:9 --budget-ms 500 --pid 1"; do
+            status=0
+            out=$("$bin" drain $args < /dev/null) || status=$?
+            test "$status" -eq 2 || { echo "::error::drain $args exited $status"; exit 1; }
+            test -z "$out" || { echo "::error::drain $args printed $out"; exit 1; }
+          done
+          ls -l "$bin"
+
+      - name: Upload the static x64 ursula-vfs-host
+        if: matrix.arch == 'x64'
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlite-vfs-host-musl-x64
+          path: clients/sqlite-vfs/target/release/ursula-vfs-host
+          if-no-files-found: error
+          retention-days: 1
 
       # The compiled-in host directory's checks (design: Hosts), as root, the way a host runs it.
       - name: Check the compiled-in host directory as root
@@ -574,6 +612,47 @@ jobs:
                 SQLITE_URSULA_VFS=/src/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so python -m pytest -v
             '
 
+  # The static musl x64 ursula-vfs-host drains as the crate's build does: its open, driver and
+  # transport against the model server, in H16 and H20 of test/host.e2e.ts.
+  sqlite-vfs-host-musl-e2e:
+    name: sqlite-vfs host tool e2e (x64 musl, model server)
+    needs: [sqlite-vfs, sqlite-vfs-host-musl]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download the extension and the model server
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: Download the static ursula-vfs-host
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-vfs-host-musl-x64
+          path: ${{ runner.temp }}/musl
+
+      - name: e2e (H16 and H20 with the static binary)
+        timeout-minutes: 10
+        run: |
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model" "$RUNNER_TEMP/musl/ursula-vfs-host"
+          cd clients/sqlite-ursula
+          npm ci
+          npm run build
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" URSULA_VFS_HOST="$RUNNER_TEMP/musl/ursula-vfs-host" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/host.e2e.ts -t "H16|H20"
+
   # The release `ursula` for the e2e against the real server, cached by the inputs that build it so
   # a PR that touches only the extension or the package does not rebuild it. Bump the key's version
   # (v1) when the build command below changes.
@@ -666,7 +745,9 @@ jobs:
           cd clients/sqlite-ursula
           npm ci
           npm run build
-          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" URSULA_VFS_HOST="$RUNNER_TEMP/vfs/ursula-vfs-host" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+          # The model server stands in for another deployment (test/host.e2e.ts, H18).
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
+          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" URSULA_VFS_HOST="$RUNNER_TEMP/vfs/ursula-vfs-host" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
 
       - name: Upload the server logs
         if: failure()

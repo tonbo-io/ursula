@@ -374,7 +374,7 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
 
 | | takeover | continuation |
 | --- | --- | --- |
-| made by | `open()` with the stream answering | the replicator: `producer-expired`, a re-cut, a re-key while bound, a provisional open after its pre-check |
+| made by | `open()` with the stream answering | the replicator: `producer-expired`, a re-cut, a re-key while bound, a provisional open or a host's drain after its pre-check |
 | epoch | above every epoch seen (own CLAIM records, the snapshot's epoch, a `403`'s `Producer-Epoch`), higher after any answer but its receipt, at most 16 rounds | exactly own + 1 |
 | loses | after 16 lost claims (`claim_races`) | at the first answer but its receipt, or a foreign frame in its reconcile: reset `fenced` |
 
@@ -398,12 +398,15 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
 
 A claim nobody timed never takes a stream over: a process back from a partition cannot fence the
 owner an explicit open installed, unless it opens a copy of that owner's own cache or shares its
-activation, as a memory clone or a constant `activation` does ([Limits](#limits)).
+activation, as a memory clone or a constant `activation` does ([Limits](#limits)). A host's drain
+([Draining](#draining)) makes continuations only: the log's latest claim again, then own + 1, behind
+the pre-check, whether the stream answers or not.
 
 #### Pre-check
 
-A provisional open ([Open](#open)) and a re-key of a continuation whose latest claim applied past
-its acknowledged offset do not claim at once. They first:
+A provisional open ([Open](#open)), a host's drain ([Draining](#draining)) and a re-key of a
+continuation whose latest claim applied past its acknowledged offset do not claim at once. They
+first:
 
 1. Send a HEAD, which gives the token, the cluster id and the request limit.
 2. Read from the log's acknowledged offset to the tail that HEAD named, with `consistency=leader`
@@ -912,10 +915,33 @@ Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
   unreachable stream. Reads come from local files, commits are pending, `synced()` waits, and the
   claim waits for the stream behind the [Pre-check](#pre-check). Without a generation or a claim,
   the open retries until its signal fires.
+- **A host's drain** (`OwnerMode::Drain`, [Draining](#draining)) runs the same local steps, then
+  decides by its own rows below. It never creates the stream, builds a generation or takes the
+  stream over.
 - All db writes at open precede binding. After binding, anything that would rewrite pages under
   live connections is a reset, never an in-place apply.
 - A stream binds under one `dir` at a time in a process. An open under another `dir` waits for a
   binding nothing of the host holds to retire, and is refused `bound_elsewhere` otherwise.
+
+The drain's rows (`open/table.rs` `decide_drain` and `decide_drain_unreachable`):
+
+| local generation | HEAD | the drain's open |
+| --- | --- | --- |
+| any | no `Ursula-Protocol`, or another release line | refuse `no_server_identity` or `protocol_mismatch` |
+| trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
+| any | `404` | refuse `not_found`: a drain never creates a stream |
+| any | another content type | refuse `stream_format` |
+| any | closed | refuse `stream_state` |
+| trusted, a CLAIM record, commits after its latest ACK | `200`, any token | continue: bind now, provisionally, on the log's token, the claim behind the [Pre-check](#pre-check) |
+| trusted, a CLAIM record, nothing after its latest ACK | `200` | decline: nothing pending |
+| replaced | `200` | decline `replaced` |
+| none, or trusted without a CLAIM record | `200` | decline: nothing to continue |
+| trusted, a CLAIM record, commits after its latest ACK | the first request unanswered, nothing sent | continue, as the unreachable row does |
+| otherwise | the first request unanswered, nothing sent | decline at once, as the `200` rows decline |
+
+A refusal or a decline keeps the local files and sends nothing but the HEAD. Another token is the
+pre-check's to decide, so the drain has no history row of its own, and a snapshot past the ACK
+plays no part: a root with commits continues whatever the stream's latest snapshot.
 
 Tests: `open/table.rs` `another_line_or_no_identity_is_refused_before_anything_else`,
 `a_404_without_identity_is_refused_not_missing`,
@@ -929,8 +955,12 @@ Tests: `open/table.rs` `another_line_or_no_identity_is_refused_before_anything_e
 `an_inheriting_history_salvages_a_generation_with_pending_commits`,
 `another_token_that_does_not_inherit_salvages_or_trashes`,
 `an_unreachable_stream_opens_a_trusted_generation_with_a_claim_provisionally`,
-`an_unreachable_stream_waits_without_a_generation_a_claim_to_continue_or_with_a_replaced_one`.
-Driver: `driver/tests.rs` `a_server_without_identity_is_refused`,
+`an_unreachable_stream_waits_without_a_generation_a_claim_to_continue_or_with_a_replaced_one`,
+and the drain's rows `a_drain_refuses_an_old_server_another_cluster_a_missing_stream_and_its_state`,
+`a_drain_continues_a_trusted_generation_with_a_claim_whatever_the_token`,
+`a_drain_declines_a_replaced_generation_one_without_a_claim_and_one_with_nothing_pending`,
+`an_unreachable_drain_continues_a_claim_and_declines_anything_else_at_once`. Driver:
+`driver/tests.rs` `a_server_without_identity_is_refused`,
 `a_server_of_another_release_line_is_refused`,
 `a_head_404_without_the_protocol_is_no_missing_stream`,
 `a_stream_of_another_content_type_is_refused`, `a_stream_of_usq1_frames_is_refused`,
@@ -1315,9 +1345,12 @@ Moving or deleting a cache directory, or a directory above it, while a root in i
 unacknowledged commits and no process has it open hides them from the host, as from the extension,
 until the root is opened where it now is.
 
-`ursula-vfs-host inspect` (`inspection::inspect`) is the host's read of the disk: a binary of the
-extension's crate that never loads SQLite, never writes a file and never takes a lock. A host runs
-it as root, so that it can read every root and every process's descriptors. One pass reads:
+`ursula-vfs-host` is a binary of the extension's crate that never loads SQLite. `inspect`
+(`inspection::inspect`) is the host's read of the disk, and never writes a file or takes a lock.
+`drain` is a process of the extension that locks roots and writes their logs and claims
+([Draining](#draining)), so a host that tells its helpers apart by executable must tell a drain
+apart by its first argument. A host runs `inspect` as root, so that it can read every root and every
+process's descriptors. One pass reads:
 
 1. The host directory: the one `--dir` names, or the compiled-in path. The inspector never reads
    `URSULA_VFS_HOST_DIR`, so a test hook left in the host's environment cannot point it at another
@@ -1516,15 +1549,154 @@ lock before the hold takes a second round), H11 (with the stream blackholed the 
 proof, and drain once it answers), and the `sqlite-vfs-perf` run with a `hold` file present, which
 checks that the extension opened it.
 
+#### Draining
+
+`ursula-vfs-host drain --origin URL --budget-ms MS [--scan S]... [--concurrency N]`
+(`drain::drain`) reopens the orphans on a host's disk, the roots no process holds that still hold
+commits the stream has not acknowledged, and sends those commits, so a host can drain them before
+it freezes the workload. It is a process of the extension. It reads the extension's settings from
+its environment as any process that loads it does, `URSULA_VFS_TOKEN_FILE` included, so a token
+never goes on its command line. It loads no SQLite: it never opens a connection, so no snapshot
+thread, checkpoint or WAL runs in it.
+
+1. One pass, the inspection's own walk and per-root read: the records of the host directory the
+   extension records into (the compiled-in path, else the test hook), then each `--scan`, without
+   the lock check. A root reached through two paths is listed once. What the pass cannot read only
+   narrows what the drain can do, and the inspection stays the host's proof.
+2. A root whose read failed is `unreadable` and one with no unacknowledged byte `clean`, neither
+   opened. A root whose directory another user owns than the drain's effective uid is `pending`,
+   `not_owner`, since a file a drain creates in it must stay its owner's. A root whose name is not
+   its stream's root name, renamed or copied, is `pending`, `misnamed`, since an open of it would
+   lock and build another root. Neither is opened.
+3. Every other root opens as a drain, at the origin followed by the stream path its segment header
+   names, by the drain's rows ([Open](#open)). The open locks the root (`in_use` when another
+   process holds it), records its cache directory as every owner open does, finishes leftovers and
+   materializes. Then it only continues the root's own claim behind the [Pre-check](#pre-check),
+   whether the stream answers or not. It never takes the stream over, creates it, builds a
+   generation or re-keys at its open, and each open draws its own activation.
+4. The drain gives the binding back at once. The binding drains as after a last close, retires once
+   every commit it held is acknowledged, with an exact, fsynced ACK, and releases the root. A
+   pre-check that meets another owner's frame resets it with nothing sent.
+5. The root is read again, and its bytes decide: none is `drained`, or `clean` when the drain held
+   nothing, and more is `pending` with a kind. A read that fails is `unreadable`, and one the
+   deadline cuts is `pending`, `budget`, with the first read's numbers. A root whose open was
+   refused keeps its refusal's kind, with the first read's numbers, when that read fails or is cut.
+
+Up to `--concurrency` streams (1 to 16, 4 by default) drain at once, the roots of one stream one
+after another, so the drain never binds one stream under two roots. Of two roots of one stream at
+most one can drain: whichever claimed later has the other's claim after its acknowledged offset.
+The drain prints one line of JSON once every root has an outcome, and at `--budget-ms` at the
+latest, its opens and its waits for a binding ending 250 ms before. It exits 0 when it printed, 2 on
+a usage error and 1 when it could not write, and it exits without waiting for its workers. A host
+bounds its run at `--budget-ms` plus 2 s at the earliest and waits for its exit in any case.
+
+A drain never reads stdin, so a host passes `/dev/null`. Its stdout carries only the one line,
+printed at the end. Its stderr carries the extension's log lines (logfmt) and a usage error's
+message, and a host drains or redirects it: a full stderr pipe blocks the extension's logging, and
+with it the driver. An exit by a signal, or a panic's 101, is no result, and a host takes a result
+only from exit 0 with one complete line. A host passes the drain exactly the VFS variables its
+workload runs with, and nothing else.
+
+What a drain guarantees is what the pre-check guarantees. Its claim applies only above the root's
+own latest claim, and only after a read found no other owner's frame between the root's
+acknowledged offset and the tail, so it never applies above a claim an explicit open installed
+before that read ([Limits](#limits), A drain's pre-check window). A root whose stream another owner
+moved on stays `pending` with nothing sent, never resurrected and never discarded. A takeover would
+fence whoever owns the stream, a live session on another host included, and then discard the very
+commits it came to send if that owner wrote.
+
+```json
+{"v":1,"origin":"https://db.example.com","uid":1000,"dir":"/var/lib/sqlite-ursula/host","roots":[
+ {"id":"notes-1f3a…","root":"/home/app/.cache/sqlite-ursula/0.8/notes-1f3a…","stream":"/acme/notes",
+  "cluster":"c1","uid":1000,"outcome":"drained","kind":null,"later":null,"before_bytes":14336,
+  "unacknowledged_bytes":0,"commits":0,"salvaged":0,"error":null},
+ {"id":"todo-9c0e…","root":"/home/app/.cache/sqlite-ursula/0.8/todo-9c0e…","stream":"/acme/todo",
+  "cluster":"c1","uid":1000,"outcome":"pending","kind":"fenced","later":"no","before_bytes":2048,
+  "unacknowledged_bytes":2048,"commits":1,"salvaged":0,"error":"fenced: ..."}],
+ "error":null}
+```
+
+- `outcome` is `drained`, `clean`, `pending` or `unreadable`. A `pending` root has a `kind` and a
+  `later`: `yes` when the cause passes by itself, `fix` when a later drain may drain it once
+  something outside it changes (the user it runs as, the token, the account, the origin, the server
+  or the local disk), and `no` when no drain can send its commits to that stream. Only an explicit
+  open of the root resolves those, by the open table, or a rename back for a misnamed root.
+- The kinds, with their `later`: `not_owner` (fix), `misnamed` (no), `in_use` (yes), `local_setup`
+  (fix), `not_found`, `stream_format`, `stream_state` and `replaced` (no), `wrong_cluster`,
+  `protocol_mismatch` and `no_server_identity` (fix), the resets `fenced`, `stale`, `rewound` and
+  `deleted` (no) and `local_damage` (fix), `internal` (no), `unreachable`, `unavailable`,
+  `rate_limited` and the condition `retrying` (yes), `unauthorized`, `payment_required`,
+  `forbidden`, `request_too_large`, `redirected` and `rejected` (fix), `budget` (yes: the deadline
+  came with no condition to name, or before the root's turn) and `reopened` (yes: another process
+  logged commits in the root after the drain released it, or the binding's retire could not write
+  its exact ACK, which the drain's log lines name as `ack_lost`). `internal` also covers a panic in
+  the drain. A token has one `later` whatever produced it. Kinds may grow within a line, and a host
+  decides one it does not know by its `later`.
+- `uid` is the drain's effective uid, read from `/proc/self/status`, and null when it could not be
+  read: the drain then opens nothing. A root's `uid` is its directory's owner. `dir` is the host
+  directory the drain read, null without one. `before_bytes` is the first read's bytes, and
+  `unacknowledged_bytes`, `commits` and `salvaged` are the last completed read's, as the inspection
+  counts them. `error` is a message for a person, at the top when the pass could not read
+  everything, the effective uid could not be read, the driver did not start or the drain's pass
+  panicked.
+- Within `v` 1 the keys, their order, the outcomes and the `later` values are fixed, and a change to
+  any of them is a new `v`. A host may refuse any other shape, acts on `outcome` and `later`, and
+  never parses `error`.
+
+A drain's lasting writes to a root are an owner open's and those of a binding that continues its
+claim: the record of its cache directory when it is missing, the leftovers finished, the
+materialization, CLAIM records of continuations only, and ACKs never above what the stream
+acknowledged. A drain killed at any point is a crash of a process of the extension: the root is an
+orphan again with at most the bytes it had, and the next drain drains it. A drain makes no write
+transaction, so it never waits at the hold, and a host drains while it holds it. An inspection
+during a drain shows the roots it holds as `held` when its lock check reads the drain's process, and
+a host waits until the drain exited before the inspection that decides. A drain is never part of a
+snapshot: the host waits for its exit, and reaps it, before it freezes.
+
+The commits a drain cannot send (`later: no`) were never acknowledged, so no `synced()` covered
+them. Their bytes stay in every inspection, since a kind never overrides bytes, until an explicit
+open of the root resolves them or the root goes with its disk. A host that holds such a root stops
+instead of taking the snapshot, or lets the application's next open of the root resolve them.
+Ursula offers no tool that discards commits.
+
+Tests: `drain/tests.rs` `every_kind_has_the_later_of_its_token_whatever_produced_it`,
+`the_origin_takes_a_scheme_a_host_and_a_port_only`, `concurrency_is_one_to_sixteen`,
+`the_plan_opens_only_a_root_with_bytes_its_user_owns_under_its_own_name`,
+`the_bytes_of_the_last_read_decide_the_outcome`,
+`the_json_has_its_keys_in_order_and_each_outcome_its_invariants`, `driver/tests.rs`
+`a_drain_open_continues_its_roots_claim_while_the_stream_answers`,
+`a_drain_handed_back_at_bind_retires_with_an_exact_ack`,
+`a_drain_of_a_root_with_nothing_after_its_ack_declines_with_nothing_sent_but_its_head`,
+`a_drain_handed_back_at_bind_outlives_the_hand_out_timer`,
+`a_drain_never_applies_above_a_claim_made_before_its_pre_check_read`,
+`a_drain_meeting_another_writers_commit_resets_stale_with_nothing_sent`,
+`a_drain_repeat_of_an_unapplied_claim_can_fence_a_claim_made_within_its_pre_check`,
+`a_drain_refuses_or_declines_with_nothing_sent_but_its_head`,
+`a_drain_of_an_unreachable_stream_continues_once_it_answers`,
+`a_drain_of_a_stream_deleted_and_created_again_resets_rewound_with_nothing_sent`, the drain's rows
+in [Open](#open), `test/host.e2e.ts` H16 to H22 and H24 against the model server and a real server,
+and CI's `sqlite-vfs-host-musl`, which runs the static binary's drain on both architectures, and
+whose x64 binary runs H16 and H20. H16: an orphan drains with one CLAIM frame, at its log's latest
+epoch + 1, no connection and no snapshot, and the application resumes above it. H17: another cache
+root's takeover, idle or committing, leaves the orphan `fenced` with the stream and the other
+process unchanged, while the application's own reopen of the orphan, a takeover, fences the other
+process. H18: a misrouted origin, a deleted stream, a deleted and recreated one, a held root and a
+renamed root are refused before any claim. H19: the token file. H20: the deadline with the stream
+blackholed or refused, a SIGKILL during the continuation, and a panic in a root's drain or in the
+pass. H21: a drain under the hold, and the inspection beside it. H22: two orphans of one stream in
+two cache roots, in either order, and orphans of two streams under `--concurrency` 1 and 2. H24: a
+root the per-root read refuses is `unreadable`, with nothing claimed, and drains once readable. The
+musl job also checks that each usage error exits 2 with nothing on stdout.
+
 ### Forks
 
 A process starts the extension with its first `ursula_open`, `ursula_events`, `ursula_import` or
-`tonbo_resolve`, before any of them makes something that lives on in the process: the driver and its
-threads, the HTTP agents with their pooled connections, the resolver's cache, a token. A child
-forked after the start has all of it in its memory but none of the threads that serve it, and a lock
-one of them held at the fork stays held in the child. Using it there would stall `synced()`, append
-to the parent's log, or send on a TLS connection the parent also writes. So in such a child, and in
-every process forked from one:
+`tonbo_resolve`, or with a host's drain, before any of them makes something that lives on in the
+process: the driver and its threads, the HTTP agents with their pooled connections, the resolver's
+cache, a token. A child forked after the start has all of it in its memory but none of the threads
+that serve it, and a lock one of them held at the fork stays held in the child. Using it there would
+stall `synced()`, append to the parent's log, or send on a TLS connection the parent also writes. So
+in such a child, and in every process forked from one:
 
 - Every SQL function fails `forked` (action `fix`: open after the fork).
 - Every method on a file of a bound database fails without running, with the code it answers after
@@ -2383,7 +2555,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   ACK are salvaged after any history event, since they may have been sent and acknowledged. A
   clean close writes an exact ACK, and commits made while provisional still replicate.
 - **Idle expiry.** An owner idle past producer expiry whose own claim frame the pre-check cannot
-  see resets `stale`.
+  see resets `stale`, and so does a host's drain of its orphan, which a takeover would have
+  drained.
 - **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
   restored copy needs its own disk ([Clones](#clones)). A host that snapshots the process finds
   the directories whose roots may hold commits in the host directory ([Hosts](#hosts)).
@@ -2392,17 +2565,26 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   original, though the copy's open was provisional. Every commit the original acknowledged stays
   in the stream, and its next commit or `synced()` resets it `fenced`. A host that copies a live
   cache stops the original first, or opens the copy while the stream answers, so its takeover is
-  explicit.
+  explicit. A host's drain of such a copy fences the original the same way, and a host never runs
+  one on a disk that holds a copy of a cache live elsewhere.
 - **A shared activation.** Two opens under one activation, a constant `activation` or a memory
   clone and its original, take each other's claims for their own. Two that compute one epoch both
   bind on one claim. Until their first divergent commit both are live, and only the server's
   digest per producer key tells them apart: the second append under that key gets
   `key-conflict` and that open resets `fenced`. After a restore starts the epochs again, a
   background claim of one can also apply above the claim an explicit open of the other installed,
-  and the explicit owner resets `fenced` at its next commit.
+  and the explicit owner resets `fenced` at its next commit. A host's drain draws its own
+  activation: under one the workload shares, its pre-check would take a live owner's claims for its
+  own.
+- **A drain's pre-check window.** A claim an explicit open makes while a host's drain's pre-check
+  reads the stream can be fenced by the drain, when the root's log holds a claim above it that the
+  server never applied, as takeovers of that root whose claims got no answer leave one: the drain's
+  repeat of that claim then applies fresh. No acknowledged commit is lost, and the fenced owner
+  keeps its tail for its next open's reconcile.
 - **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
   an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
-  around it). Each database uses two HTTP worker threads and a snapshot thread.
+  around it). Each database uses two HTTP worker threads and a snapshot thread. A drain's binding
+  has no snapshot thread.
 - **One token per process,** and no separate read origin.
 - **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold store.
 - **Local durability.** A power loss drops unacknowledged commits since the last log fsync.

@@ -115,7 +115,7 @@ impl Reason {
 
 /// What made a pass incomplete as a whole.
 #[derive(Debug, thiserror::Error)]
-enum PassError {
+pub(crate) enum PassError {
     #[error("the host directory {}: {} {why}", .dir.display(), .path.display())]
     HostDirShape {
         dir: PathBuf,
@@ -168,7 +168,7 @@ impl PassError {
 
 /// How a path of the host directory is not what it must be.
 #[derive(Debug, thiserror::Error)]
-enum Shape {
+pub(crate) enum Shape {
     #[error("is not a directory")]
     NotADirectory,
     #[error("is owned by uid {uid}, not {want}")]
@@ -179,7 +179,7 @@ enum Shape {
 
 /// Why a name in the host directory is not a record this line reads.
 #[derive(Debug, thiserror::Error)]
-enum RecordError {
+pub(crate) enum RecordError {
     #[error("is not a regular file")]
     NotAFile,
     #[error("is not a record: {0}")]
@@ -194,7 +194,7 @@ enum RecordError {
 
 /// Why a root could not be read.
 #[derive(Debug, thiserror::Error)]
-enum RootError {
+pub(crate) enum RootError {
     #[error(transparent)]
     Generation(#[from] GenerationError),
     #[error(transparent)]
@@ -238,7 +238,7 @@ enum DirState {
 /// Why a directory that may hold roots could not be read.
 #[derive(Debug, thiserror::Error)]
 #[error("{op} {}: {source}", .path.display())]
-struct DirError {
+pub(crate) struct DirError {
     op: &'static str,
     path: PathBuf,
     #[source]
@@ -260,9 +260,11 @@ enum RootRead {
     },
 }
 
+/// What a root's read found: its stream and what it holds, or why it could not be read.
 #[derive(Debug)]
-enum RootState {
+pub(crate) enum RootState {
     Read {
+        /// The stream path its segment header names.
         stream: String,
         cluster: String,
         /// The frame bytes of its pending commits.
@@ -273,7 +275,7 @@ enum RootState {
         salvaged: u64,
     },
     Unreadable {
-        error: RootError,
+        error: Arc<RootError>,
         /// Its files changed while it was read, as a drain's trim changes them: a pass of
         /// `--until-clean` reads it again instead of ending.
         changed: bool,
@@ -336,13 +338,20 @@ struct Strict<'a> {
 /// Root's uid.
 const ROOT_UID: u32 = 0;
 
+impl Strict<'static> {
+    /// The compiled-in host directory, owned by root.
+    fn compiled_in() -> Self {
+        Strict {
+            path: Path::new(hostdir::DEFAULT),
+            uid: ROOT_UID,
+        }
+    }
+}
+
 /// Reads every root of the host directory's records and of `request.scans`, and checks every open
 /// root lock (design: Hosts). Never writes or locks anything.
 pub fn inspect(request: &Inspect) -> Inspection {
-    inspect_with(request, Strict {
-        path: Path::new(hostdir::DEFAULT),
-        uid: ROOT_UID,
-    })
+    inspect_with(request, Strict::compiled_in())
 }
 
 /// [`inspect`] with the directory the strict checks apply to given.
@@ -361,6 +370,101 @@ fn inspect_with(request: &Inspect, strict: Strict<'_>) -> Inspection {
             return seen;
         }
         std::thread::sleep(AGAIN.min(until.saturating_duration_since(now)));
+    }
+}
+
+/// A root a host's drain read ([`crate::drain`]): its name, the path the walk listed it at, and
+/// what it holds.
+#[derive(Debug)]
+pub(crate) struct Listed {
+    pub(crate) id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) state: Arc<RootState>,
+}
+
+/// What narrowed a host's drain's walk ([`walk_for_drain`]): the first part of the disk it could
+/// not read.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WalkError {
+    /// The host directory, or the deadline (`budget`).
+    #[error(transparent)]
+    Pass(#[from] PassError),
+    #[error("the host directory's {name} {error}")]
+    Record {
+        name: String,
+        #[source]
+        error: RecordError,
+    },
+    #[error("the host directory holds {name}, which this line does not read")]
+    Unknown { name: String },
+    #[error(transparent)]
+    Dir(DirError),
+}
+
+/// A host's drain's walk ([`crate::drain`], design: Hosts): the inspection's own walk and per-root
+/// read, of the records of the host directory `host` (the compiled-in one checked strictly) and of
+/// `scans`, until `at`. No lock check runs. Each root it lists goes to `listed`, as it is read.
+/// Returns what narrowed the walk, the first part of the disk it could not read, if any: the host
+/// directory, a name in it this line does not read, a directory, or the deadline (`budget`).
+pub(crate) fn walk_for_drain(
+    host: Option<&Path>,
+    scans: &[PathBuf],
+    at: Option<Instant>,
+    budget: Duration,
+    listed: &mut dyn FnMut(Listed),
+) -> Option<WalkError> {
+    let deadline = Deadline { at, budget };
+    let mut unrecognized = Vec::new();
+    let (wanted, error) = wanted(host, scans, Strict::compiled_in(), &mut unrecognized);
+    let mut dirs = Vec::new();
+    let walked = walk(wanted, deadline, &mut dirs, |id, root| {
+        if let RootRead::Listed { state, .. } = read_root(&root, None, deadline)? {
+            listed(Listed { id, root, state });
+        }
+        Ok(())
+    });
+    let unlistable = dirs.into_iter().find_map(|d| match d.state {
+        DirState::Unlistable(e) => Some(WalkError::Dir(e)),
+        DirState::Present | DirState::Absent => None,
+    });
+    let unknown = unrecognized.into_iter().next().map(|u| match u.error {
+        Some(error) => WalkError::Record {
+            name: u.name,
+            error,
+        },
+        None => WalkError::Unknown { name: u.name },
+    });
+    error
+        .map(WalkError::Pass)
+        .or(unknown)
+        .or(unlistable)
+        .or_else(|| {
+            walked
+                .err()
+                .map(|Stopped| WalkError::Pass(PassError::Budget { budget }))
+        })
+}
+
+/// What a host's drain's second read of a root found ([`read_for_drain`]).
+#[derive(Debug)]
+pub(crate) enum ReadAgain {
+    Read(Arc<RootState>),
+    /// The root holds no generation: no commit.
+    NoGeneration,
+    /// The deadline cut the read.
+    Cut,
+}
+
+/// A host's drain's read of the root `root` again, by the walk's read, until `at`.
+pub(crate) fn read_for_drain(root: &Path, at: Option<Instant>) -> ReadAgain {
+    let deadline = Deadline {
+        at,
+        budget: Duration::MAX,
+    };
+    match read_root(root, None, deadline) {
+        Ok(RootRead::Listed { state, .. }) => ReadAgain::Read(state),
+        Ok(RootRead::NoGeneration { .. }) => ReadAgain::NoGeneration,
+        Err(Stopped) => ReadAgain::Cut,
     }
 }
 
@@ -586,100 +690,50 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
         unrecognized: Vec::new(),
         errors: Vec::new(),
     };
-    let mut wanted = Vec::new();
-    match records(&dir, strict, &mut inspection.unrecognized) {
-        Ok(recorded) => wanted.extend(recorded.into_iter().map(|d| (d, Source::Record))),
-        Err(e) => inspection.errors.push(e),
-    }
-    wanted.extend(request.scans.iter().map(|d| (d.clone(), Source::Scan)));
+    let (wanted, error) = wanted(
+        Some(&dir),
+        &request.scans,
+        strict,
+        &mut inspection.unrecognized,
+    );
+    inspection.errors.extend(error);
     // Every root lock the pass read, with the listed roots it is the lock of: one lock may be
     // reached through two paths.
     let mut locks: HashMap<FileId, Vec<usize>> = HashMap::new();
     let mut fresh: HashMap<PathBuf, (Fingerprint, RootRead)> = HashMap::new();
-    let mut seen = HashSet::new();
-    let mut stopped = false;
-    'dirs: for (path, from) in wanted {
-        // One entry per real path, or per path when nothing is there.
-        let (state, roots) = match fs::canonicalize(&path) {
-            Ok(real) => {
-                if !seen.insert(real.clone()) {
-                    continue;
-                }
-                match list_roots(&real, deadline) {
-                    Ok(listed) => listed,
-                    Err(Stopped) => {
-                        stopped = true;
-                        break 'dirs;
-                    }
-                }
-            }
-            Err(e) if not_there(&e) => {
-                if !seen.insert(path.clone()) {
-                    continue;
-                }
-                (DirState::Absent, Vec::new())
-            }
-            Err(source) => (
-                DirState::Unlistable(DirError {
-                    op: "resolve",
-                    path: path.clone(),
-                    source,
-                }),
-                Vec::new(),
-            ),
+    let roots = &mut inspection.roots;
+    let walked = walk(wanted, deadline, &mut inspection.dirs, |id, root| {
+        let print = fingerprint(&root, deadline)?;
+        let read = match (&print, cache.roots.remove(&root)) {
+            (Some(print), Some((before, read))) if *print == before => read,
+            _ => read_root(&root, print.as_ref(), deadline)?,
         };
-        inspection.dirs.push(DirReport {
-            dir: path,
-            from,
-            state,
-        });
-        for (id, root) in roots {
-            if deadline.passed() {
-                stopped = true;
-                break 'dirs;
+        if let Some(print) = print
+            && !read.changed()
+        {
+            fresh.insert(root.clone(), (print, read.clone()));
+        }
+        match read {
+            RootRead::NoGeneration { lock } => {
+                if let Some(lock) = lock {
+                    locks.entry(lock).or_default();
+                }
             }
-            let print = match fingerprint(&root, deadline) {
-                Ok(print) => print,
-                Err(Stopped) => {
-                    stopped = true;
-                    break 'dirs;
+            RootRead::Listed { lock, state } => {
+                if let Some(lock) = lock {
+                    locks.entry(lock).or_default().push(roots.len());
                 }
-            };
-            let read = match (&print, cache.roots.remove(&root)) {
-                (Some(print), Some((before, read))) if *print == before => read,
-                _ => match read_root(&root, print.as_ref(), deadline) {
-                    Ok(read) => read,
-                    Err(Stopped) => {
-                        stopped = true;
-                        break 'dirs;
-                    }
-                },
-            };
-            if let Some(print) = print
-                && !read.changed()
-            {
-                fresh.insert(root.clone(), (print, read.clone()));
-            }
-            match read {
-                RootRead::NoGeneration { lock } => {
-                    if let Some(lock) = lock {
-                        locks.entry(lock).or_default();
-                    }
-                }
-                RootRead::Listed { lock, state } => {
-                    if let Some(lock) = lock {
-                        locks.entry(lock).or_default().push(inspection.roots.len());
-                    }
-                    inspection.roots.push(RootReport {
-                        id,
-                        root,
-                        state,
-                        held: None,
-                    });
-                }
+                roots.push(RootReport {
+                    id,
+                    root,
+                    state,
+                    held: None,
+                });
             }
         }
-    }
+        Ok(())
+    });
+    let mut stopped = walked.is_err();
     cache.roots = fresh;
     if !stopped {
         match open_locks(request.pids.as_deref(), deadline) {
@@ -718,6 +772,76 @@ fn pass(request: &Inspect, strict: Strict<'_>, cache: &mut Cache) -> Inspection 
         });
     }
     inspection
+}
+
+/// The directories a pass reads for roots: those the records of the host directory `host` name,
+/// in record name order, then `scans` in their order. Names and records of the host directory it
+/// does not know go to `unrecognized`, and a host directory that could not be read is the error.
+fn wanted(
+    host: Option<&Path>,
+    scans: &[PathBuf],
+    strict: Strict<'_>,
+    unrecognized: &mut Vec<Unrecognized>,
+) -> (Vec<(PathBuf, Source)>, Option<PassError>) {
+    let mut wanted = Vec::new();
+    let mut error = None;
+    if let Some(host) = host {
+        match records(host, strict, unrecognized) {
+            Ok(recorded) => wanted.extend(recorded.into_iter().map(|d| (d, Source::Record))),
+            Err(e) => error = Some(e),
+        }
+    }
+    wanted.extend(scans.iter().map(|d| (d.clone(), Source::Scan)));
+    (wanted, error)
+}
+
+/// The walk of a pass (steps 2 and 3 up to each root's read): every directory of `wanted` once per
+/// real path, reported in `dirs`, and in each present one every root, by name, handed to `each`
+/// with its name and path. [`Stopped`] once `deadline` passed, or once `each` stopped.
+fn walk(
+    wanted: Vec<(PathBuf, Source)>,
+    deadline: Deadline,
+    dirs: &mut Vec<DirReport>,
+    mut each: impl FnMut(String, PathBuf) -> Result<(), Stopped>,
+) -> Result<(), Stopped> {
+    let mut seen = HashSet::new();
+    for (path, from) in wanted {
+        // One entry per real path, or per path when nothing is there.
+        let (state, roots) = match fs::canonicalize(&path) {
+            Ok(real) => {
+                if !seen.insert(real.clone()) {
+                    continue;
+                }
+                list_roots(&real, deadline)?
+            }
+            Err(e) if not_there(&e) => {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                (DirState::Absent, Vec::new())
+            }
+            Err(source) => (
+                DirState::Unlistable(DirError {
+                    op: "resolve",
+                    path: path.clone(),
+                    source,
+                }),
+                Vec::new(),
+            ),
+        };
+        dirs.push(DirReport {
+            dir: path,
+            from,
+            state,
+        });
+        for (id, root) in roots {
+            if deadline.passed() {
+                return Err(Stopped);
+            }
+            each(id, root)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `e` says nothing is at a path: missing, or a component that is not a directory.
@@ -985,7 +1109,10 @@ fn read_root(
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
             };
-            RootState::Unreadable { error, changed }
+            RootState::Unreadable {
+                error: Arc::new(error),
+                changed,
+            }
         }
     };
     Ok(RootRead::Listed {
@@ -1344,7 +1471,7 @@ fn holds_write_lock(fdinfo: &str) -> bool {
 }
 
 /// This process's effective uid, from `/proc/self/status`.
-fn effective_uid() -> Result<u32, PassError> {
+pub(crate) fn effective_uid() -> Result<u32, PassError> {
     let path = Path::new(PROC).join("self").join("status");
     let text = fs::read_to_string(&path).map_err(table("read", &path))?;
     text.lines()
