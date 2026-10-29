@@ -19,8 +19,9 @@ releases CI tests. Each class is a subclass of LangGraph's own, unmodified but f
   connection is on ``db``'s binding as ``db`` is, so its errors are the package's too.
   ``aclose()``, or ``async with``, closes it.
 
-Every write returns only once ``db.synced()`` (``asynced()``) returned after it: a checkpoint, a
-task's writes, a deleted thread, a store batch with a put or a delete, a TTL sweep. So a graph's
+Every write returns only once ``db.synced()`` (``asynced()``) returned after it: the setup that
+creates the tables, which LangGraph runs before the first read too, a checkpoint, a task's writes,
+a deleted thread, a store batch with a put or a delete, a TTL sweep. So a graph's
 ``invoke`` returns once the checkpoints of its run are in the stream, since LangGraph waits for its
 background checkpoint writes before it returns. Reads do not wait. A write refused with
 ``backlog_full`` committed nothing: it waits for ``synced()`` and runs again. A reset raises the
@@ -137,6 +138,11 @@ class UrsulaSaver(SqliteSaver):
     def from_conn_string(cls, conn_string: str) -> Any:
         raise _no_conn_string(cls, f"{cls.__name__}(sqlite_ursula.open(url))")
 
+    def setup(self) -> None:
+        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
+        if not self.is_setup:
+            _gated(self.db, super().setup)
+
     def put(self, config: Any, checkpoint: Any, metadata: Any, new_versions: Any) -> Any:
         return _gated(self.db, super().put, config, checkpoint, metadata, new_versions)
 
@@ -183,6 +189,11 @@ class AsyncUrsulaSaver(AsyncSqliteSaver):
     @classmethod
     def from_conn_string(cls, conn_string: str) -> Any:
         raise _no_conn_string(cls, f"await {cls.__name__}.open(sqlite_ursula.open(url))")
+
+    async def setup(self) -> None:
+        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
+        if not self.is_setup:
+            await _agated(self.db, super().setup)
 
     async def aput(self, config: Any, checkpoint: Any, metadata: Any, new_versions: Any) -> Any:
         return await _agated(self.db, super().aput, config, checkpoint, metadata, new_versions)
@@ -232,6 +243,11 @@ class UrsulaStore(SqliteStore):
     @classmethod
     def from_conn_string(cls, conn_string: str, **kwargs: Any) -> Any:
         raise _no_conn_string(cls, f"{cls.__name__}(sqlite_ursula.open(url, isolation_level=None))")
+
+    def setup(self) -> None:
+        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
+        if not self.is_setup:
+            _gated(self.db, super().setup)
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         listed = list(ops)
@@ -288,6 +304,11 @@ class AsyncUrsulaStore(AsyncSqliteStore):
     @classmethod
     def from_conn_string(cls, conn_string: str, **kwargs: Any) -> Any:
         raise _no_conn_string(cls, f"await {cls.__name__}.open(sqlite_ursula.open(url))")
+
+    async def setup(self) -> None:
+        # LangGraph runs it lazily, before a read too: its tables are a write like any other.
+        if not self.is_setup:
+            await _agated(self.db, super().setup)
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         listed = list(ops)

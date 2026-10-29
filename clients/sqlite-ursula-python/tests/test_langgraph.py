@@ -132,6 +132,8 @@ def test_a_write_refused_with_backlog_full_runs_again_once_synced(model, stream,
     db.execute("CREATE TABLE t(x)")
     graph = counter(UrsulaSaver(db))
     config = thread("t")
+    # The saver's setup, before the run's first read, is refused while that commit is pending, and
+    # runs again.
     assert graph.invoke({"n": 1}, config) == {"n": 2}
 
     # This commit waits two seconds for the stream and holds the backlog full meanwhile.
@@ -196,6 +198,7 @@ def test_an_async_write_refused_with_backlog_full_runs_again_once_synced(model, 
         async with await AsyncUrsulaSaver.open(db) as saver:
             graph = counter(saver)
             config = thread("t")
+            # The setup is refused while that commit is pending, and runs again.
             assert await graph.ainvoke({"n": 1}, config) == {"n": 2}
 
             model.fault("delay 2000", 1, "POST")

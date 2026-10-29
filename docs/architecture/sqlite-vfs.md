@@ -2493,9 +2493,10 @@ imports LangGraph.
   adapters add no classification of their own. `aclose()` or `async with` closes the aiosqlite
   connection, and the store's also stops its TTL sweeper. The classes take only connections
   `open()` made, and `from_conn_string` raises `invalid_argument` naming the call to use.
-- **Writes.** Every write returns once `synced()` or `asynced()` returned after it: a saver's
-  `put`, `put_writes` and `delete_thread` and their async forms, a store batch with a put or a
-  delete, and a TTL sweep. LangGraph waits for a run's background checkpoint writes before `invoke`
+- **Writes.** Every write returns once `synced()` or `asynced()` returned after it: the `setup`
+  that creates the tables, which LangGraph runs lazily before the first read too, a saver's `put`,
+  `put_writes` and `delete_thread` and their async forms, a store batch with a put or a delete, and
+  a TTL sweep. LangGraph waits for a run's background checkpoint writes before `invoke`
   returns, so the return is gated in every durability mode, and `durability="sync"` also gates what
   a node does after the step before it. Reads do not wait. A write refused with `backlog_full`
   committed nothing: it waits for `synced()` and runs again, and the extension admits any commit
