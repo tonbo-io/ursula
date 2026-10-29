@@ -1751,11 +1751,11 @@ Tests: `drain/tests.rs` `every_kind_has_the_later_of_its_token_whatever_produced
 `a_drain_refuses_or_declines_with_nothing_sent_but_its_head`,
 `a_drain_of_an_unreachable_stream_continues_once_it_answers`,
 `a_drain_of_a_stream_deleted_and_created_again_resets_rewound_with_nothing_sent`, the drain's rows
-in [Open](#open), `test/host.e2e.ts` H16 to H22, H24 and H25 against the model server and a real server,
-and CI's `sqlite-vfs-host-musl`, which runs the static binary's drain on both architectures, and
-whose x64 binary runs H16 and H20. H16: an orphan drains with one CLAIM frame, at its log's latest
-epoch + 1, no connection and no snapshot, and the application resumes above it. H17: another cache
-root's takeover, idle or committing, leaves the orphan `fenced` with the stream and the other
+in [Open](#open), `test/host.e2e.ts` H16 to H22, H24 and H25 against the model server and a real
+server, and CI's `sqlite-vfs-host-musl`, which runs the static binary's drain on both architectures,
+and whose x64 binary runs H16 and H20. H16: an orphan drains with one CLAIM frame, at its log's
+latest epoch + 1, no connection and no snapshot, and the application resumes above it. H17: another
+cache root's takeover, idle or committing, leaves the orphan `fenced` with the stream and the other
 process unchanged, while the application's own reopen of the orphan, a takeover, fences the other
 process. H18: a misrouted origin, a deleted stream, a deleted and recreated one, a held root and a
 renamed root are refused before any claim. H19: the token file. H20: the deadline with the stream

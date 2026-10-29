@@ -1127,7 +1127,7 @@ describe("the host's inspection (ursula-vfs-host inspect)", () => {
 			return (await ownedFrames(path)).flatMap((f) => (f.kind === "claim" ? [f.epoch] : []));
 		}
 
-		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget: its result, checked by the output's rules, and how long it ran. */
+		/** `ursula-vfs-host drain` through the gate, with `env` and `args` after the origin and the budget, as root with `root`: its result, checked by the output's rules, and how long it ran. */
 		async function drain(env: NodeJS.ProcessEnv, options: { budgetMs?: number; scans?: readonly string[]; origin?: string; concurrency?: number; root?: boolean } = {}): Promise<{ drained: Drained; ms: number }> {
 			const args = ["drain", "--origin", options.origin ?? front.url, "--budget-ms", String(options.budgetMs ?? 20_000), ...(options.scans ?? []).flatMap((s) => ["--scan", s])];
 			if (options.concurrency !== undefined) args.push("--concurrency", String(options.concurrency));
