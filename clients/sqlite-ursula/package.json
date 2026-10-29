@@ -21,14 +21,6 @@
     "./pi": {
       "types": "./dist/pi.d.ts",
       "default": "./dist/pi.js"
-    },
-    "./tonbo": {
-      "types": "./dist/tonbo.d.ts",
-      "default": "./dist/tonbo.js"
-    },
-    "./tonbo/pi": {
-      "types": "./dist/tonbo-pi.d.ts",
-      "default": "./dist/tonbo-pi.js"
     }
   },
   "types": "./dist/index.d.ts",

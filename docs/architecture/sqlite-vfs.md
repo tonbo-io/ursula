@@ -1993,19 +1993,6 @@ storage goes on (Pi up to 1.1)", "throws a reset as the UrsulaResetError itself,
 "waits for synced() on close, at most closeTimeoutMs", and Pi's storage conformance suite in
 `test/conformance.e2e.ts`, run in CI on Pi 1.0.0 and the newest supported Pi.
 
-### Tonbo entries
-
-The packages know nothing of Tonbo accounts, API keys or database names: a Tonbo database opens by
-its stream URL with a token, as any stream does. The `/tonbo` and `/tonbo/pi` entries of the
-TypeScript package (`tonbo.ts`, `tonbo-pi.ts`) stay in the 0.11 line only to say where opening by
-name went. Their `open`, `resolveDatabase` and `openUrsulaPiStorage` reject with a plain `Error`
-that names the entry, says it was removed in 0.11.3 and moved to the Tonbo SDK, and shows the open
-by URL with a token. They import nothing and send nothing. `/tonbo` exports only `open` and
-`resolveDatabase`, and `/tonbo/pi` only `openUrsulaPiStorage`.
-
-Tests: `test/open.e2e.ts` "reject every call with where opening a Tonbo database by name moved",
-and `scripts/smoke.mjs` on the packed package's entries.
-
 ### SQL functions
 
 Other hosts call the extension directly. Long calls take `timeout_ms`, where 0 starts the work and

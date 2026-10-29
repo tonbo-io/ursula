@@ -2,8 +2,7 @@
 // where `npm install ./*.tgz` installed @tonbo/sqlite-ursula and this platform's extension package:
 // with SQLITE_URSULA_VFS unset, loadUrsulaVfs() loads the extension from that package, the extension
 // registers its SQL functions (its SQLite version gate accepts this Node's SQLite), and a plain
-// database works through its VFS. The `/tonbo` entries only reject with where opening a Tonbo
-// database by name moved. No server is needed.
+// database works through its VFS. No server is needed.
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,15 +23,5 @@ const db = new DatabaseSync(join(mkdtempSync(join(tmpdir(), "smoke-")), "plain.d
 db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (42)");
 assert.equal(db.prepare("SELECT x FROM t").get().x, 42);
 db.close();
-
-// Removed in 0.11.3, and gone in 0.12: every function of the `/tonbo` entries rejects.
-for (const [entry, name] of [
-	["@tonbo/sqlite-ursula/tonbo", "open"],
-	["@tonbo/sqlite-ursula/tonbo", "resolveDatabase"],
-	["@tonbo/sqlite-ursula/tonbo/pi", "openUrsulaPiStorage"],
-]) {
-	const module = await import(entry);
-	await assert.rejects(module[name]("db"), (error) => error instanceof Error && error.message.startsWith(`${entry} was removed in 0.11.3: `));
-}
 
 console.log(`ok: ${process.platform}-${process.arch}, Node ${process.version}, ${functions.join(", ")}`);
