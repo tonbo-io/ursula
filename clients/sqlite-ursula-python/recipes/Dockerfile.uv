@@ -1,0 +1,18 @@
+# An application image that can host sqlite-ursula on a Debian base, x64 or arm64: a uv-managed
+# CPython, which bundles a SQLite new enough and loads extensions, instead of Debian's Python.
+FROM debian:trixie-slim
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /usr/local/bin/uv
+ENV UV_PYTHON_PREFERENCE=only-managed \
+    UV_PYTHON_INSTALL_DIR=/opt/python \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+RUN uv venv --python 3.13 /opt/venv
+
+WORKDIR /app
+COPY requirements.txt .
+RUN uv pip install --no-cache -r requirements.txt
+# Fails the build, saying what to change, on a Python that cannot host the extension.
+RUN python -m sqlite_ursula
+COPY . .
+CMD ["python", "main.py"]

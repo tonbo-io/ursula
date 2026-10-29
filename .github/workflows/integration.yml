@@ -3,7 +3,9 @@ name: Integration
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against the
 # model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three,
-# and its parts suites through three nodes behind the gateway with an S3 cold store.
+# its parts suites through three nodes behind the gateway with an S3 cold store, and the Python
+# package's suites against the model on uv-managed CPython and Alpine and against one `ursula` node,
+# with its host check on Windows.
 # S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
 # PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
@@ -391,6 +393,187 @@ jobs:
           SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" \
             uv run --no-project --python 3.13.18 clients/sqlite-vfs/e2e/fork.py
 
+  # The Python package (clients/sqlite-ursula-python) against the model server, on uv-managed
+  # CPython, whose SQLite is new enough and loads extensions: the oldest supported minor, the
+  # newest, and the newest free-threaded. uv is pinned, and with it the Python builds it installs.
+  # The 3.14 leg also lints, checks that a wheel finds the library it carries and that a
+  # uv-managed CPython on Debian hosts it as recipes/Dockerfile.uv installs it, and checks that
+  # python:3.13-slim, whose SQLite is older than the extension's floor, fails with
+  # host_unsupported and says what to use instead.
+  sqlite-ursula-python:
+    name: sqlite-ursula-python (model server, CPython ${{ matrix.python }})
+    needs: [sqlite-vfs]
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14", "3.14t"]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: Download the extension and the model server
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: Lint
+        if: matrix.python == '3.14'
+        working-directory: clients/sqlite-ursula-python
+        run: |
+          uvx ruff@0.17.1 check
+          uvx ruff@0.17.1 format --check
+
+      - name: e2e (open, synced and the events thread, errors, forks, import, the host check)
+        timeout-minutes: 10
+        working-directory: clients/sqlite-ursula-python
+        run: |
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" \
+            uv run --no-project --python "${{ matrix.python }}" --with pytest==9.1.1 python -m pytest -v
+
+      - name: A wheel finds the library it carries
+        if: matrix.python == '3.14'
+        working-directory: clients/sqlite-ursula-python
+        run: |
+          set -euo pipefail
+          mkdir -p src/sqlite_ursula/_lib
+          cp "$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" src/sqlite_ursula/_lib/
+          uv build --wheel --out-dir "$RUNNER_TEMP/dist"
+          wheel=$(ls "$RUNNER_TEMP"/dist/sqlite_ursula-*.whl)
+          python3 -c 'import sys, zipfile; names = zipfile.ZipFile(sys.argv[1]).namelist(); assert "sqlite_ursula/_lib/libsqlite_ursula_vfs.so" in names, names' "$wheel"
+          uv venv --python 3.14 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" "$wheel"
+          # Outside the checkout, so the installed package is the one imported.
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/python" -m sqlite_ursula | tee doctor.txt
+          grep -q "(bundled)$" doctor.txt
+
+      - name: A uv-managed CPython on debian:trixie-slim hosts the wheel, as recipes/Dockerfile.uv installs it
+        if: matrix.python == '3.14'
+        env:
+          IMAGE: public.ecr.aws/docker/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+        run: |
+          set -euo pipefail
+          # The recipe's steps, with the runner's uv (the pinned 0.13.6, as the recipe's) and the
+          # wheel the step above built.
+          docker run --rm -v "$(command -v uv):/usr/local/bin/uv:ro" -v "$RUNNER_TEMP/dist:/dist:ro" \
+            -e UV_PYTHON_PREFERENCE=only-managed -e UV_PYTHON_INSTALL_DIR=/opt/python -e VIRTUAL_ENV=/opt/venv \
+            "$IMAGE" sh -euc '
+              uv venv --python 3.13 /opt/venv
+              uv pip install --no-cache /dist/sqlite_ursula-*.whl
+              cd /
+              /opt/venv/bin/python -m sqlite_ursula
+            ' | tee recipe.txt
+          grep -q "^result: ok" recipe.txt
+
+      - name: python:3.13-slim cannot host the extension, and says what to use instead
+        if: matrix.python == '3.14'
+        env:
+          IMAGE: public.ecr.aws/docker/library/python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+        run: |
+          set -euo pipefail
+          status=0
+          out=$(docker run --rm -v "$PWD/clients/sqlite-ursula-python/src:/pkg:ro" -v "$RUNNER_TEMP/vfs:/vfs:ro" \
+            -e PYTHONPATH=/pkg -e SQLITE_URSULA_VFS=/vfs/libsqlite_ursula_vfs.so "$IMAGE" python -m sqlite_ursula) || status=$?
+          echo "$out"
+          test "$status" -eq 1
+          grep -q "^result: host_unsupported" <<<"$out"
+          grep -q "sqlite-ursula-vfs needs SQLite [0-9.]* or newer" <<<"$out"
+          grep -q "^fix: .*python:3.13-alpine" <<<"$out"
+
+  # The host check on Windows, which the extension has no VFS for: the package imports, and
+  # `python -m sqlite_ursula` and `open()` fail with host_unsupported, whose fix is WSL.
+  sqlite-ursula-python-windows:
+    name: sqlite-ursula-python (Windows host check)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: python -m sqlite_ursula and open() fail with host_unsupported
+        shell: bash
+        working-directory: clients/sqlite-ursula-python
+        env:
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          status=0
+          out=$(uv run --no-project --python 3.13 python -m sqlite_ursula) || status=$?
+          echo "$out"
+          test "$status" -eq 1
+          grep -q "^result: host_unsupported" <<<"$out"
+          grep -q "^fix: .*WSL" <<<"$out"
+          script='
+          import sqlite_ursula
+          try:
+              sqlite_ursula.open("http://127.0.0.1:9/a/b")
+          except sqlite_ursula.UrsulaSetupError as e:
+              print(e.kind, e.action)
+          '
+          # Python writes \r\n on Windows.
+          kind=$(uv run --no-project --python 3.13 python -c "$script" | tr -d '\r')
+          echo "$kind"
+          test "$kind" = "host_unsupported fix"
+
+  # The Python suites on python:3.13-alpine (Alpine 3.23, SQLite 3.53), the image the Docker recipe
+  # switches to: the extension and the model server are built there for musl, the extension
+  # linked dynamically as npm-publish.yml builds it, since a musl Python cannot load a static one.
+  sqlite-ursula-python-alpine:
+    name: sqlite-ursula-python (model server, python:3.13-alpine)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 40
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build for musl and run the suites in python:3.13-alpine
+        timeout-minutes: 35
+        env:
+          IMAGE: public.ecr.aws/docker/library/python:3.13-alpine3.23@sha256:b30bef26263dd158b3c8a5cca642fcd2f9c83cb6942138db50208cdb9be78bfe
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          # As in npm-publish.yml, libsqlite3-sys must not probe a system libsqlite3.
+          docker run --rm -v "$PWD:/src" -w /src/clients/sqlite-vfs \
+            -e SQLITE3_LIB_DIR=/nonexistent -e CARGO_TERM_COLOR -e TOOLCHAIN="$toolchain" \
+            -e RUSTFLAGS="-C target-feature=-crt-static" \
+            "$IMAGE" sh -euxc '
+              apk add --no-cache curl gcc musl-dev
+              (cd / && curl --proto "=https" --tlsv1.2 --retry 5 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$TOOLCHAIN")
+              "$HOME/.cargo/bin/cargo" +"$TOOLCHAIN" build --locked --release
+              "$HOME/.cargo/bin/cargo" +"$TOOLCHAIN" build --locked --release --features model --bin ursula-vfs-model
+              python -c "import sqlite3; print(\"SQLite\", sqlite3.sqlite_version)"
+              pip install --no-cache-dir --root-user-action=ignore pytest==9.1.1
+              cd /src/clients/sqlite-ursula-python
+              E2E_SERVER=model URSULA_VFS_MODEL=/src/clients/sqlite-vfs/target/release/ursula-vfs-model \
+                SQLITE_URSULA_VFS=/src/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so python -m pytest -v
+            '
+
   # The release `ursula` for the e2e against the real server, cached by the inputs that build it so
   # a PR that touches only the extension or the package does not rebuild it. Bump the key's version
   # (v1) when the build command below changes.
@@ -490,6 +673,57 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: sqlite-vfs-e2e-ursula-${{ matrix.nodes }}-logs
+          path: ${{ runner.temp }}/e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The Python suites against one release `ursula` node with an in-memory cold store. The tests
+  # that script faults, which only the model takes, skip.
+  sqlite-ursula-python-ursula:
+    name: sqlite-ursula-python (ursula, 1 node, CPython 3.14)
+    needs: [build-ursula, sqlite-vfs]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=4/ram=16/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 20
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.6"
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: Download the extension
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: e2e
+        timeout-minutes: 10
+        working-directory: clients/sqlite-ursula-python
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" \
+            uv run --no-project --python 3.14 --with pytest==9.1.1 python -m pytest -v
+
+      - name: Upload the server log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlite-ursula-python-ursula-logs
           path: ${{ runner.temp }}/e2e-logs
           if-no-files-found: ignore
           retention-days: 7
