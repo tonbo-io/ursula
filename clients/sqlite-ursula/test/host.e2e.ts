@@ -518,6 +518,8 @@ function drainedLine(stdout: string): Drained {
 	const lines = stdout.split("\n");
 	expect(lines, stdout).toHaveLength(2);
 	expect(lines[1]).toBe("");
+	// The raw line, so a host's parser can pin real output as its fixtures.
+	console.log(`drain stdout: ${lines[0]}`);
 	const drained = JSON.parse(lines[0] as string) as Drained;
 	expect(Object.keys(drained)).toEqual(DRAINED_KEYS);
 	expect(drained.v).toBe(1);
