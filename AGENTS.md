@@ -392,6 +392,12 @@ candidates come from the Commit Candidate Build workflow, which saves the image
 in the Depot Registry. A candidate's chart is installed from a checkout of the
 same commit.
 
+Once the tag exists, the release dispatches `npm-publish.yml` and
+`pypi-publish.yml` on it, so `@tonbo/sqlite-ursula` and `sqlite-ursula` ship
+at the release's version. The PyPI run waits for the `pypi` environment's
+reviewer. Either can be dispatched again by hand on the tag
+(`gh workflow run pypi-publish.yml --ref v<version> -f ref=v<version> -f dry_run=false`).
+
 ## Security Considerations
 
 - `unsafe_code = "deny"` at the workspace level.

@@ -2547,7 +2547,7 @@ What CI runs (`.github/workflows/integration.yml`):
   `python:3.13-alpine` host the library their wheel carries. `python:3.13-slim` fails with
   `host_unsupported` because its SQLite is older than the extension's floor, and the
   `py3-none-any` wheel because it carries no library.
-- `pypi-publish.yml`, by hand only: these wheels, published to PyPI through trusted publishing
+- `pypi-publish.yml`, dispatched on the tag by the Stable Release workflow, or by hand: these wheels, published to PyPI through trusted publishing
   from the `pypi` environment. A release's version publishes only from its tag `v<release>`,
   which must name the commit built, and `-patchN` releases carry `.postN`
   (`scripts/python-version.sh`). A `.devN` pre-release of the next patch publishes from a run on

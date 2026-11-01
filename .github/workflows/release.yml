@@ -408,3 +408,27 @@ jobs:
           gh release view "$tag" --repo "$REPOSITORY" --json tagName,isDraft,isPrerelease \
             --jq 'select(.tagName == "'"$tag"'" and .isDraft == false and .isPrerelease == false)' \
             >/dev/null
+
+  # The SQLite client packages publish from the release tag, which exists only
+  # once finalize has run. npm and PyPI trusted publishing trust their own
+  # workflow files, not this one, so each is dispatched on the tag rather than
+  # called. The `pypi` environment then waits for its reviewer.
+  packages:
+    name: Dispatch npm and PyPI publishes
+    needs: [validate, finalize]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch npm-publish.yml and pypi-publish.yml on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+          for workflow in npm-publish.yml pypi-publish.yml; do
+            gh workflow run "$workflow" --repo "$REPOSITORY" --ref "$tag" -f ref="$tag" -f dry_run=false
+            echo "Dispatched $workflow on $tag: https://github.com/$REPOSITORY/actions/workflows/$workflow" >>"$GITHUB_STEP_SUMMARY"
+          done
