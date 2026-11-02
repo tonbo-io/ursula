@@ -537,6 +537,17 @@ impl Gateway {
                         _ => 0,
                     },
                     response_bytes: 0,
+                    // Only reads are broken down by stream, and only by a
+                    // collector that counts them.
+                    stream_read: match ctx.class {
+                        UsageClass::Read | UsageClass::LiveRead
+                            if collector.counts_stream_reads() =>
+                        {
+                            ctx.stream_id.clone()
+                        }
+                        _ => None,
+                    },
+                    read_succeeded: false,
                 })
             }),
             _live_guard: live_guard,
@@ -797,6 +808,7 @@ impl Gateway {
         };
 
         let bucket_id = request.resource.bucket_id.clone();
+        let stream_id = request.resource.stream_id.clone();
         let action = request.action;
         let decision = access_control
             .authorizer()
@@ -822,6 +834,7 @@ impl Gateway {
         };
         Ok(Some(RequestContext {
             bucket_id,
+            stream_id,
             class: usage_class(action),
             credential_expires_at: principal.as_ref().map(|principal| principal.expires_at),
             principal: principal.as_ref().map(principal_ref),
@@ -1352,9 +1365,12 @@ impl Gateway {
 
     fn build_response(
         upstream_resp: reqwest::Response,
-        tail: ResponseTail,
+        mut tail: ResponseTail,
     ) -> Result<Response<Body>, GatewayError> {
         let status = upstream_resp.status();
+        if let Some(meter) = &mut tail.meter {
+            meter.read_succeeded = status.is_success() || status == StatusCode::NOT_MODIFIED;
+        }
         let mut headers = copy_forwarded_headers(upstream_resp.headers(), false);
 
         if status == StatusCode::TEMPORARY_REDIRECT {
@@ -1849,6 +1865,8 @@ fn is_not_hosted(response: &reqwest::Response) -> bool {
 /// authorized the request.
 struct RequestContext {
     bucket_id: String,
+    /// The stream the request names, `None` for a bucket's own routes.
+    stream_id: Option<String>,
     class: UsageClass,
     principal: Option<PrincipalRef>,
     limits: TenantLimits,
@@ -2327,17 +2345,32 @@ struct EgressMeter {
     request_bytes: u64,
     response_bytes: u64,
     chunks: u64,
+    /// The stream a read names, when the collector breaks reads down by
+    /// stream.
+    stream_read: Option<String>,
+    /// Whether the upstream answered the read `2xx` or `304`. Only such a
+    /// read counts for its stream, so a stream that does not exist never
+    /// gets a key.
+    read_succeeded: bool,
 }
 
 impl Drop for EgressMeter {
     fn drop(&mut self) {
-        self.collector.record(
-            self.key.clone(),
-            1,
-            self.request_bytes,
-            self.response_bytes,
-            self.chunks,
-        );
+        match self.stream_read.take() {
+            // A read carries no request bytes or chunks, so its bucket's
+            // record is the same either way.
+            Some(stream_id) if self.read_succeeded => {
+                self.collector
+                    .record_read(self.key.clone(), &stream_id, self.response_bytes);
+            }
+            _ => self.collector.record(
+                self.key.clone(),
+                1,
+                self.request_bytes,
+                self.response_bytes,
+                self.chunks,
+            ),
+        }
     }
 }
 

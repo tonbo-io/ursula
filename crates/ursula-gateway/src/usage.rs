@@ -8,7 +8,11 @@
 //! separately; the two ledgers are complementary, not duplicates.
 //!
 //! Aggregation model: counters accumulate in memory keyed by
-//! `(bucket, principal, action class)`. A background exporter drains them on
+//! `(bucket, principal, action class)`. A collector built with
+//! [`UsageCollector::with_stream_reads`] also breaks the successful reads down
+//! by stream, keyed by `(bucket, stream, action class)`, which a bucket's
+//! records cannot say once a bucket holds many streams. A background exporter
+//! drains them on
 //! an interval into cursor-bearing [`UsageBatch`]es and hands them to a
 //! [`UsageSink`]. A failing sink delays reporting — batches queue and merge —
 //! but never blocks request handling or drops counters while the process stays
@@ -17,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -84,6 +89,32 @@ pub struct UsageRecord {
     pub counters: UsageCounters,
 }
 
+/// Key of a per-stream read count: a stream of a bucket and the read's
+/// class, [`UsageClass::Read`] or [`UsageClass::LiveRead`]. No principal: the
+/// bucket's records already say who read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct StreamReadKey {
+    pub bucket_id: String,
+    pub stream_id: String,
+    pub class: UsageClass,
+}
+
+/// What one stream's successful reads of one class cost in a window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct StreamReadCounters {
+    pub requests: u64,
+    /// Bytes streamed to the readers, as in [`UsageCounters::response_bytes`].
+    pub response_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamReadRecord {
+    #[serde(flatten)]
+    pub key: StreamReadKey,
+    #[serde(flatten)]
+    pub counters: StreamReadCounters,
+}
+
 /// One export unit. `sequence` increases by one per drained window, so a
 /// consumer can deduplicate replays and detect gaps; merged batches keep the
 /// earliest sequence and widest window.
@@ -93,6 +124,22 @@ pub struct UsageBatch {
     pub window_start_unix_ms: u64,
     pub window_end_unix_ms: u64,
     pub records: Vec<UsageRecord>,
+    /// The window's successful reads per stream, a breakdown of part of the
+    /// `read` and `live_read` records above, when the collector counts them
+    /// ([`UsageCollector::with_stream_reads`]). A read counts here when its
+    /// upstream answered `2xx` or `304`, so a stream that does not exist never
+    /// gets a key. Left out of the JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stream_reads: Vec<StreamReadRecord>,
+    /// Successful reads not broken down by stream because the window already
+    /// held the collector's limit of streams. They are counted in `records`
+    /// all the same. Left out of the JSON when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stream_reads_unattributed: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 pub type UsageSinkFuture<'a> =
@@ -155,20 +202,64 @@ impl UsageSink for JsonlUsageSink {
 #[derive(Default)]
 struct CollectorState {
     counters: HashMap<UsageKey, UsageCounters>,
+    stream_reads: HashMap<StreamReadKey, StreamReadCounters>,
+    stream_reads_unattributed: u64,
     window_start_unix_ms: Option<u64>,
     next_sequence: u64,
     pending: VecDeque<UsageBatch>,
+}
+
+impl CollectorState {
+    fn add(
+        &mut self,
+        key: UsageKey,
+        requests: u64,
+        request_bytes: u64,
+        response_bytes: u64,
+        chunks: u64,
+    ) {
+        let now = unix_time_ms();
+        self.window_start_unix_ms.get_or_insert(now);
+        let counters = self.counters.entry(key).or_default();
+        counters.requests = counters.requests.saturating_add(requests);
+        counters.request_bytes = counters.request_bytes.saturating_add(request_bytes);
+        counters.response_bytes = counters.response_bytes.saturating_add(response_bytes);
+        counters.chunks = counters.chunks.saturating_add(chunks);
+    }
 }
 
 /// In-memory accumulation shared between the request path and the exporter.
 #[derive(Default)]
 pub struct UsageCollector {
     state: Mutex<CollectorState>,
+    /// The most streams one window breaks reads down by, or `None` when the
+    /// collector does not count reads per stream.
+    stream_read_limit: Option<NonZeroUsize>,
 }
 
 impl UsageCollector {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A collector that also counts each stream's successful reads
+    /// ([`UsageBatch::stream_reads`]), for at most `limit` streams per
+    /// window. Reads of further streams count in
+    /// [`UsageBatch::stream_reads_unattributed`], so a reader that walks many
+    /// streams bounds the window's memory, not the count.
+    ///
+    /// The counts are counters only: no request is logged, and a stream's
+    /// key holds its bucket, its id and the class of the read.
+    pub fn with_stream_reads(limit: NonZeroUsize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::default(),
+            stream_read_limit: Some(limit),
+        })
+    }
+
+    /// Whether the collector breaks reads down by stream.
+    pub fn counts_stream_reads(&self) -> bool {
+        self.stream_read_limit.is_some()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CollectorState> {
@@ -185,14 +276,43 @@ impl UsageCollector {
         response_bytes: u64,
         chunks: u64,
     ) {
-        let now = unix_time_ms();
-        let mut state = self.lock();
-        state.window_start_unix_ms.get_or_insert(now);
-        let counters = state.counters.entry(key).or_default();
-        counters.requests = counters.requests.saturating_add(requests);
-        counters.request_bytes = counters.request_bytes.saturating_add(request_bytes);
-        counters.response_bytes = counters.response_bytes.saturating_add(response_bytes);
-        counters.chunks = counters.chunks.saturating_add(chunks);
+        self.lock()
+            .add(key, requests, request_bytes, response_bytes, chunks);
+    }
+
+    /// Records one successful read of `stream_id`: in its bucket's record,
+    /// as [`UsageCollector::record`] records a request without a body, and,
+    /// when the collector counts reads per stream and `key` is a read, in
+    /// the stream's. Both land in the same window.
+    pub fn record_read(&self, key: UsageKey, stream_id: &str, response_bytes: u64) {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let class = key.class;
+        let bucket_id = key.bucket_id.clone();
+        state.add(key, 1, 0, response_bytes, 0);
+        let Some(limit) = self.stream_read_limit else {
+            return;
+        };
+        if !matches!(class, UsageClass::Read | UsageClass::LiveRead) {
+            return;
+        }
+        let stream_key = StreamReadKey {
+            bucket_id,
+            stream_id: stream_id.to_owned(),
+            class,
+        };
+        let full = state.stream_reads.len() >= limit.get();
+        if let Some(counters) = state.stream_reads.get_mut(&stream_key) {
+            counters.requests = counters.requests.saturating_add(1);
+            counters.response_bytes = counters.response_bytes.saturating_add(response_bytes);
+        } else if full {
+            state.stream_reads_unattributed = state.stream_reads_unattributed.saturating_add(1);
+        } else {
+            state.stream_reads.insert(stream_key, StreamReadCounters {
+                requests: 1,
+                response_bytes,
+            });
+        }
     }
 
     /// Moves the current window into the pending queue. Returns whether any
@@ -206,6 +326,12 @@ impl UsageCollector {
                 .drain()
                 .map(|(key, counters)| UsageRecord { key, counters })
                 .collect::<Vec<_>>();
+            let stream_reads = state
+                .stream_reads
+                .drain()
+                .map(|(key, counters)| StreamReadRecord { key, counters })
+                .collect::<Vec<_>>();
+            let stream_reads_unattributed = std::mem::take(&mut state.stream_reads_unattributed);
             let window_start = state.window_start_unix_ms.take().unwrap_or(now);
             let sequence = state.next_sequence;
             state.next_sequence = state.next_sequence.saturating_add(1);
@@ -214,6 +340,8 @@ impl UsageCollector {
                 window_start_unix_ms: window_start,
                 window_end_unix_ms: now,
                 records,
+                stream_reads,
+                stream_reads_unattributed,
             });
             while state.pending.len() > MAX_PENDING_BATCHES {
                 merge_oldest_unsent(&mut state.pending);
@@ -289,6 +417,27 @@ fn merge_oldest(pending: &mut VecDeque<UsageBatch>) {
         .into_iter()
         .map(|(key, counters)| UsageRecord { key, counters })
         .collect();
+    // No limit applies here: the merged map holds no more keys than the two
+    // batches did.
+    let mut stream_reads: HashMap<StreamReadKey, StreamReadCounters> = HashMap::new();
+    for record in oldest
+        .stream_reads
+        .into_iter()
+        .chain(next.stream_reads.drain(..))
+    {
+        let counters = stream_reads.entry(record.key).or_default();
+        counters.requests = counters.requests.saturating_add(record.counters.requests);
+        counters.response_bytes = counters
+            .response_bytes
+            .saturating_add(record.counters.response_bytes);
+    }
+    next.stream_reads = stream_reads
+        .into_iter()
+        .map(|(key, counters)| StreamReadRecord { key, counters })
+        .collect();
+    next.stream_reads_unattributed = next
+        .stream_reads_unattributed
+        .saturating_add(oldest.stream_reads_unattributed);
 }
 
 /// Drains the collector on an interval. A sink failure leaves the batch at
@@ -549,6 +698,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_reads_break_down_successful_reads_up_to_the_limit() {
+        let collector = UsageCollector::with_stream_reads(NonZeroUsize::MIN.saturating_add(1));
+        collector.record_read(key("tenant-a", UsageClass::Read), "db-1", 100);
+        collector.record_read(key("tenant-a", UsageClass::Read), "db-1", 50);
+        collector.record_read(key("tenant-a", UsageClass::LiveRead), "db-1", 7);
+        // The window holds two streams: a third is counted for its bucket only.
+        collector.record_read(key("tenant-a", UsageClass::Read), "db-2", 9);
+        // An append is never a stream read.
+        collector.record_read(key("tenant-a", UsageClass::Append), "db-3", 0);
+
+        let sink = FlakySink::new(true);
+        flush(&collector, &sink).await;
+        let batch = sink.exported.lock().expect("lock")[0].clone();
+
+        let read = batch
+            .records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Read)
+            .expect("read record");
+        assert_eq!(read.counters.requests, 3, "the bucket counts every read");
+        assert_eq!(read.counters.response_bytes, 159);
+        let mut stream_reads = batch
+            .stream_reads
+            .iter()
+            .map(|record| {
+                (
+                    record.key.stream_id.as_str(),
+                    record.key.class,
+                    record.counters.requests,
+                    record.counters.response_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        stream_reads.sort_by_key(|row| row.1 == UsageClass::LiveRead);
+        assert_eq!(stream_reads, [
+            ("db-1", UsageClass::Read, 2, 150),
+            ("db-1", UsageClass::LiveRead, 1, 7)
+        ]);
+        assert_eq!(batch.stream_reads_unattributed, 1);
+
+        let json = serde_json::to_value(&batch).expect("serialize");
+        let row = json["stream_reads"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["class"] == "read"))
+            .expect("read row");
+        assert_eq!(
+            *row,
+            serde_json::json!({
+                "bucket_id": "tenant-a",
+                "stream_id": "db-1",
+                "class": "read",
+                "requests": 2,
+                "response_bytes": 150
+            })
+        );
+        assert_eq!(json["stream_reads_unattributed"], 1);
+    }
+
+    #[test]
+    fn merged_batches_keep_their_stream_reads() {
+        let collector = UsageCollector::with_stream_reads(NonZeroUsize::MIN);
+        for _ in 0..(MAX_PENDING_BATCHES + 8) {
+            collector.record_read(key("tenant-a", UsageClass::Read), "db-1", 1);
+            collector.record_read(key("tenant-a", UsageClass::Read), "db-2", 1);
+            collector.rotate();
+        }
+
+        let state = collector.lock();
+        let requests: u64 = state
+            .pending
+            .iter()
+            .flat_map(|batch| &batch.stream_reads)
+            .map(|record| record.counters.requests)
+            .sum();
+        let unattributed: u64 = state
+            .pending
+            .iter()
+            .map(|batch| batch.stream_reads_unattributed)
+            .sum();
+        assert_eq!(requests, (MAX_PENDING_BATCHES + 8) as u64);
+        assert_eq!(unattributed, (MAX_PENDING_BATCHES + 8) as u64);
+    }
+
+    #[tokio::test]
     async fn jsonl_sink_appends_one_line_per_batch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("usage.jsonl");
@@ -561,5 +794,8 @@ mod tests {
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("\"tenant-a\""));
         assert!(contents.contains("\"response_bytes\":42"));
+        // A collector that does not count stream reads keeps the batch's
+        // earlier shape.
+        assert!(!contents.contains("stream_reads"));
     }
 }
