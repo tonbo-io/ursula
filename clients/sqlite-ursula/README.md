@@ -144,9 +144,11 @@ const harness = await Harness.open(storage, { models, registry }, context);
 await harness.close(context); // closes the storage too
 ```
 
-`harness.close(context)` closes the storage the harness was opened with, on Pi 1.0 to 1.3, so the storage needs no close of its own. Without `dir` it uses the default cache root.
+`harness.close(context)` closes the storage the harness was opened with, on Pi 1.0 to 1.5, so the storage needs no close of its own. Without `dir` it uses the default cache root.
 
-Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0, and the `/pi` entry is the only one that imports it.
+Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures: on Pi 1.5, which stores a group of commits in one `Storage.commit` call, the whole call runs again with the same batches. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.6.0, and the `/pi` entry is the only one that imports it.
+
+Pi 1.4 migrates a SQLite storage to its schema version 2 when it opens it, and Pi 1.3 or older cannot open a migrated one. A replicated database is no exception: the migration is a commit like any other, so once a Pi 1.4 or newer owner opened the stream, every later owner, a fresh cache built from the stream included, needs Pi 1.4 or newer. Roll a deployment back past Pi 1.4 only onto a new stream.
 
 `openUrsulaPiStorage(url, options)` passes `dir`, `token`, `signal`, `maxPendingBytes` and `recreate` to `open`, and takes no other option of `open`. `walAutoCheckpointPages` (SQLite's WAL auto-checkpoint threshold) and `busyTimeoutMs` (how long a statement waits for a lock) go to Pi's node driver, which opens its own connection on the database and applies Pi's defaults to the ones you leave out. `closeTimeoutMs` is 10 s by default.
 

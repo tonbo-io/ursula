@@ -405,11 +405,13 @@ jobs:
 
       # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
       # optional peer dependency, ">=oldest <first-unsupported", and the step above tests the version
-      # in the lockfile (a devDependency). This one installs the oldest without saving it, then runs
-      # the typecheck and the Pi suites: Pi's storage conformance in three modes, and the adapter's
-      # mapping of backlog_full and resets, which conformance never triggers.
-      - name: Pi suite on the oldest supported pi-durable
-        timeout-minutes: 10
+      # in the lockfile (a devDependency), the newest. This one installs older ones without saving
+      # them, then runs the typecheck and the Pi suites: Pi's storage conformance in three modes, and
+      # the adapter's mapping of backlog_full and resets, which conformance never triggers. The oldest,
+      # which throws backlog_full as StorageRejected, and 1.4.0, the last whose Storage.commit stores
+      # one commit per call, which the adapter runs again as a transaction.
+      - name: Pi suite on the oldest supported pi-durable and on 1.4.0
+        timeout-minutes: 15
         run: |
           cd clients/sqlite-ursula
           range=$(node -p 'require("./package.json").peerDependencies["@earendil-works/pi-durable"]')
@@ -418,18 +420,20 @@ jobs:
             if (bounds === null) throw new Error("pi-durable range is not >=oldest <first-unsupported: " + process.argv[1]);
             console.log(bounds[1]);
           ' "$range")
-          # pi-durable, pi-ai and chord are released together: test the oldest version of all three,
-          # the set an application on that release has, not the oldest pi-durable with newer siblings.
+          # pi-durable, pi-ai and chord are released together: test each version of all three, the
+          # set an application on that release has, not an older pi-durable with newer siblings.
           pkgs=(@earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord)
-          npm install --no-save "${pkgs[@]/%/@$oldest}"
-          for pkg in "${pkgs[@]}"; do
-            # By path: pi-ai's exports map does not expose its package.json.
-            installed=$(node -p "require(\"./node_modules/$pkg/package.json\").version")
-            echo "Pi suite on $pkg $installed, the oldest of $range"
-            [ "$installed" = "$oldest" ]
+          for version in "$oldest" 1.4.0; do
+            npm install --no-save "${pkgs[@]/%/@$version}"
+            for pkg in "${pkgs[@]}"; do
+              # By path: pi-ai's exports map does not expose its package.json.
+              installed=$(node -p "require(\"./node_modules/$pkg/package.json\").version")
+              echo "Pi suite on $pkg $installed, of $range"
+              [ "$installed" = "$version" ]
+            done
+            npm run typecheck
+            E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
           done
-          npm run typecheck
-          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
 
   # The fork guard (design: Forks) in a host that forks: CPython's sqlite3 with the extension
   # loaded, against the model server. A uv-managed CPython, whose SQLite is new enough and loads

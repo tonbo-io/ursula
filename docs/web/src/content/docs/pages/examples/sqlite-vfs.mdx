@@ -199,15 +199,17 @@ const harness = await Harness.open(storage, { models, registry }, context);
 await harness.close(context); // closes the storage too
 ```
 
-Without `dir` it uses the default cache root. On Pi 1.0 to 1.3, `harness.close(context)` closes the storage the harness was opened with, so the storage needs no close of its own.
+Without `dir` it uses the default cache root. On Pi 1.0 to 1.5, `harness.close(context)` closes the storage the harness was opened with, so the storage needs no close of its own.
 
 `openUrsulaPiStorage` opens the stream with `open` and runs Pi's own node driver on it. Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it.
 
-- A commit refused with `backlog_full` commits nothing. From Pi 1.2, it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, and the session continues.
+- A commit refused with `backlog_full` commits nothing. From Pi 1.2, it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.5, which stores a group of commits in one `Storage.commit` call, the whole call runs again with the same batches. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, and the session continues.
 - A reset throws the `UrsulaResetError` itself, so the session stops. Open the storage again, or stop when its `action` is `stop`.
-- `close` waits up to `closeTimeoutMs` for `synced()`, then closes. On Pi 1.3, `Session.close` first waits for the storage calls in flight, which wait for the stream, so closing a session during an outage waits until the stream answers. Bound the shutdown in your host if it must end sooner.
+- `close` waits up to `closeTimeoutMs` for `synced()`, then closes. From Pi 1.3, `Session.close` first waits for the storage calls in flight, which wait for the stream, so closing a session during an outage waits until the stream answers. Bound the shutdown in your host if it must end sooner.
 
-`@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.4.0`, and npm refuses the install with `ERESOLVE` outside it.
+`@earendil-works/pi-durable` is an optional peer dependency in the range `>=1.0.0 <1.6.0`, and npm refuses the install with `ERESOLVE` outside it.
+
+Pi 1.4 migrates a SQLite storage to its schema version 2 when it opens it, and Pi 1.3 or older cannot open a migrated one. The migration replicates like any other commit, so once an owner on Pi 1.4 or newer opened the stream, every later owner needs Pi 1.4 or newer, a fresh cache built from the stream included. Roll a deployment back past Pi 1.4 only onto a new stream.
 
 ## Other hosts
 
