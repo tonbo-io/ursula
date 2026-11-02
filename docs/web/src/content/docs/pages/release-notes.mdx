@@ -3,6 +3,19 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.11.5
+
+0.11.5 is a patch of 0.11 and interoperates with 0.11.0 through 0.11.4: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, `ursulactl` and the extension change only their version. Nodes, gateways and extensions of 0.11.0 through 0.11.5 run in one cluster and open, read and import the same streams. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), and the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.5. Rolling back to any earlier 0.11 release is safe.
+
+### Gateway
+
+- **Reads per stream in the usage export.** A bucket's `read` and `live_read` usage records say how much a bucket was read, not which of its streams. `ursulagw --usage-stream-reads <STREAMS>` (in the library, `UsageCollector::with_stream_reads`) adds `stream_reads` to each batch: per bucket, stream and class, the `requests` and `response_bytes` of the reads whose upstream answered `2xx` or `304`, so a stream that does not exist never gets a record. At most `STREAMS` streams are broken down per export window; reads of further streams count in `stream_reads_unattributed`. Every read stays in its bucket's record as before. Counters only, no request is logged. Without the flag a batch keeps its earlier shape. See [Security](/docs/security).
+- **`UsageBatch` gains two public fields**, `stream_reads` and `stream_reads_unattributed`, so code that builds a batch with a struct literal adds them.
+
+### Known issues
+
+The known issues of [0.11.0](#0110) are unchanged.
+
 ## 0.11.4
 
 0.11.4 is a patch of 0.11 and interoperates with 0.11.0 through 0.11.3: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, the gateway, `ursulactl` and the extension change only their version. Nodes and extensions of 0.11.0 through 0.11.4 run in one cluster and open, read and import the same streams. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), and the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.4. Rolling back to any earlier 0.11 release is safe, except that a Pi Durable storage opened by Pi 1.4 or newer cannot be opened by Pi 1.3 or older (below).
