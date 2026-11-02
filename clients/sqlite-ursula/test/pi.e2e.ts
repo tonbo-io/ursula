@@ -1,12 +1,13 @@
 // Pi Durable on the replicated database (openUrsulaPiStorage), against the e2e server
 // (test/stack.ts): the adapter's mapping, which Pi's conformance (test/conformance.e2e.ts) never
-// triggers: `backlog_full` runs again after `synced()` from Pi 1.2 and is Pi's StorageRejected up
-// to 1.1, a reset is the UrsulaResetError itself, and `close` gives up waiting at `closeTimeoutMs`.
+// triggers: `backlog_full` runs again after `synced()` from Pi 1.2 (from 1.5 the whole grouped
+// commit, each batch received once) and is Pi's StorageRejected up to 1.1, a reset is the
+// UrsulaResetError itself, and `close` gives up waiting at `closeTimeoutMs`.
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import * as durable from "@earendil-works/pi-durable";
-import type { ConversationId, Storage } from "@earendil-works/pi-durable";
-import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
+import type { ConversationId, EntryId, Seq, Storage } from "@earendil-works/pi-durable";
+import { type SqliteDatabase, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, UrsulaResetError, type UrsulaStatus, UrsulaWriteRefusedError } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
@@ -16,6 +17,14 @@ const control = loadUrsulaVfs(ext());
 /** Pi's StorageRejected, which Pi 1.2 removed. */
 const StorageRejected = (durable as Record<string, unknown>).StorageRejected as (new (message: string) => Error) | undefined;
 const ctx: Context = BACKGROUND_CONTEXT;
+/** Whether `Storage.commit` takes a group of commits, `commit(batches, receive, context)`, as from Pi 1.5. */
+const grouped = SqliteStorage.prototype.commit.length >= 3;
+/** Pi 1.5's `Storage.commit`, typed here so the suite also compiles on the single-commit releases. */
+type GroupedCommit = (
+	batches: readonly (readonly object[])[],
+	receive: (index: number, seq: Seq) => void,
+	context: Context,
+) => Promise<{ readonly stored: number; readonly refused?: unknown }>;
 afterEach(killChildren);
 
 /** The SQLite facade under a storage openUrsulaPiStorage made: the wrapped node driver. */
@@ -46,6 +55,37 @@ describe("openUrsulaPiStorage", () => {
 		expect(order[0]).toBe(1);
 		await db.run("INSERT INTO t VALUES (4)");
 		expect(await db.all("SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }]);
+		const { commits } = status(storage);
+		expect(commits.acknowledged).toBe(commits.logged);
+		await storage.close(ctx);
+	});
+
+	it.runIf(grouped)("runs a grouped commit refused with backlog_full again, each batch received once (Pi 1.5 on)", async () => {
+		const storage = await openUrsulaPiStorage(stream("pi-grouped").url, { dir: freshDir(), maxPendingBytes: 1 });
+		const commit = (storage.commit as unknown as GroupedCommit).bind(storage);
+		// The root conversation, ID 1, which Pi reserves: the first ID it mints is 2.
+		const root = 1 as ConversationId;
+		const first = await commit([[{ type: "conversation", value: { id: root } }]], () => {}, ctx);
+		expect(first).toEqual({ stored: 1 });
+		await fault("delay 1500", 1, "POST");
+		// This commit waits for the stream, which holds the backlog full meanwhile.
+		const holding = facade(storage).exec("CREATE TABLE t(x)");
+		const ids = [await storage.mintId<EntryId>(), await storage.mintId<EntryId>()];
+		const received: [number, Seq][] = [];
+		const group = commit(
+			ids.map((id) => [{ type: "entry", value: { id, conversationId: root, kind: "message" } }]),
+			(index, seq) => received.push([index, seq]),
+			ctx,
+		);
+		await new Promise((r) => setTimeout(r, 300));
+		expect(status(storage).refused).toMatchObject({ kind: "backlog_full", action: "retry" });
+		expect(received).toEqual([]);
+		await holding;
+		expect(await group).toEqual({ stored: 2 });
+		expect(received.map(([index]) => index)).toEqual([0, 1]);
+		const [[, a], [, b]] = received as [[number, Seq], [number, Seq]];
+		expect(b).toBeGreaterThan(a);
+		expect((await storage.entry(ids[1] as EntryId, ctx))?.commitSeq).toBe(b);
 		const { commits } = status(storage);
 		expect(commits.acknowledged).toBe(commits.logged);
 		await storage.close(ctx);

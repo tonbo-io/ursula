@@ -12,7 +12,7 @@
 // names a snapshot, then opens a fresh cache and checks that it was built from that snapshot.
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { ConversationId, EntryId, Id, Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
+import type { ConversationId, EntryId, Id, Storage } from "@earendil-works/pi-durable";
 import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { afterAll, describe, expect, it } from "vitest";
@@ -36,6 +36,10 @@ const facade = (storage: Storage): SqliteDatabase => (storage as unknown as { db
 /** The local file a storage openUrsulaPiStorage made runs Pi's node driver on. */
 const location = (storage: Storage): string => (storage as unknown as { db: { database: { location(): string } } }).db.database.location();
 
+/** `Storage.commit`'s arguments and settled result: one commit up to Pi 1.4, a group of them from 1.5. */
+type CommitArgs = Parameters<Storage["commit"]>;
+type Committed = Awaited<ReturnType<Storage["commit"]>>;
+
 const status = (path: string): UrsulaStatus => JSON.parse(Object.values(control.prepare("SELECT ursula_status(?)").get(path) as Record<string, string>)[0] as string) as UrsulaStatus;
 
 /**
@@ -51,17 +55,17 @@ function onSynced(storage: Storage, mode: string): Storage {
 	opens.set(mode, counts);
 	let inflight = 0;
 	const commit = storage.commit.bind(storage);
-	storage.commit = async (writes: readonly StorageWrite[], c: Context): Promise<Seq> => {
+	storage.commit = async (...args: CommitArgs): Promise<Committed> => {
 		inflight += 1;
 		try {
-			const seq = await commit(writes, c);
+			const committed = await commit(...args);
 			if (inflight === 1) {
 				const { commits } = status(path);
 				expect(commits.acknowledged, "a Pi commit resolved before the stream acknowledged it").toBe(commits.logged);
 				expect(commits).toMatchObject({ pending: 0, pending_bytes: 0 });
 				checked.set(mode, (checked.get(mode) ?? 0) + 1);
 			}
-			return seq;
+			return committed;
 		} finally {
 			inflight -= 1;
 		}
@@ -81,10 +85,10 @@ class ReopeningStorage implements Storage {
 	static async open(reopen: () => Promise<Storage>): Promise<ReopeningStorage> {
 		return new ReopeningStorage(await reopen(), reopen);
 	}
-	async commit(writes: readonly StorageWrite[], c: Context): Promise<Seq> {
-		if (this.closed) return this.current.commit(writes, c);
+	async commit(...args: CommitArgs): Promise<Committed> {
+		if (this.closed) return this.current.commit(...args);
 		try {
-			return await this.current.commit(writes, c);
+			return await this.current.commit(...args);
 		} finally {
 			await this.current.close(ctx);
 			this.current = await this.reopen();
