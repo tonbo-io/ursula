@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -3968,6 +3969,66 @@ mod admission_and_usage {
             .find(|record| record.key.class == UsageClass::Read)
             .expect("read usage record");
         assert_eq!(read_record.counters.chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn only_answered_reads_count_for_their_stream() {
+        // `/tenant-a/orders` exists; any other stream answers 404.
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "0123456789" })))
+                .await;
+        let collector = UsageCollector::with_stream_reads(NonZeroUsize::MIN.saturating_add(9));
+        let gateway = metered_gateway(&upstream.url, Arc::clone(&collector), None);
+
+        for (method, uri, status) in [
+            ("GET", "/tenant-a/orders", StatusCode::OK),
+            (
+                "GET",
+                "/tenant-a/orders?offset=now&live=long-poll",
+                StatusCode::OK,
+            ),
+            ("POST", "/tenant-a/orders", StatusCode::OK),
+            ("GET", "/tenant-a/missing", StatusCode::NOT_FOUND),
+        ] {
+            let response = send(&gateway, method, uri, "").await;
+            assert_eq!(response.status(), status, "{method} {uri}");
+            let _ = response.into_body().collect().await.expect("body");
+        }
+
+        let sink = CapturingSink {
+            batches: Mutex::new(Vec::new()),
+        };
+        crate::usage::flush(&collector, &sink).await;
+        let batches = sink.batches.lock().expect("batches lock");
+        let batch = &batches[0];
+        let read_record = batch
+            .records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Read)
+            .expect("read usage record");
+        assert_eq!(
+            read_record.counters.requests, 2,
+            "the bucket counts the 404"
+        );
+        let mut stream_reads = batch
+            .stream_reads
+            .iter()
+            .map(|record| {
+                (
+                    record.key.bucket_id.as_str(),
+                    record.key.stream_id.as_str(),
+                    record.key.class,
+                    record.counters.requests,
+                    record.counters.response_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        stream_reads.sort_by_key(|row| row.2 == UsageClass::LiveRead);
+        assert_eq!(stream_reads, [
+            ("tenant-a", "orders", UsageClass::Read, 1, 10),
+            ("tenant-a", "orders", UsageClass::LiveRead, 1, 10),
+        ]);
+        assert_eq!(batch.stream_reads_unattributed, 0);
     }
 }
 

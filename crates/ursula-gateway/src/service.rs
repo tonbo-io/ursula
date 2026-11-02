@@ -67,7 +67,10 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut usage_exporter = None;
     if let Some(usage_path) = &args.usage_log {
         let sink = Arc::new(JsonlUsageSink::create(usage_path)?);
-        let collector = UsageCollector::new();
+        let collector = match args.usage_stream_reads {
+            Some(limit) => UsageCollector::with_stream_reads(limit),
+            None => UsageCollector::new(),
+        };
         gateway = gateway.with_usage_collector(Arc::clone(&collector));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         usage_exporter = Some(tokio::spawn(crate::usage::run_exporter(
@@ -451,6 +454,14 @@ pub struct GatewayArgs {
     /// is cheaper to serve.
     #[arg(long, value_name = "BYTES", requires = "usage_log")]
     usage_chunk_bytes: Option<NonZeroU64>,
+
+    /// Also count each stream's successful reads (requests and response
+    /// bytes, by read and live read) as `stream_reads`, for at most this many
+    /// streams per export window. Reads of further streams in the window are
+    /// counted as `stream_reads_unattributed`. Unset counts reads per bucket
+    /// only.
+    #[arg(long, value_name = "STREAMS", requires = "usage_log")]
+    usage_stream_reads: Option<NonZeroUsize>,
 
     /// Origin allowed to read across origins. Repeat per origin, or pass `*`.
     /// Unset disables CORS, which leaves anonymous `public_read` buckets
