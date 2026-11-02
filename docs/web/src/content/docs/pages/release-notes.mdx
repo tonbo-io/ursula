@@ -3,6 +3,23 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.11.4
+
+0.11.4 is a patch of 0.11 and interoperates with 0.11.0 through 0.11.3: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, the gateway, `ursulactl` and the extension change only their version. Nodes and extensions of 0.11.0 through 0.11.4 run in one cluster and open, read and import the same streams. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), and the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.4. Rolling back to any earlier 0.11 release is safe, except that a Pi Durable storage opened by Pi 1.4 or newer cannot be opened by Pi 1.3 or older (below).
+
+### `@tonbo/sqlite-ursula`
+
+- **Pi Durable 1.4 and 1.5 in `/pi`.** The optional peer range of `@earendil-works/pi-durable` is `>=1.0.0 <1.6.0`, up from `<1.4.0`, so an application on the current Pi installs the package. On Pi 1.5, whose `Storage.commit` stores a group of commits in one call, a call refused with `backlog_full` runs again whole, with the same batches, once `synced()` drained the backlog; running only its transaction again would have received each batch twice. `runCounted`, new in Pi 1.5, waits for `synced()` like `run`. Pi 1.0 to 1.4 behave as before. See [Pi Durable](/docs/examples/sqlite-vfs#pi-durable).
+- **Pi 1.4's schema migration is one way.** Pi 1.4 migrates a SQLite storage to its schema version 2 when it opens it, and Pi 1.3 or older cannot open a migrated one. The migration replicates like any other commit, so once an owner on Pi 1.4 or newer opened a stream, every later owner needs Pi 1.4 or newer, a fresh cache built from the stream included.
+
+### Release
+
+- **The stable release dispatches the npm and PyPI publishes** on its tag, once the GitHub Release exists.
+
+### Known issues
+
+The known issues of [0.11.0](#0110) are unchanged.
+
 ## 0.11.3
 
 0.11.3 is a patch of 0.11 and interoperates with 0.11.0, 0.11.1 and 0.11.2: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, the gateway and `ursulactl` change only their version. 0.11.0, 0.11.1, 0.11.2 and 0.11.3 nodes run in one cluster, and extensions of all four work with any of these servers and open, read and import the same streams. The extension's local formats are unchanged. By deliberate decision, 0.11.3 breaks the 0.11 line in one place: it removes opening a Tonbo database by name and Tonbo API key tokens from the extension and from `@tonbo/sqlite-ursula`, platform features that never belonged in Ursula. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Upgrade the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.3 or replacing the extension library, once your code no longer uses what 0.11.3 removes. Rolling back to 0.11.2, 0.11.1 or 0.11.0 is safe.
