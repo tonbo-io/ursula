@@ -314,7 +314,12 @@ pub use request::immutable_read;
 pub use retention_gc::RetentionGcReport;
 pub use retention_gc::RetentionGcTarget;
 pub use retention_gc::RetentionGcTracker;
+#[expect(
+    deprecated,
+    reason = "the 0.11 API keeps collect_retained_cold_objects until the next minor"
+)]
 pub use retention_gc::collect_retained_cold_objects;
+pub use retention_gc::collect_retained_cold_objects_with_metrics;
 pub use runtime::COLD_ORPHAN_SWEEP_GRACE_MS;
 pub use runtime::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR;
 pub use runtime::ColdIndexRepairStep;

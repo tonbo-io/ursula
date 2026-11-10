@@ -2140,6 +2140,17 @@ impl ColdGcPathKind {
         }
     }
 
+    /// The one stream an exclusive chunk or an external payload belongs to.
+    /// `None` for a pack, which holds slices of many streams.
+    pub(crate) fn exclusive_stream(&self) -> Option<&BucketStreamId> {
+        match self {
+            Self::ExclusiveChunk { stream_id, .. } | Self::External { stream_id } => {
+                Some(stream_id)
+            }
+            Self::Pack { .. } => None,
+        }
+    }
+
     /// The Raft group that owns the object: a pack's own group, or the
     /// group `locate` places the stream of a chunk or an external payload in.
     fn owner(&self, locate: impl Fn(&BucketStreamId) -> RaftGroupId) -> RaftGroupId {
