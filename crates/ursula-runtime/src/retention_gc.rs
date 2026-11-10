@@ -30,6 +30,18 @@
 //! for repair, flush and compaction would remove the hazard generally; that
 //! is a follow-up.
 //!
+//! Before it deletes an object, retention GC checks the path with the shape
+//! check of cold GC (G1, [`ColdGcPathKind::parse`]): it deletes only an
+//! exclusive chunk or an external payload of the target stream itself, in
+//! the stream's own bucket. It never deletes a pack, which holds slices of
+//! many streams, even one of its own group: a page entry it collects never
+//! names a shared object, so a page naming a pack is corrupt. Any other path
+//! a page names, such as a snapshot object, another bucket's object or
+//! another group's pack, stays in the store, and the refusal is logged and
+//! counted in `cold_gc_foreign_paths_refused`. Only a corrupt or hand-edited
+//! page, or one restored from such a backup, names one. Like cold GC, the
+//! check is on the namespace, not on liveness.
+//!
 //! The tracker is leader-local and not replicated: a new leader starts it
 //! empty and waits a full grace again, which only delays collection. Page
 //! writes run inside the group actor, like the repair pass and flush page
@@ -48,7 +60,9 @@ use crate::cold_index::ColdIndexRepairInput;
 use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::parse_cold_index_page_file_name;
+use crate::cold_store::ColdGcPathKind;
 use crate::cold_store::ColdStoreHandle;
+use crate::engine::GroupEngineMetrics;
 
 /// One stream incarnation's cold objects to collect below `collect_below`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,12 +173,67 @@ impl RetentionGcTracker {
     }
 }
 
+/// Why retention GC did not delete an object a collected page names (G1).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RetentionGcRefusal {
+    /// The path is not an exclusive chunk or an external payload of the
+    /// target stream in its own bucket.
+    #[error(
+        "a cold-index page of stream '{stream_id}' below offset {collect_below} names '{path}', \
+         which is not an exclusive chunk or external payload of the stream, so retention GC \
+         does not delete it"
+    )]
+    ForeignPath {
+        stream_id: BucketStreamId,
+        collect_below: u64,
+        path: String,
+    },
+}
+
+/// The one check before retention GC deletes `path`, an object a collected
+/// page of `target` names (G1): the shape check of cold GC
+/// ([`ColdGcPathKind::parse`]) in the stream's bucket, and the object must
+/// belong to the target stream alone, so a pack never passes.
+pub(crate) fn check_retained_path(
+    target: &RetentionGcTarget,
+    path: &str,
+) -> Result<ColdGcPathKind, RetentionGcRefusal> {
+    ColdGcPathKind::parse(&target.stream_id.bucket_id, path)
+        .filter(|kind| kind.exclusive_stream() == Some(&target.stream_id))
+        .ok_or_else(|| RetentionGcRefusal::ForeignPath {
+            stream_id: target.stream_id.clone(),
+            collect_below: target.collect_below,
+            path: path.to_owned(),
+        })
+}
+
 /// Collects each target's cold objects below its `collect_below`: rewrites
 /// or deletes its pages first, then deletes the objects only those entries
-/// named. Returns the targets that completed.
+/// named. Returns the targets that completed. Refused objects are logged
+/// but not counted; [`collect_retained_cold_objects_with_metrics`] counts
+/// them.
+#[deprecated(
+    since = "0.11.6",
+    note = "use collect_retained_cold_objects_with_metrics, which also counts refused objects"
+)]
 pub async fn collect_retained_cold_objects(
     cold_store: &ColdStoreHandle,
     cache: Option<&ColdIndexPageCache<ColdStoreColdIndexPageStore>>,
+    targets: &[RetentionGcTarget],
+) -> (RetentionGcReport, Vec<RetentionGcTarget>) {
+    collect_retained_cold_objects_with_metrics(cold_store, cache, None, targets).await
+}
+
+/// Collects each target's cold objects below its `collect_below`: rewrites
+/// or deletes its pages first, then deletes the objects only those entries
+/// named, each only if it is an exclusive chunk or an external payload of
+/// the target stream in its own bucket (G1). Any other object, a pack
+/// included, stays in the store, is logged as an error and counted in
+/// `metrics`, and does not fail its target. Returns the targets that completed.
+pub async fn collect_retained_cold_objects_with_metrics(
+    cold_store: &ColdStoreHandle,
+    cache: Option<&ColdIndexPageCache<ColdStoreColdIndexPageStore>>,
+    metrics: Option<&GroupEngineMetrics>,
     targets: &[RetentionGcTarget],
 ) -> (RetentionGcReport, Vec<RetentionGcTarget>) {
     let mut report = RetentionGcReport::default();
@@ -175,6 +244,7 @@ pub async fn collect_retained_cold_objects(
             target,
             ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
             &mut report,
+            |refusal| record_refusal(metrics, refusal),
         )
         .await
         {
@@ -207,11 +277,22 @@ pub async fn collect_retained_cold_objects(
     (report, completed)
 }
 
+fn record_refusal(metrics: Option<&GroupEngineMetrics>, refusal: &RetentionGcRefusal) {
+    if let Some(metrics) = metrics {
+        metrics.record_cold_gc_refusal();
+    }
+    tracing::error!(
+        error = %refusal,
+        "retention gc refused to delete an object outside the stream's own namespace"
+    );
+}
+
 async fn collect_stream(
     cold_store: &ColdStoreHandle,
     target: &RetentionGcTarget,
     span: u64,
     report: &mut RetentionGcReport,
+    mut refused: impl FnMut(&RetentionGcRefusal),
 ) -> io::Result<bool> {
     let below = target.collect_below;
     let dir = cold_index_generation_dir(&target.stream_id, target.generation);
@@ -268,6 +349,12 @@ async fn collect_stream(
         report.pages_deleted = report.pages_deleted.saturating_add(1);
     }
     for path in doomed.difference(&kept) {
+        // G1: a refused path stays and does not fail the target, so a
+        // corrupt page cannot stall collection.
+        if let Err(refusal) = check_retained_path(target, path) {
+            refused(&refusal);
+            continue;
+        }
         cold_store.delete_chunk(path).await?;
         report.objects_deleted = report.objects_deleted.saturating_add(1);
     }
@@ -282,6 +369,7 @@ mod tests {
     use ursula_stream::ColdChunkRef;
     use ursula_stream::ObjectPayloadRef;
 
+    use super::RetentionGcRefusal;
     use super::RetentionGcReport;
     use super::RetentionGcTarget;
     use super::RetentionGcTracker;
@@ -292,6 +380,9 @@ mod tests {
     use crate::cold_index::ColdIndexPageStore;
     use crate::cold_index::ColdIndexRepairInput;
     use crate::cold_index::ColdStoreColdIndexPageStore;
+    use crate::cold_store::new_cold_chunk_path_in_generation;
+    use crate::cold_store::new_cold_pack_path;
+    use crate::cold_store::new_external_payload_path;
 
     fn chunk(start_offset: u64, end_offset: u64, s3_path: &str) -> ColdChunkRef {
         ColdChunkRef {
@@ -322,8 +413,9 @@ mod tests {
     async fn collects_whole_pages_below_the_offset_and_never_the_boundary_page() {
         let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
         let stream = BucketStreamId::new("benchcmp", "retention-pages");
-        let path = |name: &str| format!("benchcmp/retention-pages/chunks/{name}.bin");
-        let (a, x, e, c, d) = (path("a"), path("x"), path("e"), path("c"), path("d"));
+        let path = |start, end| new_cold_chunk_path_in_generation(&stream, 7, start, end);
+        let (a, e, c, d) = (path(0, 4), path(6, 9), path(9, 10), path(10, 12));
+        let x = new_external_payload_path(&stream);
         for object in [&a, &x, &e, &c, &d] {
             cold_store.write_chunk(object, b"..").await.expect("stage");
         }
@@ -362,10 +454,14 @@ mod tests {
             keep_paths: Vec::new(),
         };
         let mut report = RetentionGcReport::default();
-        let changed = collect_stream(&cold_store, &target, 8, &mut report)
-            .await
-            .expect("collect");
+        let mut refused = Vec::new();
+        let changed = collect_stream(&cold_store, &target, 8, &mut report, |refusal| {
+            refused.push(refusal.clone());
+        })
+        .await
+        .expect("collect");
         assert!(changed);
+        assert_eq!(refused, Vec::new());
         assert_eq!(report.pages_deleted, 1);
         assert_eq!(report.objects_deleted, 2);
         assert!(store.get_page(&key(0)).await.expect("read").is_none());
@@ -379,6 +475,93 @@ mod tests {
         for kept in [&e, &c, &d] {
             assert!(exists(&cold_store, kept).await, "{kept} deleted");
         }
+    }
+
+    /// G1: collects one page wholly below the offset that names a chunk of
+    /// the stream and `foreign`. The page and the chunk go; `foreign` stays
+    /// and is refused, and the target still completes.
+    async fn collect_a_page_naming(foreign: &str) {
+        let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+        let stream = BucketStreamId::new("tenant-a", "s");
+        let own = new_cold_chunk_path_in_generation(&stream, 7, 0, 4);
+        for object in [own.as_str(), foreign] {
+            cold_store.write_chunk(object, b"..").await.expect("stage");
+        }
+        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+        let key = ColdIndexPageKey {
+            stream_id: stream.clone(),
+            generation: 7,
+            page_id: 0,
+        };
+        let page = ColdIndexPage {
+            start_offset: 0,
+            end_offset: 8,
+            cold_chunks: vec![chunk(0, 4, &own), chunk(4, 6, foreign)],
+            external_segments: Vec::new(),
+        };
+        store.put_page(&key, &page).await.expect("page");
+        let target = RetentionGcTarget {
+            stream_id: stream.clone(),
+            generation: 7,
+            created_at_ms: 1,
+            collect_below: 10,
+            keep_paths: Vec::new(),
+        };
+        let mut report = RetentionGcReport::default();
+        let mut refused = Vec::new();
+        let changed = collect_stream(&cold_store, &target, 8, &mut report, |refusal| {
+            refused.push(refusal.clone());
+        })
+        .await
+        .expect("a refusal does not fail the target");
+        assert!(changed);
+        assert_eq!(report.pages_deleted, 1);
+        assert_eq!(report.objects_deleted, 1);
+        assert!(store.get_page(&key).await.expect("read").is_none());
+        assert!(!exists(&cold_store, &own).await, "{own} kept");
+        assert!(exists(&cold_store, foreign).await, "{foreign} deleted");
+        assert_eq!(refused, vec![RetentionGcRefusal::ForeignPath {
+            stream_id: stream,
+            collect_below: 10,
+            path: foreign.to_owned(),
+        }]);
+    }
+
+    #[tokio::test]
+    async fn retention_gc_keeps_a_snapshot_object_a_page_names() {
+        collect_a_page_naming(
+            "snapshots/node-1/group-1/00000000000000000042-0123456789abcdef.snap",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retention_gc_keeps_another_buckets_object_a_page_names() {
+        collect_a_page_naming(&new_cold_chunk_path_in_generation(
+            &BucketStreamId::new("tenant-b", "s"),
+            7,
+            4,
+            6,
+        ))
+        .await;
+    }
+
+    /// A pack holds slices of many streams, so retention GC deletes none,
+    /// another group's or its own.
+    #[tokio::test]
+    async fn retention_gc_keeps_a_pack_a_page_names() {
+        collect_a_page_naming(&new_cold_pack_path("tenant-a", 2)).await;
+        collect_a_page_naming(&new_cold_pack_path("tenant-a", 1)).await;
+    }
+
+    /// Another stream's objects of the same bucket are not the stream's to
+    /// collect.
+    #[tokio::test]
+    async fn retention_gc_keeps_another_streams_object_a_page_names() {
+        collect_a_page_naming(&new_external_payload_path(&BucketStreamId::new(
+            "tenant-a", "other",
+        )))
+        .await;
     }
 
     #[test]

@@ -132,7 +132,7 @@ use crate::request::WriteHotBacklog;
 use crate::request::WriteRoute;
 use crate::retention_gc::RetentionGcTarget;
 use crate::retention_gc::RetentionGcTracker;
-use crate::retention_gc::collect_retained_cold_objects;
+use crate::retention_gc::collect_retained_cold_objects_with_metrics;
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryGroupEngine {
@@ -172,6 +172,12 @@ impl InMemoryGroupEngine {
     /// Counts the folds of the entries this engine applies in `metrics`.
     pub fn set_metrics(&mut self, metrics: Option<GroupEngineMetrics>) {
         self.metrics = metrics;
+    }
+
+    /// Where this engine counts what it does, as [`Self::set_metrics`] set
+    /// it.
+    pub fn metrics(&self) -> Option<GroupEngineMetrics> {
+        self.metrics.clone()
     }
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
@@ -1992,9 +1998,10 @@ impl GroupEngine for InMemoryGroupEngine {
                     .await
                     .map_err(|err| cold_store_failure(ColdOperation::RepairIndex, err))?;
             if !retention_targets.is_empty() {
-                let (_, completed) = collect_retained_cold_objects(
+                let (_, completed) = collect_retained_cold_objects_with_metrics(
                     &cold_store,
                     self.cold_index_cache.as_deref(),
+                    self.metrics.as_ref(),
                     &retention_targets,
                 )
                 .await;

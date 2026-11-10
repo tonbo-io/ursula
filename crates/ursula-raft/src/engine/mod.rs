@@ -126,7 +126,7 @@ use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::cold_store_failure;
-use ursula_runtime::collect_retained_cold_objects;
+use ursula_runtime::collect_retained_cold_objects_with_metrics;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::expiry_sweep;
 use ursula_runtime::immutable_read;
@@ -2406,13 +2406,13 @@ impl GroupEngine for RaftGroupEngine {
                 return Ok(RepairColdIndexResponse::default());
             }
             let step = request.clone();
-            let (inputs, retention_targets) = self
+            let (inputs, retention_targets, metrics) = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
                         let engine = &mut state_machine.engine;
                         let inputs = engine.cold_index_repair_inputs_for(&step);
                         let retention_targets = engine.retention_gc_targets(&step, &inputs);
-                        (inputs, retention_targets)
+                        (inputs, retention_targets, engine.metrics())
                     })
                 })
                 .await?;
@@ -2424,9 +2424,10 @@ impl GroupEngine for RaftGroupEngine {
             // F14f: reclaim objects wholly below each visited stream's
             // retained offset once the retention grace has passed.
             if !retention_targets.is_empty() {
-                let (_, completed) = collect_retained_cold_objects(
+                let (_, completed) = collect_retained_cold_objects_with_metrics(
                     &cold_store,
                     self.cold_index_cache.as_deref(),
+                    metrics.as_ref(),
                     &retention_targets,
                 )
                 .await;

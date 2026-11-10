@@ -894,6 +894,12 @@ impl GroupEngineMetrics {
             .record_wal_storage(placement.core_id, placement.raft_group_id, sample);
     }
 
+    /// Counts one cold object that retention GC refused to delete (G1), in
+    /// `cold_gc_foreign_paths_refused` with the refusals of cold GC.
+    pub(crate) fn record_cold_gc_refusal(&self) {
+        self.inner.record_cold_gc_refusal();
+    }
+
     /// Records the end records one applied entry of the group's replica
     /// folded (F20): `swept` by a `Sweep` entry, `early` at a removal that
     /// found the group holding `ursula_stream::MAX_END_RECORDS`.
