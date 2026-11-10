@@ -3,6 +3,23 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.11.6
+
+0.11.6 is a patch of 0.11 and interoperates with 0.11.0 through 0.11.5: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the gateway, `ursulactl` and the extension change only their version. Nodes, gateways and extensions of 0.11.0 through 0.11.6 run in one cluster and open, read and import the same streams. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), and the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.6. Rolling back to any earlier 0.11 release is safe.
+
+### Server
+
+- **Retention GC deletes only the stream's own cold objects.** Before deleting an object that a cold-index page below the retained offset names, retention GC now checks it as cold GC checks a queued path: it deletes the object only if it is an exclusive chunk or an external payload of that stream, in the stream's own bucket. A pack is never deleted, because it holds slices of many streams. Any other path, such as a snapshot object or another bucket's object, also stays in the store, while the page and the stream's own objects go as before. Before, a corrupt or hand-edited page, or one restored from such a backup, could make retention GC delete them. Each refusal is logged as an error and counted in `cold_gc_foreign_paths_refused` (see [Cleaning S3](/docs/operations#cleaning-s3)).
+- **`collect_retained_cold_objects` is deprecated** in favour of `collect_retained_cold_objects_with_metrics`, which also counts the refusals in the group's metrics. The deprecated function keeps its signature and applies the same check. `InMemoryGroupEngine::metrics` is new.
+
+### Releases
+
+- **A patch release keeps the public API.** CI checks every change against the newest release of its line, with `cargo semver-checks` for the published crates and with `scripts/check_patch_api.py` for the export subpaths and names of `@tonbo/sqlite-ursula` and the public modules and names of `sqlite-ursula`.
+
+### Known issues
+
+The known issues of [0.11.0](#0110) are unchanged.
+
 ## 0.11.5
 
 0.11.5 is a patch of 0.11 and interoperates with 0.11.0 through 0.11.4: format epoch 7, backup format 5, protocol line `11` and every storage, wire and protocol format are unchanged, and the server, `ursulactl` and the extension change only their version. Nodes, gateways and extensions of 0.11.0 through 0.11.5 run in one cluster and open, read and import the same streams. Upgrade a cluster in place with an ordinary rolling restart (`helm upgrade`), and the SQLite client by installing `@tonbo/sqlite-ursula` 0.11.5. Rolling back to any earlier 0.11 release is safe.
