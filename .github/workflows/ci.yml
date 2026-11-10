@@ -106,7 +106,7 @@ jobs:
           python3 scripts/test_check_patch_api.py
           tag="$(python3 scripts/check_patch_api.py baseline)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Baseline: ${tag:-none, the workspace version's line has no release yet}"
+          echo "Baseline: ${tag:-none (no release of the workspace version line yet)}"
 
       - name: npm and Python client API
         if: steps.baseline.outputs.tag != ''
