@@ -20,6 +20,7 @@ First-principles thinking and the elegance of the implementation come before com
 - Start from what a feature must guarantee and from the user's mental model, not from how the current release does it. When compatibility with the previous minor is what shapes a design, drop that constraint in the next minor instead of designing around it.
 - Prefer a design that removes a class of problems over one that detects and patches each case. A heuristic that keeps needing new exceptions means the model is wrong.
 - Only patch releases of one minor must interoperate: formats, protocol, and rolling upgrades of a cluster or of SQLite owners. A new minor may change formats, protocols and APIs. Make it a clean break with upgrade notes, without shims, dual code paths or fields kept until a later release.
+- A patch release never breaks public API. Code written against any earlier release of the line keeps compiling and importing: no public Rust item of a published crate is removed or changed incompatibly, and no export subpath or exported name of `@tonbo/sqlite-ursula` and no public module or name of `sqlite-ursula` is removed. Deprecate instead, and remove in the next minor. The `Patch API` job of CI checks every pull request and the release commit against the newest release of the workspace version's line: `cargo semver-checks` for the crates, `scripts/check_patch_api.py` for the npm and Python packages. To start a breaking change, move the workspace to the next minor (`x.(y+1).0`) first; a line with no release yet has no baseline.
 - Reuse an existing, exercised mechanism before adding a new one, and keep one mechanism per concern.
 - Do not reach into another component's internals (for example SQLite's WAL index) to save a step. Simple and explicit beats clever.
 - Give each authority one source behind one interface, and let nothing read configuration for it directly. Peer addresses come only from `PeerDirectory`. Hosting and voters had no such seam in 0.9: static configuration was read directly at many sites, from the warm-up and `hosts_group` to readiness and the leadership balancer, and some of those predicates were written twice.
@@ -380,7 +381,8 @@ a successful push CI run on that branch: `main` for its own version, or
 `release/<major>.<minor>` for a patch to that line. `main` carries the next
 minor, so patches to a released line ship from its release branch (0.7.x from
 `release/0.7`). The image attestations name that branch as the source ref.
-The commit also needs a successful DST Nightly run and a successful Memory
+That run includes the `Patch API` job, so a patch that breaks public API
+is not released. The commit also needs a successful DST Nightly run and a successful Memory
 soak run with both the soak and the 600 s outage at their defaults, each
 dispatched on that branch (`gh workflow run memory-soak.yml --ref <branch>`).
 The dispatch may waive the DST Nightly gate, and only that gate, with a

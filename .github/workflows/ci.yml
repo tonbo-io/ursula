@@ -83,6 +83,51 @@ jobs:
             echo "::endgroup::"
           done
 
+  patch-api:
+    name: Patch API
+    # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    steps:
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      # The release tags are the baselines.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # A patch of a released line (x.y.z with a release of x.y) keeps every
+      # public API of the newest release of the line at or below it. A line
+      # with no release yet has no baseline and skips the checks.
+      - name: Baseline release
+        id: baseline
+        run: |
+          python3 scripts/test_check_patch_api.py
+          tag="$(python3 scripts/check_patch_api.py baseline)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Baseline: ${tag:-none (no release of the workspace version line yet)}"
+
+      - name: npm and Python client API
+        if: steps.baseline.outputs.tag != ''
+        run: python3 scripts/check_patch_api.py check
+
+      - name: Install Rust toolchain
+        if: steps.baseline.outputs.tag != ''
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install cargo-semver-checks
+        if: steps.baseline.outputs.tag != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Rust API of the published crates
+        if: steps.baseline.outputs.tag != ''
+        run: cargo semver-checks --workspace --baseline-rev "${{ steps.baseline.outputs.tag }}"
+
   madsim-check:
     name: Madsim check
     # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
