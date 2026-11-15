@@ -8,16 +8,34 @@
 // own that refuses each token from its expiry on, as an authorizer does. In front of
 // Ursula the gate records each request's `Authorization` header (`sentTokens`), so there the suite
 // also checks which token each request carried. The token is one per process, so each test closes
-// its databases and waits until the provider stopped (`closeAll`): the next test starts with none held.
+// its databases and waits until the provider stopped (`closeAll`), and `afterEach` does so for
+// what a failed test left open: the next test starts with none held.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
-import { type BearerToken, loadUrsulaVfs, open, type TokenProvider, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
+import { afterEach, describe, expect, it } from "vitest";
+import { type BearerToken, loadUrsulaVfs, open as openDatabase, type TokenProvider, type UrsulaDatabase, UrsulaSetupError, UrsulaUnavailableError } from "../src/index.ts";
 import { ext, fault, freshDir, gate, rejection, retired, sentTokens, stream, ursulaUrl } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** The databases the tests opened, so that `afterEach` closes those a failed test left bound. */
+const opened: UrsulaDatabase[] = [];
+
+/** `open()`, keeping the database for `afterEach`. */
+const open = async (...args: Parameters<typeof openDatabase>): Promise<UrsulaDatabase> => {
+	const db = await openDatabase(...args);
+	opened.push(db);
+	return db;
+};
+
+// The token is one per process: a database a failed test left bound would keep its provider
+// running into the next test. Close what is still open, as a passing test does itself.
+afterEach(async () => {
+	const left = opened.splice(0).filter((db) => db.isOpen);
+	if (left.length > 0) await closeAll(...left);
+});
 
 /**
  * A provider of tokens `<label>-<n>` that last `lifetimeMs`, when each of its calls started, and the
@@ -376,10 +394,13 @@ describe("a token provider", () => {
 			await db.synced();
 			expect(minted.map((m) => m.token)).toEqual(["expiring-1", "expiring-2"]);
 			const expiry = (minted[1] as { expiresAt: number }).expiresAt;
+			// A timer of the test's own for the same instant: a busy event loop delays it as much as
+			// the package's, so the call is measured from when it fired, not from the wall clock.
+			const fired = new Promise<number>((r) => setTimeout(() => r(Date.now()), Math.max(0, expiry - Date.now())));
 			// The cache mints the next token only from the expiry on: the retry due at the expiry takes
 			// it, rather than one after the backoff alone, 0.3 s or more past it.
 			await until("the call at the expiry", () => minted.length === 3);
-			expect((minted[2] as { at: number }).at - expiry).toBeLessThan(300);
+			expect((minted[2] as { at: number }).at - (await fired)).toBeLessThan(300);
 			// The source set the token in the step that took it, before this task ran again: every
 			// append from here on carries it.
 			const before = (await requests(g.control, s.path)).length;
