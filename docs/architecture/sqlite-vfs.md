@@ -1869,7 +1869,7 @@ A gate holds back what leaves the process until `synced()` says it may. It is th
 
 A returned `Response` comes back as a new `Response` with the same status, status text and headers. Its `url`, `type` and `redirected` are not carried, since a handler's response has none of them.
 
-The Python package's `gate` and `agate` ([Python](#python)) implement the first row as context managers: the block's result or error is the outcome, and `timeout` takes the place of `signal`. Python has no one response type, so they have no second row. A framework's own `sqlite3` connection raises SQLite's error unclassified, so they also ask `ursula_classify` about each SQLite error in the chain of what the block raised, on each database given (`classify_wrapped`, through the same `find_wrapped` that walks `__cause__`, SQLAlchemy's `.orig` and `ExceptionGroup`). An error the extension names passes at once, as the block raised it. Only a bare SQLite error that the state of the one database given names a refused write or a reset raises as that `UrsulaError`, which is a `sqlite3.OperationalError` too. With several databases a statement's I/O error does not say whose it is, so it passes unchanged.
+The Python package's `gate` and `agate` ([Python](#python)) implement the first row as context managers: the block's result or error is the outcome, and `timeout` takes the place of `signal`. Python has no one response type, so they have no second row. A framework's own `sqlite3` connection raises SQLite's error unclassified, so they also ask `ursula_classify` about each SQLite error in the chain of what the block raised, on each database given (`classify_wrapped`, through the same `find_wrapped` that walks `__cause__`, SQLAlchemy's `.orig` and `ExceptionGroup`). An error the extension names passes at once, as the block raised it. Only a bare SQLite error that the state of the one database given names a refused write, a reset or a retired binding's refused open raises as that `UrsulaError`, which is a `sqlite3.OperationalError` too. With several databases a statement's I/O error does not say whose it is, so it passes unchanged.
 
 What a gate does not cover: effects inside `work` before it returns, such as an outbound call or a manual acknowledgement in the middle of a handler, which need `await db.synced()` first; WebSocket frames, raw sockets, `node:http` responses written outside the gate, timers, background jobs and child processes; exactly-once effects, since a crash after the release but before an acknowledgement repeats the work, so effects need idempotency keys and message ids recorded in the same transaction; and anything beyond what `synced()` means.
 
@@ -1951,6 +1951,9 @@ at `path` has no reset and has refused no write):
   connections keep this after a reopen bound the stream anew. A `SQLITE_IOERR_AUTH` that a
   database used through `ATTACH DATABASE` raised reads as the last write the database at `path`
   refused, however old, and as `null` only while that database refused none.
+- An open of the path that fails `SQLITE_CANTOPEN` met a binding no connection opens again: the
+  database's reset when it has one, else `not_bound`, `retry`, when its binding retired (most often
+  a hand-out no connection took up within the minute), and otherwise `null`.
 - `message` is the error's message, the SQL function's own for its errors. `fix` and `request_id`
   are `null` for every failure of the extension.
 
@@ -1959,7 +1962,9 @@ Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`,
 `an_unavailable_import_says_fix`, `only_a_function_error_in_its_format_is_the_extensions`,
 `a_statement_of_a_reset_database_fails_with_its_reset`,
 `a_refused_write_is_the_last_one_its_database_refused`,
-`an_io_error_the_database_does_not_name_stays_sqlites`, `test/core.e2e.ts` "loads into the running
+`an_io_error_the_database_does_not_name_stays_sqlites`,
+`an_open_refused_by_a_retired_binding_says_open_it_again`, `driver/tests.rs`
+`a_lapsed_reader_hand_out_fails_its_open_as_not_bound_to_retry`, `test/core.e2e.ts` "loads into the running
 SQLite and registers the 0.8 functions only", "names every kind of the extension with the error and
 the action the package's own errors default to", "resets a database another process took over: 266
 for reads, 778 for writes, a fenced event", "refuses a write in EXCLUSIVE locking mode alone, as
@@ -2001,7 +2006,9 @@ returns at once.
 - `ursula_open(url, dir, options_json, timeout_ms)`: open, returning `{done, path, name, state}` or
   `{done: false, request}`. `options_json` holds `read_only`, `recreate`, `activation` (32 hex
   digits), `max_pending_bytes`, `token` and `timeout_ms`. A path `ursula_open` handed out stays
-  openable until a connection opens it, or for a minute.
+  openable until a connection opens it, or for a minute. After that minute the binding retires,
+  SQLite's open of the path fails `SQLITE_CANTOPEN`, and `ursula_classify` of that failure with
+  the path is `not_bound`, `retry`: `ursula_open` the stream again.
 - `ursula_synced(path, timeout_ms)`: `{synced, ...}`, or the reset error.
 - `ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions and resets from a
   bounded queue of 4,096, acknowledgements coalesced, what was dropped reported.

@@ -3844,6 +3844,47 @@ fn a_binding_no_connection_opens_retires() {
     assert_eq!(other.handle.life(), Life::Live);
 }
 
+// A reader's hand-out that no connection takes up within `UNCONNECTED_MS` lapses: the binding
+// retires, so the host's SQLite open of the path, made later (its next call to the extension
+// queued behind other opens), finds no binding to connect to and fails `SQLITE_CANTOPEN`.
+// `ursula_classify` of that failure must name it `not_bound`, to retry with a new `ursula_open`,
+// not leave it SQLite's bare "unable to open database file".
+#[test]
+fn a_lapsed_reader_hand_out_fails_its_open_as_not_bound_to_retry() {
+    let dir = TempDir::new("driver-reader-lapse");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let reader = w.open_result(r, reader_spec(dir.path())).unwrap();
+    w.run_for(UNCONNECTED_MS + 1_000);
+    assert_eq!(reader.handle.life(), Life::Retired);
+    assert!(!reader.handle.holds_root());
+    let path = reader.handle.generation.db().to_string_lossy().into_owned();
+    let b = Arc::new(crate::db::connection_for_tests(
+        reader.binding,
+        Arc::clone(&reader.handle),
+        path.clone(),
+    ));
+    let _registered = crate::db::registered_for_tests(&b);
+    // What the VFS's xOpen of the path checks before it answers SQLITE_CANTOPEN.
+    assert!(b.connect(Holder::Host).is_none());
+    let classified = crate::error::classify(
+        "unable to open database file",
+        i64::from(libsqlite3_sys::SQLITE_CANTOPEN),
+        || crate::db::failure_state_at(&path),
+    )
+    .map(|c| (c.kind, c.action, c.class));
+    assert_eq!(
+        classified,
+        Some((
+            crate::error::ErrorKind::NotBound,
+            crate::error::Action::Retry,
+            crate::error::ErrorClass::Setup
+        ))
+    );
+}
+
 /// The driver hears that the binding's last connection closed, and runs a while.
 fn retire_asked(w: &mut World, c: usize, bound: &Bound) {
     let now = w.now;
