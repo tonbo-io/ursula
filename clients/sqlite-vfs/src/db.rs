@@ -52,6 +52,7 @@ use crate::driver::Bound;
 use crate::driver::Connected;
 use crate::driver::Holder;
 use crate::driver::Kept;
+use crate::driver::Life;
 use crate::driver::LogPoisoned;
 use crate::driver::OpenId;
 use crate::driver::Role;
@@ -428,6 +429,7 @@ pub(crate) fn failure_state_at(full: &str) -> Option<FailureState> {
     Some(FailureState {
         reset: b.reset_kind(),
         refused,
+        retired: matches!(b.handle.life(), Life::Retired | Life::GivenUp),
     })
 }
 

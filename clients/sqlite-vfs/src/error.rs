@@ -279,11 +279,13 @@ pub(crate) struct Classified {
 }
 
 /// What a bound database says about a statement's I/O error: its reset, else the last write it
-/// refused, which only the next refusal replaces (`Commit::refusal`).
+/// refused, which only the next refusal replaces (`Commit::refusal`), and whether its binding
+/// retired (or was given up), so that no connection opens its path again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FailureState {
     pub(crate) reset: Option<ResetKind>,
     pub(crate) refused: Option<WriteRefusal>,
+    pub(crate) retired: bool,
 }
 
 /// The failure a host met, with SQLite's `message` and result code `errcode`, as the extension's
@@ -299,6 +301,10 @@ pub(crate) struct FailureState {
 ///   for a read, `SQLITE_IOERR_WRITE` for a write), and its last refused write is the
 ///   `SQLITE_IOERR_AUTH` of a write or COMMIT. A database that names neither failed another
 ///   database's statement, one used through SQL `ATTACH DATABASE`.
+/// - An open of the path a database was handed out at that fails `SQLITE_CANTOPEN` met a binding
+///   no connection opens again: its reset, else one that retired, most often a hand-out no
+///   connection took up within [`crate::driver::UNCONNECTED_MS`]. That one is `not_bound`, to
+///   retry: `ursula_open` binds the stream again.
 pub(crate) fn classify(
     message: &str,
     errcode: i64,
@@ -307,13 +313,15 @@ pub(crate) fn classify(
     if errcode == i64::from(ffi::SQLITE_ERROR) {
         return function_failure(message);
     }
-    if errcode & 0xff != i64::from(ffi::SQLITE_IOERR) {
+    let cantopen = errcode & 0xff == i64::from(ffi::SQLITE_CANTOPEN);
+    if errcode & 0xff != i64::from(ffi::SQLITE_IOERR) && !cantopen {
         return None;
     }
     let state = state()?;
     if let Some(reset) = state.reset {
         let kind = ErrorKind::Reset(reset);
         let what = match errcode {
+            _ if cantopen => "open",
             code if code == i64::from(ffi::SQLITE_IOERR_WRITE) => "write",
             code if code == i64::from(ffi::SQLITE_IOERR_READ) => "read",
             _ => "statement",
@@ -323,6 +331,17 @@ pub(crate) fn classify(
             action: kind.action(),
             class: kind.class(Surface::Bound),
             message: format!("{what} refused, {}", reset_message(reset)),
+        });
+    }
+    if cantopen {
+        return state.retired.then(|| Classified {
+            kind: ErrorKind::NotBound,
+            action: Action::Retry,
+            class: ErrorKind::NotBound.class(Surface::Bound),
+            message: "open refused, the database's binding retired before a connection opened \
+                      it (a path ursula_open handed out stays openable for a minute): \
+                      ursula_open it again."
+                .to_owned(),
         });
     }
     let refused = state
@@ -761,6 +780,7 @@ mod tests {
         Some(FailureState {
             reset: Some(kind),
             refused: None,
+            retired: false,
         })
     }
 
@@ -804,6 +824,7 @@ mod tests {
                 refused: Some(WriteRefusal::Unsupported(
                     "EXCLUSIVE locking mode".to_owned(),
                 )),
+                retired: false,
             })
         })
         .unwrap();
@@ -823,6 +844,7 @@ mod tests {
                 Some(FailureState {
                     reset: None,
                     refused: Some(refusal),
+                    retired: false,
                 })
             })
         };
@@ -871,6 +893,7 @@ mod tests {
             Some(FailureState {
                 reset: None,
                 refused: None,
+                retired: false,
             })
         };
         assert_eq!(classify("disk I/O error", IOERR_READ, clean), None);
@@ -881,6 +904,7 @@ mod tests {
             Some(FailureState {
                 reset: None,
                 refused: Some(WriteRefusal::BacklogFull { pending: 1, max: 0 }),
+                retired: false,
             })
         };
         assert_eq!(classify("disk I/O error", IOERR_WRITE, refused), None);
@@ -889,6 +913,39 @@ mod tests {
             classify("UNIQUE constraint failed: t.x", 2067, || panic!("read")),
             None
         );
+    }
+
+    // SQLite's open of a path whose binding no connection opens again fails `SQLITE_CANTOPEN`,
+    // which says nothing. A binding that retired, most often a hand-out no connection took up in
+    // time, is `not_bound`, to retry with a new `ursula_open`; a reset one is its reset; and a
+    // binding that still takes connections, or no binding, leaves the failure SQLite's own.
+    #[test]
+    fn an_open_refused_by_a_retired_binding_says_open_it_again() {
+        const CANTOPEN: i64 = 14;
+        let message = "unable to open database file";
+        let state = |reset: Option<ResetKind>, retired: bool| {
+            move || {
+                Some(FailureState {
+                    reset,
+                    refused: None,
+                    retired,
+                })
+            }
+        };
+        let lapsed = classify(message, CANTOPEN, state(None, true)).unwrap();
+        assert_eq!(
+            (lapsed.kind, lapsed.action, lapsed.class),
+            (ErrorKind::NotBound, Action::Retry, ErrorClass::Setup)
+        );
+        assert!(lapsed.message.ends_with("ursula_open it again."));
+        let fenced = classify(message, CANTOPEN, state(Some(ResetKind::Fenced), true)).unwrap();
+        assert_eq!(
+            (fenced.kind, fenced.action),
+            (ErrorKind::Reset(ResetKind::Fenced), Action::Stop)
+        );
+        assert!(fenced.message.starts_with("open refused, "));
+        assert_eq!(classify(message, CANTOPEN, state(None, false)), None);
+        assert_eq!(classify(message, CANTOPEN, || None), None);
     }
 
     // Every reset kind has the action of its reset (design: Resets), and its token is the reset's.
