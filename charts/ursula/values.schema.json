@@ -1413,6 +1413,45 @@
         }
       }
     },
+    "governance": {
+      "type": "object",
+      "description": "Cluster governance settings.",
+      "additionalProperties": false,
+      "properties": {
+        "coldHealth": {
+          "type": "object",
+          "description": "Cold-health gate overrides, rendered into governance.cold_health only when set. Null keeps the server's defaults.",
+          "additionalProperties": false,
+          "properties": {
+            "hotSizeHigh": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Per-group hot-byte high watermark in bytes, rendered as governance.cold_health.hot_size_high. Null keeps the server's 48 MiB. Must exceed hotSizeLow and, with cold storage enabled, coldStorage.flush.minHotBytes, and stay below a non-zero coldStorage.flush.maxHotBytesPerGroup."
+            },
+            "hotSizeLow": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Per-group hot-byte low watermark in bytes, rendered as governance.cold_health.hot_size_low. Null keeps the server's 32 MiB. Must be below hotSizeHigh."
+            },
+            "intervalMs": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Gate tick interval in milliseconds, rendered as governance.cold_health.interval. Null keeps the server's 2 seconds."
+            },
+            "unhealthyTicks": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Consecutive unhealthy ticks before the node sheds leadership, rendered as governance.cold_health.unhealthy_ticks. Null keeps the server's 3."
+            },
+            "healTicks": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Consecutive healthy ticks before the node counts healthy again, rendered as governance.cold_health.heal_ticks. Null keeps the server's 5."
+            }
+          }
+        }
+      }
+    },
     "tests": {
       "type": "object",
       "description": "Helm test settings.",

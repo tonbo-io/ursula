@@ -53,6 +53,7 @@
 {{- $snapshotS3TimeoutMs := .Values.snapshotStore.s3TimeoutMs -}}
 {{- $snapshotS3MaxRetries := .Values.snapshotStore.s3MaxRetries -}}
 {{- $snapshotBackend := .Values.snapshotStore.backend | default "auto" | toString -}}
+{{- $coldHealth := include "ursula.coldHealthValues" . | fromJson -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -205,6 +206,25 @@ data:
 {{- end }}
 {{- if not (eq $snapshotS3MaxRetries nil) }}
     s3_max_retries = {{ $snapshotS3MaxRetries | int64 }}
+{{- end }}
+{{- if or (not (eq $coldHealth.hotSizeHigh nil)) (not (eq $coldHealth.hotSizeLow nil)) (not (eq $coldHealth.intervalMs nil)) (not (eq $coldHealth.unhealthyTicks nil)) (not (eq $coldHealth.healTicks nil)) }}
+
+    [governance.cold_health]
+{{- if not (eq $coldHealth.intervalMs nil) }}
+    interval = "{{ $coldHealth.intervalMs | int64 }}ms"
+{{- end }}
+{{- if not (eq $coldHealth.unhealthyTicks nil) }}
+    unhealthy_ticks = {{ $coldHealth.unhealthyTicks | int64 }}
+{{- end }}
+{{- if not (eq $coldHealth.healTicks nil) }}
+    heal_ticks = {{ $coldHealth.healTicks | int64 }}
+{{- end }}
+{{- if not (eq $coldHealth.hotSizeHigh nil) }}
+    hot_size_high = "{{ $coldHealth.hotSizeHigh | int64 }}"
+{{- end }}
+{{- if not (eq $coldHealth.hotSizeLow nil) }}
+    hot_size_low = "{{ $coldHealth.hotSizeLow | int64 }}"
+{{- end }}
 {{- end }}
     EOF
 

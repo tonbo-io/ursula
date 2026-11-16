@@ -1245,5 +1245,66 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIs(parsed["storage"]["cold"]["compaction_enabled"], True)
 
 
+    def test_cold_health_renders_only_when_set(self) -> None:
+        cold = (*NAMED, "--set", "coldStorage.enabled=true", "--set", "s3.bucket=bkt")
+        self.assertNotIn("governance", tomllib.loads(render_config(*cold)))
+
+        parsed = tomllib.loads(
+            render_config(
+                *cold,
+                "--set",
+                "coldStorage.flush.maxHotBytesPerGroup=33554432",
+                "--set",
+                "governance.coldHealth.hotSizeHigh=25165824",
+                "--set",
+                "governance.coldHealth.hotSizeLow=16777216",
+                "--set",
+                "governance.coldHealth.intervalMs=1000",
+                "--set",
+                "governance.coldHealth.unhealthyTicks=4",
+                "--set",
+                "governance.coldHealth.healTicks=6",
+            )
+        )
+        self.assertEqual(parsed["storage"]["cold"]["max_hot_size_per_group"], "33554432")
+        self.assertEqual(
+            parsed["governance"]["cold_health"],
+            {
+                "interval": "1000ms",
+                "unhealthy_ticks": 4,
+                "heal_ticks": 6,
+                "hot_size_high": "25165824",
+                "hot_size_low": "16777216",
+            },
+        )
+
+    def test_cold_health_watermarks_follow_the_servers_rule(self) -> None:
+        cold = ("--set", "coldStorage.enabled=true", "--set", "s3.bucket=bkt")
+        cases = {
+            # The server default high watermark (48 MiB) is not below a 32 MiB ceiling.
+            "hotSizeHigh": ("--set", "coldStorage.flush.maxHotBytesPerGroup=33554432"),
+            # A 24 MiB high under the server default low watermark (32 MiB).
+            "hotSizeLow": ("--set", "governance.coldHealth.hotSizeHigh=25165824"),
+            # A high watermark at the flush threshold.
+            "minHotBytes": (
+                "--set",
+                "governance.coldHealth.hotSizeHigh=8388608",
+                "--set",
+                "governance.coldHealth.hotSizeLow=4194304",
+            ),
+        }
+        for named, values in cases.items():
+            with self.subTest(named):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, *cold, *values],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("governance.coldHealth", result.stderr)
+                self.assertIn(named, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

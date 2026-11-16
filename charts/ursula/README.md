@@ -599,6 +599,18 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `coldStorage.cache.blockSizeBytes` | `null` | Optional cold-read cache block size override. Renders `storage.cold.cache.block_size`. |
 | `coldStorage.cache.readaheadBlocks` | `null` | Optional cold-read cache readahead override. Renders `storage.cold.cache.readahead_blocks`. |
 
+### Governance
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `governance.coldHealth.hotSizeHigh` | `null` | Optional per-group hot-byte high watermark of the cold-health gate, in bytes. Renders `governance.cold_health.hot_size_high`; omitted keeps the server's 48 MiB. It must exceed `hotSizeLow` and, with cold storage enabled, `coldStorage.flush.minHotBytes`, and stay below a non-zero `coldStorage.flush.maxHotBytesPerGroup`, or the chart refuses to render. So a ceiling of 48 MiB or less needs it set: 24 MiB high and 16 MiB low at a 32 MiB ceiling keeps the defaults' ratio to a 64 MiB ceiling. |
+| `governance.coldHealth.hotSizeLow` | `null` | Optional per-group hot-byte low watermark in bytes. Renders `governance.cold_health.hot_size_low`; omitted keeps the server's 32 MiB. It must be below `hotSizeHigh`. |
+| `governance.coldHealth.intervalMs` | `null` | Optional gate tick interval in milliseconds. Renders `governance.cold_health.interval`; omitted keeps the server's 2 seconds. |
+| `governance.coldHealth.unhealthyTicks` | `null` | Optional consecutive unhealthy ticks before the node sheds leadership. Renders `governance.cold_health.unhealthy_ticks`; omitted keeps the server's 3. |
+| `governance.coldHealth.healTicks` | `null` | Optional consecutive healthy ticks before the node counts healthy again. Renders `governance.cold_health.heal_ticks`; omitted keeps the server's 5. |
+
+With every value omitted the chart renders no `[governance.cold_health]` table, so the generated config is the same as before these values existed.
+
 ### Snapshot Store
 
 | Value | Default | Description |

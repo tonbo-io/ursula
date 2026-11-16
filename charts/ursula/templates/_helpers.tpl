@@ -255,6 +255,46 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- fail "s3.credentials.accessKeyId and s3.credentials.secretAccessKey must both be set when inline S3 credentials are configured" -}}
 {{- end -}}
 {{- end -}}
+{{- include "ursula.validateColdHealth" . -}}
+{{- end -}}
+
+{{/*
+Mirror the server's cold-health watermark rules (ursula-config
+validate_cold_health_watermarks) on the effective values, so a config the
+server would refuse fails at render time instead of at voter start. An unset
+watermark is checked at the server's default (48 MiB high, 32 MiB low).
+*/}}
+{{- define "ursula.validateColdHealth" -}}
+{{- $coldHealth := include "ursula.coldHealthValues" . | fromJson -}}
+{{- $high := 50331648 | int64 -}}
+{{- if not (eq $coldHealth.hotSizeHigh nil) -}}
+{{- $high = $coldHealth.hotSizeHigh | int64 -}}
+{{- end -}}
+{{- $low := 33554432 | int64 -}}
+{{- if not (eq $coldHealth.hotSizeLow nil) -}}
+{{- $low = $coldHealth.hotSizeLow | int64 -}}
+{{- end -}}
+{{- if ge $low $high -}}
+{{- fail (printf "governance.coldHealth.hotSizeLow (%d bytes) must be lower than hotSizeHigh (%d bytes); an unset one keeps the server default (32 MiB low, 48 MiB high)" $low $high) -}}
+{{- end -}}
+{{- if .Values.coldStorage.enabled -}}
+{{- $minHot := .Values.coldStorage.flush.minHotBytes | int64 -}}
+{{- if le $high $minHot -}}
+{{- fail (printf "governance.coldHealth.hotSizeHigh (%d bytes) must exceed coldStorage.flush.minHotBytes (%d bytes), so normal flushing starts before leadership shedding" $high $minHot) -}}
+{{- end -}}
+{{- $maxHot := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
+{{- if and (gt $maxHot 0) (ge $high $maxHot) -}}
+{{- fail (printf "governance.coldHealth.hotSizeHigh (%d bytes) must be lower than coldStorage.flush.maxHotBytesPerGroup (%d bytes); unset, it is the server default of 48 MiB, so a ceiling at or below 48 MiB needs governance.coldHealth.hotSizeHigh and hotSizeLow set" $high $maxHot) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+governance.coldHealth as a dict, empty when governance or coldHealth is unset.
+*/}}
+{{- define "ursula.coldHealthValues" -}}
+{{- $governance := .Values.governance | default dict -}}
+{{- $governance.coldHealth | default dict | toJson -}}
 {{- end -}}
 
 {{/*
