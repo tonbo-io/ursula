@@ -59,7 +59,7 @@ from .errors import UrsulaSetupError
 from .errors import UrsulaUnavailableError
 from .errors import UrsulaWriteRefusedError
 
-__version__ = "0.11.6"
+__version__ = "0.11.7"
 
 __all__ = [
     "Action",
