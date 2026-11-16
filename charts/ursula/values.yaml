@@ -306,6 +306,26 @@ snapshotStore:
   # refuses to start.
   s3MaxRetries: null
 
+governance:
+  coldHealth:
+    # Cold-health gate overrides, rendered into [governance.cold_health] only when set.
+    # Leave them null to keep Ursula's defaults: a 48 MiB high and 32 MiB low watermark,
+    # a 2 s tick, 3 unhealthy ticks and 5 healthy ticks.
+    # Ursula requires hotSizeLow < hotSizeHigh, and with cold storage enabled
+    # coldStorage.flush.minHotBytes < hotSizeHigh < coldStorage.flush.maxHotBytesPerGroup
+    # (when that ceiling is not 0). So a ceiling of 48 MiB or less needs hotSizeHigh set:
+    # 24/16 MiB at a 32 MiB ceiling keeps the defaults' ratio to a 64 MiB ceiling.
+    # Per-group hot-byte watermark in bytes; above it a group counts toward shedding leadership.
+    hotSizeHigh: null
+    # Per-group hot-byte watermark in bytes; below it a group counts toward healthy again.
+    hotSizeLow: null
+    # Gate tick interval in milliseconds.
+    intervalMs: null
+    # Consecutive unhealthy ticks before the node sheds leadership.
+    unhealthyTicks: null
+    # Consecutive healthy ticks before the node counts healthy again.
+    healTicks: null
+
 gateway:
   # Enable the gateway Deployment and Service. The gateway is the default
   # external entrypoint; Ingress belongs under gateway.
