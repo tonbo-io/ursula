@@ -2668,9 +2668,18 @@ a.docs-card:focus-visible {
   font-family: inherit;
   font-size: 13px;
   gap: 8px;
+  min-height: 36px;
   padding: 8px 10px;
   transition: border-color 150ms ease, color 150ms ease, background-color 150ms ease;
   width: 100%;
+}
+
+/* Trim both text boxes to cap height and baseline, so centering the flex
+   items centers the glyphs even though the two fonts sit differently in
+   their line boxes. */
+.docs-version-trigger-kicker,
+.docs-version-trigger-label {
+  text-box: trim-both cap alphabetic;
 }
 
 .docs-version-trigger:hover,
