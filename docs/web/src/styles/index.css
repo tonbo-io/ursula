@@ -2653,35 +2653,102 @@ a.docs-card:focus-visible {
 /* ========== Docs versions ========== */
 
 .docs-version-switcher {
+  margin-bottom: 12px;
+  position: relative;
+}
+
+.docs-version-trigger {
+  align-items: center;
+  background: var(--bg-base);
   border: 1px solid var(--border-muted);
   border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  font-family: inherit;
+  font-size: 13px;
+  gap: 8px;
+  padding: 8px 10px;
+  transition: border-color 150ms ease, color 150ms ease, background-color 150ms ease;
+  width: 100%;
+}
+
+.docs-version-trigger:hover,
+.docs-version-trigger:focus-visible,
+.docs-version-switcher-open .docs-version-trigger {
+  background: rgba(69, 133, 136, 0.08);
+  border-color: var(--bg-accent-light);
+  outline: none;
+}
+
+.docs-version-trigger-kicker {
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.docs-version-trigger-label {
+  flex: 1;
+  text-align: left;
+}
+
+.docs-version-trigger-icon {
+  color: var(--text-soft);
+  display: inline-flex;
+  transition: transform 160ms ease;
+}
+
+.docs-version-switcher-open .docs-version-trigger-icon {
+  transform: rotate(-180deg);
+}
+
+.docs-version-menu {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px var(--surface-shadow);
+  left: 0;
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 4px;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 20;
+}
+
+.docs-version-menu[hidden] {
+  display: none;
+}
+
+.docs-version-option {
+  align-items: center;
+  border-radius: 4px;
+  color: var(--text-secondary);
   display: flex;
   font-size: 13px;
-  margin-bottom: 12px;
-  overflow: hidden;
-}
-
-.docs-version-link {
-  color: var(--text-soft);
-  flex: 1;
-  padding: 6px 10px;
-  text-align: center;
+  justify-content: space-between;
+  padding: 6px 8px;
   text-decoration: none;
+  transition: color 140ms ease, background-color 140ms ease;
 }
 
-.docs-version-link + .docs-version-link {
-  border-left: 1px solid var(--border-muted);
-}
-
-.docs-version-link:hover,
-.docs-version-link:focus-visible {
+.docs-version-option:hover,
+.docs-version-option:focus-visible {
   background: rgba(69, 133, 136, 0.08);
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  outline: none;
 }
 
-.docs-version-link-active {
-  background: var(--bg-elevated);
-  color: var(--text-secondary);
+.docs-version-option-active {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.docs-version-option-active svg {
+  color: var(--bg-accent-light);
 }
 
 .docs-version-banner {
