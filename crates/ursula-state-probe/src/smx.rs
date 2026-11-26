@@ -320,7 +320,7 @@ pub fn checkpoint_and_retain(
     checkpoint: &[u8],
     now_ms: u64,
 ) -> Result<()> {
-    let incarnation = m.head(id).map(|head| head.created_at_ms);
+    let incarnation = m.stream_incarnation(id);
     ok(
         m.apply(StreamCommand::PublishSnapshot {
             stream_id: id.clone(),
